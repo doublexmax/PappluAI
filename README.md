@@ -2,7 +2,69 @@
 
 Papplu hand correctness and a binary reward function for future model training.
 The evaluator uses this project's house rules, not a universal rummy ruleset.
+The local simulator provides a hand builder and a pass-and-play card table.
 The environment, training code, and notebook remain unfinished experiments.
+
+## Run the simulator
+
+From the repository root, start the local server with Python 3.9 or later.
+No package installation or JavaScript build is needed.
+
+```powershell
+python -m src.simulator
+```
+
+Open `http://127.0.0.1:8765` in your browser. To use another port, run
+`python -m src.simulator --port 8766`. Stop the server with Ctrl+C.
+The server accepts only local requests and is not a production web server.
+
+### Hand builder
+
+Choose the selected joker and the hand rules. Click cards in the suit gallery
+to add them, then click cards in your hand to remove individual copies.
+Load a sample to inspect a complete hand without entering all 21 cards.
+
+The result updates after each edit. A winning hand shows its complete grouping
+and what each substituted joker represents. A losing hand has reward zero, but
+the display does not claim that it contains zero useful sequences.
+Incomplete hands show the number of cards still needed.
+
+### Game table
+
+Choose one through six players for solo or local pass-and-play. The default
+uses three decks, 21 cards per player, and five required pure sequences.
+Deal a new game to shuffle and deal each player's hand.
+The game then removes one card as the joker indicator and places another on
+the discard pile. The indicator cannot be drawn during the round.
+
+Draw from the stock or the top of the discard pile. Choose a card to discard
+from your enlarged hand, or discard the drawn card immediately.
+Both choices finish the turn with the original hand size.
+Returning a card drawn from the discard pile is allowed in this simulator.
+The game does not decide whether that choice improved your hand.
+
+On multiplayer turns, pass the screen and reveal the next player's hand.
+Other players' cards are not shown. Solo play continues without the reveal step.
+A winning hand remains playable so you can experiment.
+An empty stock is not reshuffled automatically. Draw from the discard pile or
+deal a new game.
+
+Builder and table hands are separate. Table settings apply when a new game is
+dealt, not halfway through a round. Reloading the page resets both modes.
+There are no automated opponents, network players, or saved games.
+
+### Simulator limits
+
+The UI supports one through six decks, hand sizes from 3 through 30, and
+required sequence counts from 0 through 10.
+The deal must leave enough cards for all players, the indicator, and the first
+discard. Individual copies retain their identities during draw and discard.
+
+The browser calls `src\evaluate.py` through the local server. There is no second
+JavaScript version of the hand-validation rules.
+Requests are coalesced so an older result cannot overwrite an edited hand.
+An evaluation that exceeds ten seconds stops and reports an error instead of
+returning a false losing-hand result. The hand remains editable.
 
 ## House rules
 
@@ -119,8 +181,12 @@ From the repository root, the standard-library test command is:
 
 ```powershell
 python -m unittest discover -s tests -v
+node --test tests\simulator.test.mjs
 ```
 
 The tests cover the house rules and compare the evaluator with an independent
 brute-force partition oracle on small hands. Valid results are also checked
 for card conservation and legal joker assignments.
+API tests cover request validation and bounded evaluation. Game-state tests
+cover card conservation, physical copies, and draw/discard turn transitions.
+Node.js is needed only for the JavaScript tests, not to run the simulator.

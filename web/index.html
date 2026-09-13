@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Papplu simulator</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="app-header">
+      <div class="brand">
+        <h1>Papplu simulator</h1>
+        <p class="tagline">
+          Build a hand, inspect its groups, or deal a local pass-and-play table.
+        </p>
+      </div>
+      <nav class="tabs" role="tablist" aria-label="Mode">
+        <button
+          type="button"
+          role="tab"
+          id="tab-builder"
+          aria-controls="panel-builder"
+          aria-selected="true"
+          data-mode="builder"
+        >
+          Hand builder
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="tab-table"
+          aria-controls="panel-table"
+          aria-selected="false"
+          data-mode="table"
+        >
+          Game table
+        </button>
+      </nav>
+    </header>
+
+    <main id="main">
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+
+      <section
+        id="panel-builder"
+        class="panel"
+        role="tabpanel"
+        aria-labelledby="tab-builder"
+      >
+        <div class="layout">
+          <aside class="sidebar card-panel">
+            <h2>Builder settings</h2>
+            <div class="field-grid">
+              <label>
+                Cards in hand
+                <input
+                  id="builder-hand-size"
+                  type="number"
+                  min="3"
+                  max="30"
+                  value="21"
+                />
+              </label>
+              <label>
+                Required pure sequences
+                <input
+                  id="builder-required"
+                  type="number"
+                  min="0"
+                  max="10"
+                  value="5"
+                />
+              </label>
+              <label>
+                Decks (copy limit)
+                <input
+                  id="builder-decks"
+                  type="number"
+                  min="1"
+                  max="6"
+                  value="3"
+                />
+              </label>
+              <label>
+                Joker suit
+                <select id="builder-joker-suit">
+                  <option value="0" selected>♠ Spades</option>
+                  <option value="1">♥ Hearts</option>
+                  <option value="2">♦ Diamonds</option>
+                  <option value="3">♣ Clubs</option>
+                </select>
+              </label>
+              <label>
+                Joker rank
+                <select id="builder-joker-rank">
+                  <option value="0">A</option>
+                  <option value="1">2</option>
+                  <option value="2">3</option>
+                  <option value="3">4</option>
+                  <option value="4">5</option>
+                  <option value="5">6</option>
+                  <option value="6">7</option>
+                  <option value="7" selected>8</option>
+                  <option value="8">9</option>
+                  <option value="9">10</option>
+                  <option value="10">J</option>
+                  <option value="11">Q</option>
+                  <option value="12">K</option>
+                </select>
+              </label>
+            </div>
+            <p class="help">
+              Selected rank is wild in every suit. The exact joker face may fill
+              required sequences. Other same-rank cards count there only at their
+              natural rank and suit, but may substitute in additional groups. Ace
+              is low or high with no wrap. Sets need 3 or 4 distinct suits. All-joker
+              groups are allowed. The evaluator decides validity.
+            </p>
+            <div class="row wrap">
+              <label class="grow">
+                Load sample
+                <select id="builder-sample">
+                  <option value="">Choose a sample…</option>
+                  <option value="classic21">Classic valid 21 (8♠ joker)</option>
+                  <option value="exactJoker21">Exact joker in fifth sequence · valid</option>
+                  <option value="offSuitJoker21">Off-suit joker in fifth · invalid</option>
+                  <option value="naturalJoker21">Off-suit joker used naturally · valid</option>
+                  <option value="duplicateSet21">Duplicate kings with joker · invalid</option>
+                  <option value="jokerRun">Three exact 8♠ jokers · valid</option>
+                  <option value="naturalSet">Natural three 10s set</option>
+                  <option value="invalidNoise">Broken sequence · invalid</option>
+                </select>
+              </label>
+              <button type="button" id="builder-load-sample" class="secondary">
+                Load sample
+              </button>
+              <button type="button" id="builder-clear" class="ghost">
+                Clear hand
+              </button>
+            </div>
+          </aside>
+
+          <div class="content">
+            <section class="card-panel">
+              <div class="section-head">
+                <h2>Face gallery</h2>
+                <p id="builder-gallery-hint" class="muted"></p>
+              </div>
+              <div id="builder-gallery" class="gallery" aria-label="Add cards"></div>
+            </section>
+
+            <section class="card-panel">
+              <div class="section-head">
+                <h2>Your hand</h2>
+                <p id="builder-hand-count" class="count-pill">0 / 21</p>
+              </div>
+              <div
+                id="builder-hand"
+                class="hand"
+                aria-label="Builder hand cards"
+              ></div>
+              <p class="help">
+                Click a gallery face to add a copy. Click a hand card to remove it.
+                Each copy can be removed separately.
+              </p>
+            </section>
+
+            <section class="card-panel eval-panel">
+              <div class="section-head">
+                <h2>Live evaluation</h2>
+                <button type="button" id="builder-retry" class="secondary hidden">
+                  Retry
+                </button>
+              </div>
+              <div id="builder-eval" class="eval-body" aria-live="polite"></div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <section
+        id="panel-table"
+        class="panel hidden"
+        role="tabpanel"
+        aria-labelledby="tab-table"
+        hidden
+      >
+        <div class="layout">
+          <aside class="sidebar card-panel">
+            <h2>New game</h2>
+            <div class="field-grid">
+              <label>
+                Players (solo…6)
+                <input
+                  id="table-players"
+                  type="number"
+                  min="1"
+                  max="6"
+                  value="1"
+                />
+              </label>
+              <label>
+                Decks
+                <input
+                  id="table-decks"
+                  type="number"
+                  min="1"
+                  max="6"
+                  value="3"
+                />
+              </label>
+              <label>
+                Cards in hand
+                <input
+                  id="table-hand-size"
+                  type="number"
+                  min="3"
+                  max="30"
+                  value="21"
+                />
+              </label>
+              <label>
+                Required pure sequences
+                <input
+                  id="table-required"
+                  type="number"
+                  min="0"
+                  max="10"
+                  value="5"
+                />
+              </label>
+            </div>
+            <button type="button" id="table-deal" class="primary">
+              Deal new game
+            </button>
+            <p class="help">
+              Local pass-and-play, including solo. No bots. Settings apply only
+              when you deal. Empty stock is not reshuffled automatically.
+            </p>
+          </aside>
+
+          <div class="content">
+            <section id="table-board" class="card-panel table-board">
+              <p class="muted">Deal a game to start the table.</p>
+            </section>
+
+            <section class="card-panel eval-panel">
+              <div class="section-head">
+                <h2>Active hand evaluation</h2>
+                <button type="button" id="table-retry" class="secondary hidden">
+                  Retry
+                </button>
+              </div>
+              <div id="table-eval" class="eval-body" aria-live="polite"></div>
+            </section>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
