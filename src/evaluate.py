@@ -1,285 +1,317 @@
-from collections import defaultdict
-from functools import reduce, cached_property as __cached__
+"""Papplu hand validity and binary declaration reward.
 
-"""
-First: calculate the number of pure sequences in the hand.
-if the number of pure sequences is less than 3, return False.
+Card encoding is a length-52 count vector. Index = suit * 13 + rank_offset with
+suit order s, h, d, c (0..3) and ranks A,2,3,4,5,6,7,8,9,10,J,Q,K (offset 0..12).
 
-Second: find the number of unmatched cards in the hand.
-if the number of unmatched cards is 0 return True
-
-third: find the number of extra jokers (outside of the sequences)
-
-fourth: match the remaining cards outside of jokers to sets
-
-now we are left with 1) random cards 2) cards that are almost sequences 3) cards that are almost sets 4) jokers
-
-go over sets that have two cards:
-- if there is a card that can be removed from a seqeunce to make a set, do it
-- if there is a joker, use it to make a set
-
-go over sequences that have two cards:
-- apply a joker
-
-final: return True if no cards left
-
+The selected joker is an exact face index 0..51. That face may substitute in any
+meld, including required pure sequences. Every other card of the same rank may
+substitute only in melds that do not count toward the pure-sequence quota.
 """
 
-def generate_sequences(starting_hand):
-    hands = []
+from __future__ import annotations
 
-    def helper(i, hand, num_padding_sequences = 0, initial_run = 0):
-        idx = i
-        running = initial_run
-        num_sequence = num_padding_sequences
-        while idx < 52:
-            if hand[idx] == 0: # no card present
-                running = 0
-            else:
-                running += 1
-            
-            if running >= 3:
-                helper(idx+1, hand.copy(), num_padding_sequences=num_sequence, initial_run=running)
-                
-                for k in range(running):
-                    hand[idx - k] -= 1
-                idx -= running - 1
-                num_sequence += 1
+from dataclasses import dataclass
+from numbers import Integral
+from typing import Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 
-                hands.append((hand.copy(), num_sequence))
 
-                # helper(idx, hand, num_padding_sequences=num_padding_sequences)
+NUM_SUITS = 4
+NUM_RANKS = 13
+NUM_FACES = NUM_SUITS * NUM_RANKS
+MIN_MELD = 3
 
-                running = 0
-            else:
-                idx += 1
+SUITS = ("s", "h", "d", "c")
+RANKS = ("A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K")
 
-    helper(0, starting_hand.copy())
 
-    final_hands = defaultdict(int)
+@dataclass(frozen=True)
+class Meld:
+    kind: Literal["sequence", "set"]
+    cards: Tuple[int, ...]
+    represented_cards: Tuple[int, ...]
+    is_pure: bool
 
-    # since we can end up with the same hand after different types of matches, we only care about the max number of sequences per resulting hand
-    for hand, num_sequences in hands:
-        print(hand, num_sequences, ''.join(str(x) for x in hand))
-        final_hands[''.join(str(x) for x in hand)] = max(num_sequences, final_hands[''.join(str(x) for x in hand)])
 
-    return [(list(int(x) for x in hand), num_sequences) for hand, num_sequences in final_hands.items()]
+@dataclass(frozen=True)
+class HandEvaluation:
+    is_valid: bool
+    melds: Tuple[Meld, ...] = ()
 
-def generate_pure_sets(starting_hand):
-    hands = []
 
-    def helper(i, hand, num_padding_sets = 0):
-        idx = i
-        num_sets = num_padding_sets
+def _require_integral(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError("%s must be an integral number, got %r" % (name, type(value).__name__))
+    return int(value)
 
-        while idx < 52:
-            if hand[idx] == 3:
-                helper(idx+1, hand.copy(), num_padding_sets=num_sets)
-                
-                hand[idx] -= 3
-                num_sets += 1
 
-                hands.append((hand.copy(), num_sets))
+def _require_nonnegative_integral(value: object, name: str) -> int:
+    number = _require_integral(value, name)
+    if number < 0:
+        raise ValueError("%s must be nonnegative, got %d" % (name, number))
+    return number
 
-                # helper(idx, hand, num_padding_sequences=num_padding_sequences)
-            idx += 1
 
-    helper(0, starting_hand.copy())
+def _require_positive_integral(value: object, name: str) -> int:
+    number = _require_integral(value, name)
+    if number <= 0:
+        raise ValueError("%s must be positive, got %d" % (name, number))
+    return number
 
-    final_hands = defaultdict(int)
 
-    # since we can end up with the same hand after different types of matches, we only care about the max number of sequences per resulting hand
-    for hand, num_sequences in hands:
-        final_hands[''.join(str(x) for x in hand)] = max(num_sequences, final_hands[''.join(str(x) for x in hand)])
+def _parse_hand(hand: Sequence[int]) -> Tuple[int, ...]:
+    try:
+        length = len(hand)
+    except TypeError as exc:
+        raise TypeError("hand must be a sequence of length %d" % NUM_FACES) from exc
+    if length != NUM_FACES:
+        raise ValueError("hand must have length %d, got %d" % (NUM_FACES, length))
 
-    return [(list(int(x) for x in hand), num_sequences) for hand, num_sequences in final_hands.items()]
+    counts = []
+    for index, raw in enumerate(hand):
+        counts.append(_require_nonnegative_integral(raw, "hand[%d]" % index))
+    return tuple(counts)
 
-def match_cards(starting_hand):
-    sequence_hands = generate_sequences(starting_hand.copy())
 
-    hands = []
-    hands.extend(sequence_hands)
+def _parse_joker(joker: object) -> int:
+    number = _require_integral(joker, "joker")
+    if number < 0 or number >= NUM_FACES:
+        raise ValueError("joker must be in 0..%d, got %d" % (NUM_FACES - 1, number))
+    return number
 
-    for hand, num_sequences in sequence_hands:
-        set_hands = generate_pure_sets(hand.copy())
-        for hand, num_sets in set_hands:
-            hands.append((hand, num_sequences + num_sets))
-    
-    final_hands = defaultdict(int)
 
-    # since we can end up with the same hand after different types of matches, we only care about the max number of sequences per resulting hand
-    for hand, num_sequences in hands:
-        final_hands[''.join(str(x) for x in hand)] = max(num_sequences, final_hands[''.join(str(x) for x in hand)])
+def _face(suit: int, rank: int) -> int:
+    return suit * NUM_RANKS + rank
 
-    return [(list(int(x) for x in hand), num_sequences) for hand, num_sequences in final_hands.items()]
 
-def match_sets(starting_hand):
-    print(starting_hand)
+def _rank_patterns() -> Tuple[Tuple[int, ...], ...]:
+    patterns = []
+    for start in range(NUM_RANKS):
+        for end in range(start + MIN_MELD - 1, NUM_RANKS):
+            patterns.append(tuple(range(start, end + 1)))
+    for start in range(1, NUM_RANKS - 1):
+        # Ace-high runs: start..K,A (QKA, JQKA, ...). No KA2 wrap.
+        patterns.append(tuple(range(start, NUM_RANKS)) + (0,))
+    return tuple(patterns)
 
-    hands = [starting_hand.copy()]
 
-    def helper(i, hand):
-        while i < 13:
-            if hand[i] and hand[i+13] and hand[i+26] and hand[i+39]:
-                helper(i+1, hand.copy())
-                hand[i] -= 1
-                hand[i+13] -= 1
-                hand[i+26] -= 1
-                hand[i+39] -= 1
-                hands.append(hand.copy())
+RANK_PATTERNS = _rank_patterns()
 
-            elif starting_hand[i] and starting_hand[i+13] and starting_hand[i+26]:
-                helper(i+1, hand.copy())
-                hand[i] -= 1
-                hand[i+13] -= 1
-                hand[i+26] -= 1
-                hands.append(hand.copy())
 
-            else:
-                i += 1
-    
-    helper(0, starting_hand.copy())
-    
-    return hands
+def _subtract(counts: Tuple[int, ...], used: Sequence[int]) -> Tuple[int, ...]:
+    next_counts = list(counts)
+    for face in used:
+        next_counts[face] -= 1
+        if next_counts[face] < 0:
+            raise RuntimeError("internal count underflow")
+    return tuple(next_counts)
 
-def filter_jokers(hand, joker):
-    return sum(hand) - hand[joker]
 
-def match_joker_to_sequences(hand, joker):
-    hands = [hand.copy()]
+def _wild_faces(joker: int, pure: bool) -> Tuple[int, ...]:
+    if pure:
+        return (joker,)
+    rank = joker % NUM_RANKS
+    return tuple(_face(suit, rank) for suit in range(NUM_SUITS))
 
-    num_jokers = hand[joker]
 
-    def helper(i, hand, num_jokers, initial_run = 0):
-        idx = i
-        running = initial_run
-        temp_num_jokers = num_jokers
-    
-        while idx < 52:
-            if hand[idx]:
-                running += 1
-            elif hand[idx] == 0 and temp_num_jokers: # no card present but joker available
-                running += 1
-                temp_num_jokers -= 1
-            else:
-                running = 0
-                temp_num_jokers = num_jokers
-            
-            if running >= 3:
-                helper(idx+1, hand.copy(), temp_num_jokers, initial_run=running)
-                
-                for k in range(running):
-                    hand[idx - k] -= 1
-                idx -= running - 1
-                num_jokers = temp_num_jokers
+def _iter_allocations(
+    counts: Tuple[int, ...],
+    represented: Sequence[int],
+    joker: int,
+    pure: bool,
+    require_actual: Optional[int] = None,
+) -> Iterator[Tuple[int, ...]]:
+    wilds = _wild_faces(joker, pure)
+    n = len(represented)
+    actuals = [0] * n
+    pool = list(counts)
 
-                hands.append(hand.copy())
+    def place(slot: int, used_required: bool) -> Iterator[Tuple[int, ...]]:
+        if slot == n:
+            if require_actual is None or used_required:
+                yield tuple(actuals)
+            return
 
-                # helper(idx, hand, num_padding_sequences=num_padding_sequences)
+        target = represented[slot]
+        candidates = []
+        if pool[target] > 0:
+            candidates.append(target)
+        for wild in wilds:
+            if wild != target and pool[wild] > 0:
+                candidates.append(wild)
 
-                running = 0
-            else:
-                idx += 1
-        
-    helper(0, hand.copy(), num_jokers)
+        for card in candidates:
+            pool[card] -= 1
+            actuals[slot] = card
+            next_used = used_required or (require_actual is not None and card == require_actual)
+            yield from place(slot + 1, next_used)
+            pool[card] += 1
 
-    return hands
+    return place(0, False)
 
-def match_joker_to_sets(hand, joker):
-    hands = [hand.copy()]
 
-    num_jokers = hand[joker]
+def _meld_from(
+    kind: Literal["sequence", "set"],
+    actuals: Tuple[int, ...],
+    represented: Tuple[int, ...],
+    joker: int,
+) -> Meld:
+    if kind == "set":
+        is_pure = False
+    else:
+        is_pure = all(a == r or a == joker for a, r in zip(actuals, represented))
+    return Meld(kind=kind, cards=actuals, represented_cards=represented, is_pure=is_pure)
 
-    def helper(i, hand, num_jokers):
-        temp_num_jokers = num_jokers
-        while i < 13:
-            if cur_sum := max(hand[i],1) + max(hand[i+13],1) + max(hand[i+26],1) + max(hand[i+39],1) + temp_num_jokers >= 4:
-                helper(i+1, hand.copy(), temp_num_jokers)
-                hand[i] -= 1 if hand[i] else 0
-                hand[i+13] -= 1 if hand[i+13] else 0
-                hand[i+26] -= 1 if hand[i+26] else 0
-                hand[i+39] -= 1 if hand[i+39] else 0
 
-                temp_num_jokers -= 4 - cur_sum
+def _iter_sequences(
+    counts: Tuple[int, ...],
+    joker: int,
+    pure_only: bool,
+    anchor: Optional[int] = None,
+) -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
+    total = sum(counts)
+    anchor_is_wild = anchor in _wild_faces(joker, pure_only)
+    for suit in range(NUM_SUITS):
+        for pattern in RANK_PATTERNS:
+            if len(pattern) > total:
+                continue
+            represented = tuple(_face(suit, rank) for rank in pattern)
+            if anchor is not None and anchor not in represented and not anchor_is_wild:
+                continue
+            for actuals in _iter_allocations(
+                counts, represented, joker, pure_only, require_actual=anchor,
+            ):
+                meld = _meld_from("sequence", actuals, represented, joker)
+                yield meld, _subtract(counts, actuals)
 
-                hands.append(hand.copy())
 
-            elif cur_sum := max(hand[i],1) + max(hand[i+13],1) + max(hand[i+26],1) + temp_num_jokers >= 4:
-                helper(i+1, hand.copy())
-                hand[i] -= 1 if hand[i] else 0
-                hand[i+13] -= 1 if hand[i+13] else 0
-                hand[i+26] -= 1 if hand[i+26] else 0
+def _iter_sets(
+    counts: Tuple[int, ...], joker: int, anchor: int,
+) -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
+    wilds = set(_wild_faces(joker, pure=False))
+    anchor_rank = anchor % NUM_RANKS
+    anchor_is_wild = anchor in wilds
 
-                temp_num_jokers -= 3 - cur_sum
+    ranks: Sequence[int]
+    if anchor_is_wild:
+        ranks = range(NUM_RANKS)
+    else:
+        ranks = (anchor_rank,)
 
-                hands.append(hand.copy())
+    suit_combos = (
+        (0, 1, 2),
+        (0, 1, 3),
+        (0, 2, 3),
+        (1, 2, 3),
+        (0, 1, 2, 3),
+    )
 
-            else:
-                i += 1
-    
-    helper(0, hand.copy(), num_jokers)
+    for rank in ranks:
+        for suits in suit_combos:
+            represented = tuple(_face(suit, rank) for suit in suits)
+            if not anchor_is_wild and anchor not in represented:
+                continue
+            for actuals in _iter_allocations(counts, represented, joker, pure=False, require_actual=anchor):
+                meld = _meld_from("set", actuals, represented, joker)
+                yield meld, _subtract(counts, actuals)
 
-    return hands
 
-def apply_joker(hand, joker):
-    after_sequences = match_joker_to_sequences(hand.copy(), joker)
+def _collapse_candidates(
+    items: Iterator[Tuple[Meld, Tuple[int, ...]]],
+) -> List[Tuple[Meld, Tuple[int, ...]]]:
+    best = {}
+    for meld, remaining in items:
+        key = (remaining, meld.is_pure)
+        best.setdefault(key, (meld, remaining))
+    ordered = list(best.values())
+    ordered.sort(key=lambda item: (len(item[0].cards), item[0].kind, item[0].represented_cards))
+    return ordered
 
-    after_sets = []
 
-    for hand in after_sequences:
-        after_sets.extend(match_joker_to_sets(hand.copy(), joker))
-    print(after_sets, 'after sets apply joker')
-    final_hand = reduce(lambda x, y: x if sum(x) - x[joker] <= sum(y) - y[joker] else y, after_sets)
+def _search(
+    counts: Tuple[int, ...],
+    pure_needed: int,
+    joker: int,
+    memo: Dict[Tuple[Tuple[int, ...], int], Optional[Tuple[Meld, ...]]],
+) -> Optional[Tuple[Meld, ...]]:
+    key = (counts, pure_needed)
+    if key in memo:
+        return memo[key]
 
-    return final_hand
+    total = sum(counts)
+    if total == 0:
+        result: Optional[Tuple[Meld, ...]] = () if pure_needed == 0 else None
+        memo[key] = result
+        return result
+    if total < MIN_MELD:
+        memo[key] = None
+        return None
+    if pure_needed * MIN_MELD > total:
+        memo[key] = None
+        return None
 
-def matched_rate(hand, joker, required_sequences = 3, cards_in_hand = 21):
+    if pure_needed > 0:
+        # Do not pin the global lowest card: it may belong only in a later set.
+        raw = _iter_sequences(counts, joker, pure_only=True, anchor=None)
+    else:
+        anchor = next(face for face, count in enumerate(counts) if count)
+
+        def all_melds() -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
+            yield from _iter_sequences(counts, joker, pure_only=False, anchor=anchor)
+            yield from _iter_sets(counts, joker, anchor=anchor)
+
+        raw = all_melds()
+
+    for meld, remaining in _collapse_candidates(raw):
+        next_pure = max(0, pure_needed - meld.is_pure)
+        suffix = _search(remaining, next_pure, joker, memo)
+        if suffix is not None:
+            result = (meld,) + suffix
+            memo[key] = result
+            return result
+
+    memo[key] = None
+    return None
+
+
+def evaluate_hand(
+    hand: Sequence[int],
+    joker: int,
+    required_sequences: int = 5,
+    cards_in_hand: int = 21,
+) -> HandEvaluation:
+    """Return whether hand is a winning declaration and a full meld witness.
+
+    Invalid hands return is_valid False with an empty melds tuple. Wrong total
+    card count is a losing declaration, not a validation error. Malformed
+    arguments raise TypeError or ValueError.
     """
-    Determine if a hand satisfies the condition:
-        - At least *required_sequences* pure sequences.
-        - The remaining sequences can be impure sequences or sets. 
-    """
+    counts = _parse_hand(hand)
+    joker_face = _parse_joker(joker)
+    pure_needed = _require_nonnegative_integral(required_sequences, "required_sequences")
+    target_cards = _require_positive_integral(cards_in_hand, "cards_in_hand")
 
-    matched_hands = match_cards(hand.copy())
+    if sum(counts) != target_cards:
+        return HandEvaluation(is_valid=False)
 
-    possible_hands = [hand for hand, num_sequences in matched_hands if num_sequences >= required_sequences]
+    melds = _search(counts, pure_needed, joker_face, {})
+    if melds is None:
+        return HandEvaluation(is_valid=False)
+    return HandEvaluation(is_valid=True, melds=melds)
 
-    # check if there are any possible hands
-    if not possible_hands:
-        print('no possible hands')
-        return cards_in_hand
-    
-    print(possible_hands, 'possible hands')
 
-    # check after matching to sequences
-    if any(sum(x) - x[joker] == 0 for x in possible_hands):
-        print('matched by sequences')
-        return 0 
+def is_valid_hand(
+    hand: Sequence[int],
+    joker: int,
+    required_sequences: int = 5,
+    cards_in_hand: int = 21,
+) -> bool:
+    return evaluate_hand(hand, joker, required_sequences, cards_in_hand).is_valid
 
-    after_sets = [match_sets(hand)[0] for hand in possible_hands]
 
-    print(after_sets, 'after sets')
-
-    # check after matching to sets
-    if any(sum(x) - x[joker] == 0 for x in after_sets):
-        print('matched using sets')
-        return 0 
-    
-    # check after trying to use joker
-
-    best_hand = 0
-
-    for hand in possible_hands:
-        after_joker = apply_joker(hand.copy(), joker)
-        print(after_joker, 'after joker final')
-        if cur_marks:=sum(after_joker) - after_joker[joker] <= best_hand:
-            best_hand = cur_marks
-    
-    return best_hand
-
-hand = [2]*7 + [1] + [0] + [1] + [0]*42
-x = generate_sequences(hand.copy())
-y = generate_pure_sets(hand.copy())
-#print(x)
-#print(y)
-print(matched_rate(hand.copy(), 25))
+def hand_reward(
+    hand: Sequence[int],
+    joker: int,
+    required_sequences: int = 5,
+    cards_in_hand: int = 21,
+) -> float:
+    return 1.0 if is_valid_hand(hand, joker, required_sequences, cards_in_hand) else 0.0
