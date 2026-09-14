@@ -5,6 +5,10 @@ The evaluator uses this project's house rules, not a universal rummy ruleset.
 The local simulator provides a hand builder and a pass-and-play card table.
 The environment, training code, and notebook remain unfinished experiments.
 
+The Social club layout uses a warm background, player seats, a green hand mat,
+and a separate draw tray. Cards use clear sans-serif indices and a softer
+palette while keeping recognizable playing-card artwork.
+
 Card faces use original SVG artwork with red hearts and diamonds, black spades
 and clubs, mirrored corner indices, number-card pips, and colored court cards.
 Face-down cards use a generic patterned back. No external images or fonts are
@@ -45,6 +49,8 @@ The game then removes one card as the joker indicator and places another on
 the discard pile. The indicator cannot be drawn during the round.
 Settings collapse after a successful deal to leave room for play. Expand them
 to configure the next round; the current round keeps its original rules.
+On wide screens, the hand and draw tray sit side by side. On narrow screens,
+draw controls appear above the hand and turn-completion controls remain below it.
 
 Draw from the stock or the top of the discard pile. Choose a card to discard
 from your enlarged hand, or discard the drawn card immediately.

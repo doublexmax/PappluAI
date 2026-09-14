@@ -883,11 +883,18 @@ function renderTable() {
   `;
   board.append(turnBar);
 
-  const roundStrip = document.createElement("div");
-  roundStrip.className = "round-strip";
+  const drawTray = document.createElement("aside");
+  drawTray.className = "draw-tray";
+  drawTray.setAttribute("aria-label", "Draw tray and turn actions");
+  const drawSources = document.createElement("div");
+  drawSources.className = "draw-sources";
+  const drawTrayHeading = document.createElement("div");
+  drawTrayHeading.className = "draw-tray-heading";
+  drawTrayHeading.innerHTML = `<h2>Your move</h2><p>${escapeHtml(prompt)}.</p>`;
+  drawSources.append(drawTrayHeading);
 
   const jokerSpot = document.createElement("div");
-  jokerSpot.className = "pile-spot";
+  jokerSpot.className = "pile-spot joker-spot";
   const jokerCard = cardNode(st.joker.face, {
     jokerFace: st.joker.face,
     compact: true,
@@ -898,10 +905,9 @@ function renderTable() {
   jokerCopy.className = "pile-copy";
   jokerCopy.innerHTML = `<h3>Joker</h3><p>${escapeHtml(RANKS[rankOf(st.joker.face)])} is wild</p>`;
   jokerSpot.append(jokerCard, jokerCopy);
-  roundStrip.append(jokerSpot);
 
   const stockPile = document.createElement("div");
-  stockPile.className = "pile-spot";
+  stockPile.className = "pile-spot stock-pile";
   let stockCard;
   if (st.stock.length === 0) {
     stockCard = document.createElement("div");
@@ -935,10 +941,10 @@ function renderTable() {
   drawStock.addEventListener("click", () => doDraw("stock"));
   stockCopy.append(drawStock);
   stockPile.append(stockCard, stockCopy);
-  roundStrip.append(stockPile);
+  drawSources.append(stockPile);
 
   const discardPile = document.createElement("div");
-  discardPile.className = "pile-spot";
+  discardPile.className = "pile-spot discard-pile";
   let discardCardNode;
   if (discardTop) {
     discardCardNode = cardNode(discardTop.face, {
@@ -967,8 +973,8 @@ function renderTable() {
   drawDiscard.addEventListener("click", () => doDraw("discard"));
   discardCopy.append(drawDiscard);
   discardPile.append(discardCardNode, discardCopy);
-  roundStrip.append(discardPile);
-  board.append(roundStrip);
+  drawSources.append(discardPile, jokerSpot);
+  drawTray.append(drawSources);
 
   if (st.declarations.length > 0) {
     const declarations = document.createElement("section");
@@ -1001,7 +1007,7 @@ function renderTable() {
   }
 
   const handSection = document.createElement("div");
-  handSection.className = "hand-section";
+  handSection.className = "hand-section hand-mat";
   const head = document.createElement("div");
   head.className = "section-head";
   head.innerHTML = "<h2>Hand</h2>";
@@ -1130,7 +1136,7 @@ function renderTable() {
       arrangeActions.append(moveLeft, moveRight, sort);
 
       const turnActions = document.createElement("div");
-      turnActions.className = "action-group turn-actions";
+      turnActions.className = "action-group turn-actions tray-turn-actions";
       turnActions.setAttribute("aria-label", "Turn actions");
 
       const discardSelected = document.createElement("button");
@@ -1166,16 +1172,19 @@ function renderTable() {
       });
 
       turnActions.append(discardSelected, discardDrawn, declare);
-      actions.append(arrangeActions, turnActions);
+      actions.append(arrangeActions);
       handSection.append(actions);
+      drawTray.append(turnActions);
     }
   }
-  board.append(handSection);
+  const gameLayout = document.createElement("div");
+  gameLayout.className = "game-layout";
+  gameLayout.append(handSection, drawTray);
+  board.append(gameLayout);
 
   const scoreboard = document.createElement("section");
   scoreboard.className = "scoreboard";
-  scoreboard.innerHTML =
-    '<div class="score-heading"><h3>Penalty totals</h3><p class="muted">Lower is better.</p></div>';
+  scoreboard.setAttribute("aria-label", "Players and penalty totals");
   const players = document.createElement("div");
   players.className = "players-list";
   st.players.forEach((candidate, index) => {
@@ -1188,10 +1197,11 @@ function renderTable() {
     const status = candidate.active
       ? finishedStatus || "active"
       : "eliminated";
+    const isCurrent = index === st.currentPlayer && st.phase !== "finished";
     const chip = document.createElement("div");
     chip.className = [
       "player-chip",
-      index === st.currentPlayer ? "current" : "",
+      isCurrent ? "current" : "",
       status,
     ]
       .filter(Boolean)
@@ -1199,18 +1209,22 @@ function renderTable() {
     chip.dataset.playerIndex = String(index);
     chip.dataset.penaltyTotal = String(candidate.penaltyPoints);
     chip.innerHTML = `
-      <span class="player-name">${escapeHtml(candidate.name)}</span>
-      <span class="player-score">${candidate.penaltyPoints} pts</span>
-      <span class="player-state">${candidate.hand.length} cards · ${status}${
-        candidate.roundPenalty
-          ? ` · +${candidate.roundPenalty} this round`
-          : ""
-      }</span>
+      <span class="player-avatar seat-tone-${index % 6}" aria-hidden="true">${candidate.name === "You" ? "Y" : index + 1}</span>
+      <span class="player-copy">
+        <span class="player-name">${escapeHtml(candidate.name)}</span>
+        <span class="player-state">${candidate.hand.length} cards · ${status}${
+          candidate.roundPenalty
+            ? ` · +${candidate.roundPenalty} this round`
+            : ""
+        }</span>
+      </span>
+      <span class="player-score">${candidate.penaltyPoints}<small>penalty</small></span>
+      ${isCurrent ? '<span class="turn-marker">Current turn</span>' : ""}
     `;
     players.append(chip);
   });
   scoreboard.append(players);
-  board.append(scoreboard);
+  board.insertBefore(scoreboard, turnBar);
 }
 
 function reorderTableHand(targetIndex) {

@@ -15,7 +15,7 @@ function assertSelfContained(svg) {
   assert.doesNotMatch(svg, /[\u2660\u2665\u2666\u2663\u{1F0A0}]/u);
 }
 
-describe("classic card artwork", () => {
+describe("card artwork", () => {
   it("renders all 52 faces with two corners and the right pip count", () => {
     const faces = new Set();
     for (let face = 0; face < 52; face += 1) {
