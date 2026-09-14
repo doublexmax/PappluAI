@@ -141,6 +141,7 @@ class ServerTests(unittest.TestCase):
             root = Path(directory)
             (root / "index.html").write_text("<h1>Papplu</h1>", encoding="utf-8")
             (root / "game.mjs").write_text("export const ready = true;", encoding="utf-8")
+            (root / "cards.mjs").write_text("export const deck = 52;", encoding="utf-8")
             with patch("src.simulator.WEB_ROOT", root):
                 status, headers, body = self.request("GET", "/")
                 self.assertEqual(status, 200)
@@ -152,6 +153,10 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
                 self.assertGreater(int(headers["Content-Length"]), 0)
                 self.assertEqual(body, b"")
+                status, headers, body = self.request("GET", "/cards.mjs")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
+                self.assertEqual(body, b"export const deck = 52;")
 
     def test_foreign_origin_and_host_rejected(self):
         for headers in (

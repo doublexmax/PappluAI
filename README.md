@@ -5,6 +5,11 @@ The evaluator uses this project's house rules, not a universal rummy ruleset.
 The local simulator provides a hand builder and a pass-and-play card table.
 The environment, training code, and notebook remain unfinished experiments.
 
+Card faces use original SVG artwork with red hearts and diamonds, black spades
+and clubs, mirrored corner indices, number-card pips, and colored court cards.
+Face-down cards use a generic patterned back. No external images or fonts are
+downloaded.
+
 ## Run the simulator
 
 From the repository root, start the local server with Python 3.9 or later.
@@ -228,7 +233,7 @@ From the repository root, the standard-library test command is:
 
 ```powershell
 python -m unittest discover -s tests -v
-node --test tests\simulator.test.mjs
+node --test tests\simulator.test.mjs tests\card_art.test.mjs
 ```
 
 The tests cover the house rules and compare the evaluator with an independent
@@ -237,4 +242,5 @@ for card conservation and legal joker assignments.
 API tests cover request validation and bounded evaluation. Game-state tests
 cover card conservation, physical copies, card order, draw/discard transitions,
 declaration outcomes, and elimination penalties.
+Card-art tests cover all 52 faces, pip counts, and generic face-down backs.
 Node.js is needed only for the JavaScript tests, not to run the simulator.

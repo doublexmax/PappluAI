@@ -11,11 +11,11 @@ import {
   sortHand,
   toCounts,
 } from "/game.mjs";
+import { cardBackSvg, cardFaceSvg } from "/cards.mjs";
 
 const SUITS = ["♠", "♥", "♦", "♣"];
 const SUIT_NAMES = ["Spades", "Hearts", "Diamonds", "Clubs"];
 const RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
-const RED_SUITS = new Set([1, 2]);
 const DEBOUNCE_MS = 180;
 
 /** @typedef {{ id: number, face: number }} Card */
@@ -171,19 +171,12 @@ function cardNode(face, opts = {}) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "playing-card";
-  if (RED_SUITS.has(suitOf(face))) btn.classList.add("red");
   if (opts.selected) btn.classList.add("selected");
   if (opts.drawn) btn.classList.add("drawn");
   if (opts.compact) btn.classList.add("compact");
   btn.dataset.face = String(face);
   if (opts.physicalId != null) btn.dataset.id = String(opts.physicalId);
-  const rank = document.createElement("span");
-  rank.className = "rank";
-  rank.textContent = RANKS[rankOf(face)];
-  const suit = document.createElement("span");
-  suit.className = "suit";
-  suit.textContent = SUITS[suitOf(face)];
-  btn.append(rank, suit);
+  btn.innerHTML = cardFaceSvg(face);
   if (opts.jokerFace != null) {
     const badge = badgeFor(face, opts.jokerFace);
     if (badge) {
@@ -214,18 +207,12 @@ function faceButton(face, used, maxCopies, jokerFace) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "face-btn";
-  if (RED_SUITS.has(suitOf(face))) btn.classList.add("red");
-  const rank = document.createElement("span");
-  rank.className = "rank";
-  rank.textContent = RANKS[rankOf(face)];
-  const suit = document.createElement("span");
-  suit.className = "suit";
-  suit.textContent = SUITS[suitOf(face)];
+  btn.innerHTML = cardFaceSvg(face);
   const count = document.createElement("span");
   count.className = "copy-count";
   if (used === 0) count.classList.add("zero");
   count.textContent = `${used}/${maxCopies}`;
-  btn.append(rank, suit, count);
+  btn.append(count);
   const badge = badgeFor(face, jokerFace);
   if (badge) {
     const b = document.createElement("span");
@@ -927,6 +914,7 @@ function renderTable() {
     stockCard.className = "playing-card card-back compact";
     stockCard.setAttribute("role", "img");
     stockCard.setAttribute("aria-label", "Face-down stock card");
+    stockCard.innerHTML = cardBackSvg();
   }
   const stockCopy = document.createElement("div");
   stockCopy.className = "pile-copy";
@@ -996,6 +984,7 @@ function renderTable() {
       back.className = "playing-card card-back compact";
       back.setAttribute("role", "img");
       back.setAttribute("aria-label", "Face-down declared card");
+      back.innerHTML = cardBackSvg();
       const label = document.createElement("span");
       label.textContent = `${st.players[declaration.ownerIndex].name} · ${
         declaration.verdict === "pending"

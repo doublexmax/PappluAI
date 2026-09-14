@@ -20,6 +20,7 @@ ASSETS = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/game.mjs": ("game.mjs", "text/javascript; charset=utf-8"),
+    "/cards.mjs": ("cards.mjs", "text/javascript; charset=utf-8"),
 }
 MAX_BODY_BYTES = 8192
 EVALUATION_SECONDS = 10
