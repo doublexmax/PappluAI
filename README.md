@@ -21,7 +21,8 @@ The server accepts only local requests and is not a production web server.
 ### Hand builder
 
 Choose the selected joker and the hand rules. Click cards in the suit gallery
-to add them, then click cards in your hand to remove individual copies.
+to add them. Select a card in your hand and use the removal control to remove
+that copy.
 Load a sample to inspect a complete hand without entering all 21 cards.
 
 The result updates after each edit. A winning hand shows its complete grouping
@@ -45,9 +46,49 @@ The game does not decide whether that choice improved your hand.
 
 On multiplayer turns, pass the screen and reveal the next player's hand.
 Other players' cards are not shown. Solo play continues without the reveal step.
-A winning hand remains playable so you can experiment.
+**Check hand** is off by default for every player. Enable it to see live
+validity, reward, and grouping for your own hand. The next player does not
+inherit your setting, and a new round starts with checking off again.
+Having a valid hand does not automatically end the round.
 An empty stock is not reshuffled automatically. Draw from the discard pile or
 deal a new game.
+
+### Declare a win
+
+After drawing, select the card you want to put down and choose **Declare win**.
+That card goes face down into a separate declaration area, not the playable
+discard pile. The Python evaluator checks the remaining hand against the
+round's rules, even when **Check hand** is off.
+
+| Result | Outcome |
+| --- | --- |
+| Valid hand | The declaring player wins and the round ends. |
+| Invalid hand | The player loses, is eliminated from the round, and receives 80 penalty points. |
+| Evaluation error or timeout | No win, loss, or penalty is assigned. Retry the same pending declaration. |
+
+Other active players continue after an invalid declaration. Eliminated players
+are skipped, and their cards remain out of play. When only one player remains,
+that player wins automatically. An invalid solo declaration ends in a loss.
+Cards and turns cannot be changed while a declaration is awaiting a verdict.
+
+Penalty totals accumulate across deals with the same player count.
+Changing the player count resets those totals. These are false-declaration
+penalties only, not a full deadwood-scoring system. Lower totals are better.
+The evaluator's binary reward remains separate from these game penalties.
+
+The 80-point penalty and continued multiplayer play follow
+[RummyCircle's points-rummy declaration rules](https://www.rummycircle.com/rummy-variations/points-rummy.html).
+Those rules describe a 13-card game. This simulator adopts the penalty as a
+house rule for its 21-card game, not as a universal Papplu rule.
+[Pagat notes that 21-card variants have differing penalties](https://www.pagat.com/rummy/indian.html).
+
+### Arrange your cards
+
+Hands start sorted by suit and rank. Drag cards into your preferred order, or
+select a card and use the move controls. **Sort hand** restores the default
+order. Individual copies move separately, including identical-looking cards.
+Your order persists across draws, discards, checks, and turns.
+Drawing appends the new card instead of rearranging your hand.
 
 Builder and table hands are separate. Table settings apply when a new game is
 dealt, not halfway through a round. Reloading the page resets both modes.
@@ -64,7 +105,8 @@ The browser calls `src\evaluate.py` through the local server. There is no second
 JavaScript version of the hand-validation rules.
 Requests are coalesced so an older result cannot overwrite an edited hand.
 An evaluation that exceeds ten seconds stops and reports an error instead of
-returning a false losing-hand result. The hand remains editable.
+returning a false losing-hand result. Preview errors leave the hand editable.
+A pending declaration remains committed until a verdict or a new round.
 
 ## House rules
 
@@ -188,5 +230,6 @@ The tests cover the house rules and compare the evaluator with an independent
 brute-force partition oracle on small hands. Valid results are also checked
 for card conservation and legal joker assignments.
 API tests cover request validation and bounded evaluation. Game-state tests
-cover card conservation, physical copies, and draw/discard turn transitions.
+cover card conservation, physical copies, card order, draw/discard transitions,
+declaration outcomes, and elimination penalties.
 Node.js is needed only for the JavaScript tests, not to run the simulator.

@@ -1,7 +1,14 @@
 import {
+  DECLARATION_PENALTY,
+  beginDeclaration,
   createGame,
   discardCard,
   drawCard,
+  moveCard,
+  reorderHand,
+  resolveDeclaration,
+  sortCards,
+  sortHand,
   toCounts,
 } from "/game.mjs";
 
@@ -12,6 +19,15 @@ const RED_SUITS = new Set([1, 2]);
 const DEBOUNCE_MS = 180;
 
 /** @typedef {{ id: number, face: number }} Card */
+/**
+ * @typedef {{
+ *   kind: 'sequence' | 'set',
+ *   is_pure: boolean,
+ *   cards: number[],
+ *   represented_cards: number[]
+ * }} Meld
+ */
+/** @typedef {{ is_valid: boolean, reward: 0 | 1, melds: Meld[] }} Evaluation */
 
 const el = {
   status: document.getElementById("status"),
@@ -27,6 +43,10 @@ const el = {
   builderSample: document.getElementById("builder-sample"),
   builderLoadSample: document.getElementById("builder-load-sample"),
   builderClear: document.getElementById("builder-clear"),
+  builderRemove: document.getElementById("builder-remove"),
+  builderMoveLeft: document.getElementById("builder-move-left"),
+  builderMoveRight: document.getElementById("builder-move-right"),
+  builderSort: document.getElementById("builder-sort"),
   builderGallery: document.getElementById("builder-gallery"),
   builderGalleryHint: document.getElementById("builder-gallery-hint"),
   builderHand: document.getElementById("builder-hand"),
@@ -39,6 +59,8 @@ const el = {
   tableRequired: document.getElementById("table-required"),
   tableDeal: document.getElementById("table-deal"),
   tableBoard: document.getElementById("table-board"),
+  tableDeclaration: document.getElementById("table-declaration"),
+  tableDeclarationRetry: document.getElementById("table-declaration-retry"),
   tableEval: document.getElementById("table-eval"),
   tableRetry: document.getElementById("table-retry"),
 };
@@ -49,14 +71,21 @@ const builder = {
   nextId: 1,
   selectedSample: "classic21",
   lastConfig: null,
+  selectedId: /** @type {number | null} */ (null),
+  draggedId: /** @type {number | null} */ (null),
 };
 
 const table = {
   /** @type {import('./game.mjs').GameState | null} */
   state: null,
   selectedId: /** @type {number | null} */ (null),
+  draggedId: /** @type {number | null} */ (null),
   revealed: true,
   started: false,
+  checkHand: /** @type {boolean[]} */ ([]),
+  generation: 0,
+  /** @type {null | { data: Evaluation, ownerIndex: number }} */
+  declarationResult: null,
 };
 
 const evalCtl = {
@@ -68,6 +97,11 @@ const evalCtl = {
   /** @type {string} */
   mode: "builder",
   lastError: /** @type {string | null} */ (null),
+};
+
+const declarationCtl = {
+  inflight: false,
+  error: /** @type {string | null} */ (null),
 };
 
 function faceOf(suit, rank) {
@@ -243,11 +277,14 @@ function loadSample(name) {
     joker: 7,
   });
   const faces = sampleFaces(name);
-  builder.hand = faces.map((face) => {
-    const card = { id: builder.nextId, face };
-    builder.nextId += 1;
-    return card;
-  });
+  builder.hand = sortCards(
+    faces.map((face) => {
+      const card = { id: builder.nextId, face };
+      builder.nextId += 1;
+      return card;
+    }),
+  );
+  builder.selectedId = null;
   builder.selectedSample = name;
   setStatus(`Loaded sample: ${el.builderSample.selectedOptions[0]?.text || name}`);
   renderBuilder();
@@ -275,19 +312,44 @@ function renderBuilder() {
   el.builderGalleryHint.textContent = `Up to ${cfg.decks} copies per face. Hand target ${cfg.cardsInHand}. Joker ${labelFace(cfg.joker)}.`;
 
   el.builderHand.replaceChildren();
-  const sorted = builder.hand
-    .slice()
-    .sort((a, b) => a.face - b.face || a.id - b.id);
-  for (const card of sorted) {
+  for (const [index, card] of builder.hand.entries()) {
     const node = cardNode(card.face, {
       jokerFace: cfg.joker,
       physicalId: card.id,
-      title: `${labelFace(card.face)} (remove)`,
+      selected: builder.selectedId === card.id,
+      title: `${labelFace(card.face)} (select)`,
     });
-    node.addEventListener("click", () => removeBuilderCard(card.id));
+    node.draggable = true;
+    node.addEventListener("click", () => {
+      builder.selectedId = builder.selectedId === card.id ? null : card.id;
+      renderBuilder();
+      focusSelected(el.builderHand, builder.selectedId);
+    });
+    node.addEventListener("dragstart", () => {
+      builder.draggedId = card.id;
+    });
+    node.addEventListener("dragend", () => {
+      builder.draggedId = null;
+    });
+    node.addEventListener("dragover", (event) => event.preventDefault());
+    node.addEventListener("drop", (event) => {
+      event.preventDefault();
+      if (builder.draggedId == null) return;
+      builder.selectedId = builder.draggedId;
+      moveBuilderCard(index);
+      builder.draggedId = null;
+    });
     el.builderHand.append(node);
   }
   el.builderHandCount.textContent = `${builder.hand.length} / ${cfg.cardsInHand}`;
+  const selectedIndex = builder.hand.findIndex(
+    (card) => card.id === builder.selectedId,
+  );
+  el.builderRemove.disabled = selectedIndex < 0;
+  el.builderMoveLeft.disabled = selectedIndex <= 0;
+  el.builderMoveRight.disabled =
+    selectedIndex < 0 || selectedIndex === builder.hand.length - 1;
+  el.builderSort.disabled = builder.hand.length < 2;
 }
 
 function addBuilderFace(face) {
@@ -302,26 +364,58 @@ function addBuilderFace(face) {
     return;
   }
   builder.hand.push({ id: builder.nextId, face });
+  builder.selectedId = builder.nextId;
   builder.nextId += 1;
   setStatus(`Added ${labelFace(face)}.`);
   renderBuilder();
   scheduleEval("builder");
 }
 
-function removeBuilderCard(id) {
-  const idx = builder.hand.findIndex((c) => c.id === id);
+function removeBuilderCard() {
+  const idx = builder.hand.findIndex((card) => card.id === builder.selectedId);
   if (idx < 0) return;
   const [removed] = builder.hand.splice(idx, 1);
+  builder.selectedId =
+    builder.hand[Math.min(idx, builder.hand.length - 1)]?.id ?? null;
   setStatus(`Removed ${labelFace(removed.face)}.`);
   renderBuilder();
+  focusSelected(el.builderHand, builder.selectedId);
   scheduleEval("builder");
 }
 
 function clearBuilderHand() {
   builder.hand = [];
+  builder.selectedId = null;
   setStatus("Hand cleared.");
   renderBuilder();
   scheduleEval("builder");
+}
+
+function focusSelected(container, physicalId) {
+  if (physicalId == null) return;
+  container.querySelector(`[data-id="${physicalId}"]`)?.focus();
+}
+
+function moveBuilderCard(targetIndex) {
+  if (builder.selectedId == null) return;
+  builder.hand = moveCard(builder.hand, builder.selectedId, targetIndex);
+  renderBuilder();
+  focusSelected(el.builderHand, builder.selectedId);
+}
+
+function moveBuilderBy(offset) {
+  const index = builder.hand.findIndex(
+    (card) => card.id === builder.selectedId,
+  );
+  if (index < 0) return;
+  moveBuilderCard(Math.max(0, Math.min(builder.hand.length - 1, index + offset)));
+}
+
+function sortBuilderHand() {
+  builder.hand = sortCards(builder.hand);
+  renderBuilder();
+  focusSelected(el.builderHand, builder.selectedId);
+  setStatus("Hand sorted by suit and rank.");
 }
 
 function setMode(mode) {
@@ -345,7 +439,7 @@ function setMode(mode) {
 /**
  * @param {'builder' | 'table'} mode
  * @param {HTMLElement} target
- * @param {{ hand: Card[], joker: number, required: number, cardsInHand: number, hidden?: boolean, problem?: string | null, needsDiscard?: boolean }} snap
+ * @param {{ hand: Card[], joker: number, required: number, cardsInHand: number, hidden?: boolean, unchecked?: boolean, problem?: string | null, needsDiscard?: boolean }} snap
  */
 function paintEvalState(mode, target, snap) {
   if (snap.hidden) {
@@ -355,6 +449,11 @@ function paintEvalState(mode, target, snap) {
   }
   if (snap.problem) {
     target.innerHTML = `<p class="eval-wait">${escapeHtml(snap.problem)}</p>`;
+    return;
+  }
+  if (snap.unchecked) {
+    target.innerHTML =
+      '<p class="muted">Check hand is off. Turn it on to evaluate this player.</p>';
     return;
   }
   if (snap.needsDiscard) {
@@ -385,7 +484,14 @@ function scheduleEval(mode) {
   evalCtl.lastError = null;
   paintEvalState(mode, target, snap);
 
-  if (snap.hidden || snap.problem || snap.needsDiscard || snap.hand.length === 0 || snap.hand.length !== snap.cardsInHand) {
+  if (
+    snap.hidden ||
+    snap.unchecked ||
+    snap.problem ||
+    snap.needsDiscard ||
+    snap.hand.length === 0 ||
+    snap.hand.length !== snap.cardsInHand
+  ) {
     evalCtl.rev += 1;
     evalCtl.queued = null;
     return;
@@ -434,12 +540,20 @@ function snapshotFor(mode) {
   const st = table.state;
   const hidden = st.players.length > 1 && !table.revealed;
   const hand = st.players[st.currentPlayer].hand.slice();
+  const unavailable =
+    st.phase === "declaring"
+      ? "A declaration is pending."
+      : st.phase === "finished"
+        ? "The round is finished."
+        : null;
   return {
     hand,
     joker: st.joker.face,
     required: st.rules.requiredSequences,
     cardsInHand: st.rules.cardsInHand,
     hidden,
+    unchecked: !table.checkHand[st.currentPlayer],
+    problem: unavailable,
     needsDiscard: st.phase === "discard",
   };
 }
@@ -458,65 +572,24 @@ async function runEval(payload) {
   const target = payload.mode === "builder" ? el.builderEval : el.tableEval;
   const retry = payload.mode === "builder" ? el.builderRetry : el.tableRetry;
   try {
-    const res = await fetch("/api/evaluate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        hand: payload.hand,
-        joker: payload.joker,
-        required_sequences: payload.required,
-        cards_in_hand: payload.cards,
-      }),
-    });
-    const text = await res.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      throw new Error("The server returned unreadable JSON.");
-    }
+    const data = await requestEvaluation(payload);
 
     if (payload.rev !== evalCtl.rev || payload.mode !== evalCtl.mode) {
       return;
-    }
-
-    if (res.status === 503) {
-      const msg = data.error || "Evaluator unavailable";
-      evalCtl.lastError = msg;
-      const kind = /exceeded|timeout/i.test(msg) ? "Timed out" : "Unavailable";
-      target.innerHTML = `<p class="eval-bad">${kind}: ${escapeHtml(msg)}</p>
-        <p class="muted">Change the hand or press Retry to evaluate again. This is not scored as invalid.</p>`;
-      retry.classList.remove("hidden");
-      return;
-    }
-    if (!res.ok) {
-      evalCtl.lastError = data.error || `HTTP ${res.status}`;
-      target.innerHTML = `<p class="eval-bad">Error: ${escapeHtml(evalCtl.lastError)}</p>`;
-      retry.classList.remove("hidden");
-      return;
-    }
-
-    const isFace = (face) => Number.isInteger(face) && face >= 0 && face < 52;
-    if (
-      typeof data?.is_valid !== "boolean" ||
-      data.reward !== Number(data.is_valid) ||
-      !Array.isArray(data.melds) ||
-      (data.is_valid ? data.melds.length === 0 : data.melds.length !== 0) ||
-      !data.melds.every((meld) =>
-        ["sequence", "set"].includes(meld.kind) &&
-        typeof meld.is_pure === "boolean" &&
-        Array.isArray(meld.cards) && Array.isArray(meld.represented_cards) &&
-        meld.cards.length >= 3 &&
-        meld.cards.length === meld.represented_cards.length &&
-        meld.cards.every(isFace) && meld.represented_cards.every(isFace))
-    ) {
-      throw new Error("The server returned an invalid evaluation response.");
     }
     renderEvalResult(target, data, payload.joker);
   } catch (err) {
     if (payload.rev !== evalCtl.rev || payload.mode !== evalCtl.mode) return;
     evalCtl.lastError = err instanceof Error ? err.message : String(err);
-    target.innerHTML = `<p class="eval-bad">Evaluation error: ${escapeHtml(evalCtl.lastError)}</p>`;
+    const status = err instanceof Error ? err.status : undefined;
+    const kind =
+      status === 503
+        ? /exceeded|timeout/i.test(evalCtl.lastError)
+          ? "Timed out"
+          : "Unavailable"
+        : "Evaluation error";
+    target.innerHTML = `<p class="eval-bad">${kind}: ${escapeHtml(evalCtl.lastError)}</p>
+      <p class="muted">Change the hand or press Retry to evaluate again. This is not scored as invalid.</p>`;
     retry.classList.remove("hidden");
   } finally {
     evalCtl.inflight = false;
@@ -528,6 +601,73 @@ async function runEval(payload) {
   }
 }
 
+/**
+ * @param {unknown} data
+ * @returns {Evaluation}
+ */
+function validateEvaluationResponse(data) {
+  const isFace = (face) => Number.isInteger(face) && face >= 0 && face < 52;
+  if (
+    data === null ||
+    typeof data !== "object" ||
+    !("is_valid" in data) ||
+    !("reward" in data) ||
+    !("melds" in data) ||
+    typeof data.is_valid !== "boolean" ||
+    data.reward !== Number(data.is_valid) ||
+    !Array.isArray(data.melds) ||
+    (data.is_valid ? data.melds.length === 0 : data.melds.length !== 0) ||
+    !data.melds.every((meld) =>
+      meld !== null &&
+      typeof meld === "object" &&
+      ["sequence", "set"].includes(meld.kind) &&
+      typeof meld.is_pure === "boolean" &&
+      Array.isArray(meld.cards) &&
+      Array.isArray(meld.represented_cards) &&
+      meld.cards.length >= 3 &&
+      meld.cards.length === meld.represented_cards.length &&
+      meld.cards.every(isFace) &&
+      meld.represented_cards.every(isFace))
+  ) {
+    throw new Error("The server returned an invalid evaluation response.");
+  }
+  return {
+    is_valid: data.is_valid,
+    reward: data.is_valid ? 1 : 0,
+    melds: data.melds,
+  };
+}
+
+/**
+ * @param {{ hand: number[], joker: number, required: number, cards: number }} payload
+ * @returns {Promise<Evaluation>}
+ */
+async function requestEvaluation(payload) {
+  const response = await fetch("/api/evaluate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      hand: payload.hand,
+      joker: payload.joker,
+      required_sequences: payload.required,
+      cards_in_hand: payload.cards,
+    }),
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("The server returned unreadable JSON.");
+  }
+  if (!response.ok) {
+    const error = new Error(data?.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return validateEvaluationResponse(data);
+}
+
 function escapeHtml(s) {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -536,6 +676,11 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;");
 }
 
+/**
+ * @param {HTMLElement} target
+ * @param {Evaluation} data
+ * @param {number} jokerFace
+ */
 function renderEvalResult(target, data, jokerFace) {
   const ok = data.is_valid;
   const reward = data.reward;
@@ -599,17 +744,34 @@ function dealNewGame() {
     const decks = readInt(el.tableDecks);
     const cardsInHand = readInt(el.tableHandSize);
     const requiredSequences = readInt(el.tableRequired);
-    table.state = createGame({
+    const hadGame = table.state !== null;
+    const sameSeats = table.state?.players.length === players;
+    const penaltyTotals = sameSeats
+      ? table.state.players.map((player) => player.penaltyPoints)
+      : Array(players).fill(0);
+    const nextState = createGame({
       players,
       decks,
       cardsInHand,
       requiredSequences,
+      penaltyTotals,
     });
+    table.generation += 1;
+    table.state = nextState;
     table.selectedId = null;
+    table.draggedId = null;
     table.revealed = true;
     table.started = true;
+    table.checkHand = Array(players).fill(false);
+    table.declarationResult = null;
+    declarationCtl.inflight = false;
+    declarationCtl.error = null;
     setStatus(
-      `Dealt ${players === 1 ? "solo" : players + " players"} · ${cardsInHand} cards · joker ${labelFace(table.state.joker.face)}`,
+      `Dealt ${players === 1 ? "solo" : players + " players"} · ${cardsInHand} cards · joker ${labelFace(table.state.joker.face)}${
+        hadGame && !sameSeats
+          ? " · Penalty points reset because the player count changed."
+          : ""
+      }`,
     );
     renderTable();
     scheduleEval("table");
@@ -618,38 +780,90 @@ function dealNewGame() {
   }
 }
 
+function renderDeclarationResult(st) {
+  el.tableDeclarationRetry.classList.add("hidden");
+  if (st.phase === "declaring") {
+    if (declarationCtl.error) {
+      el.tableDeclaration.innerHTML = `<p class="eval-bad">Declaration check failed: ${escapeHtml(declarationCtl.error)}</p>
+        <p class="muted">No penalty was applied. Retry uses the same committed hand.</p>`;
+      el.tableDeclarationRetry.classList.remove("hidden");
+    } else {
+      el.tableDeclaration.innerHTML =
+        '<p class="eval-wait">Checking declaration...</p>';
+    }
+    return;
+  }
+  if (!table.declarationResult) {
+    el.tableDeclaration.innerHTML =
+      '<p class="muted">No declaration has been resolved this round.</p>';
+    return;
+  }
+  const { data, ownerIndex } = table.declarationResult;
+  renderEvalResult(el.tableDeclaration, data, st.joker.face);
+  const heading = document.createElement("p");
+  heading.className = data.is_valid ? "eval-ok" : "eval-bad";
+  heading.textContent = `${st.players[ownerIndex].name} declared ${data.is_valid ? "a valid hand." : "an invalid hand."}`;
+  el.tableDeclaration.prepend(heading);
+}
+
+function outcomeText(st) {
+  if (st.outcomeReason === "valid-declaration") {
+    return `${st.players[st.winnerIndex].name} wins with a valid declaration.`;
+  }
+  if (st.outcomeReason === "last-remaining") {
+    return `${st.players[st.winnerIndex].name} wins as the last active player.`;
+  }
+  return "Solo round lost after an invalid declaration.";
+}
+
 function renderTable() {
   const board = el.tableBoard;
   if (!table.state) {
     board.innerHTML = '<p class="muted">Deal a game to start the table.</p>';
+    el.tableDeclaration.innerHTML =
+      '<p class="muted">No declaration this round.</p>';
     el.tableEval.innerHTML = '<p class="muted">No active hand.</p>';
+    el.tableDeclarationRetry.classList.add("hidden");
     return;
   }
   const st = table.state;
   const multi = st.players.length > 1;
-  const covered = multi && !table.revealed;
+  const covered = multi && !table.revealed && st.phase !== "finished";
   const player = st.players[st.currentPlayer];
   const handSize = player.hand.length;
   const target = st.rules.cardsInHand;
   const discardTop = st.discard[st.discard.length - 1];
+  const canArrange = st.phase === "draw" || st.phase === "discard";
 
+  renderDeclarationResult(st);
   board.replaceChildren();
+
+  if (st.phase === "finished") {
+    const outcome = document.createElement("div");
+    outcome.className = "outcome-banner";
+    outcome.dataset.reason = st.outcomeReason;
+    outcome.textContent = outcomeText(st);
+    board.append(outcome);
+  }
 
   const meta = document.createElement("div");
   meta.className = "meta-row";
   meta.innerHTML = `
     <span class="chip">Turn ${st.turn}</span>
     <span class="chip">Phase: ${st.phase}</span>
-    <span class="chip">Active: ${escapeHtml(player.name)}</span>
+    <span class="chip">Current: ${escapeHtml(player.name)}</span>
     <span class="chip">Hand ${handSize}/${target}</span>
   `;
   board.append(meta);
 
   const jokerBox = document.createElement("div");
   jokerBox.className = "joker-spotlight";
-  const jLabel = document.createElement("div");
-  jLabel.innerHTML = `<strong>Joker indicator</strong><div class="muted">Outside play for the round. Rank ${escapeHtml(RANKS[rankOf(st.joker.face)])} is wild.</div>`;
-  jokerBox.append(cardNode(st.joker.face, { jokerFace: st.joker.face }), jLabel);
+  const jokerLabel = document.createElement("div");
+  jokerLabel.innerHTML = `<strong>Joker indicator</strong><div class="muted">Outside play for the round. Rank ${escapeHtml(RANKS[rankOf(st.joker.face)])} is wild.</div>`;
+  jokerBox.append(
+    cardNode(st.joker.face, { jokerFace: st.joker.face }),
+    jokerLabel,
+  );
   board.append(jokerBox);
 
   const piles = document.createElement("div");
@@ -661,12 +875,12 @@ function renderTable() {
   if (st.stock.length === 0) {
     const warn = document.createElement("p");
     warn.className = "warn";
-    warn.textContent = "Stock exhausted. No automatic reshuffle. Discard or deal a new game.";
+    warn.textContent =
+      "Stock exhausted. No automatic reshuffle. Discard or deal a new game.";
     stockPile.append(warn);
   } else {
     const back = document.createElement("div");
-    back.className = "playing-card";
-    back.textContent = "🂠";
+    back.className = "playing-card card-back";
     back.setAttribute("aria-hidden", "true");
     stockPile.append(back);
   }
@@ -674,16 +888,17 @@ function renderTable() {
   drawStock.type = "button";
   drawStock.className = "secondary";
   drawStock.textContent = "Draw from stock";
-  drawStock.disabled = st.phase !== "draw" || st.stock.length === 0 || covered;
+  drawStock.disabled =
+    st.phase !== "draw" || st.stock.length === 0 || covered;
   drawStock.addEventListener("click", () => doDraw("stock"));
   stockPile.append(drawStock);
   piles.append(stockPile);
 
-  const discPile = document.createElement("div");
-  discPile.className = "pile";
-  discPile.innerHTML = `<h3>Discard · ${st.discard.length}</h3>`;
+  const discardPile = document.createElement("div");
+  discardPile.className = "pile";
+  discardPile.innerHTML = `<h3>Discard · ${st.discard.length}</h3>`;
   if (discardTop) {
-    discPile.append(
+    discardPile.append(
       cardNode(discardTop.face, {
         jokerFace: st.joker.face,
         title: `Top discard ${labelFace(discardTop.face)}`,
@@ -693,36 +908,93 @@ function renderTable() {
     const empty = document.createElement("p");
     empty.className = "muted";
     empty.textContent = "Empty";
-    discPile.append(empty);
+    discardPile.append(empty);
   }
-  const drawDisc = document.createElement("button");
-  drawDisc.type = "button";
-  drawDisc.className = "secondary";
-  drawDisc.textContent = "Draw from discard";
-  drawDisc.disabled = st.phase !== "draw" || st.discard.length === 0 || covered;
-  drawDisc.addEventListener("click", () => doDraw("discard"));
-  discPile.append(drawDisc);
-  piles.append(discPile);
+  const drawDiscard = document.createElement("button");
+  drawDiscard.type = "button";
+  drawDiscard.className = "secondary";
+  drawDiscard.textContent = "Draw from discard";
+  drawDiscard.disabled =
+    st.phase !== "draw" || st.discard.length === 0 || covered;
+  drawDiscard.addEventListener("click", () => doDraw("discard"));
+  discardPile.append(drawDiscard);
+  piles.append(discardPile);
+
+  const declarationPile = document.createElement("div");
+  declarationPile.className = "pile";
+  declarationPile.innerHTML = `<h3>Declarations · ${st.declarations.length}</h3>`;
+  if (st.declarations.length === 0) {
+    declarationPile.insertAdjacentHTML(
+      "beforeend",
+      '<p class="muted">Declared cards stay face down here.</p>',
+    );
+  } else {
+    const declarationCards = document.createElement("div");
+    declarationCards.className = "declaration-zone";
+    for (const declaration of st.declarations) {
+      const item = document.createElement("div");
+      item.className = "declaration-item";
+      item.dataset.owner = String(declaration.ownerIndex);
+      const back = document.createElement("div");
+      back.className = "playing-card card-back compact";
+      back.setAttribute("role", "img");
+      back.setAttribute("aria-label", "Face-down declared card");
+      const label = document.createElement("span");
+      label.textContent = `${st.players[declaration.ownerIndex].name} · ${
+        declaration.verdict === "pending"
+          ? "checking"
+          : declaration.verdict === "valid"
+            ? "valid"
+            : `invalid (+${st.players[declaration.ownerIndex].roundPenalty})`
+      }`;
+      item.append(back, label);
+      declarationCards.append(item);
+    }
+    declarationPile.append(declarationCards);
+  }
+  piles.append(declarationPile);
   board.append(piles);
 
-  const others = document.createElement("div");
-  others.className = "players-list";
-  st.players.forEach((p, i) => {
+  const players = document.createElement("div");
+  players.className = "players-list";
+  st.players.forEach((candidate, index) => {
+    const finishedStatus =
+      st.phase === "finished" && candidate.active
+        ? index === st.winnerIndex
+          ? "winner"
+          : "lost"
+        : null;
+    const status = candidate.active
+      ? finishedStatus || "active"
+      : "eliminated";
     const chip = document.createElement("span");
-    chip.className = "player-chip" + (i === st.currentPlayer ? " active" : "");
-    chip.textContent =
-      i === st.currentPlayer
-        ? `${p.name} · ${p.hand.length} cards (active)`
-        : `${p.name} · ${p.hand.length} cards`;
-    others.append(chip);
+    chip.className = [
+      "player-chip",
+      index === st.currentPlayer ? "current" : "",
+      status,
+    ].filter(Boolean).join(" ");
+    chip.dataset.playerIndex = String(index);
+    chip.dataset.penaltyTotal = String(candidate.penaltyPoints);
+    chip.textContent = `${candidate.name} · ${candidate.hand.length} cards · Penalty points ${candidate.penaltyPoints} (lower is better) · ${status}${
+      candidate.roundPenalty ? ` · +${candidate.roundPenalty} this round` : ""
+    }`;
+    players.append(chip);
   });
-  board.append(others);
+  board.append(players);
 
   const handSection = document.createElement("div");
-  handSection.style.marginTop = "1rem";
+  handSection.className = "hand-section";
   const head = document.createElement("div");
   head.className = "section-head";
-  head.innerHTML = `<h2>${escapeHtml(player.name)} hand</h2><p class="count-pill">${handSize} / ${target}${st.phase === "discard" ? " · discard one" : " · draw first"}</p>`;
+  const prompt =
+    st.phase === "discard"
+      ? "discard or declare"
+      : st.phase === "draw"
+        ? "draw first"
+        : st.phase === "declaring"
+          ? "declaration committed"
+          : "round finished";
+  head.innerHTML = `<h2>${escapeHtml(player.name)} hand</h2><p class="count-pill">${handSize} / ${target} · ${prompt}</p>`;
   handSection.append(head);
 
   if (covered) {
@@ -744,32 +1016,87 @@ function renderTable() {
     cover.append(reveal);
     handSection.append(cover);
   } else {
-    const handEl = document.createElement("div");
-    handEl.className = "hand";
-    const sorted = player.hand
-      .slice()
-      .sort((a, b) => a.face - b.face || a.id - b.id);
-    for (const card of sorted) {
+    const checkLabel = document.createElement("label");
+    checkLabel.className = "check-control";
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.checked = Boolean(table.checkHand[st.currentPlayer]);
+    check.disabled = !canArrange;
+    check.dataset.action = "check-hand";
+    check.addEventListener("change", () => {
+      table.checkHand[st.currentPlayer] = check.checked;
+      renderTable();
+      scheduleEval("table");
+    });
+    checkLabel.append(check, document.createTextNode("Check hand"));
+    handSection.append(checkLabel);
+
+    const hand = document.createElement("div");
+    hand.className = "hand";
+    hand.dataset.playerHand = String(st.currentPlayer);
+    for (const [index, card] of player.hand.entries()) {
       const node = cardNode(card.face, {
         jokerFace: st.joker.face,
         physicalId: card.id,
         selected: table.selectedId === card.id,
         drawn: st.drawnCardId === card.id,
       });
-      node.addEventListener("click", () => {
-        if (st.phase !== "discard") {
-          setStatus("Draw a card before selecting a discard.");
-          return;
-        }
-        table.selectedId = card.id;
-        renderTable();
-      });
-      handEl.append(node);
+      node.draggable = canArrange;
+      if (canArrange) {
+        node.addEventListener("click", () => {
+          table.selectedId = table.selectedId === card.id ? null : card.id;
+          renderTable();
+          focusSelected(el.tableBoard, table.selectedId);
+        });
+        node.addEventListener("dragstart", () => {
+          table.draggedId = card.id;
+        });
+        node.addEventListener("dragend", () => {
+          table.draggedId = null;
+        });
+        node.addEventListener("dragover", (event) => event.preventDefault());
+        node.addEventListener("drop", (event) => {
+          event.preventDefault();
+          if (table.draggedId == null) return;
+          table.selectedId = table.draggedId;
+          reorderTableHand(index);
+          table.draggedId = null;
+        });
+      }
+      hand.append(node);
     }
-    handSection.append(handEl);
+    handSection.append(hand);
 
+    const selectedIndex = player.hand.findIndex(
+      (card) => card.id === table.selectedId,
+    );
     const actions = document.createElement("div");
     actions.className = "actions";
+
+    const moveLeft = document.createElement("button");
+    moveLeft.type = "button";
+    moveLeft.className = "secondary";
+    moveLeft.textContent = "Move selected left";
+    moveLeft.disabled = !canArrange || selectedIndex <= 0;
+    moveLeft.addEventListener("click", () => reorderTableHand(selectedIndex - 1));
+
+    const moveRight = document.createElement("button");
+    moveRight.type = "button";
+    moveRight.className = "secondary";
+    moveRight.textContent = "Move selected right";
+    moveRight.disabled =
+      !canArrange ||
+      selectedIndex < 0 ||
+      selectedIndex === player.hand.length - 1;
+    moveRight.addEventListener("click", () => reorderTableHand(selectedIndex + 1));
+
+    const sort = document.createElement("button");
+    sort.type = "button";
+    sort.className = "secondary";
+    sort.textContent = "Sort hand";
+    sort.disabled = !canArrange || player.hand.length < 2;
+    sort.addEventListener("click", sortTableHand);
+
     const discardSelected = document.createElement("button");
     discardSelected.type = "button";
     discardSelected.className = "primary";
@@ -778,22 +1105,61 @@ function renderTable() {
     discardSelected.disabled =
       st.phase !== "discard" || table.selectedId == null;
     discardSelected.addEventListener("click", () => {
-      if (table.selectedId == null) return;
-      doDiscard(table.selectedId);
+      if (table.selectedId != null) doDiscard(table.selectedId);
     });
+
     const discardDrawn = document.createElement("button");
     discardDrawn.type = "button";
     discardDrawn.className = "secondary";
     discardDrawn.textContent = "Discard drawn card";
     discardDrawn.disabled = st.phase !== "discard" || st.drawnCardId == null;
     discardDrawn.addEventListener("click", () => {
-      if (st.drawnCardId == null) return;
-      doDiscard(st.drawnCardId);
+      if (st.drawnCardId != null) doDiscard(st.drawnCardId);
     });
-    actions.append(discardSelected, discardDrawn);
+
+    const declare = document.createElement("button");
+    declare.type = "button";
+    declare.className = "declare";
+    declare.textContent = "Declare win";
+    declare.disabled = st.phase !== "discard" || table.selectedId == null;
+    declare.addEventListener("click", () => {
+      if (table.selectedId != null) doDeclare(table.selectedId);
+    });
+
+    actions.append(
+      moveLeft,
+      moveRight,
+      sort,
+      discardSelected,
+      discardDrawn,
+      declare,
+    );
     handSection.append(actions);
   }
   board.append(handSection);
+}
+
+function reorderTableHand(targetIndex) {
+  if (!table.state || table.selectedId == null) return;
+  try {
+    table.state = reorderHand(table.state, table.selectedId, targetIndex);
+    renderTable();
+    focusSelected(el.tableBoard, table.selectedId);
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+  }
+}
+
+function sortTableHand() {
+  if (!table.state) return;
+  try {
+    table.state = sortHand(table.state);
+    renderTable();
+    focusSelected(el.tableBoard, table.selectedId);
+    setStatus("Hand sorted by suit and rank.");
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+  }
 }
 
 function doDraw(source) {
@@ -812,6 +1178,83 @@ function doDraw(source) {
     scheduleEval("table");
   } catch (err) {
     setStatus(err instanceof Error ? err.message : String(err));
+  }
+}
+
+function doDeclare(physicalId) {
+  if (!table.state || declarationCtl.inflight) return;
+  try {
+    table.state = beginDeclaration(table.state, physicalId);
+    table.selectedId = null;
+    table.declarationResult = null;
+    declarationCtl.error = null;
+    scheduleEval("table");
+    renderTable();
+    setStatus("Declaration committed. Checking the remaining hand.");
+    void submitDeclaration(table.generation);
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function submitDeclaration(generation) {
+  if (
+    !table.state ||
+    table.state.phase !== "declaring" ||
+    declarationCtl.inflight
+  ) {
+    return;
+  }
+  const state = table.state;
+  const declaration = state.declarations[state.declarations.length - 1];
+  const declarationKey = `${declaration.ownerIndex}:${declaration.card.id}:${state.turn}`;
+  const hand = state.players[declaration.ownerIndex].hand;
+  declarationCtl.inflight = true;
+  declarationCtl.error = null;
+  renderTable();
+  try {
+    const data = await requestEvaluation({
+      hand: toCounts(hand),
+      joker: state.joker.face,
+      required: state.rules.requiredSequences,
+      cards: state.rules.cardsInHand,
+    });
+    const live = table.state;
+    const liveDeclaration = live?.declarations[live.declarations.length - 1];
+    if (
+      generation !== table.generation ||
+      !live ||
+      live.phase !== "declaring" ||
+      `${liveDeclaration.ownerIndex}:${liveDeclaration.card.id}:${live.turn}` !==
+        declarationKey
+    ) {
+      return;
+    }
+    table.state = resolveDeclaration(live, data.is_valid);
+    table.declarationResult = {
+      data,
+      ownerIndex: declaration.ownerIndex,
+    };
+    declarationCtl.error = null;
+    if (table.state.phase === "draw" && table.state.players.length > 1) {
+      table.revealed = false;
+    }
+    setStatus(
+      data.is_valid
+        ? `${state.players[declaration.ownerIndex].name} made a valid declaration.`
+        : `${state.players[declaration.ownerIndex].name} made an invalid declaration and received ${DECLARATION_PENALTY} penalty points.`,
+    );
+    renderTable();
+    if (evalCtl.mode === "table") scheduleEval("table");
+  } catch (err) {
+    if (generation !== table.generation || table.state?.phase !== "declaring") {
+      return;
+    }
+    declarationCtl.error = err instanceof Error ? err.message : String(err);
+    setStatus("Declaration could not be checked. No penalty was applied.");
+    renderTable();
+  } finally {
+    if (generation === table.generation) declarationCtl.inflight = false;
   }
 }
 
@@ -844,6 +1287,10 @@ function wire() {
     loadSample(el.builderSample.value || builder.selectedSample);
   });
   el.builderClear.addEventListener("click", clearBuilderHand);
+  el.builderRemove.addEventListener("click", removeBuilderCard);
+  el.builderMoveLeft.addEventListener("click", () => moveBuilderBy(-1));
+  el.builderMoveRight.addEventListener("click", () => moveBuilderBy(1));
+  el.builderSort.addEventListener("click", sortBuilderHand);
   for (const input of [
     el.builderHandSize,
     el.builderRequired,
@@ -864,6 +1311,9 @@ function wire() {
   }
   el.builderRetry.addEventListener("click", () => scheduleEval("builder"));
   el.tableRetry.addEventListener("click", () => scheduleEval("table"));
+  el.tableDeclarationRetry.addEventListener("click", () => {
+    void submitDeclaration(table.generation);
+  });
   el.tableDeal.addEventListener("click", dealNewGame);
 }
 

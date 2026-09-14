@@ -160,9 +160,23 @@
                 class="hand"
                 aria-label="Builder hand cards"
               ></div>
+              <div class="actions">
+                <button type="button" id="builder-move-left" class="secondary">
+                  Move selected left
+                </button>
+                <button type="button" id="builder-move-right" class="secondary">
+                  Move selected right
+                </button>
+                <button type="button" id="builder-sort" class="secondary">
+                  Sort hand
+                </button>
+                <button type="button" id="builder-remove" class="ghost">
+                  Remove selected
+                </button>
+              </div>
               <p class="help">
-                Click a gallery face to add a copy. Click a hand card to remove it.
-                Each copy can be removed separately.
+                Click a gallery face to add a copy. Select a hand card, then
+                move or remove that physical copy. Drag cards to reorder them.
               </p>
             </section>
 
@@ -236,7 +250,10 @@
             </button>
             <p class="help">
               Local pass-and-play, including solo. No bots. Settings apply only
-              when you deal. Empty stock is not reshuffled automatically.
+              when you deal. Invalid declarations eliminate that player and add
+              80 penalty points. Lower totals are better, and totals carry
+              across deals with the same player count. Empty stock is not
+              reshuffled automatically.
             </p>
           </aside>
 
@@ -247,7 +264,27 @@
 
             <section class="card-panel eval-panel">
               <div class="section-head">
-                <h2>Active hand evaluation</h2>
+                <h2>Declaration result</h2>
+                <button
+                  type="button"
+                  id="table-declaration-retry"
+                  class="secondary hidden"
+                >
+                  Retry declaration
+                </button>
+              </div>
+              <div
+                id="table-declaration"
+                class="eval-body"
+                aria-live="polite"
+              >
+                <p class="muted">No declaration this round.</p>
+              </div>
+            </section>
+
+            <section class="card-panel eval-panel">
+              <div class="section-head">
+                <h2>Optional hand check</h2>
                 <button type="button" id="table-retry" class="secondary hidden">
                   Retry
                 </button>
