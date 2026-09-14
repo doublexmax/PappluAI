@@ -20,9 +20,10 @@ The server accepts only local requests and is not a production web server.
 
 ### Hand builder
 
-Choose the selected joker and the hand rules. Click cards in the suit gallery
-to add them. Select a card in your hand and use the removal control to remove
-that copy.
+Expand the settings panel to change the hand rules or selected joker.
+Samples and the card picker remain available alongside the hand.
+Click a card under **Add cards** to add a copy. Select a card in your hand and
+choose **Remove** to remove only that copy.
 Load a sample to inspect a complete hand without entering all 21 cards.
 
 The result updates after each edit. A winning hand shows its complete grouping
@@ -37,6 +38,8 @@ uses three decks, 21 cards per player, and five required pure sequences.
 Deal a new game to shuffle and deal each player's hand.
 The game then removes one card as the joker indicator and places another on
 the discard pile. The indicator cannot be drawn during the round.
+Settings collapse after a successful deal to leave room for play. Expand them
+to configure the next round; the current round keeps its original rules.
 
 Draw from the stock or the top of the discard pile. Choose a card to discard
 from your enlarged hand, or discard the drawn card immediately.
@@ -47,9 +50,11 @@ The game does not decide whether that choice improved your hand.
 On multiplayer turns, pass the screen and reveal the next player's hand.
 Other players' cards are not shown. Solo play continues without the reveal step.
 **Check hand** is off by default for every player. Enable it to see live
-validity, reward, and grouping for your own hand. The next player does not
+validity and grouping for your own hand. The next player does not
 inherit your setting, and a new round starts with checking off again.
 Having a valid hand does not automatically end the round.
+The hand-check panel appears only when requested. Declaration results appear
+when a declaration is made, rather than occupying an empty panel during play.
 An empty stock is not reshuffled automatically. Draw from the discard pile or
 deal a new game.
 
@@ -85,7 +90,7 @@ house rule for its 21-card game, not as a universal Papplu rule.
 ### Arrange your cards
 
 Hands start sorted by suit and rank. Drag cards into your preferred order, or
-select a card and use the move controls. **Sort hand** restores the default
+select a card and use the move controls. **Sort** restores the default
 order. Individual copies move separately, including identical-looking cards.
 Your order persists across draws, discards, checks, and turns.
 Drawing appends the new card instead of rearranging your hand.

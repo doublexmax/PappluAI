@@ -35,6 +35,7 @@ const el = {
   tabTable: document.getElementById("tab-table"),
   panelBuilder: document.getElementById("panel-builder"),
   panelTable: document.getElementById("panel-table"),
+  builderSettingsSummary: document.getElementById("builder-settings-summary"),
   builderHandSize: document.getElementById("builder-hand-size"),
   builderRequired: document.getElementById("builder-required"),
   builderDecks: document.getElementById("builder-decks"),
@@ -58,9 +59,12 @@ const el = {
   tableHandSize: document.getElementById("table-hand-size"),
   tableRequired: document.getElementById("table-required"),
   tableDeal: document.getElementById("table-deal"),
+  tableSettings: document.getElementById("table-settings"),
   tableBoard: document.getElementById("table-board"),
+  tableDeclarationPanel: document.getElementById("table-declaration-panel"),
   tableDeclaration: document.getElementById("table-declaration"),
   tableDeclarationRetry: document.getElementById("table-declaration-retry"),
+  tableEvalPanel: document.getElementById("table-eval-panel"),
   tableEval: document.getElementById("table-eval"),
   tableRetry: document.getElementById("table-retry"),
 };
@@ -190,11 +194,17 @@ function cardNode(face, opts = {}) {
     }
   }
   btn.title = opts.title || labelFace(face);
+  const cardState = [
+    opts.selected ? "selected" : "",
+    opts.drawn ? "drawn card" : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
   btn.setAttribute(
     "aria-label",
     opts.title ||
       `${RANKS[rankOf(face)]} of ${SUIT_NAMES[suitOf(face)]}${
-        opts.physicalId != null ? `, id ${opts.physicalId}` : ""
+        cardState ? `, ${cardState}` : ""
       }`,
   );
   return btn;
@@ -213,6 +223,7 @@ function faceButton(face, used, maxCopies, jokerFace) {
   suit.textContent = SUITS[suitOf(face)];
   const count = document.createElement("span");
   count.className = "copy-count";
+  if (used === 0) count.classList.add("zero");
   count.textContent = `${used}/${maxCopies}`;
   btn.append(rank, suit, count);
   const badge = badgeFor(face, jokerFace);
@@ -286,6 +297,7 @@ function loadSample(name) {
   );
   builder.selectedId = null;
   builder.selectedSample = name;
+  el.builderSample.value = name;
   setStatus(`Loaded sample: ${el.builderSample.selectedOptions[0]?.text || name}`);
   renderBuilder();
   scheduleEval("builder");
@@ -294,6 +306,8 @@ function loadSample(name) {
 function renderBuilder() {
   const cfg = builderConfig();
   builder.lastConfig = cfg;
+  el.builderSettingsSummary.textContent =
+    `${cfg.cardsInHand} cards · ${cfg.requiredSequences} pure · Joker ${labelFace(cfg.joker)}`;
 
   const used = toCounts(builder.hand);
   el.builderGallery.replaceChildren();
@@ -683,12 +697,12 @@ function escapeHtml(s) {
  */
 function renderEvalResult(target, data, jokerFace) {
   const ok = data.is_valid;
-  const reward = data.reward;
   const head = document.createElement("div");
   if (ok) {
-    head.innerHTML = `<p class="eval-ok">Valid hand · reward ${escapeHtml(String(reward))}</p>`;
+    head.innerHTML = '<p class="eval-ok">Valid hand</p>';
   } else {
-    head.innerHTML = `<p class="eval-bad">Invalid · reward ${reward} · No complete grouping meets the required sequences</p>`;
+    head.innerHTML =
+      '<p class="eval-bad">Not valid. No complete grouping meets the required sequences.</p>';
   }
   target.replaceChildren(head);
 
@@ -705,7 +719,7 @@ function renderEvalResult(target, data, jokerFace) {
     block.className = "meld";
     const mh = document.createElement("div");
     mh.className = "meld-head";
-    mh.innerHTML = `<strong>${escapeHtml(meld.kind)}</strong><span>${meld.kind === "set" ? "distinct suits" : meld.is_pure ? "qualifying pure" : "impure"}</span>`;
+    mh.innerHTML = `<strong>${escapeHtml(meld.kind === "set" ? "Set" : "Sequence")}</strong><span>${meld.kind === "set" ? "distinct suits" : meld.is_pure ? "qualifying pure" : "impure"}</span>`;
     const cards = document.createElement("div");
     cards.className = "meld-cards";
     const actual = meld.cards;
@@ -766,6 +780,7 @@ function dealNewGame() {
     table.declarationResult = null;
     declarationCtl.inflight = false;
     declarationCtl.error = null;
+    el.tableSettings.open = false;
     setStatus(
       `Dealt ${players === 1 ? "solo" : players + " players"} · ${cardsInHand} cards · joker ${labelFace(table.state.joker.face)}${
         hadGame && !sameSeats
@@ -781,7 +796,14 @@ function dealNewGame() {
 }
 
 function renderDeclarationResult(st) {
+  const visible =
+    st.phase === "declaring" || table.declarationResult !== null;
+  el.tableDeclarationPanel.hidden = !visible;
   el.tableDeclarationRetry.classList.add("hidden");
+  if (!visible) {
+    el.tableDeclaration.replaceChildren();
+    return;
+  }
   if (st.phase === "declaring") {
     if (declarationCtl.error) {
       el.tableDeclaration.innerHTML = `<p class="eval-bad">Declaration check failed: ${escapeHtml(declarationCtl.error)}</p>
@@ -791,11 +813,6 @@ function renderDeclarationResult(st) {
       el.tableDeclaration.innerHTML =
         '<p class="eval-wait">Checking declaration...</p>';
     }
-    return;
-  }
-  if (!table.declarationResult) {
-    el.tableDeclaration.innerHTML =
-      '<p class="muted">No declaration has been resolved this round.</p>';
     return;
   }
   const { data, ownerIndex } = table.declarationResult;
@@ -819,11 +836,15 @@ function outcomeText(st) {
 function renderTable() {
   const board = el.tableBoard;
   if (!table.state) {
-    board.innerHTML = '<p class="muted">Deal a game to start the table.</p>';
-    el.tableDeclaration.innerHTML =
-      '<p class="muted">No declaration this round.</p>';
-    el.tableEval.innerHTML = '<p class="muted">No active hand.</p>';
+    delete board.dataset.phase;
+    board.innerHTML =
+      '<p class="empty-state">Choose settings and deal a game.</p>';
+    el.tableDeclarationPanel.hidden = true;
+    el.tableEvalPanel.hidden = true;
+    el.tableDeclaration.replaceChildren();
+    el.tableEval.replaceChildren();
     el.tableDeclarationRetry.classList.add("hidden");
+    el.tableRetry.classList.add("hidden");
     return;
   }
   const st = table.state;
@@ -834,8 +855,15 @@ function renderTable() {
   const target = st.rules.cardsInHand;
   const discardTop = st.discard[st.discard.length - 1];
   const canArrange = st.phase === "draw" || st.phase === "discard";
+  const showHandCheck =
+    Boolean(table.checkHand[st.currentPlayer]) &&
+    !covered &&
+    canArrange;
 
+  board.dataset.phase = st.phase;
   renderDeclarationResult(st);
+  el.tableEvalPanel.hidden = !showHandCheck;
+  if (!showHandCheck) el.tableRetry.classList.add("hidden");
   board.replaceChildren();
 
   if (st.phase === "finished") {
@@ -846,89 +874,118 @@ function renderTable() {
     board.append(outcome);
   }
 
-  const meta = document.createElement("div");
-  meta.className = "meta-row";
-  meta.innerHTML = `
-    <span class="chip">Turn ${st.turn}</span>
-    <span class="chip">Phase: ${st.phase}</span>
-    <span class="chip">Current: ${escapeHtml(player.name)}</span>
-    <span class="chip">Hand ${handSize}/${target}</span>
+  const prompt =
+    st.phase === "discard"
+      ? "Choose a discard or declare"
+      : st.phase === "draw"
+        ? "Draw a card"
+        : st.phase === "declaring"
+          ? "Checking declaration"
+          : "Round complete";
+  const turnBar = document.createElement("div");
+  turnBar.className = "turn-bar";
+  turnBar.innerHTML = `
+    <div>
+      <p class="eyebrow">Turn ${st.turn}</p>
+      <h2>${escapeHtml(player.name)}</h2>
+    </div>
+    <div class="turn-summary">
+      <span class="turn-prompt">${escapeHtml(prompt)}</span>
+      <span>${st.rules.requiredSequences} pure required</span>
+    </div>
   `;
-  board.append(meta);
+  board.append(turnBar);
 
-  const jokerBox = document.createElement("div");
-  jokerBox.className = "joker-spotlight";
-  const jokerLabel = document.createElement("div");
-  jokerLabel.innerHTML = `<strong>Joker indicator</strong><div class="muted">Outside play for the round. Rank ${escapeHtml(RANKS[rankOf(st.joker.face)])} is wild.</div>`;
-  jokerBox.append(
-    cardNode(st.joker.face, { jokerFace: st.joker.face }),
-    jokerLabel,
-  );
-  board.append(jokerBox);
+  const roundStrip = document.createElement("div");
+  roundStrip.className = "round-strip";
 
-  const piles = document.createElement("div");
-  piles.className = "piles";
+  const jokerSpot = document.createElement("div");
+  jokerSpot.className = "pile-spot";
+  const jokerCard = cardNode(st.joker.face, {
+    jokerFace: st.joker.face,
+    compact: true,
+    title: `Joker indicator ${labelFace(st.joker.face)}`,
+  });
+  jokerCard.disabled = true;
+  const jokerCopy = document.createElement("div");
+  jokerCopy.className = "pile-copy";
+  jokerCopy.innerHTML = `<h3>Joker</h3><p>${escapeHtml(RANKS[rankOf(st.joker.face)])} is wild</p>`;
+  jokerSpot.append(jokerCard, jokerCopy);
+  roundStrip.append(jokerSpot);
 
   const stockPile = document.createElement("div");
-  stockPile.className = "pile";
-  stockPile.innerHTML = `<h3>Stock · ${st.stock.length} left</h3>`;
+  stockPile.className = "pile-spot";
+  let stockCard;
   if (st.stock.length === 0) {
-    const warn = document.createElement("p");
-    warn.className = "warn";
-    warn.textContent =
-      "Stock exhausted. No automatic reshuffle. Discard or deal a new game.";
-    stockPile.append(warn);
+    stockCard = document.createElement("div");
+    stockCard.className = "playing-card compact empty-card";
+    stockCard.setAttribute("role", "img");
+    stockCard.setAttribute("aria-label", "Empty stock");
+    stockCard.textContent = "Empty";
   } else {
-    const back = document.createElement("div");
-    back.className = "playing-card card-back";
-    back.setAttribute("aria-hidden", "true");
-    stockPile.append(back);
+    stockCard = document.createElement("div");
+    stockCard.className = "playing-card card-back compact";
+    stockCard.setAttribute("role", "img");
+    stockCard.setAttribute("aria-label", "Face-down stock card");
+  }
+  const stockCopy = document.createElement("div");
+  stockCopy.className = "pile-copy";
+  stockCopy.innerHTML = `<h3>Stock · ${st.stock.length}</h3>`;
+  if (st.stock.length === 0) {
+    stockCopy.insertAdjacentHTML(
+      "beforeend",
+      '<p class="warn">No reshuffle</p>',
+    );
   }
   const drawStock = document.createElement("button");
   drawStock.type = "button";
   drawStock.className = "secondary";
-  drawStock.textContent = "Draw from stock";
+  drawStock.textContent = "Draw stock";
+  drawStock.setAttribute("aria-label", "Draw from stock");
   drawStock.disabled =
     st.phase !== "draw" || st.stock.length === 0 || covered;
   drawStock.addEventListener("click", () => doDraw("stock"));
-  stockPile.append(drawStock);
-  piles.append(stockPile);
+  stockCopy.append(drawStock);
+  stockPile.append(stockCard, stockCopy);
+  roundStrip.append(stockPile);
 
   const discardPile = document.createElement("div");
-  discardPile.className = "pile";
-  discardPile.innerHTML = `<h3>Discard · ${st.discard.length}</h3>`;
+  discardPile.className = "pile-spot";
+  let discardCardNode;
   if (discardTop) {
-    discardPile.append(
-      cardNode(discardTop.face, {
-        jokerFace: st.joker.face,
-        title: `Top discard ${labelFace(discardTop.face)}`,
-      }),
-    );
+    discardCardNode = cardNode(discardTop.face, {
+      jokerFace: st.joker.face,
+      compact: true,
+      title: `Top discard ${labelFace(discardTop.face)}`,
+    });
+    discardCardNode.disabled = true;
   } else {
-    const empty = document.createElement("p");
-    empty.className = "muted";
-    empty.textContent = "Empty";
-    discardPile.append(empty);
+    discardCardNode = document.createElement("div");
+    discardCardNode.className = "playing-card compact empty-card";
+    discardCardNode.setAttribute("role", "img");
+    discardCardNode.setAttribute("aria-label", "Empty discard pile");
+    discardCardNode.textContent = "Empty";
   }
+  const discardCopy = document.createElement("div");
+  discardCopy.className = "pile-copy";
+  discardCopy.innerHTML = `<h3>Discard · ${st.discard.length}</h3>`;
   const drawDiscard = document.createElement("button");
   drawDiscard.type = "button";
   drawDiscard.className = "secondary";
-  drawDiscard.textContent = "Draw from discard";
+  drawDiscard.textContent = "Draw discard";
+  drawDiscard.setAttribute("aria-label", "Draw from discard");
   drawDiscard.disabled =
     st.phase !== "draw" || st.discard.length === 0 || covered;
   drawDiscard.addEventListener("click", () => doDraw("discard"));
-  discardPile.append(drawDiscard);
-  piles.append(discardPile);
+  discardCopy.append(drawDiscard);
+  discardPile.append(discardCardNode, discardCopy);
+  roundStrip.append(discardPile);
+  board.append(roundStrip);
 
-  const declarationPile = document.createElement("div");
-  declarationPile.className = "pile";
-  declarationPile.innerHTML = `<h3>Declarations · ${st.declarations.length}</h3>`;
-  if (st.declarations.length === 0) {
-    declarationPile.insertAdjacentHTML(
-      "beforeend",
-      '<p class="muted">Declared cards stay face down here.</p>',
-    );
-  } else {
+  if (st.declarations.length > 0) {
+    const declarations = document.createElement("section");
+    declarations.className = "declarations";
+    declarations.innerHTML = `<h3>Declarations · ${st.declarations.length}</h3>`;
     const declarationCards = document.createElement("div");
     declarationCards.className = "declaration-zone";
     for (const declaration of st.declarations) {
@@ -950,72 +1007,23 @@ function renderTable() {
       item.append(back, label);
       declarationCards.append(item);
     }
-    declarationPile.append(declarationCards);
+    declarations.append(declarationCards);
+    board.append(declarations);
   }
-  piles.append(declarationPile);
-  board.append(piles);
-
-  const players = document.createElement("div");
-  players.className = "players-list";
-  st.players.forEach((candidate, index) => {
-    const finishedStatus =
-      st.phase === "finished" && candidate.active
-        ? index === st.winnerIndex
-          ? "winner"
-          : "lost"
-        : null;
-    const status = candidate.active
-      ? finishedStatus || "active"
-      : "eliminated";
-    const chip = document.createElement("span");
-    chip.className = [
-      "player-chip",
-      index === st.currentPlayer ? "current" : "",
-      status,
-    ].filter(Boolean).join(" ");
-    chip.dataset.playerIndex = String(index);
-    chip.dataset.penaltyTotal = String(candidate.penaltyPoints);
-    chip.textContent = `${candidate.name} · ${candidate.hand.length} cards · Penalty points ${candidate.penaltyPoints} (lower is better) · ${status}${
-      candidate.roundPenalty ? ` · +${candidate.roundPenalty} this round` : ""
-    }`;
-    players.append(chip);
-  });
-  board.append(players);
 
   const handSection = document.createElement("div");
   handSection.className = "hand-section";
   const head = document.createElement("div");
   head.className = "section-head";
-  const prompt =
-    st.phase === "discard"
-      ? "discard or declare"
-      : st.phase === "draw"
-        ? "draw first"
-        : st.phase === "declaring"
-          ? "declaration committed"
-          : "round finished";
-  head.innerHTML = `<h2>${escapeHtml(player.name)} hand</h2><p class="count-pill">${handSize} / ${target} · ${prompt}</p>`;
-  handSection.append(head);
+  head.innerHTML = "<h2>Hand</h2>";
+  const handTools = document.createElement("div");
+  handTools.className = "hand-tools";
+  const count = document.createElement("p");
+  count.className = "count-text";
+  count.textContent = `${handSize} / ${target}`;
+  handTools.append(count);
 
-  if (covered) {
-    const cover = document.createElement("div");
-    cover.className = "cover";
-    cover.innerHTML = `<p>Hand hidden for pass-and-play. Pass the device to ${escapeHtml(player.name)}, then reveal.</p>`;
-    const reveal = document.createElement("button");
-    reveal.type = "button";
-    reveal.className = "primary";
-    reveal.style.width = "auto";
-    reveal.textContent = "Reveal hand";
-    reveal.addEventListener("click", () => {
-      table.revealed = true;
-      table.selectedId = null;
-      setStatus(`${player.name} hand revealed.`);
-      renderTable();
-      scheduleEval("table");
-    });
-    cover.append(reveal);
-    handSection.append(cover);
-  } else {
+  if (!covered && st.phase !== "finished") {
     const checkLabel = document.createElement("label");
     checkLabel.className = "check-control";
     const check = document.createElement("input");
@@ -1029,8 +1037,30 @@ function renderTable() {
       scheduleEval("table");
     });
     checkLabel.append(check, document.createTextNode("Check hand"));
-    handSection.append(checkLabel);
+    handTools.append(checkLabel);
+  }
+  head.append(handTools);
+  handSection.append(head);
 
+  if (covered) {
+    const cover = document.createElement("div");
+    cover.className = "cover";
+    cover.innerHTML = `<p>Hand hidden for pass-and-play. Pass the device to ${escapeHtml(player.name)}, then reveal.</p>`;
+    const reveal = document.createElement("button");
+    reveal.type = "button";
+    reveal.className = "primary";
+    reveal.textContent = "Reveal hand";
+    reveal.setAttribute("aria-label", "Reveal hand");
+    reveal.addEventListener("click", () => {
+      table.revealed = true;
+      table.selectedId = null;
+      setStatus(`${player.name} hand revealed.`);
+      renderTable();
+      scheduleEval("table");
+    });
+    cover.append(reveal);
+    handSection.append(cover);
+  } else {
     const hand = document.createElement("div");
     hand.className = "hand";
     hand.dataset.playerHand = String(st.currentPlayer);
@@ -1067,76 +1097,131 @@ function renderTable() {
     }
     handSection.append(hand);
 
-    const selectedIndex = player.hand.findIndex(
-      (card) => card.id === table.selectedId,
-    );
-    const actions = document.createElement("div");
-    actions.className = "actions";
+    if (canArrange) {
+      const selectedIndex = player.hand.findIndex(
+        (card) => card.id === table.selectedId,
+      );
+      const actions = document.createElement("div");
+      actions.className = "hand-actions";
 
-    const moveLeft = document.createElement("button");
-    moveLeft.type = "button";
-    moveLeft.className = "secondary";
-    moveLeft.textContent = "Move selected left";
-    moveLeft.disabled = !canArrange || selectedIndex <= 0;
-    moveLeft.addEventListener("click", () => reorderTableHand(selectedIndex - 1));
+      const arrangeActions = document.createElement("div");
+      arrangeActions.className = "action-group arrange-actions";
+      arrangeActions.setAttribute("aria-label", "Arrange hand");
 
-    const moveRight = document.createElement("button");
-    moveRight.type = "button";
-    moveRight.className = "secondary";
-    moveRight.textContent = "Move selected right";
-    moveRight.disabled =
-      !canArrange ||
-      selectedIndex < 0 ||
-      selectedIndex === player.hand.length - 1;
-    moveRight.addEventListener("click", () => reorderTableHand(selectedIndex + 1));
+      const moveLeft = document.createElement("button");
+      moveLeft.type = "button";
+      moveLeft.className = "quiet-action";
+      moveLeft.textContent = "←";
+      moveLeft.title = "Move selected left";
+      moveLeft.setAttribute("aria-label", "Move selected left");
+      moveLeft.disabled = selectedIndex <= 0;
+      moveLeft.addEventListener("click", () =>
+        reorderTableHand(selectedIndex - 1),
+      );
 
-    const sort = document.createElement("button");
-    sort.type = "button";
-    sort.className = "secondary";
-    sort.textContent = "Sort hand";
-    sort.disabled = !canArrange || player.hand.length < 2;
-    sort.addEventListener("click", sortTableHand);
+      const moveRight = document.createElement("button");
+      moveRight.type = "button";
+      moveRight.className = "quiet-action";
+      moveRight.textContent = "→";
+      moveRight.title = "Move selected right";
+      moveRight.setAttribute("aria-label", "Move selected right");
+      moveRight.disabled =
+        selectedIndex < 0 || selectedIndex === player.hand.length - 1;
+      moveRight.addEventListener("click", () =>
+        reorderTableHand(selectedIndex + 1),
+      );
 
-    const discardSelected = document.createElement("button");
-    discardSelected.type = "button";
-    discardSelected.className = "primary";
-    discardSelected.style.width = "auto";
-    discardSelected.textContent = "Discard selected";
-    discardSelected.disabled =
-      st.phase !== "discard" || table.selectedId == null;
-    discardSelected.addEventListener("click", () => {
-      if (table.selectedId != null) doDiscard(table.selectedId);
-    });
+      const sort = document.createElement("button");
+      sort.type = "button";
+      sort.className = "quiet-action";
+      sort.textContent = "Sort";
+      sort.setAttribute("aria-label", "Sort hand");
+      sort.disabled = player.hand.length < 2;
+      sort.addEventListener("click", sortTableHand);
+      arrangeActions.append(moveLeft, moveRight, sort);
 
-    const discardDrawn = document.createElement("button");
-    discardDrawn.type = "button";
-    discardDrawn.className = "secondary";
-    discardDrawn.textContent = "Discard drawn card";
-    discardDrawn.disabled = st.phase !== "discard" || st.drawnCardId == null;
-    discardDrawn.addEventListener("click", () => {
-      if (st.drawnCardId != null) doDiscard(st.drawnCardId);
-    });
+      const turnActions = document.createElement("div");
+      turnActions.className = "action-group turn-actions";
+      turnActions.setAttribute("aria-label", "Turn actions");
 
-    const declare = document.createElement("button");
-    declare.type = "button";
-    declare.className = "declare";
-    declare.textContent = "Declare win";
-    declare.disabled = st.phase !== "discard" || table.selectedId == null;
-    declare.addEventListener("click", () => {
-      if (table.selectedId != null) doDeclare(table.selectedId);
-    });
+      const discardSelected = document.createElement("button");
+      discardSelected.type = "button";
+      discardSelected.className = "primary";
+      discardSelected.textContent = "Discard";
+      discardSelected.setAttribute("aria-label", "Discard selected");
+      discardSelected.disabled =
+        st.phase !== "discard" || table.selectedId == null;
+      discardSelected.addEventListener("click", () => {
+        if (table.selectedId != null) doDiscard(table.selectedId);
+      });
 
-    actions.append(
-      moveLeft,
-      moveRight,
-      sort,
-      discardSelected,
-      discardDrawn,
-      declare,
-    );
-    handSection.append(actions);
+      const discardDrawn = document.createElement("button");
+      discardDrawn.type = "button";
+      discardDrawn.className = "secondary";
+      discardDrawn.textContent = "Discard drawn";
+      discardDrawn.setAttribute("aria-label", "Discard drawn card");
+      discardDrawn.disabled =
+        st.phase !== "discard" || st.drawnCardId == null;
+      discardDrawn.addEventListener("click", () => {
+        if (st.drawnCardId != null) doDiscard(st.drawnCardId);
+      });
+
+      const declare = document.createElement("button");
+      declare.type = "button";
+      declare.className = "declare";
+      declare.textContent = "Declare win";
+      declare.setAttribute("aria-label", "Declare win");
+      declare.disabled = st.phase !== "discard" || table.selectedId == null;
+      declare.addEventListener("click", () => {
+        if (table.selectedId != null) doDeclare(table.selectedId);
+      });
+
+      turnActions.append(discardSelected, discardDrawn, declare);
+      actions.append(arrangeActions, turnActions);
+      handSection.append(actions);
+    }
   }
   board.append(handSection);
+
+  const scoreboard = document.createElement("section");
+  scoreboard.className = "scoreboard";
+  scoreboard.innerHTML =
+    '<div class="score-heading"><h3>Penalty totals</h3><p class="muted">Lower is better.</p></div>';
+  const players = document.createElement("div");
+  players.className = "players-list";
+  st.players.forEach((candidate, index) => {
+    const finishedStatus =
+      st.phase === "finished" && candidate.active
+        ? index === st.winnerIndex
+          ? "winner"
+          : "lost"
+        : null;
+    const status = candidate.active
+      ? finishedStatus || "active"
+      : "eliminated";
+    const chip = document.createElement("div");
+    chip.className = [
+      "player-chip",
+      index === st.currentPlayer ? "current" : "",
+      status,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    chip.dataset.playerIndex = String(index);
+    chip.dataset.penaltyTotal = String(candidate.penaltyPoints);
+    chip.innerHTML = `
+      <span class="player-name">${escapeHtml(candidate.name)}</span>
+      <span class="player-score">${candidate.penaltyPoints} pts</span>
+      <span class="player-state">${candidate.hand.length} cards · ${status}${
+        candidate.roundPenalty
+          ? ` · +${candidate.roundPenalty} this round`
+          : ""
+      }</span>
+    `;
+    players.append(chip);
+  });
+  scoreboard.append(players);
+  board.append(scoreboard);
 }
 
 function reorderTableHand(targetIndex) {
@@ -1319,5 +1404,4 @@ function wire() {
 
 wire();
 loadSample("classic21");
-el.builderSample.value = "classic21";
 setMode("builder");
