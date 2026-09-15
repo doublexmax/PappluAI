@@ -1,9 +1,10 @@
 # PappluAI
 
-Papplu hand correctness and a binary reward function for future model training.
+Papplu hand correctness and neural-network training from simulated games.
 The evaluator uses this project's house rules, not a universal rummy ruleset.
 The local simulator provides a hand builder and a pass-and-play card table.
-The environment, training code, and notebook remain unfinished experiments.
+The Python trainer uses the evaluator's binary reward in solo Monte Carlo
+episodes. The browser simulator remains separate from model training.
 
 The Social club layout uses a warm background, player seats, a green hand mat,
 and a separate draw tray. Cards use clear sans-serif indices and a softer
@@ -233,6 +234,110 @@ quota within each call. The search is exact, but its worst-case cost grows
 combinatorially. Joker-heavy hands can be slower than ordinary deals.
 This version provides correctness, not an optimized batch-training engine.
 
+## Train the model
+
+Training uses PyTorch. The evaluator and browser simulator still run without
+third-party packages. From the repository root, create a training environment.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements-training.txt
+```
+
+Start with shorter, three-card games to exercise the training loop.
+
+```powershell
+.\.venv\Scripts\python -m src.train --episodes 200 --cards-in-hand 3 --required-sequences 1 --max-turns 10 --warm-start-fraction 0.5 --seed 7 --eval-episodes 20 --eval-seed 10007 --checkpoint checkpoints\small-hand.pt
+```
+
+For the default house rules, omit the hand-size and sequence arguments.
+
+```powershell
+.\.venv\Scripts\python -m src.train --episodes 1000 --max-turns 30 --warm-start-fraction 0.5 --seed 7 --eval-episodes 50 --eval-seed 10007 --checkpoint checkpoints\papplu.pt
+```
+
+Use `python -m src.train --help` for the available training parameters.
+Choose different training and evaluation seeds. A successful short run proves
+that the training pipeline runs, not that the model plays a strong 21-card game.
+
+### Monte Carlo learning
+
+The trainer keeps the notebook's small neural network with 128-unit and 64-unit
+hidden layers. It also keeps epsilon-greedy exploration and Adam optimization.
+The unfinished tree search is replaced by complete simulated episodes.
+Each recorded action learns from the discounted rewards that actually follow
+it in that episode. Replay minibatches reuse those observations.
+
+These are Monte Carlo return targets, not DQN's bootstrapped next-state
+estimates. There is no MCTS tree, target network, or second implementation of
+the hand evaluator.
+
+The environment alternates between drawing and discarding. The model chooses
+between stock and the top discard, then chooses which card face to discard.
+Illegal actions are masked during both exploration and greedy play.
+The observation includes the hand's card counts, the top discard, the exact
+joker face, and the current phase and remaining resources.
+The model cannot see the hidden stock order.
+
+After each discard, `hand_reward` checks the original-size hand.
+A valid hand earns 1 and ends the episode. All other rewards are 0.
+The turn limit also ends an episode, so repeatedly taking and returning a
+discard cannot create an infinite game. The indicator stays out of play,
+and the stock is not reshuffled.
+
+This is solo hand-completion training. It automatically recognizes a valid
+post-discard hand, unlike the browser's explicit declaration action.
+It does not train bluffing, declaration penalties, multiplayer opponents,
+or a policy for the browser UI.
+
+### Sparse rewards and warm starts
+
+A random 21-card hand almost never satisfies all the rules.
+Learning only from random deals can produce long runs with no positive reward.
+The evaluator's reward remains binary. The trainer does not replace it with a
+heuristic score for incomplete groups.
+
+`--warm-start-fraction` mixes in single-decision discard episodes.
+These starts contain an evaluator-confirmed winning hand plus an extra card.
+The policy must choose what to discard using the ordinary observation.
+These episodes end after that discard, whether it wins or loses.
+The remaining episodes start from shuffled random deals.
+The default fraction is zero. The examples above use 0.5 to supply early
+positive examples.
+
+Warm-start wins are training results, not evidence of full-game skill.
+Held-out evaluation uses only random deals and compares greedy model play
+with a policy that samples legal actions uniformly.
+Evaluation does not update the model.
+
+The exact evaluator can be slow on difficult joker-heavy hands.
+Turn limits bound the number of decisions, not the time taken by an individual
+evaluation. Use small runs before committing to a larger training budget.
+Evaluator errors propagate rather than becoming zero-reward examples.
+
+### Model files
+
+`src\environment.py` owns the solo game and legal actions.
+`src\model.py` owns the neural network, masked action selection, and checkpoints.
+`src\train.py` owns Monte Carlo updates, training, and held-out evaluation.
+`src\Model.ipynb` imports these modules instead of maintaining separate rules
+or model implementations.
+
+Checkpoints store model weights and their configuration.
+Loading a checkpoint restores its game settings and starts a fresh replay
+buffer and optimizer. Explicit game settings must match the saved settings.
+It is fine-tuning, not an exact continuation of the previous random stream.
+Models trained with different hand rules are separate experiments.
+Training outputs under `checkpoints` are not tracked by Git.
+
+```powershell
+.\.venv\Scripts\python -m src.train --load checkpoints\small-hand.pt --episodes 100 --warm-start-fraction 0.5 --seed 8 --checkpoint checkpoints\small-hand-tuned.pt
+```
+
+The CPU trainer uses one PyTorch thread by default because the network is small.
+Use `--torch-threads` to change it or `--device cuda` with a CUDA-capable PyTorch
+installation.
+
 ## Verification
 
 From the repository root, the standard-library test command is:
@@ -250,3 +355,11 @@ cover card conservation, physical copies, card order, draw/discard transitions,
 declaration outcomes, and elimination penalties.
 Card-art tests cover all 52 faces, pip counts, and generic face-down backs.
 Node.js is needed only for the JavaScript tests, not to run the simulator.
+
+Environment tests use only the standard library. Model and training tests are
+skipped when PyTorch is absent. To include the learning, checkpoint, and CLI
+checks, run the Python suite with the training environment.
+
+```powershell
+.\.venv\Scripts\python -m unittest discover -s tests -v
+```
