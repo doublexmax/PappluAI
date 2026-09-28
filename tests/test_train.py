@@ -38,13 +38,100 @@ class TestDiscountedReturns(unittest.TestCase):
                 discounted_returns([1.0], gamma=gamma)
 
     def test_help_without_training_dependencies(self):
-        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-            self.assertEqual(train_main(["--help"]), 0)
+        real_import = __import__
+
+        def import_without_torch(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "torch" or name.startswith("torch."):
+                raise ModuleNotFoundError("blocked for CLI help test", name="torch")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with mock.patch("builtins.__import__", side_effect=import_without_torch):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                self.assertEqual(train_main(["--help"]), 0)
         self.assertIn("--checkpoint", out.getvalue())
+        self.assertIn("--architecture", out.getvalue())
+
+    def test_architecture_argument_defaults_to_inference_and_has_choices(self):
+        from src.train import build_arg_parser
+
+        parser = build_arg_parser()
+        self.assertIsNone(parser.parse_args([]).architecture)
+        for architecture in ("mlp", "wide_mlp", "suit_conv"):
+            self.assertEqual(
+                parser.parse_args(["--architecture", architecture]).architecture,
+                architecture,
+            )
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["--architecture", "unknown"])
 
 
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestTrainLearning(unittest.TestCase):
+    def test_architecture_selection_summary_and_load_inference(self):
+        from src.model import load_checkpoint
+        from src.train import train
+
+        cfg = GameConfig(
+            num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for architecture in ("mlp", "wide_mlp", "suit_conv"):
+                with self.subTest(architecture=architecture):
+                    path = os.path.join(tmp, architecture + ".pt")
+                    summary = train(
+                        episodes=0,
+                        seed=7,
+                        config=cfg,
+                        architecture=architecture,
+                        checkpoint_path=path,
+                    )
+                    loaded, _, _ = load_checkpoint(path)
+                    self.assertEqual(summary["architecture"], architecture)
+                    self.assertEqual(loaded.architecture, architecture)
+                    self.assertEqual(
+                        summary["param_count"],
+                        sum(parameter.numel() for parameter in loaded.parameters()),
+                    )
+                    inferred = train(episodes=0, seed=7, load_path=path)
+                    self.assertEqual(inferred["architecture"], architecture)
+
+    def test_default_architecture_remains_mlp(self):
+        from src.train import train
+
+        summary = train(episodes=0)
+        self.assertEqual(summary["architecture"], "mlp")
+
+    def test_explicit_architecture_mismatch_is_clean_error(self):
+        from src.train import train
+
+        cfg = GameConfig(
+            num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "wide.pt")
+            train(
+                episodes=0,
+                config=cfg,
+                architecture="wide_mlp",
+                checkpoint_path=path,
+            )
+            with self.assertRaisesRegex(ValueError, "architecture"):
+                train(episodes=0, load_path=path, architecture="mlp")
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                code = train_main(
+                    [
+                        "--load",
+                        path,
+                        "--episodes",
+                        "0",
+                        "--architecture",
+                        "suit_conv",
+                    ]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("architecture", err.getvalue())
+
     def test_episode_changes_weights_with_signal(self):
         from src.model import load_checkpoint
         from src.train import train
@@ -214,6 +301,7 @@ class TestTrainLearning(unittest.TestCase):
             "--warm-start-fraction",
             "--checkpoint",
             "--load",
+            "--architecture",
             "--eval-episodes",
             "--eval-seed",
         ):

@@ -89,6 +89,7 @@ def train(
     eval_episodes: int = 0,
     eval_seed: int = 12345,
     log_every: int = 10,
+    architecture: Optional[str] = None,
 ) -> Dict[str, object]:
     """Train Q via episodic Monte Carlo regression. Returns summary metrics."""
     import torch
@@ -128,15 +129,18 @@ def train(
     rng = random.Random(seed)
     torch.manual_seed(seed)
     torch.set_num_threads(torch_threads)
-    network = QNetwork().to(torch_device)
 
     if load_path:
         network, cfg, _ = load_checkpoint(
             load_path,
             device=torch_device,
             expected_config=config,
-            network=network,
+            expected_architecture=architecture,
         )
+    else:
+        network = QNetwork(
+            architecture="mlp" if architecture is None else architecture
+        ).to(torch_device)
     if warm_start_fraction and cfg.cards_in_hand < 3:
         raise ValueError("warm starts require at least three cards")
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
@@ -243,6 +247,8 @@ def train(
         "warm_start_fraction": warm_start_fraction,
         "encoding_version": ENCODING_VERSION,
         "checkpoint_version": CHECKPOINT_VERSION,
+        "architecture": network.architecture,
+        "param_count": sum(parameter.numel() for parameter in network.parameters()),
         "game_config": cfg.to_dict(),
         "torch_threads": torch_threads,
     }
@@ -397,6 +403,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--torch-threads", type=int, default=1, help="CPU threads for the small network (default 1).")
+    p.add_argument(
+        "--architecture",
+        choices=("mlp", "wide_mlp", "suit_conv"),
+        default=None,
+        help="Model architecture. A loaded checkpoint supplies the default.",
+    )
     p.add_argument("--num-decks", type=int, help="Decks (default 3, or loaded checkpoint).")
     p.add_argument("--cards-in-hand", type=int, help="Hand size (default 21, or loaded checkpoint).")
     p.add_argument("--required-sequences", type=int, help="Required pure sequences (default 5, or loaded checkpoint).")
@@ -448,7 +460,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.load and game_settings:
             from src.model import load_checkpoint
 
-            _, saved_config, _ = load_checkpoint(args.load)
+            _, saved_config, _ = load_checkpoint(
+                args.load, expected_architecture=args.architecture
+            )
             config = GameConfig(**{**saved_config.to_dict(), **game_settings})
         else:
             config = GameConfig(**game_settings) if not args.load else None
@@ -473,6 +487,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             eval_episodes=args.eval_episodes,
             eval_seed=args.eval_seed,
             log_every=args.log_every,
+            architecture=args.architecture,
         )
     except ModuleNotFoundError as exc:
         if exc.name != "torch":

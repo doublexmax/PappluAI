@@ -340,6 +340,68 @@ installation.
 
 ## Verification
 
+### Architecture comparison
+
+`mlp` retains the original 128/64 network and remains the default.
+`wide_mlp` tests a larger 256/128/64 network.
+`suit_conv` shares rank-local convolutions and discard scoring across suits.
+It tests whether card structure generalizes better than unrelated outputs
+for each face. All three use the same observations, legal-action masks,
+Monte Carlo returns, and binary evaluator reward.
+
+Use `--architecture` when starting a new training run. A checkpoint records its
+architecture, and `--load` restores it. Existing version-1 checkpoints load as
+the original MLP.
+
+The repeatable comparison command is:
+
+```powershell
+python -m src.compare --plan experiments\networks.json --output-dir checkpoints\network-comparison
+```
+
+The plan starts with three-card games, where random play sometimes wins.
+It runs three training seeds for each structure with equal episode and update
+budgets. It checks that an evaluator-backed discard oracle solves the warm-start
+puzzles while random play does not. That oracle is only a benchmark control,
+not a policy available to the trained agent.
+
+Architecture selection uses validation deals. Only the selected structure and
+the original MLP then see the separate final test deals. Reports contain per-game
+outcomes, parameter counts, draw-source counts, and paired bootstrap intervals
+over both training seeds and shared test deals.
+With three training seeds, these intervals are exploratory rather than
+strong statistical confirmation.
+A candidate passes the promotion gate only if it gains at least five percentage
+points over both controls and both confidence intervals exclude zero.
+This gate does not change the default model automatically.
+The screen is not evidence of strong 21-card play; that requires a separate
+full-game comparison.
+
+The 2026-09-28 screen used 6,000 episodes per model and training seeds 11, 22,
+and 33. The same 300 validation deals selected `suit_conv`. Final evaluation
+used 1,000 separate deals shared across the three trained seeds.
+
+| Architecture | Parameters | Mean validation wins | Mean final-test wins |
+| --- | ---: | ---: | ---: |
+| Original MLP | 32,886 | 1.78% | 1.10% |
+| Wider MLP | 86,902 | 2.56% | Not selected |
+| Shared suit/rank CNN | 15,939 | 22.89% | 19.90% |
+| Random legal policy | N/A | 2.33% | 2.40% |
+
+The CNN improved the final-test win rate by 18.8 percentage points over the
+original MLP. The exploratory paired 95% interval was 14.7 to 24.1 points.
+Its gain over random play was 17.5 points, with an interval of 13.5 to 22.5.
+All three CNN seeds beat both controls. These results are for three-card,
+one-sequence games with a ten-turn limit, not default Papplu.
+
+To evaluate an individual checkpoint:
+
+```powershell
+python -m src.benchmark --checkpoint checkpoints\papplu.pt --games 100 --seed 900000 --warm-games 100 --warm-seed 600000 --output checkpoints\evaluation.json
+```
+
+### Tests
+
 From the repository root, the standard-library test command is:
 
 ```powershell
