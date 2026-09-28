@@ -15,9 +15,10 @@ import argparse
 from collections import deque
 import json
 import math
+from numbers import Real
 import random
 import sys
-from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, TYPE_CHECKING, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 from src.environment import (
     ENCODING_VERSION,
@@ -38,6 +39,8 @@ Episode = Tuple[Transition, ...]
 
 
 class EpisodeReplay:
+    STATE_VERSION = 1
+
     def __init__(self, capacity: int) -> None:
         if (
             isinstance(capacity, bool)
@@ -81,6 +84,96 @@ class EpisodeReplay:
             episode = self._episodes[rng.randrange(len(self._episodes))]
             batch.append(episode[rng.randrange(len(episode))])
         return batch
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.STATE_VERSION,
+            "capacity": self._capacity,
+            "episodes": tuple(self._episodes),
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            raise TypeError("replay state must be a dict")
+        if set(state) != {"version", "capacity", "episodes"}:
+            raise ValueError("replay state has unexpected fields")
+        if state["version"] != self.STATE_VERSION:
+            raise ValueError(
+                "unsupported replay state version %r" % (state["version"],)
+            )
+        capacity = state["capacity"]
+        if (
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity != self._capacity
+        ):
+            raise ValueError(
+                "replay capacity %r does not match expected %d"
+                % (capacity, self._capacity)
+            )
+        raw_episodes = state["episodes"]
+        if not isinstance(raw_episodes, tuple):
+            raise TypeError("replay episodes must be a tuple")
+
+        episodes: Deque[Episode] = deque()
+        size = 0
+        for episode_index, raw_episode in enumerate(raw_episodes):
+            if not isinstance(raw_episode, tuple) or not raw_episode:
+                raise ValueError(
+                    "replay episode %d must be a nonempty tuple" % episode_index
+                )
+            episode: List[Transition] = []
+            for transition_index, raw_transition in enumerate(raw_episode):
+                if not isinstance(raw_transition, tuple) or len(raw_transition) != 3:
+                    raise ValueError(
+                        "replay transition %d:%d must be a three-item tuple"
+                        % (episode_index, transition_index)
+                    )
+                raw_observation, raw_action, raw_target = raw_transition
+                if not isinstance(raw_observation, tuple) or not raw_observation:
+                    raise ValueError(
+                        "replay observation %d:%d must be a nonempty tuple"
+                        % (episode_index, transition_index)
+                    )
+                if any(
+                    isinstance(value, bool)
+                    or not isinstance(value, Real)
+                    or not math.isfinite(float(value))
+                    for value in raw_observation
+                ):
+                    raise ValueError(
+                        "replay observation %d:%d must contain finite numbers"
+                        % (episode_index, transition_index)
+                    )
+                if (
+                    isinstance(raw_action, bool)
+                    or not isinstance(raw_action, int)
+                    or raw_action < 0
+                ):
+                    raise ValueError(
+                        "replay action %d:%d must be a nonnegative integer"
+                        % (episode_index, transition_index)
+                    )
+                if (
+                    isinstance(raw_target, bool)
+                    or not isinstance(raw_target, Real)
+                    or not math.isfinite(float(raw_target))
+                ):
+                    raise ValueError(
+                        "replay target %d:%d must be finite"
+                        % (episode_index, transition_index)
+                    )
+                episode.append(raw_transition)
+            episodes.append(tuple(episode))
+            size += len(episode)
+        if size > self._capacity:
+            raise ValueError(
+                "replay contains %d transitions, capacity is %d"
+                % (size, self._capacity)
+            )
+
+        self._episodes = episodes
+        self._size = size
 
 
 def discounted_returns(rewards: Sequence[float], gamma: float) -> List[float]:

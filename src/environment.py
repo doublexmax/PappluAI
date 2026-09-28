@@ -244,6 +244,95 @@ class PappluEnv:
         self._warm_start = True
         return self.observe()
 
+    def reset_curriculum(
+        self, distance: int, seed: Optional[int] = None
+    ) -> Observation:
+        if isinstance(distance, bool) or not isinstance(distance, int):
+            raise TypeError("distance must be an int")
+        if distance < 1 or distance > self.config.cards_in_hand:
+            raise ValueError(
+                "distance must be in 1..%d, got %d"
+                % (self.config.cards_in_hand, distance)
+            )
+
+        rng = random.Random()
+        if seed is None:
+            rng.setstate(self._rng.getstate())
+        else:
+            rng.seed(seed)
+
+        cfg = self.config
+        for _ in range(200):
+            winning_hand, joker, remaining = _build_natural_winning_deal(cfg, rng)
+            physical_hand = [
+                face
+                for face, count in enumerate(winning_hand)
+                for _ in range(count)
+            ]
+            removed = [
+                physical_hand[index]
+                for index in rng.sample(range(len(physical_hand)), distance)
+            ]
+            removed_faces = set(removed)
+            candidates = [
+                index
+                for index, face in enumerate(remaining)
+                if face not in removed_faces
+            ]
+            if len(candidates) < distance:
+                continue
+            replacement_indices = set(rng.sample(candidates, distance))
+            replacements = [
+                face
+                for index, face in enumerate(remaining)
+                if index in replacement_indices
+            ]
+
+            hand = winning_hand.copy()
+            for face in removed:
+                hand[face] -= 1
+            for face in replacements:
+                hand[face] += 1
+            if is_valid_hand(
+                hand,
+                joker,
+                required_sequences=cfg.required_sequences,
+                cards_in_hand=cfg.cards_in_hand,
+            ):
+                continue
+
+            deck = [
+                face
+                for index, face in enumerate(remaining)
+                if index not in replacement_indices
+            ]
+            deck.extend(removed)
+            rng.shuffle(deck)
+            discard = [deck.pop()]
+
+            self._rng.setstate(rng.getstate())
+            self._hand = hand
+            self._joker = joker
+            self._stock = deck
+            self._discard = discard
+            self._phase = Phase.DRAW
+            self._turns_remaining = cfg.max_turns
+            self._last_reward = 0.0
+            self._won = False
+            self._warm_start = False
+            return self.observe()
+
+        raise ValueError(
+            "could not build curriculum deal at distance %d for decks=%d "
+            "hand=%d seq=%d after 200 attempts"
+            % (
+                distance,
+                cfg.num_decks,
+                cfg.cards_in_hand,
+                cfg.required_sequences,
+            )
+        )
+
     def observe(self) -> Observation:
         return Observation(
             hand=tuple(self._hand),
@@ -317,8 +406,16 @@ def build_warm_start_deal(
     adds one extra card from leftover supply. Fails with ValueError rather than
     hanging when the config cannot support a constructed win.
     """
+    hand, joker, stock = _build_natural_winning_deal(config, rng)
+    hand[stock.pop()] += 1
+    return hand, joker, stock
+
+
+def _build_natural_winning_deal(
+    config: GameConfig, rng: random.Random
+) -> Tuple[List[int], int, List[int]]:
     if config.cards_in_hand < 3:
-        raise ValueError("warm starts require at least three cards")
+        raise ValueError("constructed starts require at least three cards")
     lengths = [3] * (config.cards_in_hand // 3)
     lengths[0] += config.cards_in_hand % 3
     for _ in range(200):
@@ -361,11 +458,11 @@ def build_warm_start_deal(
         for face, left in enumerate(supply):
             stock.extend([face] * left)
         rng.shuffle(stock)
-        hand[stock.pop()] += 1
         return hand, joker, stock
 
     raise ValueError(
-        "could not build warm-start deal for decks=%d hand=%d seq=%d after 200 attempts"
+        "could not build natural winning deal for decks=%d hand=%d seq=%d "
+        "after 200 attempts"
         % (
             config.num_decks,
             config.cards_in_hand,

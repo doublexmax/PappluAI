@@ -341,5 +341,113 @@ class TestWarmStart(unittest.TestCase):
         self.fail("fixture must have a losing discard")
 
 
+class TestCurriculumStart(unittest.TestCase):
+    def test_full_hand_draw_start_is_invalid_and_conserves_every_face(self):
+        cfg = GameConfig(max_turns=6)
+        env = PappluEnv(cfg)
+        obs = env.reset_curriculum(distance=4, seed=9001)
+
+        self.assertEqual(sum(obs.hand), 21)
+        self.assertEqual(obs.phase, Phase.DRAW)
+        self.assertFalse(obs.warm_start)
+        self.assertFalse(obs.won)
+        self.assertFalse(
+            is_valid_hand(
+                obs.hand,
+                obs.joker,
+                required_sequences=cfg.required_sequences,
+                cards_in_hand=cfg.cards_in_hand,
+            )
+        )
+        self.assertFalse(hasattr(obs, "target"))
+
+        counts = Counter(env._stock) + Counter(obs.discard_pile)
+        counts.update({face: count for face, count in enumerate(obs.hand)})
+        counts[obs.joker] += 1
+        self.assertEqual(
+            counts,
+            Counter({face: cfg.num_decks for face in range(52)}),
+        )
+        self.assertEqual(
+            sum(obs.hand) + obs.stock_remaining + len(obs.discard_pile),
+            cfg.num_decks * 52 - 1,
+        )
+
+    def test_distance_counts_actual_target_card_changes(self):
+        import src.environment as environment
+
+        cfg = GameConfig(max_turns=5)
+        captured = []
+        real_builder = environment._build_natural_winning_deal
+
+        def capture(config, rng):
+            deal = real_builder(config, rng)
+            captured.append(tuple(deal[0]))
+            return deal
+
+        env = PappluEnv(cfg)
+        with mock.patch(
+            "src.environment._build_natural_winning_deal",
+            side_effect=capture,
+        ):
+            obs = env.reset_curriculum(distance=8, seed=72)
+
+        target = captured[-1]
+        removed = sum(max(0, before - after) for before, after in zip(target, obs.hand))
+        added = sum(max(0, after - before) for before, after in zip(target, obs.hand))
+        self.assertEqual(removed, 8)
+        self.assertEqual(added, 8)
+
+    def test_seeded_curriculum_reset_is_repeatable(self):
+        cfg = GameConfig(max_turns=5)
+        first = PappluEnv(cfg)
+        second = PappluEnv(cfg)
+        a = first.reset_curriculum(distance=2, seed=123456)
+        b = second.reset_curriculum(distance=2, seed=123456)
+        self.assertEqual(a, b)
+        self.assertEqual(first._stock, second._stock)
+
+    def test_curriculum_uses_normal_multiturn_termination(self):
+        cfg = GameConfig(max_turns=3)
+        env = PappluEnv(cfg)
+        obs = env.reset_curriculum(distance=1, seed=81)
+        self.assertFalse(obs.warm_start)
+
+        turns = 0
+        while not obs.done:
+            hand_before = obs.hand
+            obs = env.step(ACTION_DRAW_STOCK)
+            drawn = next(
+                face
+                for face, (before, after) in enumerate(zip(hand_before, obs.hand))
+                if after == before + 1
+            )
+            obs = env.step(discard_action(drawn))
+            turns += 1
+        self.assertEqual(turns, cfg.max_turns)
+        self.assertFalse(obs.won)
+        self.assertEqual(obs.phase, Phase.TERMINAL)
+
+    def test_invalid_or_failed_curriculum_reset_does_not_mutate(self):
+        env = PappluEnv(GameConfig(max_turns=5))
+        env.reset(seed=99)
+        before = env.observe()
+        rng_before = env._rng.getstate()
+
+        for distance in (0, 22, True, 1.5):
+            with self.subTest(distance=distance), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                env.reset_curriculum(distance)
+            self.assertEqual(env.observe(), before)
+            self.assertEqual(env._rng.getstate(), rng_before)
+
+        with mock.patch("src.environment.is_valid_hand", return_value=True):
+            with self.assertRaisesRegex(ValueError, "after 200 attempts"):
+                env.reset_curriculum(1, seed=123)
+        self.assertEqual(env.observe(), before)
+        self.assertEqual(env._rng.getstate(), rng_before)
+
+
 if __name__ == "__main__":
     unittest.main()

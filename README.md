@@ -347,6 +347,64 @@ installation.
 
 ## Verification
 
+### Unattended full 21-card training
+
+`src.long_train` is a separate continuous learner for the 21-card, five-pure-
+sequence game. It does not use smaller-hand training or single-discard puzzles.
+Its curriculum starts with an invalid 21-card hand made by swapping cards from
+a valid one. The agent must draw and discard through ordinary turns to win.
+Removed cards return to a uniformly shuffled stock. Helpful future draws are
+not placed near the top, and the model never sees the original solution.
+
+The curriculum increases the number of swapped cards through 1, 2, 4, and 8.
+At least a quarter of training episodes start from ordinary random deals.
+Progression requires held-out wins, not elapsed time or falling loss.
+The final stage uses random deals only. Rewards remain the evaluator's binary
+0/1 result on a completed hand.
+
+This learner uses a 60-turn budget. Comparisons against its frozen initial model
+and random policy use that same budget; its scores are not directly comparable
+to the earlier 30-turn experiments.
+Only ordinary random-deal validation selects `best-model.pt`. Curriculum results
+are reported separately.
+
+The checkpoint files serve different purposes:
+
+| File | Purpose |
+| --- | --- |
+| `latest-state.pt` | Resume the learner, including Adam, episode replay, RNG streams, curriculum, and counters. |
+| `latest-model.pt` | Latest inference weights in the usual model checkpoint format. |
+| `best-model.pt` | Model selected by ordinary full-game validation. |
+| `baseline-model.pt` | Frozen initial model for like-for-like comparisons. |
+
+`--resume` on `src.long_train` restores full training state at a completed-episode
+boundary. It is not the weight-only fine-tuning performed by `src.train --load`.
+The cloud publisher verifies checkpoint hashes before replacing its `latest.json`
+pointer. Two alternating snapshot slots preserve the preceding coherent state
+if an upload is interrupted. Metrics history is part of each snapshot, so a
+container restart cannot overwrite earlier learning records with an empty log.
+
+The Azure container runs independently of Copilot and the local computer.
+A server-side deadline stops compute. Checkpoints remain in private Azure Blob
+Storage after compute stops, so storage charges continue until that storage is
+removed. A stopped or interrupted container can restore its last cloud checkpoint
+when restarted within the original deadline.
+
+The generated run descriptor contains resource names and deadlines, not storage
+credentials. A copy is also stored as `run.json` in the Azure artifact container.
+Use it with the CLI helper from a machine signed into Azure:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\azure_training.ps1 -Action Status -RunInfo checkpoints\long21-run.json
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\azure_training.ps1 -Action Download -RunInfo checkpoints\long21-run.json
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\azure_training.ps1 -Action Stop -RunInfo checkpoints\long21-run.json
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\azure_training.ps1 -Action Start -RunInfo checkpoints\long21-run.json
+```
+
+Stopping compute does not delete checkpoints. Downloaded snapshots are checked
+against the cloud manifest before being saved. Restarting does not silently extend
+the original safety deadline.
+
 ### Architecture comparison
 
 `mlp` retains the original 128/64 network and remains the default.
