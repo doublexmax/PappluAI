@@ -268,6 +268,13 @@ The unfinished tree search is replaced by complete simulated episodes.
 Each recorded action learns from the discounted rewards that actually follow
 it in that episode. Replay minibatches reuse those observations.
 
+The default `--replay-sampling transition` samples stored transitions uniformly.
+Long episodes therefore contribute more training examples than short puzzles.
+The optional `--replay-sampling episode` first samples a retained episode
+uniformly, then a transition within it. It samples with replacement.
+Both modes limit the buffer by the number of retained transitions; an older
+episode can be trimmed at that boundary.
+
 These are Monte Carlo return targets, not DQN's bootstrapped next-state
 estimates. There is no MCTS tree, target network, or second implementation of
 the hand evaluator.
@@ -393,6 +400,36 @@ original MLP. The exploratory paired 95% interval was 14.7 to 24.1 points.
 Its gain over random play was 17.5 points, with an interval of 13.5 to 22.5.
 All three CNN seeds beat both controls. These results are for three-card,
 one-sequence games with a ten-turn limit, not default Papplu.
+
+The paired 21-card followup used 2,000 warm-start episodes and 1,000 mixed
+episodes per architecture, with seeds 17 and 18. Both the MLP and CNN won
+**0 of 100** fresh full games, as did random play. On 200 separate discard
+puzzles, the final MLP scored 26%, the CNN 20%, and random play 26%.
+The reduced-game improvement did not transfer under this training recipe.
+The original default is therefore unchanged.
+
+A separate replay-sampling experiment continued from the same warm-trained CNN,
+using the same 1,000-episode mixed-training budget and a new evaluation set.
+
+| CNN checkpoint | Full games won / 100 | Winning discards / 200 puzzles |
+| --- | ---: | ---: |
+| Warm training only | 1 | 138 (69%) |
+| After transition-uniform replay | 0 | 59 (29.5%) |
+| After episode-uniform replay | 2 | 101 (50.5%) |
+| Random legal policy | 0 | 56 (28%) |
+
+Episode sampling retained more discard skill than transition sampling, but less
+than the warm-only checkpoint. Its two full-game wins are exploratory evidence,
+not a reliable advantage. This was one training seed. Sampling with replacement
+also changes random-number consumption, so the treatments did not follow
+identical training trajectories. The reward and architecture were unchanged.
+Both architecture and replay defaults remain unchanged.
+
+An experimental CNN run with episode sampling can be started with:
+
+```powershell
+python -m src.train --architecture suit_conv --replay-sampling episode --warm-start-fraction 0.5 --checkpoint checkpoints\cnn-episode.pt
+```
 
 To evaluate an individual checkpoint:
 

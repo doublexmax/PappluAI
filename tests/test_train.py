@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import deque
 import io
 import os
+import random
 import tempfile
 import unittest
 from unittest import mock
@@ -13,7 +15,7 @@ from src.environment import (
     discard_action,
     encode_observation,
 )
-from src.train import discounted_returns, main as train_main
+from src.train import EpisodeReplay, discounted_returns, main as train_main
 
 try:
     import torch
@@ -50,6 +52,7 @@ class TestDiscountedReturns(unittest.TestCase):
                 self.assertEqual(train_main(["--help"]), 0)
         self.assertIn("--checkpoint", out.getvalue())
         self.assertIn("--architecture", out.getvalue())
+        self.assertIn("--replay-sampling", out.getvalue())
 
     def test_architecture_argument_defaults_to_inference_and_has_choices(self):
         from src.train import build_arg_parser
@@ -65,9 +68,128 @@ class TestDiscountedReturns(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["--architecture", "unknown"])
 
+    def test_replay_sampling_argument_contract(self):
+        from src.train import build_arg_parser
+
+        parser = build_arg_parser()
+        self.assertEqual(parser.parse_args([]).replay_sampling, "transition")
+        for sampling in ("transition", "episode"):
+            self.assertEqual(
+                parser.parse_args(["--replay-sampling", sampling]).replay_sampling,
+                sampling,
+            )
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["--replay-sampling", "unknown"])
+
+
+class TestEpisodeReplay(unittest.TestCase):
+    @staticmethod
+    def transition(index):
+        return ((float(index),), index, float(index))
+
+    def test_rejects_empty_episode_and_invalid_batch(self):
+        replay = EpisodeReplay(capacity=3)
+        with self.assertRaises(ValueError):
+            replay.append(())
+        for size in (0, -1, True):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                replay.sample(random.Random(0), size)
+
+    def test_capacity_trims_oldest_episode_prefix(self):
+        replay = EpisodeReplay(capacity=5)
+        replay.append(tuple(self.transition(index) for index in range(3)))
+        replay.append(tuple(self.transition(index) for index in range(3, 7)))
+        self.assertEqual(len(replay), 5)
+
+        rng = mock.Mock()
+        rng.randrange.side_effect = [0, 0, 1, 0, 1, 1, 1, 2, 1, 3]
+        sampled = replay.sample(rng, 5)
+        self.assertEqual([transition[1] for transition in sampled], [2, 3, 4, 5, 6])
+
+    def test_oversized_episode_keeps_last_capacity_transitions(self):
+        replay = EpisodeReplay(capacity=3)
+        replay.append(tuple(self.transition(index) for index in range(8)))
+        self.assertEqual(len(replay), 3)
+
+        rng = mock.Mock()
+        rng.randrange.side_effect = [0, 0, 0, 1, 0, 2]
+        sampled = replay.sample(rng, 3)
+        self.assertEqual([transition[1] for transition in sampled], [5, 6, 7])
+
+    def test_sampling_is_seeded_and_repeatable(self):
+        replay = EpisodeReplay(capacity=20)
+        replay.append(tuple(self.transition(index) for index in range(3)))
+        replay.append(tuple(self.transition(index) for index in range(3, 10)))
+        first = replay.sample(random.Random(41), 100)
+        second = replay.sample(random.Random(41), 100)
+        self.assertEqual(first, second)
+
+    def test_sampling_weights_episodes_equally(self):
+        replay = EpisodeReplay(capacity=61)
+        replay.append((self.transition(0),))
+        replay.append(tuple(self.transition(1) for _ in range(60)))
+        sampled = replay.sample(random.Random(73), 2000)
+        short_episode_draws = sum(transition[1] == 0 for transition in sampled)
+        self.assertGreater(short_episode_draws, 900)
+        self.assertLess(short_episode_draws, 1100)
+
 
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestTrainLearning(unittest.TestCase):
+    def test_default_transition_sampling_matches_legacy_deque(self):
+        from src.train import train
+
+        episode_steps = (
+            (
+                ((0.0,), 0, 0.0),
+                ((1.0,), 1, 1.0),
+            ),
+            (
+                ((2.0,), 2, 0.0),
+                ((3.0,), 3, 0.0),
+                ((4.0,), 4, 1.0),
+            ),
+        )
+        captured = []
+
+        def capture_batch(_network, _optimizer, _loss, batch, _device, _clip):
+            captured.append(tuple(batch))
+            return 0.0
+
+        final_obs = mock.Mock(won=False)
+        with mock.patch(
+            "src.train.run_episode",
+            side_effect=[(list(steps), final_obs) for steps in episode_steps],
+        ), mock.patch("src.train._train_batch", side_effect=capture_batch):
+            summary = train(
+                episodes=2,
+                seed=29,
+                gamma=0.9,
+                batch_size=2,
+                replay_capacity=10,
+                updates_per_episode=2,
+                log_every=0,
+            )
+
+        expected = []
+        legacy_replay = deque(maxlen=10)
+        legacy_rng = random.Random(29)
+        for steps in episode_steps:
+            legacy_rng.random()
+            returns = discounted_returns([step[2] for step in steps], 0.9)
+            for (state, action, _reward), ret in zip(steps, returns):
+                legacy_replay.append((state, action, ret))
+            for _ in range(2):
+                expected.append(tuple(
+                    legacy_rng.sample(
+                        list(legacy_replay), min(2, len(legacy_replay))
+                    )
+                ))
+
+        self.assertEqual(captured, expected)
+        self.assertEqual(summary["replay_sampling"], "transition")
+
     def test_architecture_selection_summary_and_load_inference(self):
         from src.model import load_checkpoint
         from src.train import train
@@ -258,7 +380,7 @@ class TestTrainLearning(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "m.pt")
-            train(
+            summary = train(
                 episodes=2,
                 seed=0,
                 config=cfg,
@@ -266,10 +388,13 @@ class TestTrainLearning(unittest.TestCase):
                 warm_start_fraction=1.0,
                 log_every=0,
                 updates_per_episode=2,
+                replay_sampling="episode",
             )
             net, loaded_cfg, meta = load_checkpoint(path)
+            self.assertEqual(summary["replay_sampling"], "episode")
             self.assertEqual(loaded_cfg.to_dict(), cfg.to_dict())
             self.assertEqual(meta.get("algorithm"), "episodic_monte_carlo_q_regression")
+            self.assertEqual(meta["summary"]["replay_sampling"], "episode")
 
             summary = train(
                 episodes=1,
@@ -280,6 +405,7 @@ class TestTrainLearning(unittest.TestCase):
                 log_every=0,
             )
             self.assertEqual(summary["episodes"], 1)
+            self.assertEqual(summary["replay_sampling"], "transition")
             inherited = train(episodes=0, load_path=path)
             self.assertEqual(inherited["game_config"], cfg.to_dict())
 
@@ -302,6 +428,7 @@ class TestTrainLearning(unittest.TestCase):
             "--checkpoint",
             "--load",
             "--architecture",
+            "--replay-sampling",
             "--eval-episodes",
             "--eval-seed",
         ):
@@ -341,6 +468,8 @@ class TestTrainLearning(unittest.TestCase):
                     "3",
                     "--warm-start-fraction",
                     "1",
+                    "--replay-sampling",
+                    "episode",
                     "--log-every",
                     "0",
                     "--checkpoint",
@@ -373,6 +502,7 @@ class TestTrainLearning(unittest.TestCase):
             ("warm_start_fraction", float("nan")), ("grad_clip", -1),
             ("updates_per_episode", 0), ("eval_episodes", -1),
             ("log_every", -1), ("torch_threads", 0),
+            ("replay_sampling", "unknown"),
         ):
             with self.subTest(name=name, value=value):
                 with mock.patch("src.train.PappluEnv") as env:

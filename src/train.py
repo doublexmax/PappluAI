@@ -17,7 +17,7 @@ import json
 import math
 import random
 import sys
-from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 from src.environment import (
     ENCODING_VERSION,
@@ -34,6 +34,53 @@ if TYPE_CHECKING:
 
 Transition = Tuple[Tuple[float, ...], int, float]
 EpisodeStep = Tuple[Tuple[float, ...], int, float]
+Episode = Tuple[Transition, ...]
+
+
+class EpisodeReplay:
+    def __init__(self, capacity: int) -> None:
+        if (
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity < 1
+        ):
+            raise ValueError("capacity must be a positive integer")
+        self._capacity = capacity
+        self._episodes: Deque[Episode] = deque()
+        self._size = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    def append(self, episode: Episode) -> None:
+        stored = tuple(episode[-self._capacity:])
+        if not stored:
+            raise ValueError("cannot append an empty episode")
+        self._episodes.append(stored)
+        self._size += len(stored)
+
+        excess = self._size - self._capacity
+        while excess > 0:
+            oldest = self._episodes[0]
+            if len(oldest) <= excess:
+                self._episodes.popleft()
+                self._size -= len(oldest)
+                excess -= len(oldest)
+            else:
+                self._episodes[0] = oldest[excess:]
+                self._size -= excess
+                excess = 0
+
+    def sample(self, rng: random.Random, batch_size: int) -> List[Transition]:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        if not self._episodes:
+            raise ValueError("cannot sample empty replay")
+        batch: List[Transition] = []
+        for _ in range(batch_size):
+            episode = self._episodes[rng.randrange(len(self._episodes))]
+            batch.append(episode[rng.randrange(len(episode))])
+        return batch
 
 
 def discounted_returns(rewards: Sequence[float], gamma: float) -> List[float]:
@@ -90,6 +137,7 @@ def train(
     eval_seed: int = 12345,
     log_every: int = 10,
     architecture: Optional[str] = None,
+    replay_sampling: str = "transition",
 ) -> Dict[str, object]:
     """Train Q via episodic Monte Carlo regression. Returns summary metrics."""
     import torch
@@ -123,6 +171,8 @@ def train(
         raise ValueError("epsilon_end cannot exceed epsilon_start")
     if eval_episodes and eval_seed == seed:
         raise ValueError("eval_seed must differ from the training seed")
+    if replay_sampling not in ("transition", "episode"):
+        raise ValueError("replay_sampling must be 'transition' or 'episode'")
 
     cfg = config if config is not None else GameConfig()
     torch_device = torch.device(device)
@@ -148,7 +198,11 @@ def train(
 
     env = PappluEnv(cfg)
     env.seed(seed)
-    replay: Deque[Transition] = deque(maxlen=replay_capacity)
+    replay: Union[Deque[Transition], EpisodeReplay]
+    if replay_sampling == "transition":
+        replay = deque(maxlen=replay_capacity)
+    else:
+        replay = EpisodeReplay(replay_capacity)
 
     reward_sum = 0.0
     win_count = 0
@@ -180,8 +234,15 @@ def train(
         )
         rewards = [r for _, _, r in steps]
         returns = discounted_returns(rewards, gamma)
-        for (state, action, _reward), ret in zip(steps, returns):
-            replay.append((state, action, ret))
+        completed_episode = tuple(
+            (state, action, ret)
+            for (state, action, _reward), ret in zip(steps, returns)
+        )
+        if isinstance(replay, EpisodeReplay):
+            replay.append(completed_episode)
+        else:
+            for transition in completed_episode:
+                replay.append(transition)
 
         episode_reward = sum(rewards)
         reward_sum += episode_reward
@@ -200,7 +261,10 @@ def train(
 
         network.train()
         for _ in range(updates_per_episode):
-            batch = rng.sample(list(replay), min(batch_size, len(replay)))
+            if isinstance(replay, EpisodeReplay):
+                batch = replay.sample(rng, min(batch_size, len(replay)))
+            else:
+                batch = rng.sample(list(replay), min(batch_size, len(replay)))
             loss_val = _train_batch(
                 network, optimizer, loss_fn, batch, torch_device, grad_clip
             )
@@ -223,6 +287,7 @@ def train(
                         "normal_episodes": normal_episodes,
                         "normal_wins": normal_wins,
                         "replay": len(replay),
+                        "replay_sampling": replay_sampling,
                     }
                 ),
                 flush=True,
@@ -249,6 +314,7 @@ def train(
         "checkpoint_version": CHECKPOINT_VERSION,
         "architecture": network.architecture,
         "param_count": sum(parameter.numel() for parameter in network.parameters()),
+        "replay_sampling": replay_sampling,
         "game_config": cfg.to_dict(),
         "torch_threads": torch_threads,
     }
@@ -278,6 +344,7 @@ def train(
                         "win_rate",
                         "reward_avg",
                         "warm_start_fraction",
+                        "replay_sampling",
                     )
                 },
             },
@@ -387,6 +454,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--replay-capacity", type=int, default=5000)
+    p.add_argument(
+        "--replay-sampling",
+        choices=("transition", "episode"),
+        default="transition",
+        help="Replay sampling unit (default transition).",
+    )
     p.add_argument("--epsilon-start", type=float, default=1.0)
     p.add_argument("--epsilon-end", type=float, default=0.05)
     p.add_argument("--epsilon-decay-episodes", type=int, default=200)
@@ -473,6 +546,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lr=args.lr,
             batch_size=args.batch_size,
             replay_capacity=args.replay_capacity,
+            replay_sampling=args.replay_sampling,
             epsilon_start=args.epsilon_start,
             epsilon_end=args.epsilon_end,
             epsilon_decay_episodes=args.epsilon_decay_episodes,
