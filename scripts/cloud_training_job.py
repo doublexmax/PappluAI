@@ -1,5 +1,3 @@
-"""Self-contained cloud launcher and verified checkpoint publisher."""
-
 from __future__ import annotations
 
 import base64
