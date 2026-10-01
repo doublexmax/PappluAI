@@ -11,10 +11,14 @@ def migrate(source: Path, output: Path) -> dict:
     import torch
     from src.improve import ImprovementController, IMPROVEMENT_STATE_VERSION
     from src.league_train import LeagueConfig
-    from src.long_train import TrainingConfig
-    from src.environment import GameConfig
+    from src.long_train import TrainingConfig, _atomic_torch_save
 
     output.mkdir(parents=True, exist_ok=True)
+    existing = output / "latest-state.pt"
+    if existing.exists():
+        saved = torch.load(existing, map_location="cpu", weights_only=True)
+        if saved.get("config", {}).get("recycle_discard") is True:
+            return {"event": "rule_migration", "status": "already_migrated"}
     for path in source.iterdir():
         if path.is_file() and not path.name.startswith("."):
             (output / path.name).write_bytes(path.read_bytes())
@@ -22,6 +26,8 @@ def migrate(source: Path, output: Path) -> dict:
     payload = torch.load(state_path, map_location="cpu", weights_only=True)
     if payload.get("improvement_state_version") != IMPROVEMENT_STATE_VERSION:
         raise ValueError("Unsupported improvement checkpoint")
+    if payload["config"].get("recycle_discard") is True:
+        return {"event": "rule_migration", "status": "already_migrated"}
     before = {
         "league_matches": payload["league_state"]["counters"]["completed_matches"],
         "research_episodes": payload["research_state"]["counters"]["total_episodes"],
@@ -69,7 +75,7 @@ def migrate(source: Path, output: Path) -> dict:
         "old_evaluations_invalidated": True,
     }
     history.write_text(json.dumps(event) + "\n", encoding="utf-8")
-    torch.save(payload, state_path)
+    _atomic_torch_save(payload, state_path)
     controller = ImprovementController.load(str(state_path), output)
     if (
         controller.league.completed_matches != before["league_matches"]

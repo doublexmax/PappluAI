@@ -24,6 +24,26 @@ TORCH_REASON = "PyTorch not installed (see requirements-training.txt)"
 
 
 class TestMetricHistory(unittest.TestCase):
+    def test_initial_evidence_accepts_legacy_and_recycling_rules_with_explicit_labels(self):
+        from src.improve import _initial_evidence
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model.pt"
+            model.write_bytes(b"same frozen weights")
+            for recycling in (None, True, False):
+                rules = {"num_decks": 3, "cards_in_hand": 21, "required_sequences": 5, "max_turns": 60}
+                if recycling is not None:
+                    rules["recycle_discard"] = recycling
+                (root / "final-best.json").write_text(json.dumps({
+                    "checkpoint_sha256": sha256(model),
+                    "game_config": rules,
+                    "greedy": {"games": 2, "wins": 1, "outcomes": [1, 0]},
+                }))
+                verified = _initial_evidence(model)["verified_solo"]
+                self.assertEqual(verified["win_rate"], 0.5)
+                self.assertIs(verified["recycle_discard"], recycling is True)
+
     def test_cached_event_index_avoids_rescanning_the_entire_log(self):
         from src.improve import _append_metric_once, _read_metric_ids
 

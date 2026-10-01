@@ -1025,14 +1025,15 @@ def _initial_evidence(model: Path) -> dict:
     outcomes = result.get("greedy", {}).get("outcomes")
     games = result.get("greedy", {}).get("games")
     wins = result.get("greedy", {}).get("wins")
+    evaluated_rules = GameConfig.from_dict(result.get("game_config"))
     if (
         not isinstance(outcomes, list) or not outcomes
         or any(type(value) is not int or value not in (0, 1) for value in outcomes)
         or games != len(outcomes) or wins != sum(outcomes)
-        or result.get("game_config") != {
-            "num_decks": 3, "cards_in_hand": 21,
-            "required_sequences": 5, "max_turns": 60,
-        }
+        or (
+            evaluated_rules.num_decks, evaluated_rules.cards_in_hand,
+            evaluated_rules.required_sequences, evaluated_rules.max_turns,
+        ) != (3, 21, 5, 60)
     ):
         raise ValueError("Initial model evaluation must contain complete ordinary full21 outcomes")
     return {
@@ -1040,6 +1041,7 @@ def _initial_evidence(model: Path) -> dict:
             "games": games, "wins": wins, "win_rate": wins / games,
             "seed": result.get("game_seed"),
             "source": "frozen ordinary-deal evaluation",
+            "recycle_discard": evaluated_rules.recycle_discard,
         },
     }
 

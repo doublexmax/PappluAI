@@ -61,6 +61,13 @@ class TestStockRuleMigration(unittest.TestCase):
             self.assertTrue(event["old_evaluations_invalidated"])
             status = json.loads((root / "new" / "status.json").read_text())
             self.assertTrue(status["rules"]["recycle_discard"])
+            before_repeat = (root / "new" / "latest-state.pt").read_bytes()
+            repeated = migrate(root / "new", root / "new")
+            self.assertEqual(repeated["status"], "already_migrated")
+            self.assertEqual((root / "new" / "latest-state.pt").read_bytes(), before_repeat)
+            repeated_from_old_source = migrate(old.output_dir, root / "new")
+            self.assertEqual(repeated_from_old_source["status"], "already_migrated")
+            self.assertEqual((root / "new" / "latest-state.pt").read_bytes(), before_repeat)
 
 
 if __name__ == "__main__":
