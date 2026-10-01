@@ -1,5 +1,3 @@
-"""Bounded shared-deck matches for two through six Papplu agents."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field

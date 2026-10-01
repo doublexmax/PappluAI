@@ -1,5 +1,3 @@
-"""Immutable model snapshots and the protected general-access pointer."""
-
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass

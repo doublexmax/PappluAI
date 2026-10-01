@@ -1,5 +1,3 @@
-"""Seat-clustered multiplayer improvement and paired solo-retention gates."""
-
 from __future__ import annotations
 
 from pathlib import Path
