@@ -87,6 +87,7 @@ def gate_result(accepted):
                 "cards_in_hand": 21,
                 "required_sequences": 5,
                 "max_turns": kwargs["max_turns"],
+                "recycle_discard": kwargs["recycle_discard"],
             },
             "pool_hashes": [
                 sha256(path) for path in kwargs["opponent_paths"]

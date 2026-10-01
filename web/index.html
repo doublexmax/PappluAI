@@ -278,14 +278,27 @@
                       value="5"
                     />
                   </label>
+                  <label>
+                    Maximum draws per player
+                    <input
+                      id="table-max-draws"
+                      type="number"
+                      min="1"
+                      max="1000"
+                      value="60"
+                    />
+                  </label>
                 </div>
                 <details class="rules-details">
                   <summary>House rules</summary>
                   <p>
                     Settings apply to the next deal. Invalid declarations
                     eliminate that player and add 80 penalty points. Scores
-                    carry across deals with the same player count. Empty stock
-                    is not reshuffled.
+                    carry across deals with the same player count. When the
+                    stock empties, older discards are shuffled into a new stock
+                    while the top discard stays face up. The round is a draw if
+                    every active player reaches the draw limit. Stock and
+                    discard draws both count, even when that card is returned.
                   </p>
                 </details>
               </div>

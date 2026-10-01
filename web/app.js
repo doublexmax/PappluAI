@@ -58,6 +58,7 @@ const el = {
   tableDecks: document.getElementById("table-decks"),
   tableHandSize: document.getElementById("table-hand-size"),
   tableRequired: document.getElementById("table-required"),
+  tableMaxDraws: document.getElementById("table-max-draws"),
   tableDeal: document.getElementById("table-deal"),
   tableSettings: document.getElementById("table-settings"),
   tableBoard: document.getElementById("table-board"),
@@ -755,6 +756,7 @@ function dealNewGame() {
       decks,
       cardsInHand,
       requiredSequences,
+      maxDrawsPerPlayer: readInt(el.tableMaxDraws),
       penaltyTotals,
     });
     table.generation += 1;
@@ -811,6 +813,9 @@ function renderDeclarationResult(st) {
 }
 
 function outcomeText(st) {
+  if (st.outcomeReason === "draw-limit") {
+    return `Round drawn. Every active player reached the ${st.rules.maxDrawsPerPlayer}-draw limit. No winner or draw-limit penalty.`;
+  }
   if (st.outcomeReason === "valid-declaration") {
     return `${st.players[st.winnerIndex].name} wins with a valid declaration.`;
   }
@@ -841,6 +846,10 @@ function renderTable() {
   const handSize = player.hand.length;
   const target = st.rules.cardsInHand;
   const discardTop = st.discard[st.discard.length - 1];
+  const drawsRemaining = Math.max(
+    0,
+    st.rules.maxDrawsPerPlayer - player.draws,
+  );
   const canArrange = st.phase === "draw" || st.phase === "discard";
   const showHandCheck =
     Boolean(table.checkHand[st.currentPlayer]) &&
@@ -879,6 +888,7 @@ function renderTable() {
     <div class="turn-summary">
       <span class="turn-prompt">${escapeHtml(prompt)}</span>
       <span>${st.rules.requiredSequences} pure required</span>
+      <span>${drawsRemaining} of ${st.rules.maxDrawsPerPlayer} draws left</span>
     </div>
   `;
   board.append(turnBar);
@@ -908,8 +918,10 @@ function renderTable() {
 
   const stockPile = document.createElement("div");
   stockPile.className = "pile-spot stock-pile";
+  const stockCount =
+    st.stock.length || Math.max(0, st.discard.length - 1);
   let stockCard;
-  if (st.stock.length === 0) {
+  if (stockCount === 0) {
     stockCard = document.createElement("div");
     stockCard.className = "playing-card compact empty-card";
     stockCard.setAttribute("role", "img");
@@ -924,20 +936,14 @@ function renderTable() {
   }
   const stockCopy = document.createElement("div");
   stockCopy.className = "pile-copy";
-  stockCopy.innerHTML = `<h3>Stock · ${st.stock.length}</h3>`;
-  if (st.stock.length === 0) {
-    stockCopy.insertAdjacentHTML(
-      "beforeend",
-      '<p class="warn">No reshuffle</p>',
-    );
-  }
+  stockCopy.innerHTML = `<h3>Stock · ${stockCount}</h3>`;
   const drawStock = document.createElement("button");
   drawStock.type = "button";
   drawStock.className = "secondary";
   drawStock.textContent = "Draw stock";
   drawStock.setAttribute("aria-label", "Draw from stock");
   drawStock.disabled =
-    st.phase !== "draw" || st.stock.length === 0 || covered;
+    st.phase !== "draw" || stockCount === 0 || covered;
   drawStock.addEventListener("click", () => doDraw("stock"));
   stockCopy.append(drawStock);
   stockPile.append(stockCard, stockCopy);
@@ -1188,21 +1194,33 @@ function renderTable() {
   const players = document.createElement("div");
   players.className = "players-list";
   st.players.forEach((candidate, index) => {
+    const candidateDrawsRemaining = Math.max(
+      0,
+      st.rules.maxDrawsPerPlayer - candidate.draws,
+    );
     const finishedStatus =
-      st.phase === "finished" && candidate.active
+      st.phase === "finished" &&
+      candidate.active &&
+      st.outcomeReason !== "draw-limit"
         ? index === st.winnerIndex
           ? "winner"
           : "lost"
         : null;
-    const status = candidate.active
-      ? finishedStatus || "active"
-      : "eliminated";
+    let status = "eliminated";
+    if (candidate.active) {
+      status =
+        st.outcomeReason === "draw-limit"
+          ? "draw limit reached"
+          : finishedStatus || "active";
+    }
+    const statusClass =
+      status === "draw limit reached" ? "active" : status;
     const isCurrent = index === st.currentPlayer && st.phase !== "finished";
     const chip = document.createElement("div");
     chip.className = [
       "player-chip",
       isCurrent ? "current" : "",
-      status,
+      statusClass,
     ]
       .filter(Boolean)
       .join(" ");
@@ -1212,7 +1230,7 @@ function renderTable() {
       <span class="player-avatar seat-tone-${index % 6}" aria-hidden="true">${candidate.name === "You" ? "Y" : index + 1}</span>
       <span class="player-copy">
         <span class="player-name">${escapeHtml(candidate.name)}</span>
-        <span class="player-state">${candidate.hand.length} cards · ${status}${
+        <span class="player-state">${candidate.hand.length} cards · ${status} · ${candidateDrawsRemaining} draws left${
           candidate.roundPenalty
             ? ` · +${candidate.roundPenalty} this round`
             : ""
@@ -1255,12 +1273,15 @@ function doDraw(source) {
   try {
     table.state = drawCard(table.state, source);
     table.selectedId = table.state.drawnCardId;
+    const player = table.state.players[table.state.currentPlayer];
+    const drawsRemaining =
+      table.state.rules.maxDrawsPerPlayer - player.draws;
     setStatus(
       `Drew from ${source}: ${labelFace(
-        table.state.players[table.state.currentPlayer].hand.find(
+        player.hand.find(
           (c) => c.id === table.state.drawnCardId,
         ).face,
-      )}`,
+      )}. ${drawsRemaining} draws left.`,
     );
     renderTable();
     scheduleEval("table");
@@ -1327,10 +1348,13 @@ async function submitDeclaration(generation) {
     if (table.state.phase === "draw" && table.state.players.length > 1) {
       table.revealed = false;
     }
+    const declarationMessage = data.is_valid
+      ? `${state.players[declaration.ownerIndex].name} made a valid declaration.`
+      : `${state.players[declaration.ownerIndex].name} made an invalid declaration and received ${DECLARATION_PENALTY} penalty points.`;
     setStatus(
-      data.is_valid
-        ? `${state.players[declaration.ownerIndex].name} made a valid declaration.`
-        : `${state.players[declaration.ownerIndex].name} made an invalid declaration and received ${DECLARATION_PENALTY} penalty points.`,
+      table.state.outcomeReason === "draw-limit"
+        ? `${declarationMessage} ${outcomeText(table.state)}`
+        : declarationMessage,
     );
     renderTable();
     if (evalCtl.mode === "table") scheduleEval("table");
@@ -1352,7 +1376,10 @@ function doDiscard(physicalId) {
   try {
     table.state = discardCard(table.state, physicalId);
     table.selectedId = null;
-    if (multi) {
+    if (table.state.outcomeReason === "draw-limit") {
+      table.revealed = true;
+      setStatus(outcomeText(table.state));
+    } else if (multi) {
       table.revealed = false;
       setStatus(
         `Discarded. Pass to ${table.state.players[table.state.currentPlayer].name}.`,

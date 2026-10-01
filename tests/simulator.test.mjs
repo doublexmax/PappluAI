@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import {
   DECLARATION_PENALTY,
@@ -21,6 +22,14 @@ function seqRandom(values) {
     const v = values[i];
     i += 1;
     return v;
+  };
+}
+
+function seededRandom(seed) {
+  let value = seed >>> 0;
+  return () => {
+    value = (value * 1664525 + 1013904223) >>> 0;
+    return value / 2 ** 32;
   };
 }
 
@@ -56,7 +65,9 @@ describe("createGame", () => {
     assert.equal(state.outcomeReason, null);
     assert.equal(state.rules.cardsInHand, 5);
     assert.equal(state.rules.decks, 1);
+    assert.equal(state.rules.maxDrawsPerPlayer, 60);
     assert.ok(state.players.every((player) => player.active));
+    assert.ok(state.players.every((player) => player.draws === 0));
     assert.ok(state.players.every((player) => player.roundPenalty === 0));
     assert.ok(state.players.every((player) => player.penaltyPoints === 0));
     assert.ok(
@@ -89,6 +100,9 @@ describe("createGame", () => {
     assert.throws(() => createGame({ requiredSequences: -1 }), /requiredSequences/);
     assert.throws(() => createGame({ requiredSequences: 11 }), /requiredSequences/);
     assert.throws(() => createGame({ requiredSequences: NaN }), /requiredSequences/);
+    assert.throws(() => createGame({ maxDrawsPerPlayer: 0 }), /maxDrawsPerPlayer/);
+    assert.throws(() => createGame({ maxDrawsPerPlayer: 1001 }), /maxDrawsPerPlayer/);
+    assert.throws(() => createGame({ maxDrawsPerPlayer: 1.5 }), /maxDrawsPerPlayer/);
     assert.throws(() => createGame({ players: 2, penaltyTotals: [0] }), /penaltyTotals/);
     assert.throws(() => createGame({ players: 1, penaltyTotals: [-1] }), /penaltyTotals/);
     assert.throws(
@@ -170,6 +184,7 @@ describe("draw and discard", () => {
     assert.equal(back.discard[back.discard.length - 1].id, stockTop.id);
     assert.equal(back.currentPlayer, 1);
     assert.equal(back.turn, 2);
+    assert.equal(back.players[0].draws, 1);
   });
 
   it("draws from discard top", () => {
@@ -182,6 +197,7 @@ describe("draw and discard", () => {
     assert.equal(drawn.drawnCardId, top.id);
     assert.equal(drawn.discard.length, 0);
     assert.ok(drawn.players[0].hand.some((c) => c.id === top.id));
+    assert.equal(drawn.players[0].draws, 1);
   });
 
   it("keeps drawn card and discards another", () => {
@@ -233,6 +249,46 @@ describe("draw and discard", () => {
     assert.equal(state.currentPlayer, 0);
     assert.equal(state.turn, 4);
   });
+
+  it("counts every actual draw once, including a returned card", () => {
+    let state = createGame(
+      {
+        players: 1,
+        decks: 1,
+        cardsInHand: 3,
+        requiredSequences: 1,
+        maxDrawsPerPlayer: 3,
+      },
+      () => 0,
+    );
+    state = drawCard(state, "stock");
+    state = discardCard(state, state.drawnCardId);
+    assert.equal(state.players[0].draws, 1);
+
+    state = drawCard(state, "discard");
+    state = discardCard(state, state.drawnCardId);
+    assert.equal(state.players[0].draws, 2);
+  });
+
+  it("skips capped active players without eliminating them", () => {
+    let state = createGame(
+      {
+        players: 3,
+        decks: 1,
+        cardsInHand: 3,
+        requiredSequences: 1,
+        maxDrawsPerPlayer: 2,
+      },
+      () => 0,
+    );
+    state.players[1].draws = 2;
+    state = drawCard(state, "stock");
+    state = discardCard(state, state.drawnCardId);
+
+    assert.equal(state.currentPlayer, 2);
+    assert.equal(state.players[1].active, true);
+    assert.equal(state.players[1].draws, 2);
+  });
 });
 
 describe("illegal actions and exhaustion", () => {
@@ -247,16 +303,15 @@ describe("illegal actions and exhaustion", () => {
     const otherId = state.players[1].hand[0].id;
     assert.throws(() => discardCard(drawn, otherId), /active hand/);
 
-    let emptyStock = createGame(
+    const emptyStock = createGame(
       { players: 1, decks: 1, cardsInHand: 3, requiredSequences: 1 },
       () => 0,
     );
-    while (emptyStock.stock.length > 0) {
-      emptyStock = drawCard(emptyStock, "stock");
-      emptyStock = discardCard(emptyStock, emptyStock.drawnCardId);
-    }
-    assert.equal(emptyStock.stock.length, 0);
+    emptyStock.discard.push(...emptyStock.stock.splice(0));
+    emptyStock.discard = [emptyStock.discard[emptyStock.discard.length - 1]];
+    const beforeEmptyStock = freeze(emptyStock);
     assert.throws(() => drawCard(emptyStock, "stock"), /stock is empty/);
+    assert.deepEqual(freeze(emptyStock), beforeEmptyStock);
 
     const tookDiscard = drawCard(
       createGame(
@@ -278,13 +333,40 @@ describe("illegal actions and exhaustion", () => {
       () => drawCard(emptyDiscardDraw, "discard"),
       /discard is empty/,
     );
+
+    const discardOnly = createGame(
+      { players: 1, decks: 1, cardsInHand: 3, requiredSequences: 1 },
+      () => 0,
+    );
+    discardOnly.stock = [];
+    const publicTop = discardOnly.discard[0];
+    const discardDraw = drawCard(discardOnly, "discard");
+    assert.equal(discardDraw.drawnCardId, publicTop.id);
+    assert.equal(discardDraw.players[0].draws, 1);
+  });
+
+  it("rejects a capped player's draw without mutating state", () => {
+    const state = createGame(
+      {
+        players: 1,
+        decks: 1,
+        cardsInHand: 3,
+        requiredSequences: 1,
+        maxDrawsPerPlayer: 1,
+      },
+      () => 0,
+    );
+    state.players[0].draws = 1;
+    const before = freeze(state);
+    assert.throws(() => drawCard(state, "stock"), /draw limit/);
+    assert.deepEqual(freeze(state), before);
   });
 });
 
 describe("whole rounds", () => {
   it("conserves every physical card through repeated stock and pile draws", () => {
     for (const players of [1, 2, 6]) {
-      let state = createGame({ players });
+      let state = createGame({ players, maxDrawsPerPlayer: 1000 });
       const original = allCards(state).sort((a, b) => a.id - b.id);
       for (let turn = 0; turn < 100; turn += 1) {
         const source = state.stock.length && turn % 3 ? "stock" : "discard";
@@ -296,6 +378,159 @@ describe("whole rounds", () => {
         assert.ok(state.players.every((player) => player.hand.length === 21));
       }
     }
+  });
+});
+
+describe("discard recycling", () => {
+  it("keeps the public top discard and conserves cards through two seeded recycles", () => {
+    let state = createGame(
+      {
+        players: 1,
+        decks: 1,
+        cardsInHand: 3,
+        requiredSequences: 1,
+        maxDrawsPerPlayer: 1000,
+      },
+      () => 0,
+    );
+    const random = seededRandom(12345);
+    const original = allCards(state).sort((a, b) => a.id - b.id);
+    const joker = { ...state.joker };
+    const handOrder = state.players[0].hand.map((card) => card.id);
+    let recycles = 0;
+
+    while (recycles < 2) {
+      const exhaustedByDraw = state.stock.length === 1;
+      state = drawCard(state, "stock", random);
+      const returnedId = state.drawnCardId;
+      state = discardCard(state, returnedId, random);
+      if (!exhaustedByDraw) continue;
+
+      recycles += 1;
+      assert.ok(state.stock.length > 0);
+      assert.equal(state.discard.length, 1);
+      assert.equal(state.discard[0].id, returnedId);
+      assert.deepEqual(state.joker, joker);
+      assert.deepEqual(
+        state.players[0].hand.map((card) => card.id),
+        handOrder,
+      );
+      assert.deepEqual(allCards(state).sort((a, b) => a.id - b.id), original);
+    }
+    assert.equal(recycles, 2);
+  });
+
+  it("refills before a stock draw from an empty-stock fixture", () => {
+    const state = createGame(
+      { players: 1, decks: 1, cardsInHand: 3, requiredSequences: 1 },
+      () => 0,
+    );
+    state.discard.push(...state.stock.splice(0));
+    const publicTop = state.discard[state.discard.length - 1];
+    const before = freeze(state);
+    const drawn = drawCard(state, "stock", () => 0);
+
+    assert.deepEqual(freeze(state), before);
+    assert.equal(drawn.discard.length, 1);
+    assert.equal(drawn.discard[0].id, publicTop.id);
+    assert.equal(drawn.stock.length, before.discard.length - 2);
+    assert.equal(drawn.players[0].draws, 1);
+    assert.equal(new Set(allCards(drawn).map((card) => card.id)).size, 52);
+  });
+
+  it("refills after an invalid declaration before exposing the next draw", () => {
+    let state = createGame(
+      { players: 3, decks: 1, cardsInHand: 3, requiredSequences: 1 },
+      () => 0,
+    );
+    state = drawCard(state, "stock");
+    state.discard.push(...state.stock.splice(0));
+    const publicTop = state.discard[state.discard.length - 1];
+    state = beginDeclaration(state, state.drawnCardId);
+    const resolved = resolveDeclaration(state, false, seededRandom(9));
+
+    assert.equal(resolved.phase, "draw");
+    assert.ok(resolved.stock.length > 0);
+    assert.equal(resolved.discard.length, 1);
+    assert.equal(resolved.discard[0].id, publicTop.id);
+    assert.equal(resolved.declarations[0].verdict, "invalid");
+  });
+});
+
+describe("finite draw limit", () => {
+  it("finishes as a draw with no winner when every active player is capped", () => {
+    let state = createGame(
+      {
+        players: 2,
+        decks: 1,
+        cardsInHand: 3,
+        requiredSequences: 1,
+        maxDrawsPerPlayer: 1,
+      },
+      () => 0,
+    );
+    for (let player = 0; player < 2; player += 1) {
+      assert.equal(state.currentPlayer, player);
+      state = drawCard(state, "stock");
+      state = discardCard(state, state.drawnCardId);
+    }
+
+    assert.equal(state.phase, "finished");
+    assert.equal(state.winnerIndex, null);
+    assert.equal(state.outcomeReason, "draw-limit");
+    assert.ok(state.players.every((player) => player.active));
+    assert.deepEqual(
+      state.players.map((player) => player.draws),
+      [1, 1],
+    );
+    assert.deepEqual(
+      state.players.map((player) => player.penaltyPoints),
+      [0, 0],
+    );
+  });
+
+  it("allows a valid declaration after the player's last draw", () => {
+    let state = createGame(
+      {
+        players: 1,
+        decks: 1,
+        cardsInHand: 3,
+        requiredSequences: 1,
+        maxDrawsPerPlayer: 1,
+      },
+      () => 0,
+    );
+    state = drawCard(state, "stock");
+    state = beginDeclaration(state, state.drawnCardId);
+    const finished = resolveDeclaration(state, true);
+
+    assert.equal(finished.players[0].draws, 1);
+    assert.equal(finished.phase, "finished");
+    assert.equal(finished.winnerIndex, 0);
+    assert.equal(finished.outcomeReason, "valid-declaration");
+  });
+
+  it("does not award a capped last active player after an invalid declaration", () => {
+    let state = createGame(
+      {
+        players: 2,
+        decks: 1,
+        cardsInHand: 3,
+        requiredSequences: 1,
+        maxDrawsPerPlayer: 1,
+      },
+      () => 0,
+    );
+    state.players[1].draws = 1;
+    state = drawCard(state, "stock");
+    state = beginDeclaration(state, state.drawnCardId);
+    const finished = resolveDeclaration(state, false);
+
+    assert.equal(finished.phase, "finished");
+    assert.equal(finished.winnerIndex, null);
+    assert.equal(finished.outcomeReason, "draw-limit");
+    assert.equal(finished.players[1].active, true);
+    assert.equal(finished.players[0].penaltyPoints, DECLARATION_PENALTY);
   });
 });
 
@@ -629,5 +864,41 @@ describe("deal order uses injected random", () => {
       r2,
     );
     assert.deepEqual(freeze(a), freeze(b));
+  });
+});
+
+describe("browser draw-limit settings", () => {
+  it("uses the same strict range in markup and game creation", () => {
+    const html = readFileSync(
+      new URL("../web/index.html", import.meta.url),
+      "utf8",
+    );
+    const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+    assert.match(
+      html,
+      /id="table-max-draws"\s+type="number"\s+min="1"\s+max="1000"\s+value="60"/,
+    );
+    assert.match(app, /maxDrawsPerPlayer:\s*readInt\(el\.tableMaxDraws\)/);
+    assert.match(app, /draws left/);
+    assert.doesNotMatch(
+      app,
+      /body:\s*JSON\.stringify\(\{[^}]*maxDrawsPerPlayer/s,
+    );
+  });
+
+  it("keeps declarations face down and retries the committed state", () => {
+    const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+    assert.match(
+      app,
+      /back\.className = "playing-card card-back compact";[\s\S]*back\.setAttribute\("aria-label", "Face-down declared card"\)/,
+    );
+    assert.match(
+      app,
+      /tableDeclarationRetry\.addEventListener\("click", \(\) => \{\s*void submitDeclaration\(table\.generation\)/,
+    );
+    assert.match(
+      app,
+      /Declaration could not be checked\. No penalty was applied\./,
+    );
   });
 });

@@ -24,6 +24,7 @@ def snapshot(env: MultiplayerEnv):
         tuple(env._stock),
         tuple(env._discard),
         env._joker,
+        env._rng.getstate(),
     )
 
 
@@ -42,6 +43,7 @@ class TestMatchConfig(unittest.TestCase):
         self.assertEqual(config.game.cards_in_hand, 21)
         self.assertEqual(config.game.required_sequences, 5)
         self.assertEqual(config.game.max_turns, 60)
+        self.assertTrue(config.game.recycle_discard)
 
     def test_accepts_two_through_six_players(self):
         for players in range(2, 7):
@@ -262,7 +264,16 @@ class TestMultiplayerTurns(unittest.TestCase):
         self.assertEqual(view.terminal_reason, "win")
         self.assertEqual(view.turns_remaining[0], 2)
 
-    def test_stock_withdrawal_does_not_reshuffle_discard(self):
+    def test_legacy_rule_does_not_recycle_discard(self):
+        game = GameConfig(
+            num_decks=1,
+            cards_in_hand=3,
+            required_sequences=1,
+            max_turns=3,
+            recycle_discard=False,
+        )
+        self.env = MultiplayerEnv(MatchConfig(game=game, players=3))
+        self.env.reset(seed=21)
         self.env._stock = [7]
         self.env._discard = [8]
         self.env.step(ACTION_DRAW_STOCK)
@@ -274,6 +285,126 @@ class TestMultiplayerTurns(unittest.TestCase):
         self.assertFalse(mask[ACTION_DRAW_STOCK])
         self.assertTrue(mask[ACTION_TAKE_DISCARD])
         self.assertEqual(observation.stock_remaining, 0)
+
+    def test_nonterminal_discard_refills_before_next_seat_draw(self):
+        self.env._stock = [7]
+        self.env._discard = [8, 9]
+        self.env._hands[0] = [0] * 52
+        self.env._hands[0][0] = 1
+        self.env._hands[0][1] = 1
+        self.env._hands[0][2] = 1
+        self.env.step(ACTION_DRAW_STOCK)
+        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+            view = self.env.step(discard_action(7))
+        self.assertEqual(view.current_seat, 1)
+        self.assertEqual(view.phase, Phase.DRAW)
+        self.assertEqual(view.turns_remaining, (2, 3, 3))
+        self.assertEqual(view.stock_remaining, 2)
+        self.assertEqual(self.env._discard, [7])
+        self.assertTrue(legal_action_mask(self.env.observe())[ACTION_DRAW_STOCK])
+
+    def test_manual_draw_state_refills_before_stock_pop(self):
+        self.env._stock = []
+        self.env._discard = [7, 8, 9]
+        self.env._hands[0] = [0] * 52
+        self.env._hands[0][0] = 1
+        self.env._hands[0][1] = 1
+        self.env._hands[0][2] = 1
+        self.env._phase = Phase.DRAW
+        self.assertTrue(legal_action_mask(self.env.observe())[ACTION_DRAW_STOCK])
+        view = self.env.step(ACTION_DRAW_STOCK)
+        self.assertEqual(view.phase, Phase.DISCARD)
+        self.assertEqual(view.stock_remaining, 1)
+        self.assertEqual(self.env._discard, [9])
+        self.assertEqual(sum(self.env._hands[0]), 4)
+
+    def test_terminal_round_does_not_refill_or_reset_budget(self):
+        game = GameConfig(
+            num_decks=1,
+            cards_in_hand=3,
+            required_sequences=1,
+            max_turns=1,
+        )
+        env = MultiplayerEnv(MatchConfig(game=game, players=2))
+        env.reset(seed=22)
+        env._turns_remaining = [0, 1]
+        env._current_seat = 1
+        env._stock = [7]
+        env._discard = [8, 9]
+        env._hands[1] = [0] * 52
+        env._hands[1][0] = 1
+        env._hands[1][1] = 1
+        env._hands[1][2] = 1
+        env.step(ACTION_DRAW_STOCK)
+        rng_before = env._rng.getstate()
+        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+            view = env.step(discard_action(7))
+        self.assertTrue(view.done)
+        self.assertEqual(view.terminal_reason, "turns_exhausted")
+        self.assertEqual(view.turns_remaining, (0, 0))
+        self.assertEqual(view.stock_remaining, 0)
+        self.assertEqual(env._discard, [8, 9, 7])
+        self.assertEqual(env._rng.getstate(), rng_before)
+
+
+class TestMultiplayerRecycling(unittest.TestCase):
+    def test_seeded_refill_conserves_every_face_for_two_through_six_players(self):
+        for players in range(2, 7):
+            with self.subTest(players=players):
+                config = MatchConfig(players=players)
+                first = MultiplayerEnv(config)
+                second = MultiplayerEnv(config)
+                first.reset(seed=200 + players)
+                second.reset(seed=200 + players)
+                for env in (first, second):
+                    env._discard = env._stock + env._discard
+                    env._stock = []
+                    hand_before = env.observe().hand
+                    env.step(ACTION_DRAW_STOCK)
+                    drawn = next(
+                        face
+                        for face, (before, after) in enumerate(
+                            zip(hand_before, env.observe().hand)
+                        )
+                        if after == before + 1
+                    )
+                    with mock.patch(
+                        "src.multiplayer.hand_reward",
+                        return_value=0.0,
+                    ):
+                        env.step(discard_action(drawn))
+
+                self.assertEqual(snapshot(first), snapshot(second))
+                counts = Counter(first._stock)
+                counts.update(first._discard)
+                for hand in first._hands:
+                    counts.update(
+                        {
+                            face: count
+                            for face, count in enumerate(hand)
+                            if count
+                        }
+                    )
+                self.assertEqual(sum(counts.values()), 155)
+                counts[first._joker] += 1
+                self.assertEqual(
+                    counts,
+                    Counter({face: 3 for face in range(52)}),
+                )
+                self.assertEqual(len(first._hands[0]), 52)
+                self.assertTrue(
+                    all(
+                        isinstance(value, int)
+                        for hand in first._hands
+                        for value in hand
+                    )
+                )
+                self.assertTrue(
+                    all(isinstance(face, int) for face in first._stock)
+                )
+                self.assertTrue(
+                    all(isinstance(face, int) for face in first._discard)
+                )
 
 
 class TestMultiplayerAtomicity(unittest.TestCase):
@@ -302,6 +433,8 @@ class TestMultiplayerAtomicity(unittest.TestCase):
     def test_evaluator_error_preserves_pending_discard(self):
         self.env.step(ACTION_DRAW_STOCK)
         action = first_discard(self.env)
+        self.env._stock = []
+        self.env._discard = [7, 8]
         before = copy.deepcopy(snapshot(self.env))
         with mock.patch(
             "src.multiplayer.hand_reward",
@@ -317,6 +450,14 @@ class TestMultiplayerAtomicity(unittest.TestCase):
         self.env._terminal_reason = "turns_exhausted"
         before = copy.deepcopy(snapshot(self.env))
         with self.assertRaisesRegex(ValueError, "terminal"):
+            self.env.step(ACTION_DRAW_STOCK)
+        self.assertEqual(snapshot(self.env), before)
+
+    def test_invalid_stock_source_preserves_rng_and_cards(self):
+        self.env._stock = []
+        self.env._discard = [7]
+        before = copy.deepcopy(snapshot(self.env))
+        with self.assertRaisesRegex(ValueError, "illegal action"):
             self.env.step(ACTION_DRAW_STOCK)
         self.assertEqual(snapshot(self.env), before)
 

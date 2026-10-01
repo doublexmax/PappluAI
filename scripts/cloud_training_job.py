@@ -286,6 +286,23 @@ def main() -> int:
     ]
     if publisher.pointer:
         state = restore_snapshot(store, publisher.pointer, output)
+        if (
+            os.environ.get("MIGRATE_STOCK_RULES") == "1"
+            and publisher.pointer["training_status"]["rules"].get("recycle_discard") is not True
+        ):
+            migration_log = root / "rule-migration.log"
+            try:
+                with migration_log.open("w", encoding="utf-8") as log:
+                    subprocess.run(
+                        [sys.executable, "-m", "scripts.migrate_stock_rules",
+                         "--source", str(output), "--output", str(output)],
+                        stdout=log, stderr=subprocess.STDOUT, check=True,
+                        timeout=min(600, max(1, deadline - time.time())),
+                    )
+            finally:
+                publish_log(store, migration_log, "logs/rule-migration.log")
+            if not publisher.sync(output):
+                raise RuntimeError("Rule migration did not publish a coherent checkpoint")
         command.extend(["--resume", str(state)])
     else:
         command.extend(["--initial-model", os.environ["INITIAL_MODEL"]])

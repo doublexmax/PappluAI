@@ -15,7 +15,7 @@ import time
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from src.arena import MatchInterrupted
-from src.environment import ENCODING_VERSION
+from src.environment import ENCODING_VERSION, GameConfig
 from src.league_train import LeagueConfig, LeagueSession, RANDOM_OPPONENT
 from src.long_train import (
     STATUS_SCHEMA_VERSION,
@@ -48,8 +48,11 @@ class ImproveConfig:
     max_turns: int = 60
     player_counts: Tuple[int, ...] = (2, 3)
     gate_samples: int = 2_000
+    recycle_discard: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.recycle_discard) is not bool:
+            raise TypeError("recycle_discard must be a boolean")
         for name in (
             "max_cycles",
             "league_matches_per_cycle",
@@ -83,6 +86,8 @@ class ImproveConfig:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ImproveConfig":
+        if isinstance(raw, dict) and set(raw) == set(cls.__dataclass_fields__) - {"recycle_discard"}:
+            raw = {**raw, "recycle_discard": False}
         if not isinstance(raw, dict) or set(raw) != set(cls.__dataclass_fields__):
             raise ValueError("improve_config fields do not match this controller")
         values = dict(raw)
@@ -135,7 +140,10 @@ class ImprovementController:
         self.league = LeagueSession(
             baseline_path,
             league_paths,
-            config=LeagueConfig(player_counts=self.config.player_counts),
+            config=LeagueConfig(
+                game=GameConfig(max_turns=60, recycle_discard=self.config.recycle_discard),
+                player_counts=self.config.player_counts,
+            ),
             seed=self.config.seed,
         )
         self.research = TrainingSession(
@@ -570,6 +578,7 @@ class ImprovementController:
                 player_counts=self.config.player_counts,
                 samples=self.config.gate_samples,
                 deadline=deadline,
+                recycle_discard=self.config.recycle_discard,
             )
             checked = _gate_result(result, "selection")
             self.selection_results[origin] = checked
@@ -621,6 +630,7 @@ class ImprovementController:
                 player_counts=self.config.player_counts,
                 samples=self.config.gate_samples,
                 deadline=deadline,
+                recycle_discard=self.config.recycle_discard,
             )
             checked = _gate_result(result, "confirmation")
             checked["selection_passed"] = True
@@ -805,6 +815,7 @@ class ImprovementController:
                 "required_sequences": 5,
                 "max_turns": self.config.max_turns,
                 "player_counts": self.config.player_counts,
+                "recycle_discard": self.config.recycle_discard,
             },
             "champion_id": champion.id,
             "league_matches": self.league.completed_matches,
@@ -954,6 +965,7 @@ def _research_config(config: ImproveConfig) -> TrainingConfig:
         batch_size=64,
         updates_per_episode=4,
         validation_games=config.solo_games,
+        recycle_discard=config.recycle_discard,
     )
 
 

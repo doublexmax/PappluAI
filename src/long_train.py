@@ -48,6 +48,7 @@ class TrainingConfig:
     cards_in_hand: int = 21
     required_sequences: int = 5
     max_turns: int = 60
+    recycle_discard: bool = True
     replay_capacity: int = 10_000
     batch_size: int = 64
     updates_per_episode: int = 4
@@ -121,6 +122,8 @@ class TrainingConfig:
             raise ValueError("epsilon_end cannot exceed epsilon_start")
         if self.curriculum_distances != (1, 2, 4, 8):
             raise ValueError("curriculum_distances must be (1, 2, 4, 8)")
+        if type(self.recycle_discard) is not bool:
+            raise TypeError("recycle_discard must be a bool")
 
     @property
     def game_config(self) -> GameConfig:
@@ -129,6 +132,7 @@ class TrainingConfig:
             cards_in_hand=self.cards_in_hand,
             required_sequences=self.required_sequences,
             max_turns=self.max_turns,
+            recycle_discard=self.recycle_discard,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -138,9 +142,14 @@ class TrainingConfig:
     def from_dict(cls, data: Mapping[str, Any]) -> "TrainingConfig":
         if not isinstance(data, dict):
             raise TypeError("training_config must be a dict")
-        if set(data) != set(cls.__dataclass_fields__):
+        fields = set(cls.__dataclass_fields__)
+        if set(data) == fields:
+            values = dict(data)
+        elif set(data) == fields - {"recycle_discard"}:
+            values = dict(data)
+            values["recycle_discard"] = False
+        else:
             raise ValueError("training_config fields do not match this trainer")
-        values = dict(data)
         distances = values["curriculum_distances"]
         if not isinstance(distances, tuple):
             raise TypeError("curriculum_distances must be a tuple")
@@ -319,7 +328,11 @@ class TrainingSession:
             "model_checkpoint_version": CHECKPOINT_VERSION,
             "rules": config.game_config.to_dict(),
         }
-        if source_trace != expected_trace:
+        canonical_trace = dict(source_trace)
+        canonical_trace["rules"] = GameConfig.from_dict(
+            source_trace["rules"]
+        ).to_dict()
+        if canonical_trace != expected_trace:
             raise ValueError("training checkpoint source_trace is incompatible")
         seed = payload["initial_seed"]
         if isinstance(seed, bool) or not isinstance(seed, int):
@@ -881,6 +894,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Full-game turn limit. New sessions default to 60.",
     )
     parser.add_argument(
+        "--recycle-discard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Recycle older discards into stock. New sessions default to enabled.",
+    )
+    parser.add_argument(
         "--learning-rate",
         type=float,
         default=None,
@@ -1048,6 +1067,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             config = TrainingConfig(
                 max_turns=60 if args.max_turns is None else args.max_turns,
+                recycle_discard=(
+                    True
+                    if args.recycle_discard is None
+                    else args.recycle_discard
+                ),
                 learning_rate=(
                     1e-3 if args.learning_rate is None else args.learning_rate
                 ),
@@ -1113,6 +1137,7 @@ def _validate_resume_arguments(
 ) -> None:
     requested = {
         "max_turns": args.max_turns,
+        "recycle_discard": args.recycle_discard,
         "learning_rate": args.learning_rate,
         "curriculum_fraction": args.curriculum_fraction,
         "validation_games": args.validation_games,

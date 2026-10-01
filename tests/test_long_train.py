@@ -66,6 +66,8 @@ class TestLongTrainCli(unittest.TestCase):
             "--validate-every",
             "--validation-games",
             "--max-turns",
+            "--recycle-discard",
+            "--no-recycle-discard",
             "--seed",
         ):
             self.assertIn(flag, text)
@@ -90,11 +92,42 @@ class TestLongTrainCli(unittest.TestCase):
     def test_production_defaults_are_full21(self):
         config = TrainingConfig()
         self.assertEqual(config.game_config, GameConfig(max_turns=60))
+        self.assertTrue(config.recycle_discard)
+        self.assertTrue(config.to_dict()["recycle_discard"])
         self.assertEqual(config.architecture, "suit_conv")
         self.assertEqual(config.curriculum_distances, (1, 2, 4, 8))
         self.assertEqual(config.replay_capacity, 10_000)
         self.assertEqual(config.batch_size, 64)
         self.assertEqual(config.updates_per_episode, 4)
+
+    def test_legacy_config_shape_restores_historical_rule(self):
+        current = TrainingConfig().to_dict()
+        self.assertTrue(TrainingConfig.from_dict(current).recycle_discard)
+        legacy = dict(current)
+        del legacy["recycle_discard"]
+        restored = TrainingConfig.from_dict(legacy)
+        self.assertFalse(restored.recycle_discard)
+        self.assertFalse(restored.game_config.recycle_discard)
+        self.assertFalse(restored.to_dict()["recycle_discard"])
+
+        missing_other_field = dict(legacy)
+        del missing_other_field["max_turns"]
+        with self.assertRaisesRegex(ValueError, "fields"):
+            TrainingConfig.from_dict(missing_other_field)
+        for value in (0, 1, None, "true"):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                TrainingConfig(recycle_discard=value)
+
+    def test_cli_rule_override_is_explicit(self):
+        parser = build_arg_parser()
+        base = ["--initial-model", "model.pt", "--output-dir", "out"]
+        self.assertIsNone(parser.parse_args(base).recycle_discard)
+        self.assertTrue(
+            parser.parse_args(base + ["--recycle-discard"]).recycle_discard
+        )
+        self.assertFalse(
+            parser.parse_args(base + ["--no-recycle-discard"]).recycle_discard
+        )
 
 
 class TestEpisodeReplayState(unittest.TestCase):
@@ -175,10 +208,11 @@ class TestTrainingSession(unittest.TestCase):
             save_checkpoint(
                 compatible,
                 QNetwork(architecture="suit_conv"),
-                GameConfig(max_turns=30),
+                GameConfig(max_turns=30, recycle_discard=False),
             )
             session = TrainingSession(config, seed=41, initial_model=compatible)
             self.assertEqual(session.config.max_turns, 1)
+            self.assertTrue(session.config.recycle_discard)
             self.assertEqual(session.network.architecture, "suit_conv")
 
             wrong_hand = os.path.join(tmp, "wrong-hand.pt")
@@ -297,6 +331,32 @@ class TestTrainingSession(unittest.TestCase):
             changed = self.small_config(max_turns=2)
             with self.assertRaisesRegex(ValueError, "training_config"):
                 TrainingSession.load(str(path), expected_config=changed)
+
+    def test_legacy_state_shape_roundtrips_as_nonrecycling(self):
+        config = self.small_config(recycle_discard=False)
+        session = TrainingSession(config, seed=41)
+        payload = session.state_dict()
+        del payload["training_config"]["recycle_discard"]
+        del payload["source_trace"]["rules"]["recycle_discard"]
+
+        restored = TrainingSession.from_state_dict(
+            payload,
+            expected_config=config,
+        )
+        self.assertFalse(restored.config.recycle_discard)
+        rewritten = restored.state_dict()
+        self.assertFalse(rewritten["training_config"]["recycle_discard"])
+        self.assertFalse(
+            rewritten["source_trace"]["rules"]["recycle_discard"]
+        )
+
+    def test_new_state_metadata_names_recycling_rule(self):
+        session = TrainingSession(self.small_config(), seed=41)
+        payload = session.state_dict()
+        self.assertTrue(payload["training_config"]["recycle_discard"])
+        self.assertTrue(
+            payload["source_trace"]["rules"]["recycle_discard"]
+        )
 
     def test_promotion_needs_two_heldout_passes(self):
         config = self.small_config()

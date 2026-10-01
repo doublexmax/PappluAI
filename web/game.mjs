@@ -4,6 +4,7 @@
  *   name: string,
  *   hand: Card[],
  *   active: boolean,
+ *   draws: number,
  *   roundPenalty: number,
  *   penaltyPoints: number
  * }} Player
@@ -27,8 +28,13 @@
  *   drawnCardId: number | null,
  *   turn: number,
  *   winnerIndex: number | null,
- *   outcomeReason: 'valid-declaration' | 'last-remaining' | 'solo-invalid' | null,
- *   rules: { cardsInHand: number, requiredSequences: number, decks: number }
+ *   outcomeReason: 'valid-declaration' | 'last-remaining' | 'solo-invalid' | 'draw-limit' | null,
+ *   rules: {
+ *     cardsInHand: number,
+ *     requiredSequences: number,
+ *     decks: number,
+ *     maxDrawsPerPlayer: number
+ *   }
  * }} GameState
  */
 
@@ -107,6 +113,7 @@ function cloneState(state) {
       name: player.name,
       hand: player.hand.map((card) => ({ ...card })),
       active: player.active,
+      draws: player.draws,
       roundPenalty: player.roundPenalty,
       penaltyPoints: player.penaltyPoints,
     })),
@@ -129,15 +136,58 @@ function cloneState(state) {
 }
 
 /**
- * @param {Player[]} players
+ * @param {GameState} state
  * @param {number} current
+ * @returns {number | null}
  */
-function nextActivePlayer(players, current) {
-  for (let step = 1; step <= players.length; step += 1) {
-    const candidate = (current + step) % players.length;
-    if (players[candidate].active) return candidate;
+function nextDrawablePlayer(state, current) {
+  for (let step = 1; step <= state.players.length; step += 1) {
+    const candidate = (current + step) % state.players.length;
+    const player = state.players[candidate];
+    if (player.active && player.draws < state.rules.maxDrawsPerPlayer) {
+      return candidate;
+    }
   }
-  throw new Error("no active player remains");
+  return null;
+}
+
+/**
+ * @param {GameState} state
+ * @param {() => number} random
+ */
+function refillStock(state, random) {
+  if (state.stock.length > 0 || state.discard.length <= 1) return;
+  const publicTop = state.discard[state.discard.length - 1];
+  state.stock = shuffle(state.discard.slice(0, -1), random);
+  state.discard = [publicTop];
+}
+
+/**
+ * @param {GameState} state
+ */
+function finishAtDrawLimit(state) {
+  state.phase = "finished";
+  state.drawnCardId = null;
+  state.winnerIndex = null;
+  state.outcomeReason = "draw-limit";
+}
+
+/**
+ * @param {GameState} state
+ * @param {number} current
+ * @param {() => number} random
+ */
+function advanceToNextDraw(state, current, random) {
+  const candidate = nextDrawablePlayer(state, current);
+  if (candidate === null) {
+    finishAtDrawLimit(state);
+    return;
+  }
+  state.phase = "draw";
+  state.drawnCardId = null;
+  state.turn += 1;
+  state.currentPlayer = candidate;
+  refillStock(state, random);
 }
 
 /**
@@ -146,6 +196,7 @@ function nextActivePlayer(players, current) {
  *   decks?: number,
  *   cardsInHand?: number,
  *   requiredSequences?: number,
+ *   maxDrawsPerPlayer?: number,
  *   penaltyTotals?: number[]
  * }} [options]
  * @param {() => number} [random]
@@ -157,6 +208,7 @@ export function createGame(
     decks = 3,
     cardsInHand = 21,
     requiredSequences = 5,
+    maxDrawsPerPlayer = 60,
     penaltyTotals,
   } = {},
   random = Math.random,
@@ -176,6 +228,13 @@ export function createGame(
     requiredSequences > 10
   ) {
     throw new Error("requiredSequences must be an integer from 0 to 10");
+  }
+  if (
+    !Number.isInteger(maxDrawsPerPlayer) ||
+    maxDrawsPerPlayer < 1 ||
+    maxDrawsPerPlayer > 1000
+  ) {
+    throw new Error("maxDrawsPerPlayer must be an integer from 1 to 1000");
   }
   if (
     penaltyTotals !== undefined &&
@@ -213,6 +272,7 @@ export function createGame(
       name: players === 1 ? "You" : `Player ${player + 1}`,
       hand: [],
       active: true,
+      draws: 0,
       roundPenalty: 0,
       penaltyPoints: initialPenalties[player],
     });
@@ -244,16 +304,17 @@ export function createGame(
     turn: 1,
     winnerIndex: null,
     outcomeReason: null,
-    rules: { cardsInHand, requiredSequences, decks },
+    rules: { cardsInHand, requiredSequences, decks, maxDrawsPerPlayer },
   };
 }
 
 /**
  * @param {GameState} state
  * @param {'stock' | 'discard'} source
+ * @param {() => number} [random]
  * @returns {GameState}
  */
-export function drawCard(state, source) {
+export function drawCard(state, source, random = Math.random) {
   if (state.phase !== "draw") {
     throw new Error("cannot draw unless phase is draw");
   }
@@ -262,6 +323,11 @@ export function drawCard(state, source) {
   }
 
   const next = cloneState(state);
+  const player = next.players[next.currentPlayer];
+  if (player.draws >= next.rules.maxDrawsPerPlayer) {
+    throw new Error("player has reached the draw limit");
+  }
+  refillStock(next, random);
   /** @type {Card | undefined} */
   let card;
   if (source === "stock") {
@@ -277,8 +343,8 @@ export function drawCard(state, source) {
   }
   if (!card) throw new Error("draw failed");
 
-  const player = next.players[next.currentPlayer];
   player.hand.push(card);
+  player.draws += 1;
   next.phase = "discard";
   next.drawnCardId = card.id;
   return next;
@@ -287,9 +353,10 @@ export function drawCard(state, source) {
 /**
  * @param {GameState} state
  * @param {number} physicalId
+ * @param {() => number} [random]
  * @returns {GameState}
  */
-export function discardCard(state, physicalId) {
+export function discardCard(state, physicalId, random = Math.random) {
   if (state.phase !== "discard") {
     throw new Error("cannot discard unless phase is discard");
   }
@@ -313,10 +380,7 @@ export function discardCard(state, physicalId) {
     );
   }
 
-  next.phase = "draw";
-  next.drawnCardId = null;
-  next.turn += 1;
-  next.currentPlayer = nextActivePlayer(next.players, next.currentPlayer);
+  advanceToNextDraw(next, next.currentPlayer, random);
   return next;
 }
 
@@ -359,9 +423,10 @@ export function beginDeclaration(state, physicalId) {
 /**
  * @param {GameState} state
  * @param {boolean} isValid
+ * @param {() => number} [random]
  * @returns {GameState}
  */
-export function resolveDeclaration(state, isValid) {
+export function resolveDeclaration(state, isValid, random = Math.random) {
   if (state.phase !== "declaring") {
     throw new Error("no declaration is pending");
   }
@@ -392,16 +457,24 @@ export function resolveDeclaration(state, isValid) {
   const active = next.players
     .map((candidate, index) => ({ candidate, index }))
     .filter(({ candidate }) => candidate.active);
-  if (active.length <= 1) {
+  if (active.length === 0) {
     next.phase = "finished";
-    next.winnerIndex = active.length === 1 ? active[0].index : null;
-    next.outcomeReason = active.length === 1 ? "last-remaining" : "solo-invalid";
+    next.winnerIndex = null;
+    next.outcomeReason = "solo-invalid";
+    return next;
+  }
+  if (active.length === 1) {
+    if (active[0].candidate.draws >= next.rules.maxDrawsPerPlayer) {
+      finishAtDrawLimit(next);
+    } else {
+      next.phase = "finished";
+      next.winnerIndex = active[0].index;
+      next.outcomeReason = "last-remaining";
+    }
     return next;
   }
 
-  next.phase = "draw";
-  next.turn += 1;
-  next.currentPlayer = nextActivePlayer(next.players, declaration.ownerIndex);
+  advanceToNextDraw(next, declaration.ownerIndex, random);
   return next;
 }
 

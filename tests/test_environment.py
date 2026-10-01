@@ -31,6 +31,7 @@ class TestGameConfig(unittest.TestCase):
         self.assertEqual(cfg.num_decks, 3)
         self.assertEqual(cfg.cards_in_hand, 21)
         self.assertEqual(cfg.required_sequences, 5)
+        self.assertTrue(cfg.recycle_discard)
 
     def test_rejects_impossible_supply(self):
         with self.assertRaises(ValueError):
@@ -44,6 +45,34 @@ class TestGameConfig(unittest.TestCase):
         for value in (True, 1.5, "3"):
             with self.subTest(value=value), self.assertRaises(TypeError):
                 GameConfig.from_dict({**GameConfig().to_dict(), "num_decks": value})
+
+    def test_recycle_discard_requires_a_boolean(self):
+        for value in (0, 1, None, "true"):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                GameConfig(recycle_discard=value)
+
+    def test_rule_metadata_distinguishes_new_and_legacy_configs(self):
+        current = GameConfig()
+        self.assertEqual(
+            set(current.to_dict()),
+            {
+                "num_decks",
+                "cards_in_hand",
+                "required_sequences",
+                "max_turns",
+                "recycle_discard",
+            },
+        )
+        self.assertTrue(GameConfig.from_dict(current.to_dict()).recycle_discard)
+
+        legacy = current.to_dict()
+        del legacy["recycle_discard"]
+        restored = GameConfig.from_dict(legacy)
+        self.assertFalse(restored.recycle_discard)
+        self.assertFalse(restored.to_dict()["recycle_discard"])
+
+        with self.assertRaisesRegex(ValueError, "five.*legacy four"):
+            GameConfig.from_dict({"num_decks": 3})
 
 
 class TestEnvironmentCore(unittest.TestCase):
@@ -85,6 +114,8 @@ class TestEnvironmentCore(unittest.TestCase):
         obs = env.reset(seed=3)
         vec = encode_observation(obs)
         self.assertEqual(len(vec), STATE_DIM)
+        self.assertEqual(STATE_DIM, 164)
+        self.assertEqual(NUM_ACTIONS, 54)
         self.assertEqual(ENCODING_VERSION, 1)
         joker_slice = vec[104:156]
         self.assertEqual(sum(joker_slice), 1.0)
@@ -223,19 +254,216 @@ class TestEnvironmentCore(unittest.TestCase):
         self.assertEqual(obs.phase, Phase.DISCARD)
         self.assertEqual(sum(obs.hand), 4)
 
-    def test_no_stock_reshuffle(self):
-        cfg = GameConfig(num_decks=1, cards_in_hand=3, required_sequences=1, max_turns=20)
+    def test_legacy_rule_does_not_recycle_discard(self):
+        cfg = GameConfig(
+            num_decks=1,
+            cards_in_hand=3,
+            required_sequences=1,
+            max_turns=20,
+            recycle_discard=False,
+        )
         env = PappluEnv(cfg)
         env.reset(seed=11)
         env._stock = []
-        env._discard = [5]
+        env._discard = [4, 5]
         env._phase = Phase.DRAW
         env._hand = [0] * 52
         env._hand[0] = env._hand[1] = env._hand[2] = 1
+        mask = legal_action_mask(env.observe())
+        self.assertFalse(mask[ACTION_DRAW_STOCK])
+        self.assertTrue(mask[ACTION_TAKE_DISCARD])
         env.step(ACTION_TAKE_DISCARD)
-        env.step(discard_action(5))
+        with mock.patch("src.environment.hand_reward", return_value=0.0):
+            env.step(discard_action(5))
         self.assertEqual(env.observe().stock_remaining, 0)
-        self.assertGreaterEqual(len(env.observe().discard_pile), 1)
+        self.assertEqual(env.observe().discard_pile, (4, 5))
+
+    def test_empty_stock_recycles_older_discards_and_keeps_top(self):
+        cfg = GameConfig(
+            num_decks=1,
+            cards_in_hand=3,
+            required_sequences=1,
+            max_turns=60,
+        )
+        env = PappluEnv(cfg)
+        obs = env.reset(seed=0)
+        last_drawn = None
+        with mock.patch("src.environment.hand_reward", return_value=0.0):
+            for _ in range(47):
+                hand_before = obs.hand
+                obs = env.step(ACTION_DRAW_STOCK)
+                last_drawn = next(
+                    face
+                    for face, (before, after) in enumerate(
+                        zip(hand_before, obs.hand)
+                    )
+                    if after == before + 1
+                )
+                obs = env.step(discard_action(last_drawn))
+
+        self.assertEqual(obs.phase, Phase.DRAW)
+        self.assertEqual(obs.turns_remaining, 13)
+        self.assertEqual(obs.stock_remaining, 47)
+        self.assertEqual(obs.discard_pile, (last_drawn,))
+        self.assertTrue(legal_action_mask(obs)[ACTION_DRAW_STOCK])
+        encoded = encode_observation(obs)
+        self.assertEqual(encoded[52 + last_drawn], 1.0)
+        self.assertEqual(encoded[160], 47 / 52)
+        counts = Counter(env._stock) + Counter(obs.discard_pile)
+        counts.update({face: count for face, count in enumerate(obs.hand)})
+        counts[obs.joker] += 1
+        self.assertEqual(counts, Counter({face: 1 for face in range(52)}))
+        self.assertEqual(env.total_cards_in_play(), 51)
+
+    def test_seeded_recycling_is_repeatable(self):
+        cfg = GameConfig(
+            num_decks=1,
+            cards_in_hand=30,
+            required_sequences=0,
+            max_turns=80,
+        )
+
+        def play(seed):
+            env = PappluEnv(cfg)
+            obs = env.reset(seed=seed)
+            refills = 0
+            with mock.patch("src.environment.hand_reward", return_value=0.0):
+                while not obs.done:
+                    stock_before = obs.stock_remaining
+                    hand_before = obs.hand
+                    obs = env.step(ACTION_DRAW_STOCK)
+                    drawn = next(
+                        face
+                        for face, (before, after) in enumerate(
+                            zip(hand_before, obs.hand)
+                        )
+                        if after == before + 1
+                    )
+                    obs = env.step(discard_action(drawn))
+                    if not obs.done and obs.stock_remaining > stock_before - 1:
+                        refills += 1
+            return env, obs, refills
+
+        first, first_obs, first_refills = play(17)
+        second, second_obs, second_refills = play(17)
+        self.assertEqual(first_obs, second_obs)
+        self.assertEqual(first._stock, second._stock)
+        self.assertEqual(first._discard, second._discard)
+        self.assertEqual(first._rng.getstate(), second._rng.getstate())
+        self.assertGreaterEqual(first_refills, 2)
+        self.assertEqual(first_refills, second_refills)
+        self.assertEqual(first_obs.turns_remaining, 0)
+        self.assertTrue(first_obs.done)
+        self.assertEqual(len(first_obs.hand), 52)
+        self.assertTrue(all(isinstance(value, int) for value in first_obs.hand))
+        self.assertTrue(all(isinstance(face, int) for face in first._stock))
+        self.assertTrue(all(isinstance(face, int) for face in first._discard))
+
+    def test_single_discard_cannot_refill_stock(self):
+        env = PappluEnv(
+            GameConfig(
+                num_decks=1,
+                cards_in_hand=3,
+                required_sequences=1,
+                max_turns=5,
+            )
+        )
+        env.reset(seed=12)
+        env._stock = []
+        env._discard = [7]
+        env._phase = Phase.DRAW
+        before_rng = env._rng.getstate()
+        mask = legal_action_mask(env.observe())
+        self.assertFalse(mask[ACTION_DRAW_STOCK])
+        self.assertTrue(mask[ACTION_TAKE_DISCARD])
+        self.assertEqual(env.observe().discard_top, 7)
+        self.assertEqual(env._rng.getstate(), before_rng)
+
+    def test_reset_with_no_initial_stock_keeps_single_discard_available(self):
+        env = PappluEnv(
+            GameConfig(
+                num_decks=1,
+                cards_in_hand=50,
+                required_sequences=0,
+                max_turns=5,
+            )
+        )
+        obs = env.reset(seed=121)
+        self.assertEqual(obs.stock_remaining, 0)
+        self.assertEqual(len(obs.discard_pile), 1)
+        self.assertFalse(legal_action_mask(obs)[ACTION_DRAW_STOCK])
+        self.assertTrue(legal_action_mask(obs)[ACTION_TAKE_DISCARD])
+
+    def test_manual_draw_state_refills_before_stock_pop(self):
+        env = PappluEnv(
+            GameConfig(
+                num_decks=1,
+                cards_in_hand=3,
+                required_sequences=1,
+                max_turns=5,
+            )
+        )
+        env.reset(seed=13)
+        env._stock = []
+        env._discard = [7, 8, 9]
+        env._hand = [0] * 52
+        env._hand[0] = env._hand[1] = env._hand[2] = 1
+        env._phase = Phase.DRAW
+
+        self.assertTrue(legal_action_mask(env.observe())[ACTION_DRAW_STOCK])
+        obs = env.step(ACTION_DRAW_STOCK)
+        self.assertEqual(obs.phase, Phase.DISCARD)
+        self.assertEqual(obs.discard_pile, (9,))
+        self.assertEqual(obs.stock_remaining, 1)
+        self.assertEqual(sum(obs.hand), 4)
+
+    def test_invalid_stock_source_preserves_rng_and_cards(self):
+        env = PappluEnv(
+            GameConfig(
+                num_decks=1,
+                cards_in_hand=3,
+                required_sequences=1,
+                max_turns=5,
+            )
+        )
+        env.reset(seed=14)
+        env._stock = []
+        env._discard = [7]
+        before = env.observe()
+        stock_before = tuple(env._stock)
+        discard_before = tuple(env._discard)
+        rng_before = env._rng.getstate()
+        with self.assertRaisesRegex(ValueError, "illegal action"):
+            env.step(ACTION_DRAW_STOCK)
+        self.assertEqual(env.observe(), before)
+        self.assertEqual(tuple(env._stock), stock_before)
+        self.assertEqual(tuple(env._discard), discard_before)
+        self.assertEqual(env._rng.getstate(), rng_before)
+
+    def test_terminal_turn_does_not_refill_stock(self):
+        env = PappluEnv(
+            GameConfig(
+                num_decks=1,
+                cards_in_hand=3,
+                required_sequences=1,
+                max_turns=1,
+            )
+        )
+        env.reset(seed=15)
+        env._stock = [7]
+        env._discard = [8, 9]
+        env._hand = [0] * 52
+        env._hand[0] = env._hand[1] = env._hand[2] = 1
+        env._phase = Phase.DRAW
+        rng_before = env._rng.getstate()
+        env.step(ACTION_DRAW_STOCK)
+        with mock.patch("src.environment.hand_reward", return_value=0.0):
+            obs = env.step(discard_action(7))
+        self.assertTrue(obs.done)
+        self.assertEqual(obs.turns_remaining, 0)
+        self.assertEqual(obs.stock_remaining, 0)
+        self.assertEqual(obs.discard_pile, (8, 9, 7))
+        self.assertEqual(env._rng.getstate(), rng_before)
 
     def test_each_face_conserved_across_complete_episode(self):
         cfg = GameConfig(num_decks=2, cards_in_hand=6, required_sequences=1, max_turns=10)
@@ -255,10 +483,19 @@ class TestEnvironmentCore(unittest.TestCase):
         env.reset(seed=0)
         obs = env.step(ACTION_DRAW_STOCK)
         face = next(face for face, count in enumerate(obs.hand) if count)
+        env._stock = []
+        env._discard = [7, 8]
+        obs = env.observe()
+        stock_before = tuple(env._stock)
+        discard_before = tuple(env._discard)
+        rng_before = env._rng.getstate()
         with mock.patch("src.environment.hand_reward", side_effect=RuntimeError("evaluation failed")):
             with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
                 env.step(discard_action(face))
         self.assertEqual(obs, env.observe())
+        self.assertEqual(tuple(env._stock), stock_before)
+        self.assertEqual(tuple(env._discard), discard_before)
+        self.assertEqual(env._rng.getstate(), rng_before)
 
 
 class TestWarmStart(unittest.TestCase):
@@ -328,6 +565,8 @@ class TestWarmStart(unittest.TestCase):
     def test_warm_puzzle_ends_after_losing_discard(self):
         env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1))
         obs = env.reset_warm_start(seed=42)
+        env._stock = []
+        rng_before = env._rng.getstate()
         for face, count in enumerate(obs.hand):
             if count:
                 trial = list(obs.hand)
@@ -337,6 +576,9 @@ class TestWarmStart(unittest.TestCase):
                     self.assertTrue(result.done)
                     self.assertFalse(result.won)
                     self.assertEqual(result.last_reward, 0.0)
+                    self.assertEqual(result.stock_remaining, 0)
+                    self.assertEqual(len(result.discard_pile), 1)
+                    self.assertEqual(env._rng.getstate(), rng_before)
                     return
         self.fail("fixture must have a losing discard")
 

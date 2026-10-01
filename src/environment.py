@@ -4,6 +4,8 @@ Phases are DRAW -> DISCARD -> (DRAW | TERMINAL). Actions are a fixed 54-slot
 mask: 0 draw stock, 1 take discard top, 2..53 discard face 0..51. Terminal
 reward is the evaluator binary hand_reward on the post-discard hand of size
 cards_in_hand. Illegal actions and bad config raise without mutating state.
+Older discards refill an empty stock after a nonterminal discard. A manually
+assembled DRAW state refills only when a stock draw is chosen.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from typing import List, Optional, Tuple
 
 from src.evaluate import NUM_FACES, NUM_RANKS, NUM_SUITS, RANK_PATTERNS, hand_reward, is_valid_hand
 from src.reward_cache import RewardCache
+from src.stock import refill_stock, stock_draw_available
 
 ACTION_DRAW_STOCK = 0
 ACTION_TAKE_DISCARD = 1
@@ -52,6 +55,7 @@ class GameConfig:
     cards_in_hand: int = 21
     required_sequences: int = 5
     max_turns: int = 40
+    recycle_discard: bool = True
 
     def __post_init__(self) -> None:
         _require_positive_int(self.num_decks, "num_decks")
@@ -63,6 +67,8 @@ class GameConfig:
         if self.required_sequences < 0:
             raise ValueError("required_sequences must be nonnegative")
         _require_positive_int(self.max_turns, "max_turns")
+        if type(self.recycle_discard) is not bool:
+            raise TypeError("recycle_discard must be a bool")
         total = self.num_decks * NUM_FACES
         if total < self.cards_in_hand + 2:
             raise ValueError(
@@ -86,9 +92,15 @@ class GameConfig:
     def from_dict(data: dict) -> "GameConfig":
         if not isinstance(data, dict):
             raise TypeError("game_config must be a dict")
-        if set(data) != set(GameConfig.__dataclass_fields__):
-            raise ValueError("game_config must contain all four game settings")
-        return GameConfig(**data)
+        fields = set(GameConfig.__dataclass_fields__)
+        if set(data) == fields:
+            return GameConfig(**data)
+        legacy_fields = fields - {"recycle_discard"}
+        if set(data) == legacy_fields:
+            return GameConfig(**data, recycle_discard=False)
+        raise ValueError(
+            "game_config must contain all five game settings or the legacy four settings"
+        )
 
 
 @dataclass(frozen=True)
@@ -142,7 +154,11 @@ def legal_action_mask(obs: Observation) -> Tuple[bool, ...]:
     if obs.phase is Phase.TERMINAL:
         return tuple(mask)
     if obs.phase is Phase.DRAW:
-        if obs.stock_remaining > 0:
+        if stock_draw_available(
+            obs.stock_remaining,
+            len(obs.discard_pile),
+            obs.config.recycle_discard,
+        ):
             mask[ACTION_DRAW_STOCK] = True
         if obs.discard_pile:
             mask[ACTION_TAKE_DISCARD] = True
@@ -367,6 +383,12 @@ class PappluEnv:
 
         if self._phase is Phase.DRAW:
             if action == ACTION_DRAW_STOCK:
+                refill_stock(
+                    self._stock,
+                    self._discard,
+                    self._rng,
+                    self.config.recycle_discard,
+                )
                 card = self._stock.pop()
             else:
                 card = self._discard.pop()
@@ -392,7 +414,16 @@ class PappluEnv:
         self._last_reward = reward
         self._won = reward == 1.0
         done = self._won or self._warm_start or self._turns_remaining <= 0
-        self._phase = Phase.TERMINAL if done else Phase.DRAW
+        if done:
+            self._phase = Phase.TERMINAL
+        else:
+            refill_stock(
+                self._stock,
+                self._discard,
+                self._rng,
+                self.config.recycle_discard,
+            )
+            self._phase = Phase.DRAW
         return self.observe()
 
     def total_cards_in_play(self) -> int:

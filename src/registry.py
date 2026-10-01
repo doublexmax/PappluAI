@@ -167,6 +167,9 @@ class ModelRegistry:
             raise ValueError("Promotion requires accepted selection and confirmation for these exact models")
         if tuple(evidence.get("player_counts", ())) != (2, 3):
             raise ValueError("This champion gate requires two- and three-player evidence")
+        rules = evidence.get("rules")
+        if not isinstance(rules, dict) or rules.get("recycle_discard") is not True:
+            raise ValueError("Promotion evidence must use discard-recycling rules")
         multiplayer = evidence.get("multiplayer")
         solo = evidence.get("solo")
         if (

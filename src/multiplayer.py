@@ -15,6 +15,7 @@ from src.environment import (
 )
 from src.evaluate import NUM_FACES, hand_reward
 from src.reward_cache import RewardCache
+from src.stock import refill_stock
 
 
 @dataclass(frozen=True)
@@ -135,11 +136,16 @@ class MultiplayerEnv:
 
         hand = self._hands[self._current_seat]
         if self._phase is Phase.DRAW:
-            card = (
-                self._stock.pop()
-                if action == ACTION_DRAW_STOCK
-                else self._discard.pop()
-            )
+            if action == ACTION_DRAW_STOCK:
+                refill_stock(
+                    self._stock,
+                    self._discard,
+                    self._rng,
+                    self.config.game.recycle_discard,
+                )
+                card = self._stock.pop()
+            else:
+                card = self._discard.pop()
             hand[card] += 1
             self._phase = Phase.DISCARD
             self._last_reward = 0.0
@@ -172,6 +178,12 @@ class MultiplayerEnv:
             self._terminal_reason = "turns_exhausted"
             self._phase = Phase.TERMINAL
         else:
+            refill_stock(
+                self._stock,
+                self._discard,
+                self._rng,
+                self.config.game.recycle_discard,
+            )
             self._current_seat = next_seat
             self._phase = Phase.DRAW
             self._last_reward = 0.0

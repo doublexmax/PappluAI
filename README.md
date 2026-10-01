@@ -67,8 +67,14 @@ inherit your setting, and a new round starts with checking off again.
 Having a valid hand does not automatically end the round.
 The hand-check panel appears only when requested. Declaration results appear
 when a declaration is made, rather than occupying an empty panel during play.
-An empty stock is not reshuffled automatically. Draw from the discard pile or
-deal a new game.
+When the stock runs out, the most recent discard stays face up and older
+discards are shuffled into a fresh stock. The joker indicator, players' hands,
+and face-down declaration cards stay out of that shuffle.
+If only the top discard remains, there are no older cards to recycle.
+The default limit is 60 draws per player, configurable when dealing a browser
+round. Stock and discard-pile draws both count, even when the drawn card is
+returned. Recycling never resets the limit. If every remaining player reaches
+it without a declaration, the round ends as a draw with no draw-limit penalty.
 
 ### Declare a win
 
@@ -290,7 +296,9 @@ After each discard, `hand_reward` checks the original-size hand.
 A valid hand earns 1 and ends the episode. All other rewards are 0.
 The turn limit also ends an episode, so repeatedly taking and returning a
 discard cannot create an infinite game. The indicator stays out of play,
-and the stock is not reshuffled.
+and only older discards refill an exhausted stock. The visible top discard stays
+available. Each completed draw/discard turn counts toward the finite draw budget,
+including after recycling.
 
 This is solo hand-completion training. It automatically recognizes a valid
 post-discard hand, unlike the browser's explicit declaration action.
@@ -371,7 +379,9 @@ including for checkpoints originally trained with a different turn limit.
 Every policy sees only its own hand and the public discard pile, joker,
 phase, remaining stock count, and its remaining turns. Opponent hands and
 stock order never enter policy inputs. All players share the same stock and
-discard pile. Stock is not reshuffled.
+discard pile. If stock runs out, older discards become a shuffled stock while
+the top discard remains face up. Recycling does not reset any player's draw
+budget.
 The first evaluator-confirmed valid post-discard hand wins. If every player
 uses their turn budget without a win, the match is a draw.
 
@@ -422,6 +432,13 @@ seed-block margins and per-game outcomes before accepting evidence.
 Inconclusive or interrupted evaluations leave the champion unchanged.
 Engine support for four through six players is not a strength claim for those
 lineups.
+
+Discard recycling is recorded as an explicit game rule in checkpoints and
+evaluation reports. Legacy checkpoints missing `recycle_discard` are labeled
+non-recycling rather than silently relabeled. Their weights can seed new-rule
+training, but promotion requires fresh recycling-rule evidence. A rule migration
+preserves weights and historical counters, clears old-rule replay and optimizer
+moments, and archives earlier metrics before starting new selection rounds.
 
 The model registry retains immutable, checksum-addressed checkpoints. Promotion
 updates one atomic champion pointer and appends evidence to its history.

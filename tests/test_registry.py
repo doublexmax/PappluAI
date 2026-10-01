@@ -50,6 +50,10 @@ def evidence(candidate, champion):
         "seed": 60_500_000,
         "selection_seed": 60_000_000,
         "bootstrap_samples": 100,
+        "rules": {
+            "num_decks": 3, "cards_in_hand": 21, "required_sequences": 5,
+            "max_turns": 60, "recycle_discard": True,
+        },
         **evidence_metrics(multiplayer, solo, 128, 60_500_000, 100),
         "solo": solo,
         "multiplayer": multiplayer,

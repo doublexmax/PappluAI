@@ -99,6 +99,7 @@ def evaluate_gate(
     player_counts: Tuple[int, ...] = (2, 3),
     samples: int = 2000,
     deadline=None,
+    recycle_discard: bool = True,
 ) -> dict:
     import torch
     from src.arena import CheckpointPolicy, RandomPolicy, play_match
@@ -114,7 +115,7 @@ def evaluate_gate(
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise TypeError("seed must be an integer")
     torch.set_num_threads(1)
-    rules = GameConfig(max_turns=max_turns)
+    rules = GameConfig(max_turns=max_turns, recycle_discard=recycle_discard)
     candidate = CheckpointPolicy(str(candidate_path))
     champion = CheckpointPolicy(str(champion_path))
     opponents = [CheckpointPolicy(str(path)) for path in opponent_paths]
