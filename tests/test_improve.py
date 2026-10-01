@@ -34,8 +34,8 @@ class TestMetricHistory(unittest.TestCase):
                 _append_metric_once(output, "first", {"value": 1}, identifiers)
                 _append_metric_once(output, "second", {"value": 2}, identifiers)
                 _append_metric_once(output, "first", {"value": 99}, identifiers)
-            self.assertEqual(_read_metric_ids(output / "metrics.jsonl"), {"first", "second"})
-            self.assertEqual(len((output / "metrics.jsonl").read_text().splitlines()), 2)
+            self.assertEqual(_read_metric_ids(output / ".active-metrics.jsonl"), {"first", "second"})
+            self.assertEqual(len((output / ".active-metrics.jsonl").read_text().splitlines()), 2)
 
     def test_malformed_history_is_reported_instead_of_silently_skipped(self):
         from src.improve import _read_metric_ids
@@ -351,6 +351,20 @@ class TestImprovementController(unittest.TestCase):
                 path = controller.output_dir / name
                 self.assertEqual(metadata["bytes"], path.stat().st_size)
                 self.assertEqual(metadata["sha256"], sha256(path))
+
+    def test_active_metrics_cannot_invalidate_published_snapshot(self):
+        from src.improve import _append_metric_once
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = self.make_controller(Path(temporary))
+            controller.save_checkpoint()
+            status = json.loads((controller.output_dir / "status.json").read_text())
+            metadata = status["files"]["metrics.jsonl"]
+            _append_metric_once(controller.output_dir, "new-event", {"event": "test"}, controller.metric_ids)
+            self.assertEqual(sha256(controller.output_dir / "metrics.jsonl"), metadata["sha256"])
+            self.assertTrue((controller.output_dir / ".active-metrics.jsonl").read_text())
+            controller.save_checkpoint()
+            self.assertIn("new-event", (controller.output_dir / "metrics.jsonl").read_text())
 
     def test_gate_budget_exceptions_checkpoint_without_partial_promotion(self):
         from src.arena import MatchInterrupted

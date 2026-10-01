@@ -400,7 +400,9 @@ The cache includes the joker and hand rules, validates inputs before lookup,
 and never caches an exception as a losing verdict. Returning the same discard
 therefore does not repeat an expensive exact search for an unchanged hand.
 Metric deduplication indexes the log once instead of rescanning its entire
-history after every match.
+history after every match. Active metrics are written separately; the published
+metrics file changes only at a checkpoint, so continuing training cannot invalidate
+the publisher's checksums between uploads.
 It snapshots candidates and evaluates them before changing the general-access
 pointer. Selection and confirmation use separate seed banks.
 Cyclic seating and mirrored contender order share each underlying deal across

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import random
 import signal
+import shutil
 import sys
 import time
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
@@ -843,6 +844,12 @@ def save_session_checkpoint(
         output_dir / "baseline-model.pt",
     )
     _atomic_torch_save(session.state_dict(), output_dir / "latest-state.pt")
+    active_metrics = output_dir / ".active-metrics.jsonl"
+    if active_metrics.exists():
+        temporary = output_dir / ".metrics.jsonl.tmp"
+        shutil.copyfile(active_metrics, temporary)
+        _fsync_file(temporary)
+        os.replace(temporary, output_dir / "metrics.jsonl")
     return _snapshot_file_manifest(output_dir)
 
 
@@ -921,6 +928,8 @@ def run(
 
     started = time.monotonic()
     deadline = started + float(max_seconds)
+    if (output_dir / "metrics.jsonl").exists():
+        shutil.copyfile(output_dir / "metrics.jsonl", output_dir / ".active-metrics.jsonl")
     files = save_session_checkpoint(session, output_dir)
     _write_status(output_dir, session, files, "running", None, started)
     if not initialize:
@@ -1318,7 +1327,7 @@ def _append_metric(output_dir: Path, event: Mapping[str, Any]) -> None:
         "model_checkpoint_version": CHECKPOINT_VERSION,
         **event,
     }
-    with (output_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
+    with (output_dir / ".active-metrics.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(payload, sort_keys=True) + "\n")
         stream.flush()
         os.fsync(stream.fileno())

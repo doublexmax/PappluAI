@@ -482,6 +482,24 @@ class TestTrainingSession(unittest.TestCase):
                 self.assertEqual(network.architecture, "suit_conv")
                 self.assertEqual(game, session.config.game_config)
 
+    def test_live_metric_append_preserves_the_published_checkpoint_hash(self):
+        from src.long_train import _append_metric
+
+        session = TrainingSession(self.small_config(), seed=41)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            manifest = save_session_checkpoint(session, output)
+            published = (output / "metrics.jsonl").read_bytes()
+            _append_metric(output, {"event": "new-episode", "episode": 1})
+            self.assertEqual((output / "metrics.jsonl").read_bytes(), published)
+            self.assertEqual(hashlib.sha256(published).hexdigest(), manifest["metrics.jsonl"]["sha256"])
+            updated = save_session_checkpoint(session, output)
+            self.assertIn(b"new-episode", (output / "metrics.jsonl").read_bytes())
+            self.assertEqual(
+                hashlib.sha256((output / "metrics.jsonl").read_bytes()).hexdigest(),
+                updated["metrics.jsonl"]["sha256"],
+            )
+
     def test_run_status_distinguishes_stop_reasons(self):
         config = self.small_config()
         cases = (

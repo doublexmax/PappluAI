@@ -106,7 +106,7 @@ class ImprovementController:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if any((self.output_dir / name).exists() for name in ("latest-state.pt", "status.json")):
             raise ValueError("Training outputs already exist; use --resume")
-        self.metric_ids = _read_metric_ids(self.output_dir / "metrics.jsonl")
+        self.metric_ids = _read_metric_ids(self.output_dir / ".active-metrics.jsonl")
         self.registry = ModelRegistry(self.output_dir)
 
         initial_evidence = _initial_evidence(Path(initial_model))
@@ -197,7 +197,12 @@ class ImprovementController:
         controller = cls.__new__(cls)
         controller.config = ImproveConfig.from_dict(payload["config"])
         controller.output_dir = Path(output_dir)
-        controller.metric_ids = _read_metric_ids(controller.output_dir / "metrics.jsonl")
+        if (controller.output_dir / "metrics.jsonl").exists():
+            _atomic_copy(
+                controller.output_dir / "metrics.jsonl",
+                controller.output_dir / ".active-metrics.jsonl",
+            )
+        controller.metric_ids = _read_metric_ids(controller.output_dir / ".active-metrics.jsonl")
         controller.registry = ModelRegistry(controller.output_dir)
         controller.baseline_id = _record_id(payload["baseline_id"], "baseline_id")
         raw_opponents = payload["opponent_ids"]
@@ -430,6 +435,9 @@ class ImprovementController:
         _atomic_torch_save(
             self.state_dict(), self.output_dir / "latest-state.pt"
         )
+        active_metrics = self.output_dir / ".active-metrics.jsonl"
+        if active_metrics.exists():
+            _atomic_copy(active_metrics, self.output_dir / "metrics.jsonl")
         files = _snapshot_manifest(self.output_dir)
         _atomic_json(
             self._status_payload(
@@ -1095,7 +1103,7 @@ def _append_metric_once(
     output_dir: Path, event_id: str, event: Mapping[str, Any],
     known_ids: Optional[set] = None,
 ) -> None:
-    path = output_dir / "metrics.jsonl"
+    path = output_dir / ".active-metrics.jsonl"
     output_dir.mkdir(parents=True, exist_ok=True)
     identifiers = _read_metric_ids(path) if known_ids is None else known_ids
     if event_id in identifiers:

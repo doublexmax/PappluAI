@@ -262,7 +262,11 @@ def main() -> int:
     if smoke and store.get_json("resume-proof.json") is not None:
         publisher.heartbeat("smoke_completed")
         return 0
-    if smoke or os.environ.get("VALIDATE_BEFORE_TRAIN") == "1" and publisher.pointer is None:
+    if (
+        smoke
+        or os.environ.get("REVALIDATE_SOURCE") == "1"
+        or os.environ.get("VALIDATE_BEFORE_TRAIN") == "1" and publisher.pointer is None
+    ):
         test_log = root / "tests.log"
         try:
             with test_log.open("w", encoding="utf-8") as log:
