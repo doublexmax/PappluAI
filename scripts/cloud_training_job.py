@@ -83,10 +83,21 @@ def restore_snapshot(store: BlobStore, pointer: dict, output: Path) -> Path:
     return output / "latest-state.pt"
 
 
-def training_required(pointer, episode_limit: int, deadline: float, now: float) -> bool:
+def training_required(
+    pointer, episode_limit: int, deadline: float, now: float,
+    counter: str = "completed_episodes",
+) -> bool:
     if now >= deadline:
         return False
-    return pointer is None or pointer["training_status"]["completed_episodes"] < episode_limit
+    return pointer is None or pointer["training_status"][counter] < episode_limit
+
+
+def learner_contract(module: str) -> tuple:
+    if module == "src.long_train":
+        return "--max-episodes", "completed_episodes"
+    if module == "src.improve":
+        return "--max-cycles", "completed_cycles"
+    raise ValueError("Unsupported cloud training module")
 
 
 class Publisher:
@@ -251,7 +262,7 @@ def main() -> int:
     if smoke and store.get_json("resume-proof.json") is not None:
         publisher.heartbeat("smoke_completed")
         return 0
-    if smoke:
+    if smoke or os.environ.get("VALIDATE_BEFORE_TRAIN") == "1" and publisher.pointer is None:
         test_log = root / "tests.log"
         try:
             with test_log.open("w", encoding="utf-8") as log:
@@ -263,8 +274,10 @@ def main() -> int:
         finally:
             store.request("logs/tests.log", test_log.read_bytes())
     training_arguments = json.loads(os.environ["TRAINING_ARGUMENTS"])
+    module = os.environ.get("TRAINING_MODULE", "src.long_train")
+    limit_argument, work_counter = learner_contract(module)
     command = [
-        sys.executable, "-u", "-m", "src.long_train", "--output-dir", str(output),
+        sys.executable, "-u", "-m", module, "--output-dir", str(output),
         *training_arguments,
     ]
     if publisher.pointer:
@@ -276,8 +289,8 @@ def main() -> int:
         deadline - 120,
         datetime.fromisoformat(os.environ["TRAIN_DEADLINE_UTC"]).timestamp(),
     )
-    episode_limit = int(training_arguments[training_arguments.index("--max-episodes") + 1])
-    if training_required(publisher.pointer, episode_limit, train_deadline, time.time()):
+    episode_limit = int(training_arguments[training_arguments.index(limit_argument) + 1])
+    if training_required(publisher.pointer, episode_limit, train_deadline, time.time(), work_counter):
         command.extend(["--max-seconds", str(max(1, int(train_deadline - time.time())))])
         run_process(command, output, publisher, train_deadline + 60, "smoke" if smoke else "training")
     elif publisher.pointer is None:
@@ -288,18 +301,18 @@ def main() -> int:
         resumed = root / "resumed"
         state = restore_snapshot(store, before, resumed)
         resume_arguments = json.loads(os.environ["TRAINING_ARGUMENTS"])
-        limit_index = resume_arguments.index("--max-episodes") + 1
+        limit_index = resume_arguments.index(limit_argument) + 1
         resume_arguments[limit_index] = str(int(resume_arguments[limit_index]) + 2)
         resume_command = [
-            sys.executable, "-u", "-m", "src.long_train",
+            sys.executable, "-u", "-m", module,
             "--resume", str(state), "--output-dir", str(resumed),
             *resume_arguments, "--max-seconds", str(max(1, int(deadline - time.time() - 60))),
         ]
         run_process(resume_command, resumed, publisher, deadline - 30, "smoke")
         if (
             publisher.pointer["files"]["latest-state.pt"]["sha256"] == before["files"]["latest-state.pt"]["sha256"]
-            or publisher.pointer["training_status"]["completed_episodes"]
-            != before["training_status"]["completed_episodes"] + 2
+            or publisher.pointer["training_status"][work_counter]
+            != before["training_status"][work_counter] + 2
         ):
             raise RuntimeError("Resume smoke did not advance the checkpoint")
         store.put_json("resume-proof.json", {
@@ -328,7 +341,7 @@ def main() -> int:
             evaluation_command = [
                 sys.executable, "-u", "-m", "src.benchmark",
                 "--checkpoint", str(output / (label + "-model.pt")),
-                "--games", "256", "--seed", "40000000", "--warm-games", "0",
+                "--games", "256", "--seed", os.environ.get("FINAL_EVALUATION_SEED", "40000000"), "--warm-games", "0",
                 "--output", str(result_path),
             ]
             run_process(evaluation_command, output, publisher, deadline - 30, "final-" + label)

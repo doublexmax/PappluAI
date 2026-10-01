@@ -345,6 +345,104 @@ The CPU trainer uses one PyTorch thread by default because the network is small.
 Use `--torch-threads` to change it or `--device cuda` with a CUDA-capable PyTorch
 installation.
 
+## General-access champion and agent league
+
+The frozen general-access model is
+`checkpoints\champions\full21-20260929\model.pt`. Its checksum is
+`44c073dfb7bd63712fb7e04dd1f3b03f676e972d1d9562c953f9123d8d547e48`.
+The snapshot includes the final evaluation behind its 164/256 ordinary solo
+wins. It is a retained baseline, not the latest training state.
+GA here means **general access**, not genetic algorithm.
+
+### Multiplayer agent arena
+
+Run two through six checkpoint or random agents against one shared deck:
+
+```powershell
+python -m src.arena --model checkpoints\champions\full21-20260929\model.pt --model checkpoints\full-game-2026-09-28\mlp-trained.pt --model random --games 12 --seed 71 --output checkpoints\arena-results.json
+```
+
+Each `--model` adds a player. Use `random` for a uniform legal-action control.
+Compatible version-1 and version-2 MLP, wider MLP, and suit-convolution
+checkpoints may appear in the same match. Each must use three decks, 21 cards,
+and five required pure sequences. The match supplies its own 60-turn budget,
+including for checkpoints originally trained with a different turn limit.
+
+Every policy sees only its own hand and the public discard pile, joker,
+phase, remaining stock count, and its remaining turns. Opponent hands and
+stock order never enter policy inputs. All players share the same stock and
+discard pile. Stock is not reshuffled.
+The first evaluator-confirmed valid post-discard hand wins. If every player
+uses their turn budget without a win, the match is a draw.
+
+This is a headless agent arena. It does not change the browser's pass-and-play
+table or train its false-declaration and penalty strategy. The existing
+164-value observation and 54-action encoding remain compatible.
+
+### Two learning tracks, one protected champion
+
+The league challenger learns from actual multiplayer matches against frozen
+agents, including the champion, historical checkpoints, and random controls.
+Only the challenger's parameters receive gradient updates. Its own trajectory
+uses discounted terminal win rewards, with zero for losses and draws.
+
+A separate solo research challenger starts from the best checkpoint, not the
+regressed final weights. It uses its own network, optimizer, episode replay,
+and random streams with a lower learning rate. A promising solo result is a
+nomination for league evaluation, never automatic deployment.
+Neither track mutates the general-access model in place.
+There is no mutation, crossover, genetic selection, or guarantee that updates
+improve a candidate.
+
+The cycle controller interleaves both learners on one worker to limit cost.
+Each game caches a bounded set of exact evaluator results for repeated hands.
+The cache includes the joker and hand rules, validates inputs before lookup,
+and never caches an exception as a losing verdict. Returning the same discard
+therefore does not repeat an expensive exact search for an unchanged hand.
+Metric deduplication indexes the log once instead of rescanning its entire
+history after every match.
+It snapshots candidates and evaluates them before changing the general-access
+pointer. Selection and confirmation use separate seed banks.
+Cyclic seating and mirrored contender order share each underlying deal across
+all positions. Mirroring also balances which contender follows the weaker
+third player. Statistical
+comparisons group the rotations by deal instead of treating them as independent
+samples.
+
+The first promotion gate covers two- and three-player matches. The candidate
+must gain at least five percentage points against the frozen champion with a
+positive lower paired confidence bound. Neither tested player count may regress.
+On ordinary solo 21-card deals, its point estimate must not decrease, and the
+paired lower bound must stay within three percentage points of the champion.
+Confirmation needs at least 32 independent seed blocks and 256 solo games.
+The registry recomputes summaries and confidence intervals from the raw
+seed-block margins and per-game outcomes before accepting evidence.
+Inconclusive or interrupted evaluations leave the champion unchanged.
+Engine support for four through six players is not a strength claim for those
+lineups.
+
+The model registry retains immutable, checksum-addressed checkpoints. Promotion
+updates one atomic champion pointer and appends evidence to its history.
+Latest learner weights are never implicitly the deployed model.
+Both learner states and the registry are included in durable cloud snapshots.
+
+```powershell
+python -m src.improve --initial-model checkpoints\champions\full21-20260929\model.pt --opponent checkpoints\full-game-2026-09-28\mlp-trained.pt --output-dir checkpoints\league --max-cycles 64 --max-seconds 334800
+```
+
+Use this command on remote compute, not as a local background dependency.
+The cloud controller can run `src.improve` independently of Copilot using the
+same status, download, stop, and restart helper as solo training.
+The campaign has an explicit deadline and retains snapshots when compute stops.
+Continual candidate training does not guarantee continual champion promotions.
+The initial remote campaign is capped at 96 hours, with roughly 93 hours for
+learning and the remainder reserved for confirmation. At one CPU and 3 GiB in
+West US, its retail compute ceiling is about $5.95, excluding storage and
+transactions. The longer-term target is approximately $45 per 30 days, not
+permission for unlimited overlapping jobs. A new campaign must set a new
+explicit deadline. Stopping or closing Copilot does not stop Azure, but the
+server-side deadline does.
+
 ## Verification
 
 ### Unattended full 21-card training

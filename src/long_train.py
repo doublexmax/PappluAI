@@ -152,6 +152,7 @@ class TrainingSession:
         config: TrainingConfig,
         seed: int,
         initial_model: Optional[str] = None,
+        initial_stage_index: int = 0,
     ) -> None:
         import torch
         import torch.nn as nn
@@ -159,6 +160,15 @@ class TrainingSession:
 
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise TypeError("seed must be an int")
+        if (
+            isinstance(initial_stage_index, bool)
+            or not isinstance(initial_stage_index, int)
+            or not 0 <= initial_stage_index <= len(config.curriculum_distances)
+        ):
+            raise ValueError(
+                "initial_stage_index must be in 0..%d"
+                % len(config.curriculum_distances)
+            )
         self.config = config
         self.initial_seed = seed
         torch.set_num_threads(config.torch_threads)
@@ -196,7 +206,7 @@ class TrainingSession:
 
         self.total_episodes = 0
         self.total_updates = 0
-        self.stage_index = 0
+        self.stage_index = initial_stage_index
         self.stage_episodes = 0
         self.epsilon_progress = 0
         self.consecutive_passing_validations = 0
@@ -238,9 +248,19 @@ class TrainingSession:
         expected_config: Optional[TrainingConfig] = None,
     ) -> "TrainingSession":
         import torch
-        from src.model import CHECKPOINT_VERSION
 
         payload = torch.load(path, map_location="cpu", weights_only=True)
+        return cls.from_state_dict(payload, expected_config=expected_config)
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        payload: Mapping[str, Any],
+        expected_config: Optional[TrainingConfig] = None,
+    ) -> "TrainingSession":
+        import torch
+        from src.model import CHECKPOINT_VERSION
+
         if not isinstance(payload, dict):
             raise ValueError("training checkpoint must be a dict")
         required = {
@@ -303,6 +323,9 @@ class TrainingSession:
         seed = payload["initial_seed"]
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise ValueError("training checkpoint seed must be an int")
+        _validate_finite_tree(
+            payload["optimizer_state_dict"], "optimizer_state_dict"
+        )
 
         session = cls(config=config, seed=seed)
         session.network.load_state_dict(payload["network_state_dict"], strict=True)
@@ -448,6 +471,8 @@ class TrainingSession:
         import torch
         from src.model import CHECKPOINT_VERSION
 
+        optimizer_state = self.optimizer.state_dict()
+        _validate_finite_tree(optimizer_state, "optimizer_state_dict")
         return {
             "training_state_version": TRAINING_STATE_VERSION,
             "encoding_version": ENCODING_VERSION,
@@ -456,7 +481,7 @@ class TrainingSession:
             "training_config": self.config.to_dict(),
             "initial_seed": self.initial_seed,
             "network_state_dict": self.network.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
+            "optimizer_state_dict": optimizer_state,
             "replay_state_dict": self.replay.state_dict(),
             "counters": {
                 "total_episodes": self.total_episodes,
@@ -849,6 +874,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Full-game turn limit. New sessions default to 60.",
     )
     parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="Optimizer learning rate. New sessions default to 0.001.",
+    )
+    parser.add_argument(
+        "--curriculum-fraction",
+        type=float,
+        default=None,
+        help="Fraction of curriculum deals. New sessions default to 0.75.",
+    )
+    parser.add_argument(
+        "--initial-stage",
+        type=int,
+        default=None,
+        help="Initial curriculum stage 0..4. New sessions default to 0.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -996,6 +1039,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             config = TrainingConfig(
                 max_turns=60 if args.max_turns is None else args.max_turns,
+                learning_rate=(
+                    1e-3 if args.learning_rate is None else args.learning_rate
+                ),
+                curriculum_fraction=(
+                    0.75
+                    if args.curriculum_fraction is None
+                    else args.curriculum_fraction
+                ),
                 validation_games=(
                     64 if args.validation_games is None else args.validation_games
                 ),
@@ -1007,6 +1058,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 config=config,
                 seed=41 if args.seed is None else args.seed,
                 initial_model=args.initial_model,
+                initial_stage_index=(
+                    0 if args.initial_stage is None else args.initial_stage
+                ),
             )
             initialize = True
         reason = run(
@@ -1050,6 +1104,8 @@ def _validate_resume_arguments(
 ) -> None:
     requested = {
         "max_turns": args.max_turns,
+        "learning_rate": args.learning_rate,
+        "curriculum_fraction": args.curriculum_fraction,
         "validation_games": args.validation_games,
         "validate_every": args.validate_every,
     }
@@ -1064,6 +1120,8 @@ def _validate_resume_arguments(
             "resume seed %d does not match saved seed %d"
             % (args.seed, session.initial_seed)
         )
+    if args.initial_stage is not None:
+        raise ValueError("--initial-stage is only valid for a new session")
 
 
 def _append_validation_metrics(
@@ -1333,6 +1391,28 @@ def _validate_model_state(
             raise ValueError("%s tensor %s is incompatible" % (name, key))
         result[key] = value.detach().cpu().clone()
     return result
+
+
+def _validate_finite_tree(value: Any, name: str) -> None:
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        if (value.is_floating_point() or value.is_complex()) and not bool(
+            torch.isfinite(value).all().item()
+        ):
+            raise ValueError("%s contains a non-finite tensor" % name)
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("%s contains a non-finite number" % name)
+        return
+    if isinstance(value, Mapping):
+        for child in value.values():
+            _validate_finite_tree(child, name)
+        return
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            _validate_finite_tree(child, name)
 
 
 def _optional_validation(value: Any, name: str) -> Optional[Dict[str, Any]]:

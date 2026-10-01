@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from scripts.cloud_training_job import Publisher, restore_snapshot, training_required
+from scripts.cloud_training_job import Publisher, restore_snapshot, training_required, learner_contract
 
 
 class MemoryStore:
@@ -120,6 +120,15 @@ class TestCloudSnapshots(unittest.TestCase):
         store.fail_name = "heartbeat.json"
         publisher = Publisher(store, "run", "source")
         publisher.heartbeat("training")
+
+    def test_cycle_controller_contract_does_not_count_training_episodes_as_cycles(self):
+        self.assertEqual(learner_contract("src.improve"), ("--max-cycles", "completed_cycles"))
+        self.assertEqual(learner_contract("src.long_train"), ("--max-episodes", "completed_episodes"))
+        pointer = {"training_status": {"completed_cycles": 2, "completed_episodes": 1000}}
+        self.assertTrue(training_required(pointer, 4, 100, 50, "completed_cycles"))
+        self.assertFalse(training_required(pointer, 2, 100, 50, "completed_cycles"))
+        with self.assertRaises(ValueError):
+            learner_contract("unapproved.module")
 
 
 if __name__ == "__main__":
