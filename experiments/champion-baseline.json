@@ -1,0 +1,23 @@
+{
+  "name": "full21-20260929",
+  "role": "frozen general-access baseline",
+  "checkpoint": "checkpoints/champions/full21-20260929/model.pt",
+  "sha256": "44c073dfb7bd63712fb7e04dd1f3b03f676e972d1d9562c953f9123d8d547e48",
+  "architecture": "suit_conv",
+  "rules": {
+    "num_decks": 3,
+    "cards_in_hand": 21,
+    "required_sequences": 5,
+    "max_turns": 60
+  },
+  "ordinary_solo_confirmation": {
+    "seed": 40000000,
+    "games": 256,
+    "wins": 164,
+    "win_rate": 0.640625,
+    "baseline_wins": 6,
+    "random_wins": 0
+  },
+  "scope": "One training run, ordinary solo full21 games. This is not prior multiplayer evidence.",
+  "policy": "Never overwrite this model; only an independently confirmed challenger may change the registry champion pointer."
+}
