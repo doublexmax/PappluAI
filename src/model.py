@@ -300,7 +300,13 @@ def load_checkpoint(
                 network.num_actions,
             )
         )
-    network.load_state_dict(payload["model_state_dict"])
+    model_state = payload["model_state_dict"]
+    if not isinstance(model_state, dict) or any(
+        not isinstance(value, torch.Tensor) or not torch.isfinite(value).all().item()
+        for value in model_state.values()
+    ):
+        raise ValueError("Checkpoint contains non-finite model weights")
+    network.load_state_dict(model_state)
     network.to(device)
     network.eval()
 

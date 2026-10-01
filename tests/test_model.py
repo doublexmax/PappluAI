@@ -321,6 +321,17 @@ class TestQNetwork(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "incompatible"):
                 load_checkpoint(path)
 
+    def test_checkpoint_rejects_nonfinite_imported_model(self):
+        from src.model import QNetwork, build_checkpoint, load_checkpoint
+
+        payload = build_checkpoint(QNetwork(), GameConfig())
+        payload["model_state_dict"]["fc1.weight"][0, 0] = float("nan")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "nonfinite.pt")
+            torch.save(payload, path)
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                load_checkpoint(path)
+
     def test_mask_excludes_actions_below_old_sentinel(self):
         from src.model import QNetwork, select_greedy_action
 

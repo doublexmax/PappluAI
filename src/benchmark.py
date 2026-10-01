@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import random
+import time
 from typing import List, Optional, Sequence, Tuple
 
 from src.environment import GameConfig, PappluEnv, Phase, discard_action
@@ -35,6 +36,7 @@ def evaluate_games(
     seed: int,
     policy: str = "greedy",
     warm_start: bool = False,
+    deadline: Optional[float] = None,
 ) -> PolicyResults:
     from src.model import select_greedy_action, select_random_legal
 
@@ -51,12 +53,16 @@ def evaluate_games(
     network.eval()
     try:
         for index in range(games):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Game evaluation reached its time limit")
             obs = (
                 env.reset_warm_start(seed=seed + index)
                 if warm_start else env.reset(seed=seed + index)
             )
             rng = random.Random(seed + index + 10_000_000)
             while not obs.done:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Game evaluation reached its time limit")
                 if policy == "greedy":
                     action = select_greedy_action(network, obs)
                 elif policy == "random":

@@ -15,6 +15,7 @@ import random
 from typing import List, Optional, Tuple
 
 from src.evaluate import NUM_FACES, NUM_RANKS, NUM_SUITS, RANK_PATTERNS, hand_reward, is_valid_hand
+from src.reward_cache import RewardCache
 
 ACTION_DRAW_STOCK = 0
 ACTION_TAKE_DISCARD = 1
@@ -194,6 +195,7 @@ class PappluEnv:
         self._last_reward = 0.0
         self._won = False
         self._warm_start = False
+        self._reward_cache = RewardCache()
 
     def seed(self, seed: int) -> None:
         self._rng.seed(seed)
@@ -377,11 +379,12 @@ class PappluEnv:
         next_hand = self._hand.copy()
         next_hand[face] -= 1
 
-        reward = hand_reward(
+        reward = self._reward_cache.score(
             next_hand,
             self._joker,
             required_sequences=self.config.required_sequences,
             cards_in_hand=self.config.cards_in_hand,
+            evaluator=hand_reward,
         )
         self._hand = next_hand
         self._discard.append(face)
