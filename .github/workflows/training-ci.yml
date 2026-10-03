@@ -1,0 +1,44 @@
+name: Training CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  training:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-training.txt
+      - run: python -m pip install -r requirements-training.txt
+      - name: Run core training tests
+        run: >-
+          python -m unittest -v
+          tests.test_environment
+          tests.test_reward_cache
+          tests.test_model
+          tests.test_train
+          tests.test_long_train
+          tests.test_benchmark
+      - name: Check command help
+        run: |
+          python -m src.train --help
+          python -m src.long_train --help
+          python -m src.benchmark --help
+          python -m src.compare --help
+      - name: Check short trainer checkpoint and evaluation
+        run: |
+          python -m src.train --episodes 2 --num-decks 2 --cards-in-hand 3 --required-sequences 1 --max-turns 3 --warm-start-fraction 1 --seed 7 --eval-episodes 1 --eval-seed 1007 --log-every 0 --checkpoint "${RUNNER_TEMP}/smoke.pt"
+          python -m src.benchmark --checkpoint "${RUNNER_TEMP}/smoke.pt" --output "${RUNNER_TEMP}/smoke-evaluation.json" --games 1 --warm-games 1
+      - name: Check full-hand fresh train and exact resume
+        run: |
+          python -m src.long_train --output-dir "${RUNNER_TEMP}/full21" --max-episodes 1 --max-seconds 120 --checkpoint-every 1 --validation-games 1 --validate-every 100 --max-turns 1 --seed 41
+          python -m src.long_train --resume "${RUNNER_TEMP}/full21/latest-state.pt" --output-dir "${RUNNER_TEMP}/full21" --max-episodes 2 --max-seconds 120 --checkpoint-every 1
+          python -m src.benchmark --checkpoint "${RUNNER_TEMP}/full21/latest-model.pt" --output "${RUNNER_TEMP}/full21-evaluation.json" --games 1 --warm-games 0

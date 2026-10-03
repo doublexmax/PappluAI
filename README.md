@@ -1,9 +1,9 @@
 # PappluAI
 
-Papplu hand correctness and a binary reward function for future model training.
+Papplu hand correctness and a binary reward function for model training.
 The evaluator uses this project's house rules, not a universal rummy ruleset.
 The local simulator provides a hand builder and a pass-and-play card table.
-The environment, training code, and notebook remain unfinished experiments.
+The optional training tools use PyTorch.
 
 The Social club layout uses a warm background, player seats, a green hand mat,
 and a separate draw tray. Cards use clear sans-serif indices and a softer
@@ -232,6 +232,62 @@ first sequence it finds. It caches remaining card counts and the unmet sequence
 quota within each call. The search is exact, but its worst-case cost grows
 combinatorially. Joker-heavy hands can be slower than ordinary deals.
 This version provides correctness, not an optimized batch-training engine.
+
+## Train a model
+
+Install the optional training dependency from the repository root.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements-training.txt
+```
+
+`src.train` runs episodic Monte Carlo Q-value regression. It does not use DQN,
+tree search, or genetic algorithms.
+
+### Run a short discard-puzzle smoke test
+
+This command runs 20 three-card warm-start episodes on CPU. It checks the
+training, checkpoint, load, and evaluation paths. It does not measure full
+21-card play.
+
+```powershell
+.\.venv\Scripts\python -m src.train --episodes 20 --num-decks 2 --cards-in-hand 3 --required-sequences 1 --max-turns 5 --warm-start-fraction 1 --eval-episodes 10 --eval-seed 1000 --log-every 0 --checkpoint checkpoints\smoke.pt
+.\.venv\Scripts\python -m src.benchmark --checkpoint checkpoints\smoke.pt --output runs\smoke-evaluation.json --games 20 --warm-games 20
+```
+
+To continue from those weights, use `--load`. This path starts a new optimizer
+and replay buffer.
+
+```powershell
+.\.venv\Scripts\python -m src.train --load checkpoints\smoke.pt --episodes 5 --checkpoint checkpoints\smoke-finetuned.pt
+```
+
+### Train the default 21-card model
+
+`src.long_train` trains from scratch when you omit both `--initial-model` and
+`--resume`. The default configuration uses three decks, 21 cards, five pure
+sequences, a 60-turn limit, and the `suit_conv` network.
+
+```powershell
+.\.venv\Scripts\python -m src.long_train --output-dir runs\full21
+```
+
+The trainer writes standard model checkpoints and `latest-state.pt`.
+The state checkpoint includes the model, optimizer, replay buffer, counters,
+curriculum state, and random-number-generator states. Resume from that file to
+continue the same run exactly.
+
+```powershell
+.\.venv\Scripts\python -m src.long_train --resume runs\full21\latest-state.pt --output-dir runs\full21
+.\.venv\Scripts\python -m src.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
+```
+
+`src.model.load_checkpoint` accepts generated version 1 and version 2 model
+checkpoints. Version 1 uses the `mlp` architecture and the historical
+nonrecycling discard rule when the saved game settings omit
+`recycle_discard`. Version 2 records the architecture and all five game
+settings.
 
 ## Verification
 
