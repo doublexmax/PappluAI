@@ -1,0 +1,27 @@
+{
+  "architectures": ["mlp", "wide_mlp", "suit_conv"],
+  "training_seeds": [11, 22, 33],
+  "screen": {
+    "cards_in_hand": 3,
+    "required_sequences": 1,
+    "max_turns": 10,
+    "episodes": 6000,
+    "warm_start_fraction": 0.5,
+    "batch_size": 64,
+    "replay_capacity": 10000,
+    "updates_per_episode": 4,
+    "epsilon_decay_episodes": 5000,
+    "validation_seed": 300000,
+    "validation_games": 300,
+    "test_seed": 900000,
+    "test_games": 1000,
+    "warm_validation_seed": 600000,
+    "warm_validation_games": 300
+  },
+  "promotion_target": {
+    "minimum_structures": 3,
+    "absolute_win_rate_gain": 0.05,
+    "required_controls": ["mlp", "random"],
+    "test_selection_rule": "Select on validation means only; compare the selected structure against the original MLP and random on untouched test deals."
+  }
+}
