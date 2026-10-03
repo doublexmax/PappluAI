@@ -289,6 +289,64 @@ nonrecycling discard rule when the saved game settings omit
 `recycle_discard`. Version 2 records the architecture and all five game
 settings.
 
+### Compare policies in shared-deck matches
+
+`src.arena` runs headless matches with two through six seats. Repeat `--model`
+once per seat. Use `random` for a random legal policy.
+
+```powershell
+.\.venv\Scripts\python -m src.arena --model checkpoints\candidate.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
+```
+
+The report records each seat order, winner label, terminal reason, action
+count, and remaining stock. Checkpoint policies load lazily and must match the
+saved deck, hand, and sequence rules.
+
+### Train a challenger against a frozen league
+
+`src.league_train` updates only the challenger. The initial model, checkpoint
+opponents, and random policy stay frozen.
+
+```powershell
+.\.venv\Scripts\python -m src.league_train --initial-model checkpoints\champion.pt --opponent checkpoints\frozen-opponent.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.league_train --initial-model checkpoints\champion.pt --opponent checkpoints\frozen-opponent.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+```
+
+The state checkpoint is written only after a complete match. It contains the
+network, Adam state, replay, counters, opponent-pool identity, and random
+number generator states. A pool refresh freezes the new snapshots and keeps
+the replay.
+
+### Run finite improvement cycles
+
+`src.improve` alternates league matches and independent research episodes. It
+then evaluates both candidates against the frozen champion.
+
+```powershell
+.\.venv\Scripts\python -m src.improve --initial-model checkpoints\champion.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1
+.\.venv\Scripts\python -m src.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600
+```
+
+`champion.json` is the only champion authority. Model snapshots are immutable.
+Selection uses at least 32 independent seed blocks. Confirmation uses a fresh
+bank of at least 128 blocks and confirms only the selected nominee. Promotion
+also requires 256 paired solo games. Training updates are stochastic and are
+not an atomic group, so published metrics need not improve monotonically.
+`status.json` is written last and describes the stable published snapshot.
+
+To start the discard-recycling rule regime from a nonrecycling run, migrate
+into a separate output directory.
+
+```powershell
+.\.venv\Scripts\python -m src.rule_migration --source runs\legacy --output runs\recycling
+```
+
+Migration preserves model weights, counters, random number generator states,
+and the champion pointer. It clears replay, Adam moments, pending candidates,
+and old-rule validations. `rule-migration.json` records the transition.
+Re-running against an already migrated destination makes no changes. The
+migration does not compare scores across the two rule regimes.
+
 ## Verification
 
 From the repository root, the standard-library test command is:
