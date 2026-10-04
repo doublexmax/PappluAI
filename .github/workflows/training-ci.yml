@@ -12,17 +12,7 @@ on:
       - "README.md"
       - "TRAINING.md"
       - ".github/workflows/training-ci.yml"
-  pull_request:
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "tools/check_training_architecture.py"
-      - "tools/training_characterization.py"
-      - "requirements-training.txt"
-      - "experiments/**"
-      - "README.md"
-      - "TRAINING.md"
-      - ".github/workflows/training-ci.yml"
+  pull_request: {}
   workflow_dispatch:
     inputs:
       baseline_ref:

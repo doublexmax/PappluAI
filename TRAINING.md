@@ -129,7 +129,9 @@ simulator checks free of PyTorch, verifies CLI help at the optional-dependency
 boundary, runs the 192 focused training tests, exercises short checkpoint and
 resume workflows.
 
-Training-related path filters avoid unrelated runs. `workflow_dispatch`
+Every pull request runs the `portable` and `training` jobs before merge. Push
+path filters do not affect pull requests and apply only to direct pushes.
+`workflow_dispatch`
 remains available when the complete gate needs to be started manually. Set its
 optional `baseline_ref` input only for a one-off package or serialization
 migration. That separate job compares deterministic model, replay, checkpoint,
