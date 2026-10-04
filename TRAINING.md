@@ -69,7 +69,7 @@ when that field is absent.
 Repeat `--model` once per seat, using either a checkpoint or `random`.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.arena --model checkpoints\candidate.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
+.\.venv\Scripts\python -m src.cli.arena --model runs\full21\latest-model.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
 ```
 
 `runs\arena.json` records seating, winners, terminal reasons, action counts,
@@ -78,11 +78,14 @@ turn counts, and remaining stock.
 ## Train against a frozen league
 
 Only the challenger is updated. The initial model, checkpoint opponents, and
-random policy remain frozen.
+random policy remain frozen. Copy the generated full-hand model to make the
+opponent snapshot explicit.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.league --initial-model checkpoints\champion.pt --opponent checkpoints\frozen-opponent.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
-.\.venv\Scripts\python -m src.cli.league --initial-model checkpoints\champion.pt --opponent checkpoints\frozen-opponent.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+New-Item -ItemType Directory -Force checkpoints
+Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
+.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
 ```
 
 League checkpoints are published only at match boundaries and preserve the
@@ -94,7 +97,7 @@ Improvement alternates league and independent research training, evaluates
 both candidates, and promotes only through the guarded evidence gate.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.improve --initial-model checkpoints\champion.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1
+.\.venv\Scripts\python -m src.cli.improve --initial-model runs\full21\latest-model.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1
 .\.venv\Scripts\python -m src.cli.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600
 ```
 
@@ -103,10 +106,14 @@ immutable. `status.json` describes the latest stable published state.
 
 ## Migrate to discard recycling
 
-Start a new rule regime from an older nonrecycling improvement directory:
+The fresh run above already uses discard recycling, so it does not need
+migration. If you own a historical nonrecycling improvement directory, set its
+path explicitly and migrate it into a new directory:
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.rule_migration --source runs\legacy --output runs\recycling
+$legacyRun = "C:\path\to\historical-nonrecycling-run"
+if (-not (Test-Path "$legacyRun\latest-state.pt")) { throw "latest-state.pt not found" }
+.\.venv\Scripts\python -m src.cli.rule_migration --source $legacyRun --output runs\recycling
 ```
 
 The migration preserves model weights, counters, random streams, and champion
@@ -120,9 +127,10 @@ idempotent.
 automation or a long-running training job. It keeps evaluator and browser
 simulator checks free of PyTorch, verifies CLI help at the optional-dependency
 boundary, runs the 192 focused training tests, exercises short checkpoint and
-resume workflows, and compares deterministic model, replay, checkpoint, and
-full-state behavior with merged baseline
-`f4adea8efcd929c6c8878ad2a4883c3a00d5d4cb`.
+resume workflows.
 
 Training-related path filters avoid unrelated runs. `workflow_dispatch`
-remains available when the complete gate needs to be started manually.
+remains available when the complete gate needs to be started manually. Set its
+optional `baseline_ref` input only for a one-off package or serialization
+migration. That separate job compares deterministic model, replay, checkpoint,
+and full-state behavior with the selected baseline and uploads both reports.

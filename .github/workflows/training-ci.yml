@@ -24,6 +24,11 @@ on:
       - "TRAINING.md"
       - ".github/workflows/training-ci.yml"
   workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Optional ref for a one-off compatibility comparison
+        required: false
+        type: string
 
 jobs:
   portable:
@@ -60,26 +65,12 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements-training.txt
       - run: python -m pip install -r requirements-training.txt
-      - name: Compare merged baseline and refactor behavior
-        run: |
-          git worktree add --detach "${RUNNER_TEMP}/baseline" f4adea8efcd929c6c8878ad2a4883c3a00d5d4cb
-          python tools/training_characterization.py --layout baseline --source-root "${RUNNER_TEMP}/baseline" --output "${RUNNER_TEMP}/characterization/baseline"
-          python tools/training_characterization.py --layout refactor --source-root . --baseline-output "${RUNNER_TEMP}/characterization/baseline" --output "${RUNNER_TEMP}/characterization/refactor"
-      - name: Upload characterization evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: training-characterization
-          path: |
-            ${{ runner.temp }}/characterization/baseline/result.json
-            ${{ runner.temp }}/characterization/refactor/result.json
       - name: Run core training tests
         run: >-
           python -m unittest -v
@@ -116,3 +107,36 @@ jobs:
           python -m src.cli.league --initial-model "${RUNNER_TEMP}/initial-full21.pt" --output-dir "${RUNNER_TEMP}/league" --resume "${RUNNER_TEMP}/league/latest-state.pt" --matches 0 --max-seconds 120 --checkpoint-every 1
           python -m src.cli.improve --initial-model "${RUNNER_TEMP}/initial-full21.pt" --output-dir "${RUNNER_TEMP}/improve" --max-seconds 300 --max-cycles 1 --league-matches 1 --research-episodes 1 --selection-blocks 2 --confirmation-blocks 2 --solo-games 2 --checkpoint-every 1 --seed 53
           python -c 'import json, os, pathlib; root = pathlib.Path(os.environ["RUNNER_TEMP"]); arena = json.loads((root / "arena.json").read_text()); status = json.loads((root / "improve" / "status.json").read_text()); assert arena["config"]["game"]["cards_in_hand"] == 21; assert len(arena["games"]) == 1; assert (root / "league" / "latest-state.pt").is_file(); assert status["completed_cycles"] == 1; assert status["promotions"] == 0'
+
+  characterization:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.baseline_ref != ''
+    needs: portable
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASELINE_REF: ${{ inputs.baseline_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-training.txt
+      - run: python -m pip install -r requirements-training.txt
+      - name: Compare selected baseline and current behavior
+        run: |
+          BASELINE_SHA="$(git rev-parse --verify "${BASELINE_REF}^{commit}")"
+          git worktree add --detach "${RUNNER_TEMP}/baseline" "${BASELINE_SHA}"
+          python tools/training_characterization.py --layout baseline --source-root "${RUNNER_TEMP}/baseline" --output "${RUNNER_TEMP}/characterization/baseline"
+          python tools/training_characterization.py --layout refactor --source-root . --baseline-output "${RUNNER_TEMP}/characterization/baseline" --output "${RUNNER_TEMP}/characterization/refactor"
+      - name: Upload characterization evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-characterization-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/characterization/baseline/result.json
+            ${{ runner.temp }}/characterization/refactor/result.json

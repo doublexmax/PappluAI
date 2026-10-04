@@ -308,7 +308,7 @@ settings.
 once per seat. Use `random` for a random legal policy.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.arena --model checkpoints\candidate.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
+.\.venv\Scripts\python -m src.cli.arena --model runs\full21\latest-model.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
 ```
 
 The report records each seat order, winner label, terminal reason, action
@@ -321,8 +321,10 @@ saved deck, hand, and sequence rules.
 opponents, and random policy stay frozen.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.league --initial-model checkpoints\champion.pt --opponent checkpoints\frozen-opponent.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
-.\.venv\Scripts\python -m src.cli.league --initial-model checkpoints\champion.pt --opponent checkpoints\frozen-opponent.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+New-Item -ItemType Directory -Force checkpoints
+Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
+.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
 ```
 
 The state checkpoint is written only after a complete match. It contains the
@@ -336,7 +338,7 @@ the replay.
 then evaluates both candidates against the frozen champion.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.improve --initial-model checkpoints\champion.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1
+.\.venv\Scripts\python -m src.cli.improve --initial-model runs\full21\latest-model.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1
 .\.venv\Scripts\python -m src.cli.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600
 ```
 
@@ -347,11 +349,14 @@ also requires 256 paired solo games. Training updates are stochastic and are
 not an atomic group, so published metrics need not improve monotonically.
 `status.json` is written last and describes the stable published snapshot.
 
-To start the discard-recycling rule regime from a nonrecycling run, migrate
-into a separate output directory.
+Current runs already use discard recycling. To migrate a historical
+nonrecycling improvement run, point to its output and use a separate
+destination.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.rule_migration --source runs\legacy --output runs\recycling
+$legacyRun = "C:\path\to\historical-nonrecycling-run"
+if (-not (Test-Path "$legacyRun\latest-state.pt")) { throw "latest-state.pt not found" }
+.\.venv\Scripts\python -m src.cli.rule_migration --source $legacyRun --output runs\recycling
 ```
 
 Migration preserves model weights, counters, random number generator states,
