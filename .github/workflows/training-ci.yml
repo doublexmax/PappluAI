@@ -37,6 +37,7 @@ jobs:
           tests.test_evaluate
           tests.test_evaluate_oracle
           tests.test_search_patterns
+          tests.test_penalty
           tests.test_execution
       - name: Check browser simulator
         run: node --test tests/simulator.test.mjs tests/card_art.test.mjs
@@ -51,6 +52,8 @@ jobs:
           python -m src.cli.improve --help
           python -m src.cli.rule_migration --help
           python -m src.cli.calibration --help
+          python -m src.cli.tournament --help
+          python -m src.cli.ratings --help
 
   training:
     needs: portable
@@ -79,6 +82,8 @@ jobs:
           tests.test_multiplayer
           tests.test_match_telemetry
           tests.test_calibration
+          tests.test_ratings
+          tests.test_tournament
           tests.test_arena
           tests.test_registry
           tests.test_promotion

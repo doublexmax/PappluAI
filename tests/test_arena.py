@@ -104,6 +104,18 @@ class TestArenaMatches(unittest.TestCase):
             [0.0, 1.0],
         )
         self.assertEqual(result.trajectories[1], ())
+        self.assertIsNone(result.terminal_snapshot)
+
+    def test_terminal_capture_is_opt_in_and_keeps_every_hand(self):
+        config = MatchConfig(game=self.game, players=2)
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
+            result = play_match(
+                [FirstLegalPolicy(), FirstLegalPolicy()],
+                config, seed=711, record_terminal=True,
+            )
+        self.assertIsNotNone(result.terminal_snapshot)
+        self.assertEqual(len(result.terminal_snapshot.hands), 2)
+        self.assertEqual(tuple(sum(hand) for hand in result.terminal_snapshot.hands), (3, 3))
 
     def test_policies_receive_only_their_own_hand_and_public_state(self):
         game = GameConfig(

@@ -57,6 +57,12 @@ class MatchTelemetry:
     refill_turns: Tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class TerminalSnapshot:
+    hands: Tuple[Tuple[int, ...], ...]
+    joker: int
+
+
 class MultiplayerEnv:
     """Mutable match state with immutable public observations and views."""
 
@@ -211,6 +217,11 @@ class MultiplayerEnv:
             discard_draws=tuple(self._discard_draws),
             refill_turns=tuple(self._refill_turns),
         )
+
+    def terminal_snapshot(self) -> TerminalSnapshot:
+        if self._phase is not Phase.TERMINAL or self._terminal_reason is None:
+            raise ValueError("terminal hands are available only after a completed match")
+        return TerminalSnapshot(tuple(tuple(hand) for hand in self._hands), self._joker)
 
     def _refill_stock(self) -> None:
         if refill_stock(

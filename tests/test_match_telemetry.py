@@ -102,6 +102,22 @@ class TestMatchTelemetry(unittest.TestCase):
         self.assertEqual(env.telemetry().discard_draws, (0, 0))
         self.assertEqual(env.telemetry().refill_turns, ())
 
+    def test_private_terminal_snapshot_is_unavailable_during_play(self):
+        env = self.make_match()
+        with self.assertRaisesRegex(ValueError, "only after"):
+            env.terminal_snapshot()
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
+            for _ in range(4):
+                env.step(ACTION_DRAW_STOCK)
+                self.discard_first(env)
+        snapshot = env.terminal_snapshot()
+        expected = tuple(tuple(hand) for hand in env._hands)
+        self.assertEqual(snapshot.hands, expected)
+        self.assertEqual(snapshot.joker, env._joker)
+        self.assertFalse(hasattr(env.observe(), "opponent_hands"))
+        env.reset(seed=999)
+        self.assertEqual(snapshot.hands, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
