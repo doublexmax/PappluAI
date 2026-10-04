@@ -5,14 +5,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from src.benchmark import (
+from src.evaluation.benchmark import (
     PolicyResults,
     evaluate_checkpoint,
     evaluate_games,
     paired_comparison,
 )
-from src.environment import GameConfig
-from src.compare import run_comparison
+from src.game.environment import GameConfig
+from src.evaluation.compare import run_comparison
 
 try:
     import torch
@@ -67,22 +67,22 @@ class TestComparisonPlan(unittest.TestCase):
 @unittest.skipIf(torch is None, "Training dependencies not installed")
 class TestEvaluation(unittest.TestCase):
     def test_checkpoint_evaluation_restores_torch_threads(self):
-        from src.model import QNetwork
+        from src.model.network import QNetwork
 
         before = torch.get_num_threads()
         outcomes = PolicyResults((0,), 0, 0)
         with mock.patch(
-            "src.model.load_checkpoint",
+            "src.evaluation.benchmark.load_checkpoint",
             return_value=(QNetwork(), GameConfig(), {}),
         ), mock.patch(
-            "src.benchmark.evaluate_games",
+            "src.evaluation.benchmark.evaluate_games",
             return_value=outcomes,
         ):
             evaluate_checkpoint("generated.pt", games=1, warm_games=0)
         self.assertEqual(torch.get_num_threads(), before)
 
         with mock.patch(
-            "src.model.load_checkpoint",
+            "src.evaluation.benchmark.load_checkpoint",
             side_effect=RuntimeError("load failed"),
         ):
             with self.assertRaisesRegex(RuntimeError, "load failed"):
@@ -90,7 +90,7 @@ class TestEvaluation(unittest.TestCase):
         self.assertEqual(torch.get_num_threads(), before)
 
     def test_puzzle_oracle_proves_sensitivity(self):
-        from src.model import QNetwork
+        from src.model.network import QNetwork
 
         config = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=3)
         network = QNetwork()
@@ -100,7 +100,7 @@ class TestEvaluation(unittest.TestCase):
         self.assertLess(sum(random_policy.outcomes), 19)
 
     def test_evaluation_preserves_network_and_rng(self):
-        from src.model import QNetwork
+        from src.model.network import QNetwork
 
         network = QNetwork()
         config = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=2)
@@ -115,7 +115,7 @@ class TestEvaluation(unittest.TestCase):
             self.assertTrue(torch.equal(old, new))
 
     def test_validation_rejects_empty_games(self):
-        from src.model import QNetwork
+        from src.model.network import QNetwork
 
         with self.assertRaises(ValueError):
             evaluate_games(QNetwork(), GameConfig(), 0, 0)

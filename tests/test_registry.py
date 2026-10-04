@@ -5,9 +5,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from src.checkpoints import atomic_write_json
-from src.promotion import evidence_metrics
-from src.registry import ModelRecord, ModelRegistry
+from src.checkpoints.io import atomic_write_json
+from src.checkpoints.evidence import evidence_metrics
+from src.checkpoints.registry import ModelRecord, ModelRegistry
 
 
 def install_record(registry, data, origin):

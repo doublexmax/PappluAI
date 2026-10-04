@@ -4,11 +4,13 @@ from collections import deque
 import io
 import os
 import random
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from src.environment import (
+from src.game.environment import (
     GameConfig,
     PappluEnv,
     Phase,
@@ -16,8 +18,8 @@ from src.environment import (
     discard_action,
     encode_observation,
 )
-from src.train import main as train_main
-from src.training_core import EpisodeReplay, discounted_returns
+from src.cli.solo import main as train_main
+from src.training.core import EpisodeReplay, discounted_returns
 
 try:
     import torch
@@ -42,16 +44,26 @@ class TestDiscountedReturns(unittest.TestCase):
                 discounted_returns([1.0], gamma=gamma)
 
     def test_help_without_training_dependencies(self):
-        real_import = __import__
-
-        def import_without_torch(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "torch" or name.startswith("torch."):
-                raise ModuleNotFoundError("blocked for CLI help test", name="torch")
-            return real_import(name, globals, locals, fromlist, level)
-
-        with mock.patch("builtins.__import__", side_effect=import_without_torch):
-            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-                self.assertEqual(train_main(["--help"]), 0)
+        script = """
+import builtins
+import runpy
+import sys
+real_import = builtins.__import__
+def import_without_torch(name, *args, **kwargs):
+    if name == "torch" or name.startswith("torch."):
+        raise ModuleNotFoundError("blocked for CLI help test", name="torch")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = import_without_torch
+sys.argv = ["src.cli.solo", "--help"]
+runpy.run_module("src.cli.solo", run_name="__main__")
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         for flag in (
             "--episodes",
             "--max-turns",
@@ -67,11 +79,11 @@ class TestDiscountedReturns(unittest.TestCase):
             "--eval-episodes",
             "--eval-seed",
         ):
-            self.assertIn(flag, out.getvalue())
-        self.assertIn("fine-tune", out.getvalue().lower())
+            self.assertIn(flag, completed.stdout)
+        self.assertIn("fine-tune", completed.stdout.lower())
 
     def test_architecture_argument_defaults_to_inference_and_has_choices(self):
-        from src.train import build_arg_parser
+        from src.cli.solo import build_arg_parser
 
         parser = build_arg_parser()
         self.assertIsNone(parser.parse_args([]).architecture)
@@ -85,7 +97,7 @@ class TestDiscountedReturns(unittest.TestCase):
                 parser.parse_args(["--architecture", "unknown"])
 
     def test_replay_sampling_argument_contract(self):
-        from src.train import build_arg_parser
+        from src.cli.solo import build_arg_parser
 
         parser = build_arg_parser()
         self.assertEqual(parser.parse_args([]).replay_sampling, "transition")
@@ -155,7 +167,7 @@ class TestEpisodeReplay(unittest.TestCase):
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestTrainLearning(unittest.TestCase):
     def test_transition_sampling_uses_separate_seeded_streams(self):
-        from src.train import train
+        from src.training.solo import train
 
         def state(index):
             return (float(index),) + (0.0,) * (STATE_DIM - 1)
@@ -194,10 +206,10 @@ class TestTrainLearning(unittest.TestCase):
             return 0.0
 
         with mock.patch(
-            "src.train.run_episode",
+            "src.training.solo.run_episode",
             side_effect=run_seeded_episode,
         ), mock.patch(
-            "src.training_core.train_batch",
+            "src.training.optimization.train_batch",
             side_effect=capture_batch,
         ):
             summary = train(
@@ -241,8 +253,8 @@ class TestTrainLearning(unittest.TestCase):
         self.assertEqual(summary["replay_sampling"], "transition")
 
     def test_architecture_selection_summary_and_load_inference(self):
-        from src.model import load_checkpoint
-        from src.train import train
+        from src.model.network import load_checkpoint
+        from src.training.solo import train
 
         cfg = GameConfig(
             num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
@@ -269,13 +281,13 @@ class TestTrainLearning(unittest.TestCase):
                     self.assertEqual(inferred["architecture"], architecture)
 
     def test_default_architecture_remains_mlp(self):
-        from src.train import train
+        from src.training.solo import train
 
         summary = train(episodes=0)
         self.assertEqual(summary["architecture"], "mlp")
 
     def test_explicit_architecture_mismatch_is_clean_error(self):
-        from src.train import train
+        from src.training.solo import train
 
         cfg = GameConfig(
             num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
@@ -306,8 +318,8 @@ class TestTrainLearning(unittest.TestCase):
 
     def test_controlled_discard_task_raises_chosen_q(self):
         """Repeated warm-start 3-card puzzle: correct discard value should rise."""
-        from src.model import load_checkpoint, select_greedy_action
-        from src.train import train
+        from src.model.network import load_checkpoint, select_greedy_action
+        from src.training.solo import train
 
         cfg = GameConfig(
             num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
@@ -341,7 +353,7 @@ class TestTrainLearning(unittest.TestCase):
             path = os.path.join(tmp, "model.pt")
             train(episodes=0, seed=42, config=cfg, checkpoint_path=path)
             initial, _, _ = load_checkpoint(path)
-            with mock.patch("src.train.PappluEnv", FixedPuzzleEnv):
+            with mock.patch("src.training.solo.PappluEnv", FixedPuzzleEnv):
                 summary = train(
                     episodes=80, seed=42, config=cfg,
                     warm_start_fraction=1.0, epsilon_decay_episodes=60,
@@ -359,7 +371,7 @@ class TestTrainLearning(unittest.TestCase):
         self.assertEqual(env.step(select_greedy_action(net, obs)).last_reward, 1.0)
 
     def test_seeded_train_reproducible_metrics(self):
-        from src.train import train
+        from src.training.solo import train
 
         cfg = GameConfig(
             num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
@@ -381,8 +393,8 @@ class TestTrainLearning(unittest.TestCase):
         self.assertEqual(a, b)
 
     def test_heldout_eval_no_param_mutation(self):
-        from src.model import QNetwork
-        from src.train import evaluate_policy
+        from src.model.network import QNetwork
+        from src.training.solo import evaluate_policy
 
         cfg = GameConfig(
             num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
@@ -399,8 +411,8 @@ class TestTrainLearning(unittest.TestCase):
             self.assertTrue(torch.allclose(a, b))
 
     def test_checkpoint_save_load_cli_smoke(self):
-        from src.train import train
-        from src.model import load_checkpoint
+        from src.training.solo import train
+        from src.model.network import load_checkpoint
 
         cfg = GameConfig(
             num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
@@ -494,7 +506,7 @@ class TestTrainLearning(unittest.TestCase):
                 self.assertIn("does not match", err.getvalue())
 
     def test_rejects_invalid_hyperparameters_before_any_game(self):
-        from src.train import train
+        from src.training.solo import train
 
         for name, value in (
             ("episodes", -1), ("episodes", True), ("batch_size", 0),
@@ -507,7 +519,7 @@ class TestTrainLearning(unittest.TestCase):
             ("replay_sampling", "unknown"),
         ):
             with self.subTest(name=name, value=value):
-                with mock.patch("src.train.PappluEnv") as env:
+                with mock.patch("src.training.solo.PappluEnv") as env:
                     with self.assertRaises(ValueError):
                         train(**{name: value})
                     env.assert_not_called()

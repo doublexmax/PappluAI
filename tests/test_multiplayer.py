@@ -6,7 +6,7 @@ import operator
 import unittest
 from unittest import mock
 
-from src.environment import (
+from src.game.environment import (
     ACTION_DRAW_STOCK,
     ACTION_TAKE_DISCARD,
     GameConfig,
@@ -14,7 +14,7 @@ from src.environment import (
     discard_action,
     legal_action_mask,
 )
-from src.multiplayer import MatchConfig, MatchView, MultiplayerEnv
+from src.game.multiplayer import MatchConfig, MatchView, MultiplayerEnv
 
 
 def snapshot(env: MultiplayerEnv):
@@ -173,7 +173,7 @@ class TestMultiplayerTurns(unittest.TestCase):
         self.assert_faces_conserved()
         self.env.step(ACTION_DRAW_STOCK)
         self.assert_faces_conserved()
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             self.env.step(first_discard(self.env))
         self.assert_faces_conserved()
 
@@ -195,7 +195,7 @@ class TestMultiplayerTurns(unittest.TestCase):
         self.assertFalse(discard_mask[ACTION_TAKE_DISCARD])
         self.assertTrue(any(discard_mask[2:]))
 
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             view = self.env.step(first_discard(self.env))
         self.assertEqual(view.current_seat, 1)
         self.assertEqual(view.phase, Phase.DRAW)
@@ -204,7 +204,7 @@ class TestMultiplayerTurns(unittest.TestCase):
     def test_exhausted_seat_is_skipped(self):
         self.env._turns_remaining = [2, 0, 2]
         self.env.step(ACTION_DRAW_STOCK)
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             view = self.env.step(first_discard(self.env))
         self.assertEqual(view.current_seat, 2)
         self.assertEqual(view.turns_remaining, (1, 0, 2))
@@ -218,7 +218,7 @@ class TestMultiplayerTurns(unittest.TestCase):
         )
         env = MultiplayerEnv(MatchConfig(game=game, players=2))
         env.reset(seed=8)
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             env.step(ACTION_DRAW_STOCK)
             first = env.step(first_discard(env))
             self.assertFalse(first.done)
@@ -259,7 +259,7 @@ class TestMultiplayerTurns(unittest.TestCase):
         self.env._discard = [8]
         self.env.step(ACTION_DRAW_STOCK)
         self.assertEqual(self.env._stock, [])
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             self.env.step(discard_action(7))
         observation = self.env.observe()
         mask = legal_action_mask(observation)
@@ -275,7 +275,7 @@ class TestMultiplayerTurns(unittest.TestCase):
         self.env._hands[0][1] = 1
         self.env._hands[0][2] = 1
         self.env.step(ACTION_DRAW_STOCK)
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             view = self.env.step(discard_action(7))
         self.assertEqual(view.current_seat, 1)
         self.assertEqual(view.phase, Phase.DRAW)
@@ -318,7 +318,7 @@ class TestMultiplayerTurns(unittest.TestCase):
         env._hands[1][2] = 1
         env.step(ACTION_DRAW_STOCK)
         rng_before = env._rng.getstate()
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             view = env.step(discard_action(7))
         self.assertTrue(view.done)
         self.assertEqual(view.terminal_reason, "turns_exhausted")
@@ -350,7 +350,7 @@ class TestMultiplayerRecycling(unittest.TestCase):
                         if after == before + 1
                     )
                     with mock.patch(
-                        "src.multiplayer.hand_reward",
+                        "src.game.multiplayer.hand_reward",
                         return_value=0.0,
                     ):
                         env.step(discard_action(drawn))
@@ -404,7 +404,7 @@ class TestMultiplayerAtomicity(unittest.TestCase):
         self.env._discard = [7, 8]
         before = copy.deepcopy(snapshot(self.env))
         with mock.patch(
-            "src.multiplayer.hand_reward",
+            "src.game.multiplayer.hand_reward",
             side_effect=RuntimeError("evaluation failed"),
         ):
             with self.assertRaisesRegex(RuntimeError, "evaluation failed"):

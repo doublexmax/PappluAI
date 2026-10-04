@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from src.evaluate import hand_reward, is_valid_hand
-from src.environment import (
+from src.game.environment import (
     ACTION_DRAW_STOCK,
     ACTION_TAKE_DISCARD,
     ENCODING_VERSION,
@@ -261,7 +261,7 @@ class TestEnvironmentCore(unittest.TestCase):
         self.assertFalse(mask[ACTION_DRAW_STOCK])
         self.assertTrue(mask[ACTION_TAKE_DISCARD])
         env.step(ACTION_TAKE_DISCARD)
-        with mock.patch("src.environment.hand_reward", return_value=0.0):
+        with mock.patch("src.game.environment.hand_reward", return_value=0.0):
             env.step(discard_action(5))
         self.assertEqual(env.observe().stock_remaining, 0)
         self.assertEqual(env.observe().discard_pile, (4, 5))
@@ -276,7 +276,7 @@ class TestEnvironmentCore(unittest.TestCase):
         env = PappluEnv(cfg)
         obs = env.reset(seed=0)
         last_drawn = None
-        with mock.patch("src.environment.hand_reward", return_value=0.0):
+        with mock.patch("src.game.environment.hand_reward", return_value=0.0):
             for _ in range(47):
                 hand_before = obs.hand
                 obs = env.step(ACTION_DRAW_STOCK)
@@ -315,7 +315,7 @@ class TestEnvironmentCore(unittest.TestCase):
             env = PappluEnv(cfg)
             obs = env.reset(seed=seed)
             refills = 0
-            with mock.patch("src.environment.hand_reward", return_value=0.0):
+            with mock.patch("src.game.environment.hand_reward", return_value=0.0):
                 while not obs.done:
                     stock_before = obs.stock_remaining
                     hand_before = obs.hand
@@ -445,7 +445,7 @@ class TestEnvironmentCore(unittest.TestCase):
         env._phase = Phase.DRAW
         rng_before = env._rng.getstate()
         env.step(ACTION_DRAW_STOCK)
-        with mock.patch("src.environment.hand_reward", return_value=0.0):
+        with mock.patch("src.game.environment.hand_reward", return_value=0.0):
             obs = env.step(discard_action(7))
         self.assertTrue(obs.done)
         self.assertEqual(obs.turns_remaining, 0)
@@ -477,7 +477,7 @@ class TestEnvironmentCore(unittest.TestCase):
         stock_before = tuple(env._stock)
         discard_before = tuple(env._discard)
         rng_before = env._rng.getstate()
-        with mock.patch("src.environment.hand_reward", side_effect=RuntimeError("evaluation failed")):
+        with mock.patch("src.game.environment.hand_reward", side_effect=RuntimeError("evaluation failed")):
             with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
                 env.step(discard_action(face))
         self.assertEqual(obs, env.observe())
@@ -589,7 +589,7 @@ class TestCurriculumStart(unittest.TestCase):
         )
 
     def test_distance_counts_actual_target_card_changes(self):
-        import src.environment as environment
+        import src.game.environment as environment
 
         cfg = GameConfig(max_turns=5)
         captured = []
@@ -602,7 +602,7 @@ class TestCurriculumStart(unittest.TestCase):
 
         env = PappluEnv(cfg)
         with mock.patch(
-            "src.environment._build_natural_winning_deal",
+            "src.game.environment._build_natural_winning_deal",
             side_effect=capture,
         ):
             obs = env.reset_curriculum(distance=8, seed=72)
@@ -657,7 +657,7 @@ class TestCurriculumStart(unittest.TestCase):
             self.assertEqual(env.observe(), before)
             self.assertEqual(env._rng.getstate(), rng_before)
 
-        with mock.patch("src.environment.is_valid_hand", return_value=True):
+        with mock.patch("src.game.environment.is_valid_hand", return_value=True):
             with self.assertRaisesRegex(ValueError, "after 200 attempts"):
                 env.reset_curriculum(1, seed=123)
         self.assertEqual(env.observe(), before)

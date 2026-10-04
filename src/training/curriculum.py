@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -10,24 +9,38 @@ import math
 import os
 from pathlib import Path
 import random
-import signal
 import shutil
 import sys
 import time
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
-from src.checkpoints import (
+import torch
+import torch.nn as nn
+
+from src.checkpoints.io import (
     atomic_copy,
-    atomic_torch_save,
     atomic_write_json,
-    clone_model_state,
     require_checkpoint_fields,
     require_checkpoint_int,
+)
+from src.checkpoints.tensor import (
+    atomic_torch_save,
+    clone_model_state,
     validate_checkpoint_tree,
     validate_model_state,
 )
-from src.environment import ENCODING_VERSION, GameConfig, PappluEnv, encode_observation
-from src.training_core import EpisodeReplay, discounted_returns, train_batch
+from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv, encode_observation
+from src.model.network import (
+    CHECKPOINT_VERSION,
+    QNetwork,
+    build_checkpoint,
+    load_checkpoint,
+    select_action,
+    select_greedy_action,
+    select_random_legal,
+)
+from src.training.core import EpisodeReplay, discounted_returns
+from src.training.optimization import train_batch
 
 
 TRAINING_STATE_VERSION = 1
@@ -173,10 +186,6 @@ class TrainingSession:
         initial_model: Optional[str] = None,
         initial_stage_index: int = 0,
     ) -> None:
-        import torch
-        import torch.nn as nn
-        from src.model import QNetwork, load_checkpoint
-
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise TypeError("seed must be an int")
         if (
@@ -266,8 +275,6 @@ class TrainingSession:
         path: str,
         expected_config: Optional[TrainingConfig] = None,
     ) -> "TrainingSession":
-        import torch
-
         payload = torch.load(path, map_location="cpu", weights_only=True)
         return cls.from_state_dict(payload, expected_config=expected_config)
 
@@ -277,8 +284,6 @@ class TrainingSession:
         payload: Mapping[str, Any],
         expected_config: Optional[TrainingConfig] = None,
     ) -> "TrainingSession":
-        import torch
-
         previous_rng_state = torch.get_rng_state()
         try:
             return cls._from_state_dict(
@@ -295,9 +300,6 @@ class TrainingSession:
         payload: Mapping[str, Any],
         expected_config: Optional[TrainingConfig] = None,
     ) -> "TrainingSession":
-        import torch
-        from src.model import CHECKPOINT_VERSION
-
         if not isinstance(payload, dict):
             raise ValueError("training checkpoint must be a dict")
         required = {
@@ -525,9 +527,6 @@ class TrainingSession:
         return session
 
     def state_dict(self) -> Dict[str, Any]:
-        import torch
-        from src.model import CHECKPOINT_VERSION
-
         optimizer_state = self.optimizer.state_dict()
         validate_checkpoint_tree(optimizer_state, "optimizer_state_dict")
         return {
@@ -582,9 +581,6 @@ class TrainingSession:
         }
 
     def run_episode(self, deadline: Optional[float] = None) -> Optional[Dict[str, Any]]:
-        import torch
-        from src.model import select_action
-
         epsilon = self.current_epsilon
         distance = self.current_distance
         rng_snapshot = {
@@ -799,8 +795,6 @@ class TrainingSession:
         }
 
     def _restore_rng_snapshot(self, snapshot: Mapping[str, Any]) -> None:
-        import torch
-
         self.deal_rng.setstate(snapshot["deal"])
         self.action_rng.setstate(snapshot["action"])
         self.replay_rng.setstate(snapshot["replay"])
@@ -824,8 +818,6 @@ def evaluate_policy_pair(
     deadline: Optional[float] = None,
     stop_requested: Callable[[], bool] = lambda: False,
 ) -> Dict[str, Any]:
-    from src.model import select_greedy_action, select_random_legal
-
     _positive_int(games, "games")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise TypeError("seed must be an int")
@@ -898,69 +890,6 @@ def save_session_checkpoint(
     if active_metrics.exists():
         atomic_copy(active_metrics, output_dir / "metrics.jsonl")
     return _snapshot_file_manifest(output_dir)
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument(
-        "--initial-model",
-        help="Start from model weights. Omit with --resume to train from scratch.",
-    )
-    source.add_argument("--resume")
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--max-episodes", type=int, default=1_000_000)
-    parser.add_argument("--max-seconds", type=float, default=82_800)
-    parser.add_argument("--checkpoint-every", type=int, default=100)
-    parser.add_argument(
-        "--validate-every",
-        type=int,
-        default=None,
-        help="Validation cadence. New sessions default to 1000 episodes.",
-    )
-    parser.add_argument(
-        "--validation-games",
-        type=int,
-        default=None,
-        help="Games per policy and validation source. New sessions default to 64.",
-    )
-    parser.add_argument(
-        "--max-turns",
-        type=int,
-        default=None,
-        help="Full-game turn limit. New sessions default to 60.",
-    )
-    parser.add_argument(
-        "--recycle-discard",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Recycle older discards into stock. New sessions default to enabled.",
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=None,
-        help="Optimizer learning rate. New sessions default to 0.001.",
-    )
-    parser.add_argument(
-        "--curriculum-fraction",
-        type=float,
-        default=None,
-        help="Fraction of curriculum deals. New sessions default to 0.75.",
-    )
-    parser.add_argument(
-        "--initial-stage",
-        type=int,
-        default=None,
-        help="Initial curriculum stage 0..4. New sessions default to 0.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Training seed. New sessions default to 41.",
-    )
-    return parser
 
 
 def run(
@@ -1058,143 +987,6 @@ def run(
     return reason
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_arg_parser()
-    try:
-        args = parser.parse_args(list(argv) if argv is not None else None)
-    except SystemExit as exc:
-        return int(exc.code) if isinstance(exc.code, int) else 1
-
-    session: Optional[TrainingSession] = None
-    output_dir = Path(args.output_dir)
-    started = time.monotonic()
-    stop = [False]
-
-    def request_stop(_signum: int, _frame: Any) -> None:
-        stop[0] = True
-
-    previous_handler = signal.getsignal(signal.SIGTERM)
-    try:
-        signal.signal(signal.SIGTERM, request_stop)
-        _nonnegative_int(args.max_episodes, "max_episodes")
-        _positive_int(args.checkpoint_every, "checkpoint_every")
-        if (
-            isinstance(args.max_seconds, bool)
-            or not isinstance(args.max_seconds, (int, float))
-            or not math.isfinite(float(args.max_seconds))
-            or args.max_seconds < 0
-        ):
-            raise ValueError("max_seconds must be finite and nonnegative")
-        if args.resume:
-            session = TrainingSession.load(args.resume)
-            _validate_resume_arguments(session, args)
-            initialize = session.baseline_validation is None
-        else:
-            managed_outputs = (
-                "latest-state.pt",
-                "latest-model.pt",
-                "best-model.pt",
-                "baseline-model.pt",
-                "status.json",
-                "metrics.jsonl",
-            )
-            if any((output_dir / name).exists() for name in managed_outputs):
-                raise ValueError(
-                    "output directory already has training outputs; use --resume"
-                )
-            config = TrainingConfig(
-                max_turns=60 if args.max_turns is None else args.max_turns,
-                recycle_discard=(
-                    True
-                    if args.recycle_discard is None
-                    else args.recycle_discard
-                ),
-                learning_rate=(
-                    1e-3 if args.learning_rate is None else args.learning_rate
-                ),
-                curriculum_fraction=(
-                    0.75
-                    if args.curriculum_fraction is None
-                    else args.curriculum_fraction
-                ),
-                validation_games=(
-                    64 if args.validation_games is None else args.validation_games
-                ),
-                validate_every=(
-                    1_000 if args.validate_every is None else args.validate_every
-                ),
-            )
-            session = TrainingSession(
-                config=config,
-                seed=41 if args.seed is None else args.seed,
-                initial_model=args.initial_model,
-                initial_stage_index=(
-                    0 if args.initial_stage is None else args.initial_stage
-                ),
-            )
-            initialize = True
-        reason = run(
-            session,
-            output_dir,
-            max_episodes=args.max_episodes,
-            max_seconds=args.max_seconds,
-            checkpoint_every=args.checkpoint_every,
-            stop_requested=lambda: stop[0],
-            initialize=initialize,
-        )
-        print(
-            json.dumps(
-                {
-                    "status": reason,
-                    "episodes": session.total_episodes,
-                    "updates": session.total_updates,
-                    "stage": session.stage_index,
-                    "distance": session.current_distance,
-                    "best_score": session.best_score,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-        return 0
-    except (TypeError, ValueError, OSError, RuntimeError, KeyError) as exc:
-        _publish_error(output_dir, session, str(exc), started)
-        print("error: %s" % exc, file=sys.stderr, flush=True)
-        return 2
-    except BaseException as exc:
-        _publish_error(output_dir, session, str(exc), started)
-        print("error: %s" % exc, file=sys.stderr, flush=True)
-        return 1
-    finally:
-        signal.signal(signal.SIGTERM, previous_handler)
-
-
-def _validate_resume_arguments(
-    session: TrainingSession, args: argparse.Namespace
-) -> None:
-    requested = {
-        "max_turns": args.max_turns,
-        "recycle_discard": args.recycle_discard,
-        "learning_rate": args.learning_rate,
-        "curriculum_fraction": args.curriculum_fraction,
-        "validation_games": args.validation_games,
-        "validate_every": args.validate_every,
-    }
-    for name, value in requested.items():
-        if value is not None and value != getattr(session.config, name):
-            raise ValueError(
-                "resume cannot change %s from %r to %r"
-                % (name, getattr(session.config, name), value)
-            )
-    if args.seed is not None and args.seed != session.initial_seed:
-        raise ValueError(
-            "resume seed %d does not match saved seed %d"
-            % (args.seed, session.initial_seed)
-        )
-    if args.initial_stage is not None:
-        raise ValueError("--initial-stage is only valid for a new session")
-
-
 def _append_validation_metrics(
     output_dir: Path,
     session: TrainingSession,
@@ -1260,8 +1052,6 @@ def _model_payload(
     state_dict: Mapping[str, Any],
     role: str,
 ) -> Dict[str, Any]:
-    from src.model import build_checkpoint
-
     checkpoint_episodes = {
         "latest": session.total_episodes,
         "best": session.best_episode,
@@ -1294,8 +1084,6 @@ def _status_payload(
     stop_reason: Optional[str],
     started: float,
 ) -> Dict[str, Any]:
-    from src.model import CHECKPOINT_VERSION
-
     return {
         "status_schema_version": STATUS_SCHEMA_VERSION,
         "status": status,
@@ -1385,8 +1173,6 @@ def _publish_error(
 
 
 def _append_metric(output_dir: Path, event: Mapping[str, Any]) -> None:
-    from src.model import CHECKPOINT_VERSION
-
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "algorithm": ALGORITHM,
@@ -1446,7 +1232,3 @@ def _positive_int(value: Any, name: str) -> int:
     if number <= 0:
         raise ValueError("%s must be positive" % name)
     return number
-
-
-if __name__ == "__main__":
-    sys.exit(main())

@@ -6,13 +6,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from src.improve import (
+import src.training.improve as improve_runtime
+from src.training.improve import (
     ALGORITHM,
     ImproveConfig,
     ImprovementController,
-    build_arg_parser,
 )
-from src.registry import file_sha256
+from src.cli.improve import build_arg_parser
+from src.checkpoints.io import file_sha256
 
 try:
     import torch
@@ -25,7 +26,7 @@ TORCH_REASON = "PyTorch not installed (see requirements-training.txt)"
 
 class TestMetricHistory(unittest.TestCase):
     def test_initial_evidence_accepts_legacy_and_recycling_rules_with_explicit_labels(self):
-        from src.improve import _initial_evidence
+        from src.training.improve import _initial_evidence
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -63,12 +64,12 @@ class TestMetricHistory(unittest.TestCase):
                 )
 
     def test_cached_event_index_avoids_rescanning_the_entire_log(self):
-        from src.improve import _append_metric_once, _read_metric_ids
+        from src.training.improve import _append_metric_once, _read_metric_ids
 
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             identifiers = set()
-            with mock.patch("src.improve.json.loads", side_effect=AssertionError("unexpected rescan")):
+            with mock.patch("src.training.improve.json.loads", side_effect=AssertionError("unexpected rescan")):
                 _append_metric_once(output, "first", {"value": 1}, identifiers)
                 _append_metric_once(output, "second", {"value": 2}, identifiers)
                 _append_metric_once(output, "first", {"value": 99}, identifiers)
@@ -76,7 +77,7 @@ class TestMetricHistory(unittest.TestCase):
             self.assertEqual(len((output / ".active-metrics.jsonl").read_text().splitlines()), 2)
 
     def test_malformed_history_is_reported_instead_of_silently_skipped(self):
-        from src.improve import _read_metric_ids
+        from src.training.improve import _read_metric_ids
 
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "metrics.jsonl"
@@ -91,7 +92,7 @@ def sha256(path):
 
 def gate_result(accepted):
     def evaluate(**kwargs):
-        from src.promotion import balanced_seat_orders, evidence_metrics
+        from src.checkpoints.evidence import balanced_seat_orders, evidence_metrics
 
         blocks = kwargs["seed_blocks"]
         multiplayer = {
@@ -142,8 +143,8 @@ def gate_result(accepted):
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestImprovementController(unittest.TestCase):
     def make_model(self, path):
-        from src.environment import GameConfig
-        from src.model import QNetwork, save_checkpoint
+        from src.game.environment import GameConfig
+        from src.model.network import QNetwork, save_checkpoint
 
         save_checkpoint(
             str(path),
@@ -262,7 +263,7 @@ class TestImprovementController(unittest.TestCase):
             original_bytes = controller.registry.model_path(original.id).read_bytes()
             self.prepare_distinct_candidates(controller)
             with mock.patch(
-                "src.promotion.evaluate_gate",
+                "src.training.improve.evaluate_gate",
                 side_effect=gate_result(False),
             ):
                 controller._selection_step()
@@ -298,7 +299,7 @@ class TestImprovementController(unittest.TestCase):
                 return next(decisions)(**kwargs)
 
             with mock.patch(
-                "src.promotion.evaluate_gate",
+                "src.training.improve.evaluate_gate",
                 side_effect=evaluate,
             ):
                 controller._selection_step()
@@ -330,7 +331,7 @@ class TestImprovementController(unittest.TestCase):
                 return gate_result(next(decisions))(**kwargs)
 
             with mock.patch(
-                "src.promotion.evaluate_gate",
+                "src.training.improve.evaluate_gate",
                 side_effect=evaluate,
             ):
                 controller._selection_step()
@@ -383,7 +384,7 @@ class TestImprovementController(unittest.TestCase):
             self.assertEqual(after["opponent_ids"], before["opponent_ids"])
 
     def test_resume_can_extend_runtime_cap_but_not_learning_settings(self):
-        from src.improve import _validate_resume_options
+        from src.cli.improve import _validate_resume_options
 
         with tempfile.TemporaryDirectory() as temporary:
             controller = self.make_controller(Path(temporary))
@@ -392,12 +393,22 @@ class TestImprovementController(unittest.TestCase):
                 "--resume", "latest-state.pt", "--output-dir", "output",
                 "--max-seconds", "60", "--max-cycles", "3",
             ]
-            _validate_resume_options(controller, parser.parse_args(arguments), arguments)
+            _validate_resume_options(
+                improve_runtime,
+                controller,
+                parser.parse_args(arguments),
+                arguments,
+            )
             self.assertEqual(controller.config.max_cycles, 3)
             self.assertEqual(controller.config.league_matches_per_cycle, 1)
             invalid = arguments + ["--league-matches", "999"]
             with self.assertRaisesRegex(ValueError, "cannot change"):
-                _validate_resume_options(controller, parser.parse_args(invalid), invalid)
+                _validate_resume_options(
+                    improve_runtime,
+                    controller,
+                    parser.parse_args(invalid),
+                    invalid,
+                )
 
     def test_solo_resume_rejects_nonfinite_optimizer_state(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -407,7 +418,7 @@ class TestImprovementController(unittest.TestCase):
                 0: {"exp_avg": torch.tensor([float("nan")])}
             }
             with self.assertRaisesRegex(ValueError, "non-finite"):
-                from src.long_train import TrainingSession
+                from src.training.curriculum import TrainingSession
 
                 TrainingSession.from_state_dict(payload)
 
@@ -445,7 +456,7 @@ class TestImprovementController(unittest.TestCase):
                 self.assertEqual(metadata["sha256"], sha256(path))
 
     def test_active_metrics_cannot_invalidate_published_snapshot(self):
-        from src.improve import _append_metric_once
+        from src.training.improve import _append_metric_once
 
         with tempfile.TemporaryDirectory() as temporary:
             controller = self.make_controller(Path(temporary))
@@ -459,8 +470,8 @@ class TestImprovementController(unittest.TestCase):
             self.assertIn("new-event", (controller.output_dir / "metrics.jsonl").read_text())
 
     def test_gate_budget_exceptions_checkpoint_without_partial_promotion(self):
-        from src.arena import MatchInterrupted
-        from src.promotion import GateInterrupted
+        from src.evaluation.arena import MatchInterrupted
+        from src.evaluation.promotion import GateInterrupted
 
         interruptions = (
             GateInterrupted("deadline"),
@@ -475,7 +486,7 @@ class TestImprovementController(unittest.TestCase):
                     champion_id = controller.registry.champion().id
                     before = controller.state_dict()
                     with mock.patch(
-                        "src.promotion.evaluate_gate",
+                        "src.training.improve.evaluate_gate",
                         side_effect=interruption,
                     ):
                         reason = controller.run(10)

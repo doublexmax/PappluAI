@@ -7,11 +7,13 @@ import json
 import os
 from pathlib import Path
 import random
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from src.environment import (
+from src.game.environment import (
     ACTION_DRAW_STOCK,
     NUM_ACTIONS,
     STATE_DIM,
@@ -21,17 +23,16 @@ from src.environment import (
     discard_action,
     encode_observation,
 )
-from src.long_train import (
+from src.training.curriculum import (
     STATUS_SCHEMA_VERSION,
     TRAINING_STATE_VERSION,
     TrainingConfig,
     TrainingSession,
-    build_arg_parser,
-    main,
     run,
     save_session_checkpoint,
 )
-from src.training_core import EpisodeReplay
+from src.cli.curriculum import build_arg_parser
+from src.training.core import EpisodeReplay
 
 try:
     import torch
@@ -55,17 +56,27 @@ def validation(greedy, random_rate):
 
 class TestLongTrainCli(unittest.TestCase):
     def test_help_does_not_import_torch(self):
-        real_import = __import__
-
-        def import_without_torch(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "torch" or name.startswith("torch."):
-                raise ModuleNotFoundError("blocked", name="torch")
-            return real_import(name, globals, locals, fromlist, level)
-
-        with mock.patch("builtins.__import__", side_effect=import_without_torch):
-            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-                self.assertEqual(main(["--help"]), 0)
-        text = out.getvalue()
+        script = """
+import builtins
+import runpy
+import sys
+real_import = builtins.__import__
+def import_without_torch(name, *args, **kwargs):
+    if name == "torch" or name.startswith("torch."):
+        raise ModuleNotFoundError("blocked for CLI help test", name="torch")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = import_without_torch
+sys.argv = ["src.cli.curriculum", "--help"]
+runpy.run_module("src.cli.curriculum", run_name="__main__")
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        text = completed.stdout
         for flag in (
             "--initial-model",
             "--resume",
@@ -229,7 +240,7 @@ class TestTrainingSession(unittest.TestCase):
             self.assertEqual(left, right)
 
     def test_initial_model_allows_turn_budget_change_only(self):
-        from src.model import QNetwork, save_checkpoint
+        from src.model.network import QNetwork, save_checkpoint
 
         config = self.small_config()
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,7 +276,7 @@ class TestTrainingSession(unittest.TestCase):
                 )
 
     def test_resume_reproduces_next_action_batch_rng_and_update(self):
-        from src.model import select_action
+        from src.model.network import select_action
 
         config = self.small_config()
         control = TrainingSession(config, seed=41)
@@ -419,10 +430,10 @@ class TestTrainingSession(unittest.TestCase):
             return [episode[-1]]
 
         with mock.patch(
-            "src.long_train.PappluEnv",
+            "src.training.curriculum.PappluEnv",
             Full21FixtureEnv,
         ), mock.patch(
-            "src.model.select_action",
+            "src.training.curriculum.select_action",
             side_effect=winning_action,
         ), mock.patch.object(
             session.replay,
@@ -547,7 +558,7 @@ class TestTrainingSession(unittest.TestCase):
         full = validation(0.2, 0.3)
         curriculum = validation(0.4, 0.1)
         with mock.patch(
-            "src.long_train.evaluate_policy_pair",
+            "src.training.curriculum.evaluate_policy_pair",
             side_effect=[full, curriculum, full, curriculum],
         ):
             first = session.run_validation()
@@ -577,7 +588,7 @@ class TestTrainingSession(unittest.TestCase):
             for name, value in session.best_model_state.items()
         }
         with mock.patch(
-            "src.long_train.evaluate_policy_pair",
+            "src.training.curriculum.evaluate_policy_pair",
             side_effect=[full, curriculum],
         ):
             result = session.run_validation()
@@ -605,15 +616,15 @@ class TestTrainingSession(unittest.TestCase):
         expected = before_action.state_dict()
         final_expected = final_step.state_dict()
 
-        with mock.patch("src.long_train.time.monotonic", return_value=2.0):
+        with mock.patch("src.training.curriculum.time.monotonic", return_value=2.0):
             self.assertIsNone(before_action.run_episode(deadline=1.0))
         with mock.patch(
-            "src.long_train.time.monotonic",
+            "src.training.curriculum.time.monotonic",
             side_effect=[0.0, 2.0],
         ):
             self.assertIsNone(mid_trajectory.run_episode(deadline=1.0))
         with mock.patch(
-            "src.long_train.time.monotonic",
+            "src.training.curriculum.time.monotonic",
             side_effect=[0.0, 0.0, 2.0],
         ):
             self.assertIsNone(final_step.run_episode(deadline=1.0))
@@ -660,7 +671,7 @@ class TestTrainingSession(unittest.TestCase):
         config = self.small_config(validate_every=2)
         session = TrainingSession(config, seed=41)
         with mock.patch(
-            "src.long_train.evaluate_policy_pair",
+            "src.training.curriculum.evaluate_policy_pair",
             return_value=validation(0.1, 0.0),
         ):
             session.initialize_validation()
@@ -672,7 +683,7 @@ class TestTrainingSession(unittest.TestCase):
             resumed = TrainingSession.load(str(output / "latest-state.pt"))
             self.assertEqual(resumed.last_validation_episode, 0)
             with mock.patch(
-                "src.long_train.evaluate_policy_pair",
+                "src.training.curriculum.evaluate_policy_pair",
                 return_value=validation(0.2, 0.0),
             ):
                 with mock.patch.object(
@@ -687,7 +698,7 @@ class TestTrainingSession(unittest.TestCase):
             self.assertEqual(resumed.best_score, 0.2)
 
     def test_validation_budget_does_not_publish_partial_scores(self):
-        from src.long_train import ValidationInterrupted
+        from src.training.curriculum import ValidationInterrupted
 
         session = TrainingSession(self.small_config(), seed=41)
         before = session.state_dict()["rng_states"]
@@ -702,7 +713,7 @@ class TestTrainingSession(unittest.TestCase):
             self.assertEqual(before[name], after[name])
 
     def test_atomic_checkpoint_has_resumable_and_standard_models(self):
-        from src.model import load_checkpoint
+        from src.model.network import load_checkpoint
 
         session = TrainingSession(self.small_config(), seed=41)
         session.total_episodes = 6
@@ -721,7 +732,7 @@ class TestTrainingSession(unittest.TestCase):
                 real_replace(source, destination)
 
             with mock.patch(
-                "src.checkpoints.os.replace",
+                "src.checkpoints.tensor.os.replace",
                 side_effect=capture_replace,
             ):
                 manifest = save_session_checkpoint(session, output)
@@ -786,7 +797,7 @@ class TestTrainingSession(unittest.TestCase):
                 self.assertEqual(meta["checkpoint_episodes"], episodes)
 
     def test_live_metric_append_preserves_the_published_checkpoint_hash(self):
-        from src.long_train import _append_metric
+        from src.training.curriculum import _append_metric
 
         session = TrainingSession(self.small_config(), seed=41)
         with tempfile.TemporaryDirectory() as temporary:

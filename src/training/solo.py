@@ -11,25 +11,33 @@ separately and are not held-out full-game wins.
 
 from __future__ import annotations
 
-import argparse
 from collections import deque
 import json
 import math
 import random
-import sys
-from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
-import src.training_core as training_core
-from src.environment import (
+import torch
+import torch.nn as nn
+
+import src.training.core as training_core
+import src.training.optimization as training_optimization
+from src.game.environment import (
     ENCODING_VERSION,
     GameConfig,
     Observation,
     PappluEnv,
     encode_observation,
 )
-if TYPE_CHECKING:
-    import torch
-    from src.model import QNetwork
+from src.model.network import (
+    CHECKPOINT_VERSION,
+    QNetwork,
+    load_checkpoint,
+    save_checkpoint,
+    select_action,
+    select_greedy_action,
+    select_random_legal,
+)
 
 EpisodeStep = Tuple[Tuple[float, ...], int, float]
 
@@ -42,8 +50,6 @@ def run_episode(
     warm_start: bool = False,
     device: Optional["torch.device"] = None,
 ) -> Tuple[List[EpisodeStep], Observation]:
-    from src.model import select_action
-
     obs = env.reset_warm_start() if warm_start else env.reset()
     steps: List[EpisodeStep] = []
     while not obs.done:
@@ -79,10 +85,6 @@ def train(
     replay_sampling: str = "transition",
 ) -> Dict[str, object]:
     """Train Q via episodic Monte Carlo regression. Returns summary metrics."""
-    import torch
-    import torch.nn as nn
-    from src.model import CHECKPOINT_VERSION, QNetwork, load_checkpoint, save_checkpoint
-
     for name, value, minimum in (
         ("episodes", episodes, 0),
         ("batch_size", batch_size, 1),
@@ -213,7 +215,7 @@ def train(
                     list(replay),
                     min(batch_size, len(replay)),
                 )
-            loss_val = training_core.train_batch(
+            loss_val = training_optimization.train_batch(
                 network, optimizer, loss_fn, batch, torch_device, grad_clip
             )
             loss_sum += loss_val
@@ -311,8 +313,6 @@ def evaluate_policy(
     compare_random: bool = True,
 ) -> Dict[str, float]:
     """Held-out greedy play on standard random deals. No learning updates."""
-    from src.model import select_greedy_action, select_random_legal
-
     if isinstance(games, bool) or not isinstance(games, int) or games <= 0:
         raise ValueError("games must be a positive integer")
     cfg = config if config is not None else GameConfig()
@@ -362,142 +362,3 @@ def evaluate_policy(
     if was_training:
         network.train()
     return result
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description=(
-            "Train a Papplu Q-network with episodic Monte Carlo return regression "
-            "(not DQN). Rewards come from src.evaluate.hand_reward."
-        )
-    )
-    p.add_argument("--episodes", type=int, default=100)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--gamma", type=float, default=0.99)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--replay-capacity", type=int, default=5000)
-    p.add_argument(
-        "--replay-sampling",
-        choices=("transition", "episode"),
-        default="transition",
-        help="Replay sampling unit (default transition).",
-    )
-    p.add_argument("--epsilon-start", type=float, default=1.0)
-    p.add_argument("--epsilon-end", type=float, default=0.05)
-    p.add_argument("--epsilon-decay-episodes", type=int, default=200)
-    p.add_argument(
-        "--warm-start-fraction",
-        type=float,
-        default=0.0,
-        help=(
-            "Fraction of episodes that start as winning-hand-plus-extra discard "
-            "puzzles (default 0 = random deals)."
-        ),
-    )
-    p.add_argument("--updates-per-episode", type=int, default=4)
-    p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--device", type=str, default="cpu")
-    p.add_argument("--torch-threads", type=int, default=1, help="CPU threads for the small network (default 1).")
-    p.add_argument(
-        "--architecture",
-        choices=("mlp", "wide_mlp", "suit_conv"),
-        default=None,
-        help="Model architecture. A loaded checkpoint supplies the default.",
-    )
-    p.add_argument("--num-decks", type=int, help="Decks (default 3, or loaded checkpoint).")
-    p.add_argument("--cards-in-hand", type=int, help="Hand size (default 21, or loaded checkpoint).")
-    p.add_argument("--required-sequences", type=int, help="Required pure sequences (default 5, or loaded checkpoint).")
-    p.add_argument(
-        "--max-turns",
-        type=int,
-        help="Turn budget (default 40, or loaded checkpoint).",
-    )
-    p.add_argument(
-        "--checkpoint",
-        type=str,
-        default="",
-        help="Path to write the trained checkpoint after training.",
-    )
-    p.add_argument(
-        "--load",
-        type=str,
-        default="",
-        help=(
-            "Load weights and game settings to fine-tune. Replay and optimizer "
-            "start fresh. Explicit game settings must match the checkpoint."
-        ),
-    )
-    p.add_argument(
-        "--eval-episodes",
-        type=int,
-        default=0,
-        help="Held-out greedy vs random games after training (0 skips).",
-    )
-    p.add_argument("--eval-seed", type=int, default=12345)
-    p.add_argument("--log-every", type=int, default=10)
-    return p
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_arg_parser()
-    try:
-        args = parser.parse_args(list(argv) if argv is not None else None)
-    except SystemExit as exc:
-        code = exc.code
-        return int(code) if isinstance(code, int) else 1
-
-    try:
-        game_settings = {
-            name: getattr(args, name)
-            for name in ("num_decks", "cards_in_hand", "required_sequences", "max_turns")
-            if getattr(args, name) is not None
-        }
-        if args.load and game_settings:
-            from src.model import load_checkpoint
-
-            _, saved_config, _ = load_checkpoint(
-                args.load, expected_architecture=args.architecture
-            )
-            config = GameConfig(**{**saved_config.to_dict(), **game_settings})
-        else:
-            config = GameConfig(**game_settings) if not args.load else None
-        summary = train(
-            episodes=args.episodes,
-            seed=args.seed,
-            gamma=args.gamma,
-            lr=args.lr,
-            batch_size=args.batch_size,
-            replay_capacity=args.replay_capacity,
-            replay_sampling=args.replay_sampling,
-            epsilon_start=args.epsilon_start,
-            epsilon_end=args.epsilon_end,
-            epsilon_decay_episodes=args.epsilon_decay_episodes,
-            warm_start_fraction=args.warm_start_fraction,
-            updates_per_episode=args.updates_per_episode,
-            grad_clip=args.grad_clip,
-            device=args.device,
-            torch_threads=args.torch_threads,
-            config=config,
-            checkpoint_path=args.checkpoint or None,
-            load_path=args.load or None,
-            eval_episodes=args.eval_episodes,
-            eval_seed=args.eval_seed,
-            log_every=args.log_every,
-            architecture=args.architecture,
-        )
-    except ModuleNotFoundError as exc:
-        if exc.name != "torch":
-            raise
-        print("error: PyTorch is required. Run python -m pip install -r requirements-training.txt", file=sys.stderr)
-        return 2
-    except (TypeError, ValueError, OSError, RuntimeError, KeyError) as exc:
-        print("error: %s" % exc, file=sys.stderr)
-        return 2
-
-    print(json.dumps(summary, sort_keys=True))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

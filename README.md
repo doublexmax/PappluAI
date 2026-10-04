@@ -242,8 +242,21 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements-training.txt
 ```
 
-`src.train` runs episodic Monte Carlo Q-value regression. It does not use DQN,
-tree search, or genetic algorithms.
+The executable commands live under `src.cli`; they parse arguments before
+loading the optional PyTorch runtime. Implementation modules are grouped by
+responsibility:
+
+| Package | Responsibility |
+|---|---|
+| `src.game` | Rules, state encoding, stock handling, and multiplayer state |
+| `src.model` | Network architectures and model checkpoints |
+| `src.training` | Replay, optimization, solo, curriculum, league, and improvement training |
+| `src.evaluation` | Benchmarks, policy comparison, arena matches, and promotion gates |
+| `src.checkpoints` | Atomic files, tensor validation, evidence, registries, and rule migration |
+
+`src.cli.solo` runs episodic Monte Carlo Q-value regression. It does not use
+DQN, tree search, or genetic algorithms. See [TRAINING.md](TRAINING.md) for a
+fresh-clone walkthrough of every training workflow.
 
 ### Run a short discard-puzzle smoke test
 
@@ -252,25 +265,25 @@ training, checkpoint, load, and evaluation paths. It does not measure full
 21-card play.
 
 ```powershell
-.\.venv\Scripts\python -m src.train --episodes 20 --num-decks 2 --cards-in-hand 3 --required-sequences 1 --max-turns 5 --warm-start-fraction 1 --eval-episodes 10 --eval-seed 1000 --log-every 0 --checkpoint checkpoints\smoke.pt
-.\.venv\Scripts\python -m src.benchmark --checkpoint checkpoints\smoke.pt --output runs\smoke-evaluation.json --games 20 --warm-games 20
+.\.venv\Scripts\python -m src.cli.solo --episodes 20 --num-decks 2 --cards-in-hand 3 --required-sequences 1 --max-turns 5 --warm-start-fraction 1 --eval-episodes 10 --eval-seed 1000 --log-every 0 --checkpoint checkpoints\smoke.pt
+.\.venv\Scripts\python -m src.cli.benchmark --checkpoint checkpoints\smoke.pt --output runs\smoke-evaluation.json --games 20 --warm-games 20
 ```
 
 To continue from those weights, use `--load`. This path starts a new optimizer
 and replay buffer.
 
 ```powershell
-.\.venv\Scripts\python -m src.train --load checkpoints\smoke.pt --episodes 5 --checkpoint checkpoints\smoke-finetuned.pt
+.\.venv\Scripts\python -m src.cli.solo --load checkpoints\smoke.pt --episodes 5 --checkpoint checkpoints\smoke-finetuned.pt
 ```
 
 ### Train the default 21-card model
 
-`src.long_train` trains from scratch when you omit both `--initial-model` and
+`src.cli.curriculum` trains from scratch when you omit both `--initial-model` and
 `--resume`. The default configuration uses three decks, 21 cards, five pure
 sequences, a 60-turn limit, and the `suit_conv` network.
 
 ```powershell
-.\.venv\Scripts\python -m src.long_train --output-dir runs\full21
+.\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21
 ```
 
 The trainer writes standard model checkpoints and `latest-state.pt`.
@@ -279,11 +292,11 @@ curriculum state, and random-number-generator states. Resume from that file to
 continue the same run exactly.
 
 ```powershell
-.\.venv\Scripts\python -m src.long_train --resume runs\full21\latest-state.pt --output-dir runs\full21
-.\.venv\Scripts\python -m src.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
+.\.venv\Scripts\python -m src.cli.curriculum --resume runs\full21\latest-state.pt --output-dir runs\full21
+.\.venv\Scripts\python -m src.cli.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
 ```
 
-`src.model.load_checkpoint` accepts generated version 1 and version 2 model
+`src.model.network.load_checkpoint` accepts generated version 1 and version 2 model
 checkpoints. Version 1 uses the `mlp` architecture and the historical
 nonrecycling discard rule when the saved game settings omit
 `recycle_discard`. Version 2 records the architecture and all five game
@@ -291,11 +304,11 @@ settings.
 
 ### Compare policies in shared-deck matches
 
-`src.arena` runs headless matches with two through six seats. Repeat `--model`
+`src.cli.arena` runs headless matches with two through six seats. Repeat `--model`
 once per seat. Use `random` for a random legal policy.
 
 ```powershell
-.\.venv\Scripts\python -m src.arena --model checkpoints\candidate.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
+.\.venv\Scripts\python -m src.cli.arena --model runs\full21\latest-model.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
 ```
 
 The report records each seat order, winner label, terminal reason, action
@@ -304,12 +317,14 @@ saved deck, hand, and sequence rules.
 
 ### Train a challenger against a frozen league
 
-`src.league_train` updates only the challenger. The initial model, checkpoint
+`src.cli.league` updates only the challenger. The initial model, checkpoint
 opponents, and random policy stay frozen.
 
 ```powershell
-.\.venv\Scripts\python -m src.league_train --initial-model checkpoints\champion.pt --opponent checkpoints\frozen-opponent.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
-.\.venv\Scripts\python -m src.league_train --initial-model checkpoints\champion.pt --opponent checkpoints\frozen-opponent.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+New-Item -ItemType Directory -Force checkpoints
+Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
+.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
 ```
 
 The state checkpoint is written only after a complete match. It contains the
@@ -319,12 +334,12 @@ the replay.
 
 ### Run finite improvement cycles
 
-`src.improve` alternates league matches and independent research episodes. It
+`src.cli.improve` alternates league matches and independent research episodes. It
 then evaluates both candidates against the frozen champion.
 
 ```powershell
-.\.venv\Scripts\python -m src.improve --initial-model checkpoints\champion.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1
-.\.venv\Scripts\python -m src.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600
+.\.venv\Scripts\python -m src.cli.improve --initial-model runs\full21\latest-model.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1
+.\.venv\Scripts\python -m src.cli.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600
 ```
 
 `champion.json` is the only champion authority. Model snapshots are immutable.
@@ -334,11 +349,14 @@ also requires 256 paired solo games. Training updates are stochastic and are
 not an atomic group, so published metrics need not improve monotonically.
 `status.json` is written last and describes the stable published snapshot.
 
-To start the discard-recycling rule regime from a nonrecycling run, migrate
-into a separate output directory.
+Current runs already use discard recycling. To migrate a historical
+nonrecycling improvement run, point to its output and use a separate
+destination.
 
 ```powershell
-.\.venv\Scripts\python -m src.rule_migration --source runs\legacy --output runs\recycling
+$legacyRun = "C:\path\to\historical-nonrecycling-run"
+if (-not (Test-Path "$legacyRun\latest-state.pt")) { throw "latest-state.pt not found" }
+.\.venv\Scripts\python -m src.cli.rule_migration --source $legacyRun --output runs\recycling
 ```
 
 Migration preserves model weights, counters, random number generator states,

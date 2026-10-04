@@ -12,10 +12,10 @@ except ImportError:
 @unittest.skipIf(torch is None, "Training dependencies not installed")
 class TestStockRuleMigration(unittest.TestCase):
     def test_preserves_weights_counters_and_champion_but_retires_old_rule_experience(self):
-        from src.environment import GameConfig
-        from src.improve import ImproveConfig, ImprovementController
-        from src.model import QNetwork, save_checkpoint
-        from src.rule_migration import migrate
+        from src.game.environment import GameConfig
+        from src.training.improve import ImproveConfig, ImprovementController
+        from src.model.network import QNetwork, save_checkpoint
+        from src.checkpoints.rule_migration import migrate
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

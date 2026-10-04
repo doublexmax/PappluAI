@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import random
 from typing import List, Optional, Tuple
 
-from src.environment import (
+from src.game.environment import (
     ACTION_DRAW_STOCK,
     NUM_ACTIONS,
     GameConfig,
@@ -14,8 +14,8 @@ from src.environment import (
     legal_action_mask,
 )
 from src.evaluate import NUM_FACES, hand_reward
-from src.reward_cache import RewardCache
-from src.stock import refill_stock
+from src.game.reward_cache import RewardCache
+from src.game.stock import refill_stock
 
 
 @dataclass(frozen=True)

@@ -7,21 +7,21 @@ import tempfile
 import unittest
 from unittest import mock
 
-from src.arena import (
+from src.evaluation.arena import (
     CheckpointPolicy,
     EpsilonPolicy,
     MatchInterrupted,
     MatchResult,
     RandomPolicy,
-    main,
     play_match,
     rotated_matches,
 )
-from src.environment import (
+from src.cli.arena import main
+from src.game.environment import (
     GameConfig,
     legal_action_mask,
 )
-from src.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.multiplayer import MatchConfig, MultiplayerEnv
 
 try:
     import torch
@@ -65,7 +65,7 @@ class TestArenaMatches(unittest.TestCase):
     def test_draw_records_complete_zero_reward_trajectories(self):
         config = MatchConfig(game=self.game, players=3)
         policies = [FirstLegalPolicy() for _ in range(3)]
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             result = play_match(
                 policies,
                 config,
@@ -86,7 +86,7 @@ class TestArenaMatches(unittest.TestCase):
 
     def test_only_winning_discard_receives_reward(self):
         config = MatchConfig(game=self.game, players=2)
-        with mock.patch("src.multiplayer.hand_reward", return_value=1.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=1.0):
             result = play_match(
                 [FirstLegalPolicy(), FirstLegalPolicy()],
                 config,
@@ -117,7 +117,7 @@ class TestArenaMatches(unittest.TestCase):
             tuple(hand) for hand in expected._hands
         )
 
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             play_match(policies, config, seed=72)
 
         for seat, policy in enumerate(policies):
@@ -130,7 +130,7 @@ class TestArenaMatches(unittest.TestCase):
 
     def test_seed_repeats_deck_policy_rng_and_trajectories(self):
         config = MatchConfig(game=self.game, players=2)
-        with mock.patch("src.multiplayer.hand_reward", return_value=0.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             first = play_match(
                 [RandomLegalPolicy(), RandomLegalPolicy()],
                 config,
@@ -149,9 +149,9 @@ class TestArenaMatches(unittest.TestCase):
         policy = FirstLegalPolicy()
         config = MatchConfig(game=self.game, players=2)
         with mock.patch(
-            "src.arena.time.monotonic",
+            "src.evaluation.arena.time.monotonic",
             side_effect=(0.0, 2.0),
-        ), mock.patch("src.multiplayer.hand_reward") as evaluator:
+        ), mock.patch("src.game.multiplayer.hand_reward") as evaluator:
             with self.assertRaises(MatchInterrupted):
                 play_match(
                     [policy, FirstLegalPolicy()],
@@ -201,7 +201,7 @@ class TestArenaMatches(unittest.TestCase):
         )
         policy = FirstLegalPolicy(policy_config)
         config = MatchConfig(game=self.game, players=2)
-        with mock.patch("src.multiplayer.hand_reward", return_value=1.0):
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=1.0):
             result = play_match(
                 [policy, FirstLegalPolicy(policy_config)],
                 config,
@@ -221,7 +221,7 @@ class TestArenaMatches(unittest.TestCase):
             stock_remaining=30,
             trajectories=((), (), ()),
         )
-        with mock.patch("src.arena.play_match", return_value=result) as play:
+        with mock.patch("src.evaluation.arena.play_match", return_value=result) as play:
             results = rotated_matches(
                 policies,
                 MatchConfig(game=self.game, players=3),
@@ -263,7 +263,7 @@ class TestArenaCli(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             output = os.path.join(tmp, "matches.json")
-            with mock.patch("src.arena.play_match", return_value=fake) as play:
+            with mock.patch("src.evaluation.arena.play_match", return_value=fake) as play:
                 code = main(
                     [
                         "--model",
@@ -303,7 +303,7 @@ class TestArenaCli(unittest.TestCase):
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class TestArenaCheckpoints(unittest.TestCase):
     def test_v1_v2_mlp_wide_and_cnn_checkpoints_load_in_eval_mode(self):
-        from src.model import QNetwork, build_checkpoint, save_checkpoint
+        from src.model.network import QNetwork, build_checkpoint, save_checkpoint
 
         checkpoint_config = GameConfig(max_turns=40)
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,7 +335,7 @@ class TestArenaCheckpoints(unittest.TestCase):
                     self.assertFalse(policy.network.training)
 
     def test_mlp_and_cnn_checkpoints_play_matched_full21_random_smoke(self):
-        from src.model import QNetwork, save_checkpoint
+        from src.model.network import QNetwork, save_checkpoint
 
         checkpoint_config = GameConfig(max_turns=40)
         match_config = MatchConfig(
@@ -352,7 +352,7 @@ class TestArenaCheckpoints(unittest.TestCase):
                         checkpoint_config,
                     )
                     with mock.patch(
-                        "src.multiplayer.hand_reward",
+                        "src.game.multiplayer.hand_reward",
                         side_effect=(0.0, 1.0),
                     ):
                         result = play_match(
@@ -369,7 +369,7 @@ class TestArenaCheckpoints(unittest.TestCase):
                     )
 
     def test_epsilon_boundaries_select_legal_actions_without_changing_mode(self):
-        from src.model import QNetwork
+        from src.model.network import QNetwork
 
         for epsilon in (0.0, 1.0):
             with self.subTest(epsilon=epsilon):

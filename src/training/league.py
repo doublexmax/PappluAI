@@ -2,32 +2,43 @@
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import asdict, dataclass, field
-import json
 import math
 from pathlib import Path
 import random
-import signal
-import sys
 import time
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from src.checkpoints import (
-    atomic_torch_save,
+import torch
+import torch.nn as nn
+
+from src.checkpoints.io import (
     require_checkpoint_fields,
     require_checkpoint_int,
+    file_sha256,
+)
+from src.checkpoints.tensor import (
+    atomic_torch_save,
     validate_checkpoint_tree,
     validate_model_state,
 )
-from src.environment import (
+from src.evaluation.arena import (
+    CheckpointPolicy,
+    EpsilonPolicy,
+    MatchInterrupted,
+    RandomPolicy,
+    play_match,
+)
+from src.game.environment import (
     ENCODING_VERSION,
     NUM_ACTIONS,
     STATE_DIM,
     GameConfig,
 )
-from src.registry import file_sha256
-from src.training_core import EpisodeReplay, discounted_returns, train_batch
+from src.game.multiplayer import MatchConfig
+from src.model.network import build_checkpoint, load_checkpoint
+from src.training.core import EpisodeReplay, discounted_returns
+from src.training.optimization import train_batch
 
 
 LEAGUE_STATE_VERSION = 1
@@ -133,10 +144,6 @@ class LeagueSession:
         config: Optional[LeagueConfig] = None,
         seed: int = 41,
     ) -> None:
-        import torch
-        import torch.nn as nn
-        from src.model import load_checkpoint
-
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise TypeError("seed must be an int")
         self.config = LeagueConfig() if config is None else config
@@ -190,10 +197,6 @@ class LeagueSession:
         ) * fraction
 
     def train_match(self, deadline: Optional[float] = None) -> Dict[str, Any]:
-        import torch
-        from src.arena import EpsilonPolicy, MatchInterrupted, play_match
-        from src.multiplayer import MatchConfig
-
         rng_snapshot = (
             self.deal_rng.getstate(),
             self.opponent_rng.getstate(),
@@ -325,8 +328,6 @@ class LeagueSession:
         }
 
     def load_state_dict(self, payload: Mapping[str, Any]) -> None:
-        import torch
-
         required = {
             "league_state_version",
             "encoding_version",
@@ -466,8 +467,6 @@ class LeagueSession:
         opponent_paths: Sequence[str] = (),
         expected_config: Optional[LeagueConfig] = None,
     ) -> "LeagueSession":
-        import torch
-
         payload = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(payload, dict):
             raise ValueError("league checkpoint must be a dict")
@@ -484,8 +483,6 @@ class LeagueSession:
         return session
 
     def export_model(self, path: Path, role: str = "latest") -> None:
-        from src.model import build_checkpoint
-
         payload = build_checkpoint(
             self.network,
             self.config.game,
@@ -527,103 +524,6 @@ def save_session_checkpoint(session: LeagueSession, output_dir: Path) -> None:
     session.export_model(output_dir / "latest-model.pt")
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--initial-model", required=True)
-    parser.add_argument("--opponent", action="append", default=[])
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--matches", type=int, required=True)
-    parser.add_argument("--max-seconds", type=float, default=82_800)
-    parser.add_argument("--checkpoint-every", type=int, default=16)
-    parser.add_argument("--seed", type=int, default=41)
-    parser.add_argument("--resume")
-    return parser
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_arg_parser()
-    try:
-        args = parser.parse_args(list(argv) if argv is not None else None)
-    except SystemExit as exc:
-        return int(exc.code) if isinstance(exc.code, int) else 1
-
-    stop = [False]
-
-    def request_stop(_signum: int, _frame: Any) -> None:
-        stop[0] = True
-
-    previous_handler = signal.getsignal(signal.SIGTERM)
-    try:
-        from src.arena import MatchInterrupted
-
-        signal.signal(signal.SIGTERM, request_stop)
-        require_checkpoint_int(args.matches, "matches", minimum=0)
-        require_checkpoint_int(
-            args.checkpoint_every,
-            "checkpoint_every",
-            minimum=1,
-        )
-        if (
-            isinstance(args.max_seconds, bool)
-            or not isinstance(args.max_seconds, (int, float))
-            or not math.isfinite(float(args.max_seconds))
-            or args.max_seconds < 0
-        ):
-            raise ValueError("max_seconds must be finite and nonnegative")
-        output_dir = Path(args.output_dir)
-        session = (
-            LeagueSession.load(
-                args.resume,
-                args.initial_model,
-                args.opponent,
-                expected_config=LeagueConfig(),
-            )
-            if args.resume
-            else LeagueSession(
-                args.initial_model,
-                opponent_paths=args.opponent,
-                seed=args.seed,
-            )
-        )
-        save_session_checkpoint(session, output_dir)
-        target = session.completed_matches + args.matches
-        deadline = time.monotonic() + float(args.max_seconds)
-        reason = "matches"
-        while session.completed_matches < target:
-            if stop[0]:
-                reason = "stopped"
-                break
-            if time.monotonic() >= deadline:
-                reason = "budget"
-                break
-            try:
-                result = session.train_match(deadline=deadline)
-            except MatchInterrupted:
-                reason = "budget"
-                break
-            print(json.dumps(result, sort_keys=True), flush=True)
-            if session.completed_matches % args.checkpoint_every == 0:
-                save_session_checkpoint(session, output_dir)
-        save_session_checkpoint(session, output_dir)
-        print(
-            json.dumps(
-                {
-                    "status": reason,
-                    "matches": session.completed_matches,
-                    "updates": session.total_updates,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-        return 0
-    except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
-        print("error: %s" % exc, file=sys.stderr, flush=True)
-        return 2
-    finally:
-        signal.signal(signal.SIGTERM, previous_handler)
-
-
 def _require_compatible_game(
     actual: GameConfig, expected: GameConfig, label: str
 ) -> None:
@@ -644,8 +544,6 @@ def _load_opponents(
     opponent_paths: Sequence[str],
     game: GameConfig,
 ) -> Tuple[_Opponent, ...]:
-    from src.arena import CheckpointPolicy, RandomPolicy
-
     opponents = []
     seen = set()
     for path in (initial_model, *opponent_paths, RANDOM_OPPONENT):
@@ -689,7 +587,3 @@ def _action(raw: Any) -> int:
             % (NUM_ACTIONS - 1)
         )
     return raw
-
-
-if __name__ == "__main__":
-    sys.exit(main())
