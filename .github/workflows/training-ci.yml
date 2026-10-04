@@ -36,6 +36,7 @@ jobs:
           python -m unittest -v
           tests.test_evaluate
           tests.test_evaluate_oracle
+          tests.test_search_patterns
       - name: Check browser simulator
         run: node --test tests/simulator.test.mjs tests/card_art.test.mjs
       - name: Check command help without training dependencies

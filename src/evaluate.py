@@ -95,6 +95,12 @@ def _rank_patterns() -> Tuple[Tuple[int, ...], ...]:
 
 
 RANK_PATTERNS = _rank_patterns()
+_SEARCH_SEQUENCES = tuple(
+    tuple(_face(suit, rank) for rank in pattern)
+    for suit in range(NUM_SUITS)
+    for pattern in RANK_PATTERNS
+    if len(pattern) <= 5
+)
 
 
 def _subtract(counts: Tuple[int, ...], used: Sequence[int]) -> Tuple[int, ...]:
@@ -169,33 +175,36 @@ def _iter_sequences(
     anchor: Optional[int] = None,
 ) -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
     total = sum(counts)
-    anchor_is_wild = anchor in _wild_faces(joker, pure_only)
-    for suit in range(NUM_SUITS):
-        for pattern in RANK_PATTERNS:
-            if len(pattern) > total:
-                continue
-            represented = tuple(_face(suit, rank) for rank in pattern)
-            if anchor is not None and anchor not in represented and not anchor_is_wild:
-                continue
-            for actuals in _iter_allocations(
-                counts, represented, joker, pure_only, require_actual=anchor,
-            ):
-                meld = _meld_from("sequence", actuals, represented, joker)
-                yield meld, _subtract(counts, actuals)
+    wilds = _wild_faces(joker, pure_only)
+    wild_count = sum(counts[face] for face in wilds)
+    anchor_is_wild = anchor in wilds
+    natural = tuple(count > 0 and face not in wilds for face, count in enumerate(counts))
+    # Longer runs split into legal pieces of three to five cards without losing purity.
+    for represented in _SEARCH_SEQUENCES:
+        if len(represented) > total:
+            continue
+        if anchor is not None and anchor not in represented and not anchor_is_wild:
+            continue
+        if len(represented) - sum(natural[face] for face in represented) > wild_count:
+            continue
+        for actuals in _iter_allocations(
+            counts, represented, joker, pure_only, require_actual=anchor,
+        ):
+            meld = _meld_from("sequence", actuals, represented, joker)
+            yield meld, _subtract(counts, actuals)
 
 
 def _iter_sets(
-    counts: Tuple[int, ...], joker: int, anchor: int,
+    counts: Tuple[int, ...], joker: int, anchor: Optional[int] = None,
 ) -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
     wilds = set(_wild_faces(joker, pure=False))
-    anchor_rank = anchor % NUM_RANKS
     anchor_is_wild = anchor in wilds
 
     ranks: Sequence[int]
-    if anchor_is_wild:
+    if anchor is None or anchor_is_wild:
         ranks = range(NUM_RANKS)
     else:
-        ranks = (anchor_rank,)
+        ranks = (anchor % NUM_RANKS,)
 
     suit_combos = (
         (0, 1, 2),
@@ -208,23 +217,11 @@ def _iter_sets(
     for rank in ranks:
         for suits in suit_combos:
             represented = tuple(_face(suit, rank) for suit in suits)
-            if not anchor_is_wild and anchor not in represented:
+            if anchor is not None and not anchor_is_wild and anchor not in represented:
                 continue
             for actuals in _iter_allocations(counts, represented, joker, pure=False, require_actual=anchor):
                 meld = _meld_from("set", actuals, represented, joker)
                 yield meld, _subtract(counts, actuals)
-
-
-def _collapse_candidates(
-    items: Iterator[Tuple[Meld, Tuple[int, ...]]],
-) -> List[Tuple[Meld, Tuple[int, ...]]]:
-    best = {}
-    for meld, remaining in items:
-        key = (remaining, meld.is_pure)
-        best.setdefault(key, (meld, remaining))
-    ordered = list(best.values())
-    ordered.sort(key=lambda item: (len(item[0].cards), item[0].kind, item[0].represented_cards))
-    return ordered
 
 
 def _search(
@@ -233,44 +230,82 @@ def _search(
     joker: int,
     memo: Dict[Tuple[Tuple[int, ...], int], Optional[Tuple[Meld, ...]]],
 ) -> Optional[Tuple[Meld, ...]]:
-    key = (counts, pure_needed)
-    if key in memo:
-        return memo[key]
-
-    total = sum(counts)
-    if total == 0:
-        result: Optional[Tuple[Meld, ...]] = () if pure_needed == 0 else None
-        memo[key] = result
-        return result
-    if total < MIN_MELD:
-        memo[key] = None
+    if sum(counts) < pure_needed * MIN_MELD:
         return None
-    if pure_needed * MIN_MELD > total:
-        memo[key] = None
-        return None
+    faces, options = _compile_meld_options(counts, joker)
+    initial = tuple(counts[face] for face in faces)
 
-    if pure_needed > 0:
-        # Do not pin the global lowest card: it may belong only in a later set.
-        raw = _iter_sequences(counts, joker, pure_only=True, anchor=None)
-    else:
-        anchor = next(face for face, count in enumerate(counts) if count)
-
-        def all_melds() -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
-            yield from _iter_sequences(counts, joker, pure_only=False, anchor=anchor)
-            yield from _iter_sets(counts, joker, anchor=anchor)
-
-        raw = all_melds()
-
-    for meld, remaining in _collapse_candidates(raw):
-        next_pure = max(0, pure_needed - meld.is_pure)
-        suffix = _search(remaining, next_pure, joker, memo)
-        if suffix is not None:
-            result = (meld,) + suffix
+    def visit(state: Tuple[int, ...], needed: int) -> Optional[Tuple[Meld, ...]]:
+        key = (state, needed)
+        if key in memo:
+            return memo[key]
+        total = sum(state)
+        if not total:
+            result: Optional[Tuple[Meld, ...]] = () if needed == 0 else None
             memo[key] = result
             return result
+        if total < MIN_MELD or total < needed * MIN_MELD:
+            memo[key] = None
+            return None
+        anchor = next(index for index, count in enumerate(state) if count)
+        for option in options[anchor]:
+            if any(state[position] < copies for position, copies in option.take):
+                continue
+            remaining = list(state)
+            for position, copies in option.take:
+                remaining[position] -= copies
+            suffix = visit(tuple(remaining), max(0, needed - option.meld.is_pure))
+            if suffix is not None:
+                result = (option.meld,) + suffix
+                memo[key] = result
+                return result
+        memo[key] = None
+        return None
 
-    memo[key] = None
-    return None
+    return visit(initial, pure_needed)
+
+
+@dataclass(frozen=True)
+class _MeldOption:
+    meld: Meld
+    take: Tuple[Tuple[int, int], ...]
+
+
+def _compile_meld_options(
+    counts: Tuple[int, ...], joker: int,
+) -> Tuple[Tuple[int, ...], Tuple[Tuple[_MeldOption, ...], ...]]:
+    wilds = _wild_faces(joker, pure=False)
+    faces = tuple(sorted(
+        (face for face, count in enumerate(counts) if count),
+        key=lambda face: (face in wilds, face),
+    ))
+    positions = {face: index for index, face in enumerate(faces)}
+    best: Dict[Tuple[Tuple[int, int], ...], Meld] = {}
+
+    def candidates() -> Iterator[Meld]:
+        for meld, _ in _iter_sequences(counts, joker, pure_only=False):
+            yield meld
+        for meld, _ in _iter_sets(counts, joker):
+            yield meld
+
+    for meld in candidates():
+        used: Dict[int, int] = {}
+        for face in meld.cards:
+            position = positions[face]
+            used[position] = used.get(position, 0) + 1
+        take = tuple(sorted(used.items()))
+        previous = best.get(take)
+        if previous is None or meld.is_pure and not previous.is_pure:
+            best[take] = meld
+    by_anchor: List[List[_MeldOption]] = [[] for _ in faces]
+    for take, meld in best.items():
+        by_anchor[take[0][0]].append(_MeldOption(meld, take))
+    for options in by_anchor:
+        options.sort(key=lambda option: (
+            not option.meld.is_pure, len(option.meld.cards),
+            option.meld.kind, option.meld.represented_cards, option.take,
+        ))
+    return faces, tuple(tuple(options) for options in by_anchor)
 
 
 def evaluate_hand(
