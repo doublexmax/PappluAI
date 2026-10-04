@@ -73,7 +73,9 @@ Repeat `--model` once per seat, using either a checkpoint or `random`.
 ```
 
 `runs\arena.json` records seating, winners, terminal reasons, action counts,
-turn counts, and remaining stock.
+turn counts, and remaining stock. Its `telemetry` field records stock draws
+and discard draws per seat, plus the completed-turn number of each stock
+refill. A refill does not reset the turn budget.
 
 ## Train against a frozen league
 
@@ -126,7 +128,7 @@ idempotent.
 `.github\workflows\training-ci.yml` is a CPU regression gate, not deployment
 automation or a long-running training job. It keeps evaluator and browser
 simulator checks free of PyTorch, verifies CLI help at the optional-dependency
-boundary, runs the 192 focused training tests, exercises short checkpoint and
+boundary, runs the focused training tests, and exercises short checkpoint and
 resume workflows.
 
 Every pull request runs the `portable` and `training` jobs before merge. Push

@@ -16,7 +16,7 @@ from src.game.environment import (
     encode_observation,
     legal_action_mask,
 )
-from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv
 from src.model.network import (
     load_checkpoint,
     select_action,
@@ -111,6 +111,7 @@ class MatchResult:
     seat_turns: Tuple[int, ...]
     action_count: int
     stock_remaining: int
+    telemetry: MatchTelemetry
     trajectories: Tuple[Tuple[EpisodeStep, ...], ...]
 
 
@@ -181,6 +182,7 @@ def play_match(
         seat_turns=seat_turns,
         action_count=action_count,
         stock_remaining=view.stock_remaining,
+        telemetry=env.telemetry(),
         trajectories=tuple(tuple(steps) for steps in trajectories),
     )
 

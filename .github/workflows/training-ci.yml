@@ -74,6 +74,7 @@ jobs:
         run: >-
           python -m unittest -v
           tests.test_multiplayer
+          tests.test_match_telemetry
           tests.test_arena
           tests.test_registry
           tests.test_promotion

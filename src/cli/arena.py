@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
@@ -92,6 +93,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "seat_turns": result.seat_turns,
                 "action_count": result.action_count,
                 "stock_remaining": result.stock_remaining,
+                "telemetry": asdict(result.telemetry),
             }
         )
 
