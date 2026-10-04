@@ -1,4 +1,4 @@
-"""Papplu hand validity and binary declaration reward.
+"""Papplu hand validity, binary declaration reward, and minimum penalty scoring.
 
 Card encoding is a length-52 count vector. Index = suit * 13 + rank_offset with
 suit order s, h, d, c (0..3) and ranks A,2,3,4,5,6,7,8,9,10,J,Q,K (offset 0..12).
@@ -350,3 +350,144 @@ def hand_reward(
     cards_in_hand: int = 21,
 ) -> float:
     return 1.0 if is_valid_hand(hand, joker, required_sequences, cards_in_hand) else 0.0
+
+
+SCORING_VERSION = 1
+
+_RANK_POINTS = (10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10)
+_UNREACHABLE = float("inf")
+
+
+@dataclass(frozen=True)
+class HandPenalty:
+    """Lowest sequence-gated penalty of a hand and one grouping that attains it.
+
+    Every card is in exactly one exempt meld or in counted_cards, a 52-count
+    vector like the hand. points is the card points of counted_cards. When the
+    grouping holds fewer qualifying sequences than required, every exempt meld
+    is a qualifying sequence.
+    """
+
+    points: int
+    exempt_melds: Tuple[Meld, ...]
+    counted_cards: Tuple[int, ...]
+
+    @property
+    def qualifying_sequences(self) -> int:
+        return sum(meld.kind == "sequence" and meld.is_pure for meld in self.exempt_melds)
+
+
+def minimum_penalty(
+    hand: Sequence[int], joker: int, required_sequences: int = 5,
+) -> HandPenalty:
+    """Return the lowest unmatched-card penalty over every legal grouping of hand.
+
+    Cards 2 through 10 score their face value, A, J, Q, and K score 10, and
+    every card of the joker's rank scores 0. Qualifying sequences are the pure
+    sequences that count toward required_sequences, and they always exempt their
+    cards. Other melds exempt theirs only in a grouping that also holds the
+    required qualifying sequences. The returned grouping meets the quota
+    whenever some optimal grouping does. Any hand size is scored. Malformed
+    arguments raise like evaluate_hand.
+    """
+    counts = _parse_hand(hand)
+    joker_face = _parse_joker(joker)
+    quota = _require_nonnegative_integral(required_sequences, "required_sequences")
+    faces, options = _compile_meld_options(counts, joker_face)
+    start = tuple(counts[face] for face in faces)
+    points = tuple(_card_points(face, joker_face) for face in faces)
+
+    # A grouping below the quota scores the same as its qualifying sequences
+    # alone. The minimum is therefore the lower of an all-meld search that must
+    # meet the quota and a qualifying-sequence search without one.
+    search, need = _PenaltySearch(points, options), quota
+    best = search.cost(start, need)
+    if best:
+        low = _PenaltySearch(points, tuple(
+            tuple(option for option in anchored if option.meld.is_pure)
+            for anchored in options
+        ))
+        low_best = low.cost(start, 0)
+        if low_best < best:
+            search, need, best = low, 0, low_best
+
+    melds = search.witness(start, need)
+    counted = counts
+    for meld in melds:
+        counted = _subtract(counted, meld.cards)
+    total = sum(_card_points(face, joker_face) * count for face, count in enumerate(counted))
+    if total != best:
+        raise RuntimeError("internal penalty witness mismatch")
+    return HandPenalty(points=total, exempt_melds=melds, counted_cards=counted)
+
+
+def _card_points(face: int, joker: int) -> int:
+    rank = face % NUM_RANKS
+    return 0 if rank == joker % NUM_RANKS else _RANK_POINTS[rank]
+
+
+class _PenaltySearch:
+    """Exact minimum counted points, memoized on (remaining copies, unmet quota).
+
+    The first position holding a card is the anchor. Its card either stays
+    counted or joins an option filed under that position.
+    """
+
+    def __init__(
+        self,
+        points: Tuple[int, ...],
+        options: Tuple[Tuple[_MeldOption, ...], ...],
+    ) -> None:
+        self._points = points
+        self._scoring = tuple(position for position, value in enumerate(points) if value)
+        self._options = options
+        self._memo: Dict[Tuple[Tuple[int, ...], int], float] = {}
+
+    def cost(self, state: Tuple[int, ...], need: int) -> float:
+        key = (state, need)
+        if key not in self._memo:
+            self._memo[key] = self._solve(state, need)
+        return self._memo[key]
+
+    def witness(self, state: Tuple[int, ...], need: int) -> Tuple[Meld, ...]:
+        melds: List[Meld] = []
+        while not self._settled(state, need):
+            target = self.cost(state, need)
+            for meld, rest, rest_need, points in self._branches(state, need):
+                if points + self.cost(rest, rest_need) == target:
+                    break
+            else:
+                raise RuntimeError("internal penalty witness mismatch")
+            if meld is not None:
+                melds.append(meld)
+            state, need = rest, rest_need
+        return tuple(melds)
+
+    def _settled(self, state: Tuple[int, ...], need: int) -> bool:
+        return need == 0 and not any(state[position] for position in self._scoring)
+
+    def _solve(self, state: Tuple[int, ...], need: int) -> float:
+        if self._settled(state, need):
+            return 0
+        if sum(state) < need * MIN_MELD:
+            return _UNREACHABLE
+        best = _UNREACHABLE
+        for _, rest, rest_need, points in self._branches(state, need):
+            best = min(best, points + self.cost(rest, rest_need))
+            if not best:
+                break
+        return best
+
+    def _branches(
+        self, state: Tuple[int, ...], need: int,
+    ) -> Iterator[Tuple[Optional[Meld], Tuple[int, ...], int, int]]:
+        anchor = next(position for position, count in enumerate(state) if count)
+        for option in self._options[anchor]:
+            if all(state[position] >= copies for position, copies in option.take):
+                rest = list(state)
+                for position, copies in option.take:
+                    rest[position] -= copies
+                yield option.meld, tuple(rest), max(0, need - option.meld.is_pure), 0
+        rest = list(state)
+        rest[anchor] -= 1
+        yield None, tuple(rest), need, self._points[anchor]
