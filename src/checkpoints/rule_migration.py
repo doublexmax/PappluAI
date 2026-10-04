@@ -2,24 +2,23 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 from pathlib import Path
 
-from src.checkpoints import (
+import torch
+
+from src.checkpoints.io import (
     atomic_copy,
-    atomic_torch_save,
     atomic_write_json,
 )
+from src.checkpoints.tensor import atomic_torch_save
+from src.training.curriculum import TrainingConfig
+from src.training.improve import ImprovementController, IMPROVEMENT_STATE_VERSION
+from src.training.league import LeagueConfig
 
 
 def migrate(source: Path, output: Path) -> dict:
-    import torch
-    from src.improve import ImprovementController, IMPROVEMENT_STATE_VERSION
-    from src.league_train import LeagueConfig
-    from src.long_train import TrainingConfig
-
     source = Path(source)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -144,8 +143,6 @@ def _finish_interrupted_migration(
             "event": "rule_migration",
             "status": "already_migrated",
         }
-    from src.improve import ImprovementController
-
     event = json.loads(audit_path.read_text(encoding="utf-8"))
     controller = ImprovementController.load(str(state_path), output)
     _atomic_write_event(output / "metrics.jsonl", event)
@@ -172,16 +169,3 @@ def _published_migration_complete(output: Path) -> bool:
         and "latest-state.pt" in files
         and "rule-migration.json" in files
     )
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", required=True)
-    parser.add_argument("--output", required=True)
-    args = parser.parse_args()
-    print(json.dumps(migrate(Path(args.source), Path(args.output)), sort_keys=True))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

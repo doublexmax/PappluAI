@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-import random
-import time
 import math
 from numbers import Real
-from typing import Sequence, Tuple
-
-from src.registry import file_sha256
+import random
+from typing import Sequence
 
 
 MIN_SELECTION_SEED_BLOCKS = 32
@@ -24,10 +20,6 @@ class ValidatedGateEvidence:
     rules: dict
 
 
-class GateInterrupted(RuntimeError):
-    pass
-
-
 def balanced_seat_orders(players: int) -> tuple:
     if isinstance(players, bool) or not isinstance(players, int) or not 2 <= players <= 6:
         raise ValueError("players must be an integer in 2..6")
@@ -40,7 +32,11 @@ def balanced_seat_orders(players: int) -> tuple:
     )
 
 
-def clustered_interval(values: Sequence[float], samples: int = 2000, seed: int = 81) -> list:
+def clustered_interval(
+    values: Sequence[float],
+    samples: int = 2000,
+    seed: int = 81,
+) -> list:
     if not values or isinstance(samples, bool) or not isinstance(samples, int) or samples < 100:
         raise ValueError("Nonempty seed-block scores and at least 100 bootstrap samples are required")
     if any(
@@ -59,7 +55,13 @@ def clustered_interval(values: Sequence[float], samples: int = 2000, seed: int =
     return [bootstrap[int(samples * 0.025)], bootstrap[int(samples * 0.975)]]
 
 
-def evidence_metrics(multiplayer: dict, solo: dict, blocks: int, seed: int, samples: int) -> dict:
+def evidence_metrics(
+    multiplayer: dict,
+    solo: dict,
+    blocks: int,
+    seed: int,
+    samples: int,
+) -> dict:
     if not isinstance(multiplayer, dict) or set(multiplayer) != {"2", "3"}:
         raise ValueError("Both player-count result sets are required")
     margins = {}
@@ -252,151 +254,3 @@ def validate_gate_evidence(
         seed=seed,
         rules=dict(rules),
     )
-
-
-def evaluate_gate(
-    candidate_path: str,
-    champion_path: str,
-    opponent_paths: Sequence[str],
-    seed: int,
-    seed_blocks: int,
-    solo_games: int,
-    max_turns: int = 60,
-    player_counts: Tuple[int, ...] = (2, 3),
-    samples: int = 2000,
-    deadline=None,
-    recycle_discard: bool = True,
-) -> dict:
-    import torch
-    from src.arena import CheckpointPolicy, RandomPolicy, play_match
-    from src.benchmark import evaluate_games
-    from src.environment import GameConfig
-    from src.multiplayer import MatchConfig
-
-    for name, value in (
-        ("seed_blocks", seed_blocks),
-        ("solo_games", solo_games),
-        ("max_turns", max_turns),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError("%s must be a positive integer" % name)
-    if tuple(player_counts) != (2, 3):
-        raise ValueError("The current promotion gate covers two- and three-player matches")
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise TypeError("seed must be an integer")
-
-    previous_threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    try:
-        rules = GameConfig(
-            max_turns=max_turns,
-            recycle_discard=recycle_discard,
-        )
-        candidate = CheckpointPolicy(str(candidate_path))
-        champion = CheckpointPolicy(str(champion_path))
-        opponents = [
-            CheckpointPolicy(str(path)) for path in opponent_paths
-        ]
-        opponents.append(RandomPolicy())
-        by_player_count = {}
-
-        def check_deadline():
-            if deadline is not None and time.monotonic() >= deadline:
-                raise GateInterrupted(
-                    "Promotion evaluation reached its time limit"
-                )
-
-        for players in player_counts:
-            raw = []
-            for index in range(seed_blocks):
-                check_deadline()
-                fillers = [
-                    opponents[(index + seat) % len(opponents)]
-                    for seat in range(players - 2)
-                ]
-                lineup = [candidate, champion, *fillers]
-                results = []
-                orders = balanced_seat_orders(players)
-                for order in orders:
-                    policies = [lineup[index] for index in order]
-                    match = play_match(
-                        policies,
-                        MatchConfig(game=rules, players=players),
-                        seed + index,
-                        deadline=deadline,
-                    )
-                    winner = (
-                        None
-                        if match.winner is None
-                        else order[match.winner]
-                    )
-                    results.append(
-                        1 if winner == 0 else -1 if winner == 1 else 0
-                    )
-                raw.append(sum(results) / len(orders))
-            by_player_count[str(players)] = {
-                "seed_block_margins": raw,
-                "candidate_minus_champion": sum(raw) / len(raw),
-                "games": seed_blocks * len(balanced_seat_orders(players)),
-            }
-        solo_seed = seed + 100_000
-        check_deadline()
-        candidate_solo = evaluate_games(
-            candidate.network,
-            rules,
-            solo_games,
-            solo_seed,
-            deadline=deadline,
-        )
-        champion_solo = evaluate_games(
-            champion.network,
-            rules,
-            solo_games,
-            solo_seed,
-            deadline=deadline,
-        )
-        solo = {
-            "seed": solo_seed,
-            "games": solo_games,
-            "candidate_outcomes": list(candidate_solo.outcomes),
-            "champion_outcomes": list(champion_solo.outcomes),
-            "candidate_wins": sum(candidate_solo.outcomes),
-            "champion_wins": sum(champion_solo.outcomes),
-        }
-        metrics = evidence_metrics(
-            by_player_count,
-            solo,
-            seed_blocks,
-            seed,
-            samples,
-        )
-        accepted = gate_accepted(
-            by_player_count,
-            metrics,
-            seed_blocks,
-            solo_games,
-        )
-        return {
-            "candidate_sha256": file_sha256(Path(candidate_path)),
-            "champion_sha256": file_sha256(Path(champion_path)),
-            "opponent_sha256": [
-                file_sha256(Path(path)) for path in opponent_paths
-            ],
-            "accepted": accepted,
-            "seed": seed,
-            "seed_blocks": seed_blocks,
-            "bootstrap_samples": samples,
-            "seating": "Cyclic rotations with mirrored contender order",
-            "player_counts": list(player_counts),
-            "max_turns": max_turns,
-            **metrics,
-            "multiplayer": by_player_count,
-            "solo": solo,
-            "rules": rules.to_dict(),
-            "scope": (
-                "Two-/three-player seat-clustered league gate with "
-                "ordinary full21 solo retention."
-            ),
-        }
-    finally:
-        torch.set_num_threads(previous_threads)

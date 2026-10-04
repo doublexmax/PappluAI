@@ -17,8 +17,8 @@ import random
 from typing import List, Optional, Tuple
 
 from src.evaluate import NUM_FACES, NUM_RANKS, NUM_SUITS, RANK_PATTERNS, hand_reward, is_valid_hand
-from src.reward_cache import RewardCache
-from src.stock import refill_stock, stock_draw_available
+from src.game.reward_cache import RewardCache
+from src.game.stock import refill_stock, stock_draw_available
 
 ACTION_DRAW_STOCK = 0
 ACTION_TAKE_DISCARD = 1

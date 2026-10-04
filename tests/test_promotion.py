@@ -2,9 +2,11 @@ import random
 import unittest
 from unittest import mock
 
-from src.promotion import (
+from src.checkpoints.evidence import (
     balanced_seat_orders,
     clustered_interval,
+)
+from src.evaluation.promotion import (
     evaluate_gate,
 )
 
@@ -64,7 +66,7 @@ class TestSeatClusterBootstrap(unittest.TestCase):
         torch.set_num_threads(2)
         try:
             with mock.patch(
-                "src.arena.CheckpointPolicy",
+                "src.evaluation.promotion.CheckpointPolicy",
                 side_effect=RuntimeError("bad checkpoint"),
             ), self.assertRaisesRegex(RuntimeError, "bad checkpoint"):
                 evaluate_gate(

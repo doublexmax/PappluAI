@@ -7,8 +7,8 @@ import random
 import torch
 import torch.nn as nn
 
-from src.checkpoints import validate_model_state
-from src.environment import (
+from src.checkpoints.tensor import validate_model_state
+from src.game.environment import (
     ENCODING_VERSION,
     NUM_ACTIONS,
     STATE_DIM,

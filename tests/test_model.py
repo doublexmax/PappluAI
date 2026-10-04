@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 
-from src.environment import (
+from src.game.environment import (
     ENCODING_VERSION,
     NUM_ACTIONS,
     STATE_DIM,
@@ -20,7 +20,7 @@ except ImportError:
     torch = None
 
 if torch is not None:
-    from src.model import CHECKPOINT_VERSION
+    from src.model.network import CHECKPOINT_VERSION
 
 TORCH_REASON = "PyTorch not installed (see requirements-training.txt)"
 ARCHITECTURES = ("mlp", "wide_mlp", "suit_conv")
@@ -29,7 +29,7 @@ ARCHITECTURES = ("mlp", "wide_mlp", "suit_conv")
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestQNetwork(unittest.TestCase):
     def test_forward_shape_and_finite_gradients(self):
-        from src.model import QNetwork
+        from src.model.network import QNetwork
 
         for architecture in ARCHITECTURES:
             with self.subTest(architecture=architecture):
@@ -46,7 +46,7 @@ class TestQNetwork(unittest.TestCase):
                 ))
 
     def test_architecture_contract_and_validation(self):
-        from src.model import QNetwork
+        from src.model.network import QNetwork
 
         for architecture in ARCHITECTURES:
             net = QNetwork(architecture=architecture)
@@ -59,7 +59,7 @@ class TestQNetwork(unittest.TestCase):
             QNetwork(state_dim=10, architecture="suit_conv")
 
     def test_masking_is_unchanged_for_all_architectures(self):
-        from src.model import QNetwork, masked_q_values
+        from src.model.network import QNetwork, masked_q_values
 
         state = [0.0] * STATE_DIM
         mask = tuple(index % 3 == 0 for index in range(NUM_ACTIONS))
@@ -75,7 +75,7 @@ class TestQNetwork(unittest.TestCase):
                         self.assertTrue(torch.isneginf(q_values[index]))
 
     def test_masked_greedy_respects_mask(self):
-        from src.model import QNetwork, select_greedy_action, select_action
+        from src.model.network import QNetwork, select_greedy_action, select_action
         import random
 
         net = QNetwork()
@@ -94,7 +94,7 @@ class TestQNetwork(unittest.TestCase):
         self.assertTrue(mask[action_e])
 
     def test_epsilon_explores_legal_only(self):
-        from src.model import QNetwork, select_action
+        from src.model.network import QNetwork, select_action
         import random
 
         net = QNetwork()
@@ -111,7 +111,7 @@ class TestQNetwork(unittest.TestCase):
         self.assertTrue(seen <= legal)
 
     def test_checkpoint_roundtrip_prediction_all_architectures(self):
-        from src.model import QNetwork, save_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, save_checkpoint, load_checkpoint
 
         cfg = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=5)
         env = PappluEnv(cfg)
@@ -138,7 +138,7 @@ class TestQNetwork(unittest.TestCase):
                     self.assertTrue(torch.allclose(before, after))
 
     def test_generated_version_one_checkpoint_loads_as_mlp(self):
-        from src.model import QNetwork, build_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, build_checkpoint, load_checkpoint
 
         cfg = GameConfig()
         payload = build_checkpoint(QNetwork(), cfg)
@@ -156,7 +156,7 @@ class TestQNetwork(unittest.TestCase):
         )
 
     def test_version_two_checkpoint_requires_known_architecture(self):
-        from src.model import QNetwork, build_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, build_checkpoint, load_checkpoint
 
         cfg = GameConfig()
         for architecture in (None, "attention"):
@@ -175,7 +175,7 @@ class TestQNetwork(unittest.TestCase):
                         load_checkpoint(path)
 
     def test_checkpoint_rejects_expected_architecture_mismatch(self):
-        from src.model import QNetwork, save_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, save_checkpoint, load_checkpoint
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "wide.pt")
@@ -186,7 +186,7 @@ class TestQNetwork(unittest.TestCase):
                 load_checkpoint(path, expected_architecture="mlp")
 
     def test_checkpoint_rejects_network_mismatch_before_mutation(self):
-        from src.model import QNetwork, save_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, save_checkpoint, load_checkpoint
 
         target = QNetwork()
         before = {
@@ -204,7 +204,7 @@ class TestQNetwork(unittest.TestCase):
             self.assertTrue(torch.equal(value, before[name]))
 
     def test_checkpoint_rejects_late_bad_tensor_before_mutation(self):
-        from src.model import QNetwork, build_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, build_checkpoint, load_checkpoint
 
         target = QNetwork()
         with torch.no_grad():
@@ -226,7 +226,7 @@ class TestQNetwork(unittest.TestCase):
             self.assertTrue(torch.equal(value, before[name]), msg=name)
 
     def test_suit_conv_is_suit_equivariant(self):
-        from src.model import QNetwork
+        from src.model.network import QNetwork
 
         network = QNetwork(architecture="suit_conv")
         state = torch.zeros(2, STATE_DIM)
@@ -256,7 +256,7 @@ class TestQNetwork(unittest.TestCase):
         )
 
     def test_suit_conv_appends_high_ace_without_circular_padding(self):
-        from src.model import QNetwork
+        from src.model.network import QNetwork
 
         network = QNetwork(architecture="suit_conv")
         self.assertEqual(network.suit_conv1.padding_mode, "zeros")
@@ -282,7 +282,7 @@ class TestQNetwork(unittest.TestCase):
         torch.testing.assert_close(conv_input[:, 13], expected[:, 0])
 
     def test_checkpoint_rejects_bad_version(self):
-        from src.model import QNetwork, build_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, build_checkpoint, load_checkpoint
 
         cfg = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=5)
         net = QNetwork()
@@ -295,7 +295,7 @@ class TestQNetwork(unittest.TestCase):
                 load_checkpoint(path)
 
     def test_checkpoint_rejects_config_mismatch(self):
-        from src.model import QNetwork, save_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, save_checkpoint, load_checkpoint
 
         cfg = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=5)
         other = GameConfig(cards_in_hand=6, required_sequences=1, max_turns=5)
@@ -311,7 +311,7 @@ class TestQNetwork(unittest.TestCase):
         self.assertEqual(ENCODING_VERSION, 1)
 
     def test_checkpoint_rejects_missing_encoding_dimensions(self):
-        from src.model import QNetwork, build_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, build_checkpoint, load_checkpoint
 
         payload = build_checkpoint(QNetwork(), GameConfig())
         del payload["state_dim"]
@@ -322,7 +322,7 @@ class TestQNetwork(unittest.TestCase):
                 load_checkpoint(path)
 
     def test_checkpoint_rejects_nonfinite_imported_model(self):
-        from src.model import QNetwork, build_checkpoint, load_checkpoint
+        from src.model.network import QNetwork, build_checkpoint, load_checkpoint
 
         payload = build_checkpoint(QNetwork(), GameConfig())
         payload["model_state_dict"]["fc1.weight"][0, 0] = float("nan")
@@ -333,7 +333,7 @@ class TestQNetwork(unittest.TestCase):
                 load_checkpoint(path)
 
     def test_mask_excludes_actions_below_old_sentinel(self):
-        from src.model import QNetwork, select_greedy_action
+        from src.model.network import QNetwork, select_greedy_action
 
         net = QNetwork()
         with torch.no_grad():

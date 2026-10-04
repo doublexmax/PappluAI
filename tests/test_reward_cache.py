@@ -2,7 +2,7 @@ import unittest
 from unittest import mock
 
 from src.evaluate import hand_reward
-from src.reward_cache import RewardCache
+from src.game.reward_cache import RewardCache
 
 
 class TestExactRewardCache(unittest.TestCase):

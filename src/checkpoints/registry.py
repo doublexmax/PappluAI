@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 from typing import Any, Dict, Optional, Sequence
 
-from src.checkpoints import atomic_write_json
+from src.checkpoints import evidence as gate_evidence
+from src.checkpoints.io import atomic_write_json, file_metadata, file_sha256
 
 
 @dataclass(frozen=True)
@@ -20,20 +20,6 @@ class ModelRecord:
     metadata: Dict[str, Any]
     evidence: Dict[str, Any]
     parents: tuple
-
-
-def file_metadata(path: Path) -> Dict[str, Any]:
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            size += len(chunk)
-            digest.update(chunk)
-    return {"sha256": digest.hexdigest(), "bytes": size}
-
-
-def file_sha256(path: Path) -> str:
-    return str(file_metadata(path)["sha256"])
 
 
 class ModelRegistry:
@@ -83,7 +69,8 @@ class ModelRegistry:
         evidence: Optional[dict] = None,
         parents: Sequence[str] = (),
     ) -> ModelRecord:
-        from src.model import load_checkpoint
+        # Registry reads stay Torch-free; registration validates model files.
+        from src.model.network import load_checkpoint
 
         source = Path(path)
         digest = file_sha256(source)
@@ -147,12 +134,6 @@ class ModelRegistry:
         return record
 
     def promote(self, candidate_id: str, expected_id: str, evidence: dict) -> ModelRecord:
-        from src.promotion import (
-            MIN_CONFIRMATION_SEED_BLOCKS,
-            MIN_SELECTION_SEED_BLOCKS,
-            validate_gate_evidence,
-        )
-
         current = self.champion()
         candidate = self.get(candidate_id)
         self.model_path(candidate.id)
@@ -165,19 +146,19 @@ class ModelRegistry:
             or evidence.get("selection_passed") is not True
         ):
             raise ValueError("Promotion requires a passed selection gate")
-        confirmation = validate_gate_evidence(
+        confirmation = gate_evidence.validate_gate_evidence(
             evidence,
             phase="confirmation",
             candidate_sha256=candidate.sha256,
             champion_sha256=current.sha256,
-            minimum_seed_blocks=MIN_CONFIRMATION_SEED_BLOCKS,
+            minimum_seed_blocks=gate_evidence.MIN_CONFIRMATION_SEED_BLOCKS,
         )
-        selection = validate_gate_evidence(
+        selection = gate_evidence.validate_gate_evidence(
             evidence.get("selection"),
             phase="selection",
             candidate_sha256=candidate.sha256,
             champion_sha256=current.sha256,
-            minimum_seed_blocks=MIN_SELECTION_SEED_BLOCKS,
+            minimum_seed_blocks=gate_evidence.MIN_SELECTION_SEED_BLOCKS,
         )
         if (
             evidence.get("selection_seed") != selection.seed

@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 import subprocess
 import sys
 import time
 
-from src.benchmark import paired_comparison
+from src.evaluation.benchmark import paired_comparison
 
 
 def run_comparison(plan: dict, output: Path) -> dict:
@@ -78,7 +77,7 @@ def run_comparison(plan: dict, output: Path) -> dict:
     def evaluate(name, checkpoint, games, seed, warm_games=0, sensitivity=False):
         destination = output / (name + ".json")
         command = [
-            sys.executable, "-m", "src.benchmark", "--checkpoint", str(checkpoint),
+            sys.executable, "-m", "src.cli.benchmark", "--checkpoint", str(checkpoint),
             "--output", str(destination), "--games", str(games), "--seed", str(seed),
             "--warm-games", str(warm_games),
             "--warm-seed", str(screen["warm_validation_seed"]),
@@ -96,7 +95,7 @@ def run_comparison(plan: dict, output: Path) -> dict:
     ]
     sensitivity_checkpoint = output / "sensitivity.pt"
     run("sensitivity-model", [
-        sys.executable, "-m", "src.train", "--episodes", "0",
+        sys.executable, "-m", "src.cli.solo", "--episodes", "0",
         "--seed", "0", "--architecture", "mlp",
         "--checkpoint", str(sensitivity_checkpoint), *rules,
     ])
@@ -111,7 +110,7 @@ def run_comparison(plan: dict, output: Path) -> dict:
             name = "%s-seed-%d" % (architecture, seed)
             checkpoint = output / (name + ".pt")
             command = [
-                sys.executable, "-u", "-m", "src.train",
+                sys.executable, "-u", "-m", "src.cli.solo",
                 "--architecture", architecture, "--seed", str(seed),
                 "--checkpoint", str(checkpoint), "--log-every", "500", *rules,
             ]
@@ -170,17 +169,3 @@ def run_comparison(plan: dict, output: Path) -> dict:
         )
     }), flush=True)
     return report
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", required=True)
-    parser.add_argument("--output-dir", required=True)
-    args = parser.parse_args()
-    plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
-    run_comparison(plan, Path(args.output_dir))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

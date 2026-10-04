@@ -1,56 +1,19 @@
 from __future__ import annotations
 
-import json
 import math
 import os
 from pathlib import Path
-import shutil
-from typing import AbstractSet, Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping
 
-__all__ = (
-    "atomic_copy",
-    "atomic_torch_save",
-    "atomic_write_json",
-    "clone_model_state",
-    "require_checkpoint_fields",
-    "require_checkpoint_int",
-    "validate_checkpoint_tree",
-    "validate_model_state",
-)
-
-
-def atomic_copy(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name("." + destination.name + ".tmp")
-    shutil.copyfile(source, temporary)
-    _fsync_file(temporary)
-    os.replace(temporary, destination)
-
-
-def atomic_write_json(payload: Mapping[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name("." + path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(
-            payload,
-            allow_nan=False,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    _fsync_file(temporary)
-    os.replace(temporary, path)
+import torch
 
 
 def atomic_torch_save(payload: Mapping[str, Any], path: Path) -> None:
-    import torch
-
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name("." + path.name + ".tmp")
     torch.save(dict(payload), temporary)
-    _fsync_file(temporary)
+    with temporary.open("rb+") as stream:
+        os.fsync(stream.fileno())
     os.replace(temporary, path)
 
 
@@ -66,8 +29,6 @@ def validate_model_state(
     reference: Mapping[str, Any],
     name: str,
 ) -> Dict[str, Any]:
-    import torch
-
     if not isinstance(value, dict) or set(value) != set(reference):
         raise ValueError("%s fields do not match the network" % name)
     result = {}
@@ -91,8 +52,6 @@ def validate_model_state(
 
 
 def validate_checkpoint_tree(value: Any, name: str) -> None:
-    import torch
-
     if isinstance(value, torch.Tensor):
         if (value.is_floating_point() or value.is_complex()) and not bool(
             torch.isfinite(value).all().item()
@@ -116,33 +75,3 @@ def validate_checkpoint_tree(value: Any, name: str) -> None:
     raise ValueError(
         "%s contains unsupported value %s" % (name, type(value).__name__)
     )
-
-
-def require_checkpoint_fields(
-    value: Any,
-    fields: AbstractSet[str],
-    name: str,
-) -> Dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != set(fields):
-        raise ValueError("%s fields do not match this checkpoint" % name)
-    return value
-
-
-def require_checkpoint_int(
-    value: Any,
-    name: str,
-    minimum: Optional[int] = None,
-    maximum: Optional[int] = None,
-) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError("%s must be an int" % name)
-    if minimum is not None and value < minimum:
-        raise ValueError("%s must be at least %d" % (name, minimum))
-    if maximum is not None and value > maximum:
-        raise ValueError("%s must be at most %d" % (name, maximum))
-    return value
-
-
-def _fsync_file(path: Path) -> None:
-    with path.open("rb+") as stream:
-        os.fsync(stream.fileno())

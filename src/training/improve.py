@@ -2,39 +2,37 @@
 
 from __future__ import annotations
 
-import argparse
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 import json
 import math
 import os
 from pathlib import Path
-import signal
-import sys
 import time
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from src.arena import MatchInterrupted
-from src.checkpoints import (
+import torch
+
+from src.checkpoints import evidence
+from src.checkpoints.io import (
     atomic_copy,
-    atomic_torch_save,
     atomic_write_json,
+    file_metadata,
+    file_sha256,
     require_checkpoint_fields,
     require_checkpoint_int,
 )
-from src.environment import ENCODING_VERSION, GameConfig
-from src.league_train import LeagueConfig, LeagueSession, RANDOM_OPPONENT
-from src.long_train import (
+from src.checkpoints.registry import ModelRegistry
+from src.checkpoints.tensor import atomic_torch_save
+from src.evaluation.arena import MatchInterrupted
+from src.evaluation.promotion import GateInterrupted, evaluate_gate
+from src.game.environment import ENCODING_VERSION, GameConfig
+from src.model.network import CHECKPOINT_VERSION, build_checkpoint
+from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
+from src.training.curriculum import (
     STATUS_SCHEMA_VERSION,
     TrainingConfig,
     TrainingSession,
 )
-from src.promotion import (
-    GateInterrupted,
-    MIN_CONFIRMATION_SEED_BLOCKS,
-    MIN_SELECTION_SEED_BLOCKS,
-    MIN_SOLO_GAMES,
-)
-from src.registry import ModelRegistry, file_metadata, file_sha256
 
 
 IMPROVEMENT_STATE_VERSION = 1
@@ -48,9 +46,9 @@ class ImproveConfig:
     league_matches_per_cycle: int = 128
     research_episodes_per_cycle: int = 128
     seed: int = 41
-    selection_blocks: int = MIN_SELECTION_SEED_BLOCKS
-    confirmation_blocks: int = MIN_CONFIRMATION_SEED_BLOCKS
-    solo_games: int = MIN_SOLO_GAMES
+    selection_blocks: int = evidence.MIN_SELECTION_SEED_BLOCKS
+    confirmation_blocks: int = evidence.MIN_CONFIRMATION_SEED_BLOCKS
+    solo_games: int = evidence.MIN_SOLO_GAMES
     checkpoint_every: int = 16
     max_turns: int = 60
     player_counts: Tuple[int, ...] = (2, 3)
@@ -181,8 +179,6 @@ class ImprovementController:
 
     @classmethod
     def load(cls, path: str, output_dir: Path) -> "ImprovementController":
-        import torch
-
         payload = torch.load(path, map_location="cpu", weights_only=True)
         required = {
             "improvement_state_version",
@@ -492,8 +488,6 @@ class ImprovementController:
         elif learner == "research" and not can_research:
             learner = "league"
         if learner == "league":
-            from src.arena import MatchInterrupted
-
             try:
                 result = self.league.train_match(deadline=deadline)
             except MatchInterrupted:
@@ -579,8 +573,6 @@ class ImprovementController:
         self.phase = "selection"
 
     def _selection_step(self, deadline: Optional[float] = None) -> None:
-        from src.promotion import evaluate_gate
-
         champion = self.registry.get(self.champion_at_cycle_id)
         for origin in ("league", "research"):
             if origin in self.selection_results:
@@ -634,8 +626,6 @@ class ImprovementController:
         self.phase = "confirmation"
 
     def _confirmation_step(self, deadline: Optional[float] = None) -> None:
-        from src.promotion import evaluate_gate
-
         champion = self.registry.get(self.champion_at_cycle_id)
         if self.confirmation_result is None:
             result = evaluate_gate(
@@ -805,8 +795,6 @@ class ImprovementController:
         stop_reason: Optional[str],
         started: float,
     ) -> Dict[str, Any]:
-        from src.model import CHECKPOINT_VERSION
-
         champion = self.registry.champion()
         return {
             "status_schema_version": STATUS_SCHEMA_VERSION,
@@ -845,144 +833,6 @@ class ImprovementController:
         }
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--initial-model")
-    source.add_argument("--resume")
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--opponent", action="append", default=[])
-    parser.add_argument("--max-seconds", type=float, required=True)
-    parser.add_argument("--max-cycles", type=int, default=64)
-    parser.add_argument(
-        "--league-matches",
-        "--league-matches-per-cycle",
-        dest="league_matches_per_cycle",
-        type=int,
-        default=128,
-    )
-    parser.add_argument(
-        "--research-episodes",
-        "--research-episodes-per-cycle",
-        dest="research_episodes_per_cycle",
-        type=int,
-        default=128,
-    )
-    parser.add_argument("--seed", type=int, default=41)
-    parser.add_argument("--selection-blocks", type=int, default=32)
-    parser.add_argument("--confirmation-blocks", type=int, default=128)
-    parser.add_argument("--solo-games", type=int, default=256)
-    parser.add_argument("--checkpoint-every", type=int, default=16)
-    return parser
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_arg_parser()
-    supplied_arguments = list(argv) if argv is not None else sys.argv[1:]
-    try:
-        args = parser.parse_args(supplied_arguments)
-    except SystemExit as exc:
-        return int(exc.code) if isinstance(exc.code, int) else 1
-
-    output_dir = Path(args.output_dir)
-    stop = [False]
-
-    def request_stop(_signum: int, _frame: Any) -> None:
-        stop[0] = True
-
-    previous_handler = signal.getsignal(signal.SIGTERM)
-    try:
-        signal.signal(signal.SIGTERM, request_stop)
-        if args.resume:
-            controller = ImprovementController.load(args.resume, output_dir)
-            _validate_resume_options(controller, args, supplied_arguments)
-        else:
-            controller = ImprovementController(
-                args.initial_model,
-                output_dir,
-                opponent_paths=args.opponent,
-                config=ImproveConfig(
-                    max_cycles=args.max_cycles,
-                    league_matches_per_cycle=args.league_matches_per_cycle,
-                    research_episodes_per_cycle=args.research_episodes_per_cycle,
-                    seed=args.seed,
-                    selection_blocks=args.selection_blocks,
-                    confirmation_blocks=args.confirmation_blocks,
-                    solo_games=args.solo_games,
-                    checkpoint_every=args.checkpoint_every,
-                ),
-            )
-        reason = controller.run(
-            args.max_seconds,
-            stop_requested=lambda: stop[0],
-        )
-        print(
-            json.dumps(
-                {
-                    "status": reason,
-                    "cycle": controller.cycle_index,
-                    "champion_id": controller.registry.champion().id,
-                    "league_matches": controller.league.completed_matches,
-                    "research_episodes": controller.research.total_episodes,
-                    "promotions": controller.promotions,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-        return 0
-    except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
-        print("error: %s" % exc, file=sys.stderr, flush=True)
-        return 2
-    finally:
-        signal.signal(signal.SIGTERM, previous_handler)
-
-
-def _validate_resume_options(controller, args, supplied_arguments):
-    explicit = {value.split("=", 1)[0] for value in supplied_arguments if value.startswith("--")}
-    learning_options = {
-        "--league-matches": "league_matches_per_cycle",
-        "--league-matches-per-cycle": "league_matches_per_cycle",
-        "--research-episodes": "research_episodes_per_cycle",
-        "--research-episodes-per-cycle": "research_episodes_per_cycle",
-        "--selection-blocks": "selection_blocks",
-        "--confirmation-blocks": "confirmation_blocks",
-        "--solo-games": "solo_games",
-        "--seed": "seed",
-    }
-    for option, field in learning_options.items():
-        if option in explicit and getattr(args, field) != getattr(controller.config, field):
-            raise ValueError("Resume cannot change %s" % option)
-    for path in args.opponent:
-        if path == RANDOM_OPPONENT:
-            continue
-        digest = file_sha256(Path(path))
-        record = controller.registry.get(digest[:20])
-        if record.sha256 != digest or (
-            record.origin != "frozen_opponent" and record.id != controller.baseline_id
-        ):
-            raise ValueError("Resume cannot add or replace the initial opponent pool")
-    changes = {}
-    if "--max-cycles" in explicit:
-        require_checkpoint_int(
-            args.max_cycles,
-            "max_cycles",
-            minimum=1,
-        )
-        if args.max_cycles < controller.cycle_index:
-            raise ValueError("max_cycles cannot be below completed cycles")
-        changes["max_cycles"] = args.max_cycles
-    if "--checkpoint-every" in explicit:
-        require_checkpoint_int(
-            args.checkpoint_every,
-            "checkpoint_every",
-            minimum=1,
-        )
-        changes["checkpoint_every"] = args.checkpoint_every
-    if changes:
-        controller.config = replace(controller.config, **changes)
-
-
 def _research_config(config: ImproveConfig) -> TrainingConfig:
     return TrainingConfig(
         learning_rate=1e-4,
@@ -999,8 +849,6 @@ def _research_config(config: ImproveConfig) -> TrainingConfig:
 def _research_model_payload(
     session: TrainingSession, cycle: int
 ) -> Dict[str, Any]:
-    from src.model import build_checkpoint
-
     return build_checkpoint(
         session.network,
         session.config.game_config,
@@ -1202,7 +1050,3 @@ def _optional_dict(value: Any, name: str) -> Optional[Dict[str, Any]]:
     if not isinstance(value, dict):
         raise ValueError("%s must be a dict or None" % name)
     return dict(value)
-
-
-if __name__ == "__main__":
-    sys.exit(main())

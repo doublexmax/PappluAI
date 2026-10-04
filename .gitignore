@@ -172,6 +172,8 @@ cython_debug/
 
 # Training outputs
 checkpoints/
+!src/checkpoints/
+!src/checkpoints/*.py
 *.pt
 *.pth
 runs/

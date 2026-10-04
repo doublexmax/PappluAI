@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import asdict, dataclass
-import json
-from pathlib import Path
 import random
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Tuple
 
-from src.environment import GameConfig, PappluEnv, Phase, discard_action
+import torch
+
+from src.game.environment import GameConfig, PappluEnv, Phase, discard_action
 from src.evaluate import hand_reward
+from src.model.network import (
+    load_checkpoint,
+    select_greedy_action,
+    select_random_legal,
+)
 
 
 @dataclass(frozen=True)
@@ -38,8 +42,6 @@ def evaluate_games(
     warm_start: bool = False,
     deadline: Optional[float] = None,
 ) -> PolicyResults:
-    from src.model import select_greedy_action, select_random_legal
-
     if isinstance(games, bool) or not isinstance(games, int) or games <= 0:
         raise ValueError("games must be a positive integer")
     if policy not in ("greedy", "random", "oracle"):
@@ -98,9 +100,6 @@ def evaluate_checkpoint(
     warm_seed: int = 600000,
     sensitivity: bool = False,
 ) -> dict:
-    import torch
-    from src.model import load_checkpoint
-
     if isinstance(warm_games, bool) or not isinstance(warm_games, int) or warm_games < 0:
         raise ValueError("warm_games must be a nonnegative integer")
     if sensitivity and not warm_games:
@@ -199,31 +198,3 @@ def paired_comparison(
         "games_per_seed": games,
         "method": "paired bootstrap over training seeds and shared deals",
     }
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--games", type=int, default=300)
-    parser.add_argument("--seed", type=int, default=300000)
-    parser.add_argument("--warm-games", type=int, default=300)
-    parser.add_argument("--warm-seed", type=int, default=600000)
-    parser.add_argument("--sensitivity", action="store_true")
-    args = parser.parse_args(argv)
-    result = evaluate_checkpoint(
-        args.checkpoint, args.games, args.seed, args.warm_games,
-        args.warm_seed, args.sensitivity,
-    )
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps({
-        key: value for key, value in result.items()
-        if key not in ("greedy", "random", "warm_greedy", "warm_random", "warm_oracle")
-    }))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

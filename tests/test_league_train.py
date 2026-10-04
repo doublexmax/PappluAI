@@ -6,13 +6,13 @@ import tempfile
 import unittest
 from unittest import mock
 
-from src.environment import GameConfig, STATE_DIM
-from src.league_train import (
+from src.game.environment import GameConfig, STATE_DIM
+from src.training.league import (
     LeagueConfig,
     LeagueSession,
-    build_arg_parser,
     save_session_checkpoint,
 )
+from src.cli.league import build_arg_parser
 
 try:
     import torch
@@ -41,7 +41,7 @@ def fake_match(policies, config, seed, record_trajectories=False, deadline=None)
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestLeagueSession(unittest.TestCase):
     def make_model(self, path: Path, max_turns: int = 60) -> None:
-        from src.model import QNetwork, save_checkpoint
+        from src.model.network import QNetwork, save_checkpoint
 
         save_checkpoint(
             str(path),
@@ -84,7 +84,7 @@ class TestLeagueSession(unittest.TestCase):
                 for entry in session._opponents
                 if hasattr(entry.policy, "network")
             ]
-            with mock.patch("src.arena.play_match", side_effect=fake_match):
+            with mock.patch("src.training.league.play_match", side_effect=fake_match):
                 result = session.train_match()
             self.assertTrue(result["updated"])
             self.assertTrue(
@@ -109,7 +109,7 @@ class TestLeagueSession(unittest.TestCase):
             config = LeagueConfig(batch_size=1, updates_per_match=1)
             control = LeagueSession(str(champion), config=config, seed=91)
             split = LeagueSession(str(champion), config=config, seed=91)
-            with mock.patch("src.arena.play_match", side_effect=fake_match):
+            with mock.patch("src.training.league.play_match", side_effect=fake_match):
                 control.train_match()
                 split.train_match()
             path = root / "state.pt"
@@ -119,7 +119,7 @@ class TestLeagueSession(unittest.TestCase):
                 str(champion),
                 expected_config=config,
             )
-            with mock.patch("src.arena.play_match", side_effect=fake_match):
+            with mock.patch("src.training.league.play_match", side_effect=fake_match):
                 control_result = control.train_match()
                 resumed_result = resumed.train_match()
             self.assertEqual(control_result, resumed_result)
@@ -139,7 +139,7 @@ class TestLeagueSession(unittest.TestCase):
             )
 
     def test_interrupted_match_rewinds_without_update(self):
-        from src.arena import MatchInterrupted
+        from src.evaluation.arena import MatchInterrupted
 
         with tempfile.TemporaryDirectory() as temporary:
             champion = Path(temporary) / "champion.pt"
@@ -147,7 +147,7 @@ class TestLeagueSession(unittest.TestCase):
             session = LeagueSession(str(champion), seed=12)
             before = session.state_dict()
             with mock.patch(
-                "src.arena.play_match",
+                "src.training.league.play_match",
                 side_effect=MatchInterrupted("deadline"),
             ):
                 with self.assertRaises(MatchInterrupted):
@@ -172,7 +172,7 @@ class TestLeagueSession(unittest.TestCase):
                     trajectories=tuple(() for _ in policies),
                 )
 
-            with mock.patch("src.arena.play_match", side_effect=no_action):
+            with mock.patch("src.training.league.play_match", side_effect=no_action):
                 result = session.train_match()
             self.assertFalse(result["updated"])
             self.assertEqual(session.completed_matches, 1)
@@ -192,7 +192,7 @@ class TestLeagueSession(unittest.TestCase):
                     updates_per_match=1,
                 ),
             )
-            with mock.patch("src.arena.play_match", side_effect=fake_match):
+            with mock.patch("src.training.league.play_match", side_effect=fake_match):
                 session.train_match()
                 result = session.train_match()
             self.assertEqual(result["challenger_seat"], 1)
@@ -232,7 +232,7 @@ class TestLeagueSession(unittest.TestCase):
                 [str(first)],
                 config=LeagueConfig(batch_size=1, updates_per_match=1),
             )
-            with mock.patch("src.arena.play_match", side_effect=fake_match):
+            with mock.patch("src.training.league.play_match", side_effect=fake_match):
                 session.train_match()
             replay_before = session.replay.state_dict()
             hashes_before = session.opponent_hashes
@@ -254,7 +254,7 @@ class TestLeagueSession(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             wrong = root / "wrong.pt"
-            from src.model import QNetwork, save_checkpoint
+            from src.model.network import QNetwork, save_checkpoint
 
             with self.assertRaisesRegex(ValueError, "60 turns"):
                 LeagueConfig(game=GameConfig(max_turns=1))
@@ -282,7 +282,7 @@ class TestLeagueSession(unittest.TestCase):
             payload = session.state_dict()
             parameter = next(iter(payload["optimizer_state_dict"]["state"].values()), None)
             if parameter is None:
-                with mock.patch("src.arena.play_match", side_effect=fake_match):
+                with mock.patch("src.training.league.play_match", side_effect=fake_match):
                     session.train_match()
                 payload = session.state_dict()
                 parameter = next(
@@ -304,7 +304,7 @@ class TestLeagueSession(unittest.TestCase):
                     updates_per_match=1,
                 ),
             )
-            with mock.patch("src.arena.play_match", side_effect=fake_match):
+            with mock.patch("src.training.league.play_match", side_effect=fake_match):
                 session.train_match()
             network_before = copy.deepcopy(session.network.state_dict())
             payload = copy.deepcopy(session.state_dict())
