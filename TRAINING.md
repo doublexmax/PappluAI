@@ -1,8 +1,8 @@
 # Training walkthrough
 
 All commands in this guide run from a fresh repository clone on Windows
-PowerShell. Training is CPU-compatible but requires the optional PyTorch
-dependency.
+PowerShell with Python 3.10 or newer. Training is CPU-compatible but requires
+the optional training dependencies.
 
 ## Set up a fresh clone
 
@@ -76,6 +76,38 @@ Repeat `--model` once per seat, using either a checkpoint or `random`.
 turn counts, and remaining stock. Its `telemetry` field records stock draws
 and discard draws per seat, plus the completed-turn number of each stock
 refill. A refill does not reset the turn budget.
+
+## Calibrate multiplayer draw limits
+
+Use a directory containing immutable `model-<sha256>.pt` snapshots, such as
+an improvement run's registry. The calibration adds a seeded random baseline.
+The pool must contain enough distinct competitors for the largest table.
+
+```powershell
+.\.venv\Scripts\python -m src.cli.calibration --models-dir runs\improve --output-dir runs\calibration --caps 30 60 90 120 180 --players 2 3 4 --blocks 512 --workers 4
+```
+
+Each independent deal samples a lineup and seating independently of the deck,
+then plays that same assignment under every candidate cap. This command runs
+7,680 games. It uses independent deals rather than counting correlated seat
+permutations as additional trials.
+
+`protocol.json` fixes the models, source, caps, seeds, and sample budget.
+Completed cases are persisted individually. Repeating the same command resumes
+unfinished work. Use a new output directory and fresh seeds for a new study.
+`status.json` reports progress; `summary.json` contains outcomes, refill counts,
+and the cap comparison.
+
+The default selection bound allows at most a 5% probability that the larger
+guard obtains a declaration where the candidate cap does not. One-sided exact
+binomial bounds account for the compared caps and table sizes. An incomplete
+or underpowered study does not select a cap, and the largest guard is never
+chosen as a fallback. This is evidence about the frozen model pool, not a
+universal human-game limit.
+
+Workers have coordinator-enforced deadlines. A timeout is an execution failure,
+not a game draw. The command stops on a worker failure and retains completed
+cases for recovery.
 
 ## Train against a frozen league
 
