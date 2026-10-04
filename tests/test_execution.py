@@ -50,6 +50,14 @@ class TestBoundedWorkers(unittest.TestCase):
         self.assertEqual(results[0].kind, "worker_exit")
         self.assertIn("7", results[0].detail)
 
+    def test_end_of_batch_failure_does_not_reduce_future_capacity(self):
+        with BoundedWorkers(sleep_or_return, workers=3, task_seconds=0.2) as pool:
+            failed = list(pool.run(("hang",)))
+            self.assertIsInstance(failed[0], WorkerFailure)
+            completed = list(pool.run(("a", "b", "c", "d", "e", "f")))
+            self.assertTrue(all(isinstance(result, WorkerResult) for result in completed))
+            self.assertEqual(pool.worker_count, 3)
+
     def test_leaving_context_cancels_owned_workers(self):
         before = {process.pid for process in multiprocessing.active_children()}
         pool = BoundedWorkers(sleep_or_return, workers=2, task_seconds=10)

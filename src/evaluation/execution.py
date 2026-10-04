@@ -111,6 +111,10 @@ class BoundedWorkers(Generic[Job, Result]):
     def __exit__(self, *exception) -> None:
         self.close()
 
+    @property
+    def worker_count(self) -> int:
+        return sum(slot.process.is_alive() for slot in self._slots)
+
     def _spawn(self) -> _Worker:
         parent, child = self._context.Pipe()
         process = self._context.Process(
@@ -160,6 +164,8 @@ class BoundedWorkers(Generic[Job, Result]):
     ) -> Iterator[Union[WorkerResult[Job, Result], WorkerFailure[Job]]]:
         if not self._open:
             raise RuntimeError("use BoundedWorkers as a context manager")
+        while len(self._slots) < self.workers:
+            self._slots.append(self._spawn())
         iterator = iter(jobs)
         exhausted = object()
         pending = next(iterator, exhausted)

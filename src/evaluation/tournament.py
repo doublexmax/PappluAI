@@ -32,7 +32,9 @@ class TournamentPaused(RuntimeError):
     pass
 
 
-def _initialize_worker() -> None:
+def _initialize_worker(expected_source: str) -> None:
+    if _source_fingerprint() != expected_source:
+        raise RuntimeError("worker source changed; use the original frozen source or begin a new execution")
     torch.set_num_threads(1)
     _POLICIES.clear()
 
@@ -210,7 +212,7 @@ def run_tournament(
             "workers": workers, "match_seconds": match_seconds, "profiles": profiles,
             "reference": anchor, "cap_policy": cap_policy, "cap_weight": cap_weight,
         }, root / "executions" / ("%d.json" % time.time_ns()))
-        last_status = last_discovery = 0.0
+        last_status = last_discovery = last_publish = 0.0
 
         def tick(active: int) -> None:
             nonlocal last_status
@@ -219,7 +221,8 @@ def run_tournament(
             if time.monotonic() - last_status >= 5:
                 atomic_write_json({
                     "phase": "running", "pid": os.getpid(), "unix_time": time.time(),
-                    "active_jobs": active, "reference": anchor, "cap_policy": cap_policy,
+                    "active_jobs": active, "worker_processes": pool.worker_count,
+                    "reference": anchor, "cap_policy": cap_policy,
                     "cap_weight": cap_weight, **store.progress(profiles),
                 }, root / "status.json")
                 last_status = time.monotonic()
@@ -230,7 +233,8 @@ def run_tournament(
                     _execute_job, models_dir=str(model_registry.root),
                     match_seconds=match_seconds, source_sha256=source_sha256,
                 ),
-                workers=workers, task_seconds=match_seconds, initializer=_initialize_worker,
+                workers=workers, task_seconds=match_seconds,
+                initializer=partial(_initialize_worker, expected_source=source_sha256),
             ) as pool:
                 while True:
                     tick(0)
@@ -274,7 +278,9 @@ def run_tournament(
                             store.record_scores(job["id"], result["penalties"], result["version"])
                         else:
                             raise RuntimeError("worker returned an unknown tournament phase")
-                    _publish_standings(store, profiles, anchor, root, cap_policy, cap_weight)
+                    if time.monotonic() - last_publish >= 15:
+                        _publish_standings(store, profiles, anchor, root, cap_policy, cap_weight)
+                        last_publish = time.monotonic()
         except (TournamentPaused, KeyboardInterrupt):
             phase = "paused"
         except (ValueError, RuntimeError, OSError, sqlite3.Error) as exception:
@@ -283,11 +289,23 @@ def run_tournament(
         finally:
             if phase == "failed" and error is None and sys.exc_info()[1] is not None:
                 error = str(sys.exc_info()[1])
-            _publish_standings(store, profiles, anchor, root, cap_policy, cap_weight)
+            publication_error = None
+            try:
+                _publish_standings(store, profiles, anchor, root, cap_policy, cap_weight)
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exception:
+                publication_error = exception
+                print("Could not publish final standings: %s" % exception, file=sys.stderr)
             final = {
                 "phase": phase, "error": error, "pid": os.getpid(),
-                "unix_time": time.time(), "active_jobs": 0, "reference": anchor,
+                "unix_time": time.time(), "active_jobs": 0, "worker_processes": 0,
+                "reference": anchor,
                 "cap_policy": cap_policy, "cap_weight": cap_weight, **store.progress(profiles),
             }
-            atomic_write_json(final, root / "status.json")
+            try:
+                atomic_write_json(final, root / "status.json")
+            except OSError as exception:
+                publication_error = exception
+                print("Could not publish final status: %s" % exception, file=sys.stderr)
+            if publication_error is not None and error is None:
+                raise publication_error
     return final

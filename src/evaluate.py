@@ -1,4 +1,4 @@
-"""Papplu hand validity, binary declaration reward, and minimum penalty scoring.
+"""
 
 Card encoding is a length-52 count vector. Index = suit * 13 + rank_offset with
 suit order s, h, d, c (0..3) and ranks A,2,3,4,5,6,7,8,9,10,J,Q,K (offset 0..12).
@@ -95,11 +95,11 @@ def _rank_patterns() -> Tuple[Tuple[int, ...], ...]:
 
 
 RANK_PATTERNS = _rank_patterns()
-_SEARCH_SEQUENCES = tuple(
+_IRREDUCIBLE_SEQUENCES = tuple(
     tuple(_face(suit, rank) for rank in pattern)
     for suit in range(NUM_SUITS)
     for pattern in RANK_PATTERNS
-    if len(pattern) <= 5
+    if len(pattern) < 2 * MIN_MELD
 )
 
 
@@ -179,8 +179,7 @@ def _iter_sequences(
     wild_count = sum(counts[face] for face in wilds)
     anchor_is_wild = anchor in wilds
     natural = tuple(count > 0 and face not in wilds for face, count in enumerate(counts))
-    # Longer runs split into legal pieces of three to five cards without losing purity.
-    for represented in _SEARCH_SEQUENCES:
+    for represented in _IRREDUCIBLE_SEQUENCES:
         if len(represented) > total:
             continue
         if anchor is not None and anchor not in represented and not anchor_is_wild:
@@ -397,21 +396,19 @@ def minimum_penalty(
     start = tuple(counts[face] for face in faces)
     points = tuple(_card_points(face, joker_face) for face in faces)
 
-    # A grouping below the quota scores the same as its qualifying sequences
-    # alone. The minimum is therefore the lower of an all-meld search that must
-    # meet the quota and a qualifying-sequence search without one.
-    search, need = _PenaltySearch(points, options), quota
-    best = search.cost(start, need)
-    if best:
-        low = _PenaltySearch(points, tuple(
+    quota_search = _PenaltySearch(points, options)
+    quota_score = quota_search.cost(start, quota)
+    selected_search, selected_need, best = quota_search, quota, quota_score
+    if quota_score:
+        qualifying_only_search = _PenaltySearch(points, tuple(
             tuple(option for option in anchored if option.meld.is_pure)
             for anchored in options
         ))
-        low_best = low.cost(start, 0)
-        if low_best < best:
-            search, need, best = low, 0, low_best
+        qualifying_score = qualifying_only_search.cost(start, 0)
+        if qualifying_score < quota_score:
+            selected_search, selected_need, best = qualifying_only_search, 0, qualifying_score
 
-    melds = search.witness(start, need)
+    melds = selected_search.witness(start, selected_need)
     counted = counts
     for meld in melds:
         counted = _subtract(counted, meld.cards)
@@ -427,12 +424,6 @@ def _card_points(face: int, joker: int) -> int:
 
 
 class _PenaltySearch:
-    """Exact minimum counted points, memoized on (remaining copies, unmet quota).
-
-    The first position holding a card is the anchor. Its card either stays
-    counted or joins an option filed under that position.
-    """
-
     def __init__(
         self,
         points: Tuple[int, ...],

@@ -35,11 +35,6 @@ def card_points(face, joker):
 
 
 def brute_force_penalty(faces, joker, required):
-    """Minimum over every grouping, scored straight from the rule, legality from group_quality.
-
-    Also reports whether some grouping attaining the minimum meets the quota.
-    """
-
     def groupings(remaining):
         if not remaining:
             yield ()

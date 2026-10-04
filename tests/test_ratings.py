@@ -4,6 +4,9 @@ import copy
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+
+from openskill.models import PlackettLuce
 
 from src.evaluation.ratings import RatingStore, discounted_posterior, placements, write_rating_report
 from src.game.environment import GameConfig
@@ -132,6 +135,44 @@ class TestRatingStore(unittest.TestCase):
         self.assertGreater(rows[IDENTITIES[0]]["rating"], 1500)
         self.assertEqual(rows[IDENTITIES[1]]["rating"], 1500)
         self.assertEqual(rows[IDENTITIES[0]]["games"], 2)
+
+    def test_live_publication_only_updates_newly_settled_blocks(self):
+        engines = []
+
+        def counted_model(**parameters):
+            engine = mock.Mock(wraps=PlackettLuce(**parameters))
+            engines.append(engine)
+            return engine
+
+        for job in self.jobs():
+            complete(self.store, job)
+        with mock.patch("src.evaluation.ratings.PlackettLuce", side_effect=counted_model):
+            first = self.store.report(self.profile, IDENTITIES[1], "points")
+            self.assertEqual(sum(engine.rate.call_count for engine in engines), 2)
+            self.assertEqual(first, self.store.report(self.profile, IDENTITIES[1], "points"))
+            self.assertEqual(sum(engine.rate.call_count for engine in engines), 2)
+            next_jobs = self.jobs(1)
+            complete(self.store, next_jobs[0])
+            self.store.report(self.profile, IDENTITIES[1], "points")
+            self.assertEqual(sum(engine.rate.call_count for engine in engines), 2)
+            complete(self.store, next_jobs[1])
+            current = self.store.report(self.profile, IDENTITIES[1], "points")
+            self.assertEqual(sum(engine.rate.call_count for engine in engines), 4)
+            with RatingStore(self.path, read_only=True) as reader:
+                self.assertEqual(current, reader.report(self.profile, IDENTITIES[1], "points"))
+
+    def test_filtered_and_discounted_mixed_blocks_disclose_effective_imbalance(self):
+        jobs = self.jobs()
+        complete(self.store, jobs[0])
+        complete(self.store, jobs[1], winner=None)
+        full = self.store.report(self.profile, IDENTITIES[0], "points")
+        completed = self.store.report(self.profile, IDENTITIES[0], "exclude")
+        discounted = self.store.report(self.profile, IDENTITIES[0], "weighted-points")
+        self.assertTrue(full["raw_seatings_balanced"])
+        self.assertTrue(full["effective_seatings_balanced"])
+        self.assertEqual(completed["mixed_cap_blocks"], 1)
+        self.assertFalse(completed["effective_seatings_balanced"])
+        self.assertFalse(discounted["effective_seatings_balanced"])
 
     def test_duplicate_results_do_not_change_ratings_and_conflicts_fail(self):
         jobs = self.jobs()

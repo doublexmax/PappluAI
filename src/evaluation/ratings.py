@@ -71,6 +71,7 @@ class RatingStore:
         self.read_only = read_only
         self._connection = None
         self._lock = None
+        self._projections: dict[tuple, _ProjectionState] = {}
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -122,6 +123,7 @@ class RatingStore:
         self.close()
 
     def close(self) -> None:
+        self._projections.clear()
         if self._connection is not None:
             self._connection.close()
             self._connection = None
@@ -227,11 +229,11 @@ class RatingStore:
             raise ValueError("unknown rating protocol")
         return json.loads(row["config"])
 
-    def blocks(self, protocol: str) -> list[dict]:
+    def blocks(self, protocol: str, after: int = -1) -> list[dict]:
         return [
             {"ordinal": row["ordinal"], "seed": row["seed"], "lineup": json.loads(row["lineup"])}
             for row in self.connection.execute(
-                "SELECT ordinal,seed,lineup FROM blocks WHERE protocol=? ORDER BY ordinal", (protocol,),
+                "SELECT ordinal,seed,lineup FROM blocks WHERE protocol=? AND ordinal>? ORDER BY ordinal", (protocol, after),
             )
         ]
 
@@ -453,6 +455,15 @@ class RatingStore:
             raise RuntimeError("rating replay requires openskill==" + OPEN_SKILL_VERSION)
         if self.connection.in_transaction:
             raise RuntimeError("report requires a settled database transaction")
+        cached = not self.read_only and samples == 0
+        cache_key = (protocol, cap_policy, cap_weight, _json(RATING_PARAMETERS))
+        if cached and cache_key in self._projections:
+            projection = self._projections[cache_key]
+        else:
+            projection = _ProjectionState(cap_policy, cap_weight)
+            if cached:
+                self._projections[cache_key] = projection
+        projected = False
         self.connection.execute("BEGIN")
         try:
             config = self._protocol(protocol)
@@ -461,9 +472,11 @@ class RatingStore:
                 raise ValueError("reference competitor is not registered")
             revision = self.connection.execute("SELECT revision FROM state WHERE id=1").fetchone()[0]
             blocks = []
-            incomplete = failed = deferred = 0
+            incomplete = deferred = newly_settled_failed = 0
+            failed = projection.failed_blocks
+            cursor = projection.cursor
             prefix_open = True
-            for block in self.blocks(protocol):
+            for block in self.blocks(protocol, after=projection.cursor):
                 rows = self.connection.execute(
                     """SELECT j.status,j.participants,r.winner,r.ending,r.points
                        FROM jobs j LEFT JOIN results r ON r.job=j.id
@@ -479,7 +492,9 @@ class RatingStore:
                 if not prefix_open:
                     deferred += int(not unsettled)
                     continue
+                cursor = block["ordinal"]
                 if any(row["status"] == "failed" for row in rows):
+                    newly_settled_failed += 1
                     continue
                 blocks.append({
                     "id": block["ordinal"],
@@ -489,9 +504,17 @@ class RatingStore:
                         for row in rows
                     ],
                 })
+            projection.add_competitors(competitors)
+            for block in blocks:
+                projection.append(block)
+            projection.cursor = cursor
+            projection.failed_blocks += newly_settled_failed
+            rows = projection.rows(reference)
+            projected = True
         finally:
             self.connection.rollback()
-        rows = _fold(blocks, competitors, reference, cap_policy, cap_weight)
+            if cached and not projected:
+                self._projections.pop(cache_key, None)
         if samples:
             if samples < 100:
                 raise ValueError("bootstrap reports require at least 100 replicates")
@@ -528,8 +551,14 @@ class RatingStore:
             "openskill_version": OPEN_SKILL_VERSION, "tau": 0,
             "rating_parameters": dict(RATING_PARAMETERS),
             "display": {"center": 1500, "scale": 40},
-            "completed_blocks": len(blocks), "incomplete_blocks": incomplete, "failed_blocks": failed,
+            "completed_blocks": projection.completed_blocks, "incomplete_blocks": incomplete, "failed_blocks": failed,
             "deferred_blocks": deferred,
+            "mixed_cap_blocks": projection.mixed_cap_blocks,
+            "raw_seatings_balanced": True,
+            "effective_seatings_balanced": not (
+                projection.mixed_cap_blocks
+                and (cap_policy in ("undecided", "exclude") or cap_policy == "weighted-points" and cap_weight < 1)
+            ),
             "bootstrap_samples": samples, "bootstrap_seed": seed,
             "uncertainty_unit": "complete independent deal block",
             "rows": sorted(rows.values(), key=lambda row: (row["rating"] is None, -(row["rating"] or 0), row["id"])),
@@ -537,76 +566,100 @@ class RatingStore:
 
 
 def _fold(blocks: list[dict], competitors: dict, reference: str, cap_policy: str, cap_weight: float = 0.25) -> dict:
-    model = PlackettLuce(**RATING_PARAMETERS)
-    ratings = {}
-    counters = {
-        identity: {
-            "id": identity, "label": record["label"], "games": 0, "rated_games": 0,
-            "weighted_games": 0.0,
-            "declaration_wins": 0, "cap_endings": 0, "penalty_sum": 0,
-            "blocks": set(), "rating_blocks": set(), "opponents": set(),
-            "has_beaten": False, "has_lost": False,
-        }
-        for identity, record in competitors.items()
-    }
+    projection = _ProjectionState(cap_policy, cap_weight)
+    projection.add_competitors(competitors)
     for block in blocks:
+        projection.append(block)
+    return projection.rows(reference)
+
+
+class _ProjectionState:
+    def __init__(self, cap_policy: str, cap_weight: float) -> None:
+        self.model = PlackettLuce(**RATING_PARAMETERS)
+        self.cap_policy = cap_policy
+        self.cap_weight = cap_weight
+        self.ratings = {}
+        self.counters = {}
+        self.cursor = -1
+        self.completed_blocks = 0
+        self.failed_blocks = 0
+        self.mixed_cap_blocks = 0
+
+    def add_competitors(self, competitors: dict) -> None:
+        for identity, record in competitors.items():
+            if identity not in self.counters:
+                self.counters[identity] = {
+                    "id": identity, "label": record["label"], "games": 0, "rated_games": 0,
+                    "weighted_games": 0.0, "declaration_wins": 0, "cap_endings": 0, "penalty_sum": 0,
+                    "blocks": set(), "rating_blocks": set(), "opponents": set(),
+                    "has_beaten": False, "has_lost": False,
+                }
+
+    def append(self, block: dict) -> None:
+        self.completed_blocks += 1
+        endings = {game["ending"] for game in block["games"]}
+        self.mixed_cap_blocks += int(len(endings) > 1)
         for game in block["games"]:
             identities = game["participants"]
-            ranks = placements(game["points"], game["winner"], game["ending"], cap_policy)
+            ranks = placements(game["points"], game["winner"], game["ending"], self.cap_policy)
             for seat, identity in enumerate(identities):
-                row = counters[identity]
+                row = self.counters[identity]
                 row["games"] += 1
                 row["blocks"].add(block["id"])
                 row["declaration_wins"] += int(game["winner"] == seat)
                 row["cap_endings"] += int(game["ending"] == "turns_exhausted")
                 row["penalty_sum"] += game["points"][seat]
-            weight = cap_weight if game["ending"] == "turns_exhausted" and cap_policy == "weighted-points" else 1.0
+            weight = self.cap_weight if game["ending"] == "turns_exhausted" and self.cap_policy == "weighted-points" else 1.0
             if ranks is None or weight == 0:
                 continue
             for identity in identities:
-                if identity not in ratings:
-                    ratings[identity] = model.rating(name=identity)
-            teams = [[ratings[identity]] for identity in identities]
+                if identity not in self.ratings:
+                    self.ratings[identity] = self.model.rating(name=identity)
+            teams = [[self.ratings[identity]] for identity in identities]
             prior = [(team[0].mu, team[0].sigma) for team in teams]
-            updated = model.rate(teams, ranks=list(ranks))
+            updated = self.model.rate(teams, ranks=list(ranks))
             for seat, identity in enumerate(identities):
                 if weight == 1:
-                    ratings[identity] = updated[seat][0]
+                    self.ratings[identity] = updated[seat][0]
                 else:
                     mu, sigma = discounted_posterior(
                         *prior[seat], updated[seat][0].mu, updated[seat][0].sigma, weight,
                     )
-                    ratings[identity] = model.rating(mu=mu, sigma=sigma, name=identity)
-                row = counters[identity]
+                    self.ratings[identity] = self.model.rating(mu=mu, sigma=sigma, name=identity)
+                row = self.counters[identity]
                 row["rated_games"] += 1
                 row["weighted_games"] += weight
                 row["rating_blocks"].add(block["id"])
                 row["opponents"].update(other for other in identities if other != identity)
                 row["has_beaten"] |= any(rank > ranks[seat] for rank in ranks)
                 row["has_lost"] |= any(rank < ranks[seat] for rank in ranks)
-    connected = {reference} if reference in ratings else set()
-    frontier = list(connected)
-    while frontier:
-        for other in counters[frontier.pop()]["opponents"] - connected:
-            connected.add(other)
-            frontier.append(other)
-    for identity, row in counters.items():
-        rating = ratings.get(identity)
-        row["mu"] = None if rating is None else rating.mu
-        row["sigma"] = None if rating is None else rating.sigma
-        row["rating"] = 1500 + 40 * (rating.mu - ratings[reference].mu) if identity in connected else None
-        row["mean_penalty"] = row["penalty_sum"] / row["games"] if row["games"] else None
-        row["declaration_rate"] = row["declaration_wins"] / row["games"] if row["games"] else None
-        row["blocks"] = len(row["blocks"])
-        row["rating_blocks"] = len(row["rating_blocks"])
-        row["opponents"] = len(row["opponents"])
-        row["interval95"] = None
-        row["is_reference"] = identity == reference
-        row["status"] = (
-            "unrated" if rating is None else "unconnected" if identity not in connected
-            else "anchor" if identity == reference else "provisional"
-        )
-    return counters
+    def rows(self, reference: str) -> dict:
+        connected = {reference} if reference in self.ratings else set()
+        frontier = list(connected)
+        while frontier:
+            for other in self.counters[frontier.pop()]["opponents"] - connected:
+                connected.add(other)
+                frontier.append(other)
+        rows = {}
+        for identity, counter in self.counters.items():
+            row = dict(counter)
+            rating = self.ratings.get(identity)
+            row["mu"] = None if rating is None else rating.mu
+            row["sigma"] = None if rating is None else rating.sigma
+            row["rating"] = 1500 + 40 * (rating.mu - self.ratings[reference].mu) if identity in connected else None
+            row["mean_penalty"] = row["penalty_sum"] / row["games"] if row["games"] else None
+            row["declaration_rate"] = row["declaration_wins"] / row["games"] if row["games"] else None
+            row["blocks"] = len(row["blocks"])
+            row["rating_blocks"] = len(row["rating_blocks"])
+            row["opponents"] = len(row["opponents"])
+            row["interval95"] = None
+            row["is_reference"] = identity == reference
+            row["status"] = (
+                "unrated" if rating is None else "unconnected" if identity not in connected
+                else "anchor" if identity == reference else "provisional"
+            )
+            rows[identity] = row
+        return rows
 
 
 def _quantile(values: Sequence[float], fraction: float) -> float:

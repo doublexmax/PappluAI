@@ -12,7 +12,7 @@ import unittest
 import torch
 
 from src.evaluation.ratings import RatingStore
-from src.evaluation.tournament import choose_lineup, run_tournament
+from src.evaluation.tournament import _initialize_worker, choose_lineup, run_tournament
 from src.game.environment import GameConfig
 from src.model.network import QNetwork, save_checkpoint
 
@@ -117,6 +117,10 @@ class TestTournament(unittest.TestCase):
             history.append({"lineup": list(lineup)})
         counts = {identity: sum(identity in block["lineup"] for block in history) for identity in identities}
         self.assertLessEqual(max(counts.values()) - min(counts.values()), 2)
+
+    def test_worker_refuses_a_different_source_fingerprint(self):
+        with self.assertRaisesRegex(RuntimeError, "worker source changed"):
+            _initialize_worker("0" * 64)
 
 
 if __name__ == "__main__":

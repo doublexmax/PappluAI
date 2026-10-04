@@ -106,8 +106,13 @@ own verified copies, so deleting a source does not change an already admitted
 competitor. A seeded random policy provides a fixed baseline.
 
 Lineups favor less-tested models and less-covered opponent pairs, not current
-rating estimates. Every deal uses all seat permutations. This controls both
-seat position and neighboring opponents, whose discarded cards affect play.
+rating estimates. Every deal uses all seat permutations. The raw match collection
+therefore balances seat position and neighboring opponents.
+
+Dropping or discounting capped games can break that balance within a mixed
+deal block. Reports expose `mixed_cap_blocks` and `effective_seatings_balanced`.
+The completed-only control is conditional evidence, not a claim of perfect
+effective seat balance.
 
 One coordinator owns the SQLite database. Workers play or score jobs and never
 write ratings. A hard watchdog terminates owned workers that exceed their
@@ -118,8 +123,10 @@ be retried without replaying the game. Identical repeated results are
 idempotent; conflicting results fail explicitly.
 
 Rating calculations follow the persisted block and seating order, not worker
-completion order. Only complete, scored blocks in the settled prefix are
-published as balanced evidence. Failed blocks remain visible.
+completion order. Only complete, scored blocks in the settled prefix are used.
+Failed blocks remain visible. The live writer retains a disposable projection
+and applies only newly settled blocks; a read-only report can replay from the
+canonical database. Standings publication is rate-limited.
 
 ## Read the results
 
