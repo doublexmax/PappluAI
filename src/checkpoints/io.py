@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import hashlib
+import time
 from typing import AbstractSet, Any, Dict, Mapping, Optional
 
 __all__ = (
@@ -22,7 +23,7 @@ def atomic_copy(source: Path, destination: Path) -> None:
     temporary = destination.with_name("." + destination.name + ".tmp")
     shutil.copyfile(source, temporary)
     _fsync_file(temporary)
-    os.replace(temporary, destination)
+    _replace_file(temporary, destination)
 
 
 def atomic_write_json(payload: Mapping[str, Any], path: Path) -> None:
@@ -39,7 +40,7 @@ def atomic_write_json(payload: Mapping[str, Any], path: Path) -> None:
         encoding="utf-8",
     )
     _fsync_file(temporary)
-    os.replace(temporary, path)
+    _replace_file(temporary, path)
 
 
 def file_metadata(path: Path) -> Dict[str, Any]:
@@ -79,6 +80,23 @@ def require_checkpoint_int(
     if maximum is not None and value > maximum:
         raise ValueError("%s must be at most %d" % (name, maximum))
     return value
+
+
+def _replace_file(temporary: Path, destination: Path) -> None:
+    deadline = time.monotonic() + 2
+    delay = 0.005
+    while True:
+        try:
+            os.replace(temporary, destination)
+            return
+        except PermissionError as error:
+            if os.name != "nt" or getattr(error, "winerror", None) not in (5, 32, 33):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.05)
 
 
 def _fsync_file(path: Path) -> None:

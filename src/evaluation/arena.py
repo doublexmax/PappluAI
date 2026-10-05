@@ -16,7 +16,7 @@ from src.game.environment import (
     encode_observation,
     legal_action_mask,
 )
-from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv, TerminalSnapshot
 from src.model.network import (
     load_checkpoint,
     select_action,
@@ -111,7 +111,9 @@ class MatchResult:
     seat_turns: Tuple[int, ...]
     action_count: int
     stock_remaining: int
+    telemetry: MatchTelemetry
     trajectories: Tuple[Tuple[EpisodeStep, ...], ...]
+    terminal_snapshot: Optional[TerminalSnapshot] = None
 
 
 def play_match(
@@ -120,6 +122,8 @@ def play_match(
     seed: int,
     record_trajectories: bool = False,
     deadline: Optional[float] = None,
+    *,
+    record_terminal: bool = False,
 ) -> MatchResult:
     if not isinstance(config, MatchConfig):
         raise TypeError("config must be a MatchConfig")
@@ -129,6 +133,8 @@ def play_match(
         raise ValueError(
             "expected %d policies, got %d" % (config.players, len(policies))
         )
+    if type(record_terminal) is not bool:
+        raise TypeError("record_terminal must be a boolean")
     for seat, policy in enumerate(policies):
         if not callable(getattr(policy, "act", None)):
             raise TypeError("policy at seat %d must define act" % seat)
@@ -181,7 +187,9 @@ def play_match(
         seat_turns=seat_turns,
         action_count=action_count,
         stock_remaining=view.stock_remaining,
+        telemetry=env.telemetry(),
         trajectories=tuple(tuple(steps) for steps in trajectories),
+        terminal_snapshot=env.terminal_snapshot() if record_terminal else None,
     )
 
 

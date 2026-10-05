@@ -227,6 +227,14 @@ The old `matched_rate` prototype and its matching helpers have been removed.
 Use `hand_reward` for training rewards and `evaluate_hand` for a grouping.
 The new reward is not the old prototype's unmatched-card count.
 
+`minimum_penalty(hand, joker, required_sequences=5)` returns an exact
+`HandPenalty` for a hand of any size. Its `points`, `exempt_melds`, and
+`counted_cards` describe one minimum-penalty grouping. Numbered cards use face
+value, A/J/Q/K score 10, and joker-rank cards score zero. Qualifying sequences
+are exempt, but sets and other melds become exempt only when the required
+sequences exist in that same grouping. A zero penalty does not prove a valid
+declaration. The binary reward remains unchanged.
+
 The evaluator searches alternative groupings instead of greedily removing the
 first sequence it finds. It caches remaining card counts and the unmet sequence
 quota within each call. The search is exact, but its worst-case cost grows
@@ -257,6 +265,8 @@ responsibility:
 `src.cli.solo` runs episodic Monte Carlo Q-value regression. It does not use
 DQN, tree search, or genetic algorithms. See [TRAINING.md](TRAINING.md) for a
 fresh-clone walkthrough of every training workflow.
+See [RATINGS.md](RATINGS.md) for persistent multiplayer tournaments,
+point-based placements, uncertainty, and capped-game evidence.
 
 ### Run a short discard-puzzle smoke test
 

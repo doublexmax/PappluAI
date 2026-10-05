@@ -21,7 +21,7 @@ from src.game.environment import (
     GameConfig,
     legal_action_mask,
 )
-from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv
 
 try:
     import torch
@@ -76,6 +76,9 @@ class TestArenaMatches(unittest.TestCase):
         self.assertEqual(result.terminal_reason, "turns_exhausted")
         self.assertEqual(result.seat_turns, (2, 2, 2))
         self.assertEqual(result.action_count, 12)
+        self.assertEqual(result.telemetry.stock_draws, (2, 2, 2))
+        self.assertEqual(result.telemetry.discard_draws, (0, 0, 0))
+        self.assertEqual(result.telemetry.refill_turns, ())
         self.assertEqual(tuple(map(len, result.trajectories)), (4, 4, 4))
         for trajectory in result.trajectories:
             for state, action, reward in trajectory:
@@ -101,6 +104,18 @@ class TestArenaMatches(unittest.TestCase):
             [0.0, 1.0],
         )
         self.assertEqual(result.trajectories[1], ())
+        self.assertIsNone(result.terminal_snapshot)
+
+    def test_terminal_capture_is_opt_in_and_keeps_every_hand(self):
+        config = MatchConfig(game=self.game, players=2)
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
+            result = play_match(
+                [FirstLegalPolicy(), FirstLegalPolicy()],
+                config, seed=711, record_terminal=True,
+            )
+        self.assertIsNotNone(result.terminal_snapshot)
+        self.assertEqual(len(result.terminal_snapshot.hands), 2)
+        self.assertEqual(tuple(sum(hand) for hand in result.terminal_snapshot.hands), (3, 3))
 
     def test_policies_receive_only_their_own_hand_and_public_state(self):
         game = GameConfig(
@@ -219,6 +234,7 @@ class TestArenaMatches(unittest.TestCase):
             seat_turns=(2, 2, 2),
             action_count=12,
             stock_remaining=30,
+            telemetry=MatchTelemetry((2, 2, 2), (0, 0, 0), ()),
             trajectories=((), (), ()),
         )
         with mock.patch("src.evaluation.arena.play_match", return_value=result) as play:
@@ -259,6 +275,7 @@ class TestArenaCli(unittest.TestCase):
             seat_turns=(1, 0),
             action_count=2,
             stock_remaining=110,
+            telemetry=MatchTelemetry((1, 0), (0, 0), ()),
             trajectories=((), ()),
         )
         with tempfile.TemporaryDirectory() as tmp:

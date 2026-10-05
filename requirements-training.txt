@@ -1,1 +1,2 @@
 torch>=2.6
+openskill==6.2.0

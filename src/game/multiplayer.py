@@ -50,6 +50,19 @@ class MatchView:
     stock_remaining: int
 
 
+@dataclass(frozen=True)
+class MatchTelemetry:
+    stock_draws: Tuple[int, ...]
+    discard_draws: Tuple[int, ...]
+    refill_turns: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TerminalSnapshot:
+    hands: Tuple[Tuple[int, ...], ...]
+    joker: int
+
+
 class MultiplayerEnv:
     """Mutable match state with immutable public observations and views."""
 
@@ -69,6 +82,9 @@ class MultiplayerEnv:
         self._winner: Optional[int] = None
         self._terminal_reason: Optional[str] = None
         self._turns_remaining = [0] * self.config.players
+        self._stock_draws = [0] * self.config.players
+        self._discard_draws = [0] * self.config.players
+        self._refill_turns: List[int] = []
         self._last_reward = 0.0
         self._reward_cache = RewardCache()
 
@@ -101,6 +117,9 @@ class MultiplayerEnv:
             self.config.game.max_turns
             for _ in range(self.config.players)
         ]
+        self._stock_draws = [0] * self.config.players
+        self._discard_draws = [0] * self.config.players
+        self._refill_turns = []
         self._last_reward = 0.0
         return self.view()
 
@@ -137,15 +156,12 @@ class MultiplayerEnv:
         hand = self._hands[self._current_seat]
         if self._phase is Phase.DRAW:
             if action == ACTION_DRAW_STOCK:
-                refill_stock(
-                    self._stock,
-                    self._discard,
-                    self._rng,
-                    self.config.game.recycle_discard,
-                )
+                self._refill_stock()
                 card = self._stock.pop()
+                self._stock_draws[self._current_seat] += 1
             else:
                 card = self._discard.pop()
+                self._discard_draws[self._current_seat] += 1
             hand[card] += 1
             self._phase = Phase.DISCARD
             self._last_reward = 0.0
@@ -178,12 +194,7 @@ class MultiplayerEnv:
             self._terminal_reason = "turns_exhausted"
             self._phase = Phase.TERMINAL
         else:
-            refill_stock(
-                self._stock,
-                self._discard,
-                self._rng,
-                self.config.game.recycle_discard,
-            )
+            self._refill_stock()
             self._current_seat = next_seat
             self._phase = Phase.DRAW
             self._last_reward = 0.0
@@ -199,6 +210,32 @@ class MultiplayerEnv:
             turns_remaining=tuple(self._turns_remaining),
             stock_remaining=len(self._stock),
         )
+
+    def telemetry(self) -> MatchTelemetry:
+        return MatchTelemetry(
+            stock_draws=tuple(self._stock_draws),
+            discard_draws=tuple(self._discard_draws),
+            refill_turns=tuple(self._refill_turns),
+        )
+
+    def terminal_snapshot(self) -> TerminalSnapshot:
+        if self._phase is not Phase.TERMINAL or self._terminal_reason is None:
+            raise ValueError("terminal hands are available only after a completed match")
+        return TerminalSnapshot(tuple(tuple(hand) for hand in self._hands), self._joker)
+
+    def _refill_stock(self) -> None:
+        if refill_stock(
+            self._stock,
+            self._discard,
+            self._rng,
+            self.config.game.recycle_discard,
+        ):
+            self._refill_turns.append(
+                sum(
+                    self.config.game.max_turns - remaining
+                    for remaining in self._turns_remaining
+                )
+            )
 
     def _next_active_seat(self, seat: int) -> Optional[int]:
         for offset in range(1, self.config.players + 1):
