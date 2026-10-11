@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import io
 import tempfile
 import unittest
 from unittest import mock
 
-from src.game.environment import GameConfig, STATE_DIM
+from collections import Counter
+from src.game.environment import GameConfig
+from src.game.multiplayer import MultiplayerEnv
 from src.training.league import (
     LeagueConfig,
     LeagueSession,
     save_session_checkpoint,
 )
-from src.cli.league import build_arg_parser
+from src.cli.league import build_arg_parser, main
 
 try:
     import torch
@@ -26,7 +29,12 @@ TORCH_REASON = "PyTorch not installed (see requirements-training.txt)"
 def fake_match(policies, config, seed, record_trajectories=False, deadline=None):
     from types import SimpleNamespace
 
-    step = ((0.0,) * STATE_DIM, 0, 0.0)
+    env = MultiplayerEnv(config)
+    env.reset(seed)
+    trajectories = []
+    for seat in range(config.players):
+        env._current_seat = seat
+        trajectories.append(((env.observe(), 0, 0.0),))
     return SimpleNamespace(
         seed=seed,
         winner=0,
@@ -34,7 +42,7 @@ def fake_match(policies, config, seed, record_trajectories=False, deadline=None)
         seat_turns=tuple(1 for _ in policies),
         action_count=len(policies),
         stock_remaining=100,
-        trajectories=tuple((step,) for _ in policies),
+        trajectories=tuple(trajectories),
     )
 
 
@@ -45,7 +53,7 @@ class TestLeagueSession(unittest.TestCase):
 
         save_checkpoint(
             str(path),
-            QNetwork(architecture="suit_conv"),
+            QNetwork(),
             GameConfig(max_turns=max_turns),
         )
 
@@ -196,8 +204,8 @@ class TestLeagueSession(unittest.TestCase):
                 session.train_match()
                 result = session.train_match()
             self.assertEqual(result["challenger_seat"], 1)
-            newest = session.replay.state_dict()["episodes"][-1]
-            self.assertEqual(newest[-1][2], 0.0)
+            newest = session.replay.state_dict()["episodes"][-1]["transitions"]
+            self.assertEqual(newest[-1][3], 0.0)
 
     def test_changed_opponent_pool_is_rejected_on_resume(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -256,12 +264,12 @@ class TestLeagueSession(unittest.TestCase):
             wrong = root / "wrong.pt"
             from src.model.network import QNetwork, save_checkpoint
 
-            with self.assertRaisesRegex(ValueError, "60 turns"):
-                LeagueConfig(game=GameConfig(max_turns=1))
+            with self.assertRaisesRegex(ValueError, "21 cards"):
+                LeagueConfig(game=GameConfig(cards_in_hand=18))
 
             save_checkpoint(
                 str(wrong),
-                QNetwork(architecture="suit_conv"),
+                QNetwork(),
                 GameConfig(cards_in_hand=18, required_sequences=5),
             )
             with self.assertRaisesRegex(ValueError, "21 cards"):
@@ -308,12 +316,11 @@ class TestLeagueSession(unittest.TestCase):
                 session.train_match()
             network_before = copy.deepcopy(session.network.state_dict())
             payload = copy.deepcopy(session.state_dict())
-            episode = list(
-                payload["replay_state_dict"]["episodes"][0]
-            )
-            state, _action, target = episode[0]
-            episode[0] = (state, 54, target)
-            payload["replay_state_dict"]["episodes"] = (tuple(episode),)
+            journal = payload["replay_state_dict"]["episodes"][0]
+            episode = list(journal["transitions"])
+            state, prefix, _action, target = episode[0]
+            episode[0] = (state, prefix, 54, target)
+            journal["transitions"] = tuple(episode)
             first_parameter = next(
                 iter(payload["network_state_dict"].values())
             )
@@ -345,6 +352,21 @@ class TestLeagueSession(unittest.TestCase):
                 session.state_dict()["counters"],
             )
 
+    def test_count_and_seat_schedules_are_independently_balanced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            champion = Path(temporary) / "champion.pt"
+            self.make_model(champion)
+            session = LeagueSession(
+                str(champion), config=LeagueConfig(batch_size=1, updates_per_match=1),
+            )
+            with mock.patch("src.training.league.play_match", side_effect=fake_match):
+                results = [session.train_match() for _ in range(36)]
+            self.assertEqual(Counter(result["players"] for result in results), {2: 12, 3: 12, 4: 12})
+            for players in (2, 3, 4):
+                counts = Counter(result["challenger_seat"] for result in results if result["players"] == players)
+                self.assertEqual(counts, {seat: 12 // players for seat in range(players)})
+            self.assertEqual(session.state_dict()["count_matches"], {2: 12, 3: 12, 4: 12})
+
     def test_remote_actual_two_player_match_updates_complete_boundary(self):
         with tempfile.TemporaryDirectory() as temporary:
             champion = Path(temporary) / "champion.pt"
@@ -369,6 +391,36 @@ class TestLeagueSession(unittest.TestCase):
 
 
 class TestLeagueCli(unittest.TestCase):
+    @unittest.skipIf(torch is None, TORCH_REASON)
+    def test_resume_accepts_partial_matching_options_and_rejects_changes_before_publish(self):
+        from src.model.network import QNetwork, save_checkpoint
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model.pt"
+            save_checkpoint(str(model), QNetwork(), GameConfig())
+            session = LeagueSession(str(model), config=LeagueConfig(
+                game=GameConfig(max_turns=1), batch_size=2, updates_per_match=1,
+            ), seed=73)
+            output = root / "league"
+            save_session_checkpoint(session, output)
+            args = [
+                "--initial-model", str(model), "--resume", str(output / "latest-state.pt"),
+                "--output-dir", str(output), "--matches", "0", "--max-seconds", "0",
+            ]
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(main([*args, "--players", "2", "3", "4"]), 0)
+            before = (output / "latest-state.pt").read_bytes()
+            for options in (
+                ["--players", "2"], ["--max-turns", "60"],
+                ["--batch-size", "64"], ["--seed", "74"],
+            ):
+                with self.subTest(options=options), mock.patch(
+                    "sys.stderr", new_callable=io.StringIO,
+                ) as error:
+                    self.assertEqual(main([*args, *options]), 2)
+                    self.assertIn("resume cannot change", error.getvalue())
+                self.assertEqual((output / "latest-state.pt").read_bytes(), before)
+
     def test_cli_exposes_bounded_resume_contract(self):
         parser = build_arg_parser()
         args = parser.parse_args(

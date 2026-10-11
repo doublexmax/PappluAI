@@ -1,4 +1,5 @@
 import random
+from collections import Counter
 import unittest
 from unittest import mock
 
@@ -17,6 +18,13 @@ except ImportError:
 
 
 class TestSeatClusterBootstrap(unittest.TestCase):
+    def test_four_players_cover_adjacent_and_opposite_contenders_equally(self):
+        orders = balanced_seat_orders(4)
+        self.assertEqual(len(set(orders)), 24)
+        self.assertEqual(Counter(order.index(0) for order in orders), {0: 6, 1: 6, 2: 6, 3: 6})
+        self.assertEqual(Counter((order.index(1) - order.index(0)) % 4 for order in orders),
+                         {1: 8, 2: 8, 3: 8})
+
     def test_identical_contenders_cannot_gain_from_following_a_weak_opponent(self):
         orders = balanced_seat_orders(3)
         scores = []

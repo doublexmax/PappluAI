@@ -2,14 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from itertools import permutations
 from numbers import Real
 import random
 from typing import Sequence
+
+from src.game.environment import ENCODING_VERSION, GameConfig
+from src.model.spec import ARCHITECTURE
 
 
 MIN_SELECTION_SEED_BLOCKS = 32
 MIN_CONFIRMATION_SEED_BLOCKS = 128
 MIN_SOLO_GAMES = 256
+GATE_SCHEMA_VERSION = 2
+PLAYER_COUNTS = (2, 3, 4)
 
 
 @dataclass(frozen=True)
@@ -24,6 +30,8 @@ def balanced_seat_orders(players: int) -> tuple:
     if isinstance(players, bool) or not isinstance(players, int) or not 2 <= players <= 6:
         raise ValueError("players must be an integer in 2..6")
     lineup = tuple(range(players))
+    if players == 4:
+        return tuple(permutations(lineup))
     lineups = (lineup,) if players == 2 else (lineup, (1, 0, *lineup[2:]))
     return tuple(
         order[rotation:] + order[:rotation]
@@ -62,10 +70,10 @@ def evidence_metrics(
     seed: int,
     samples: int,
 ) -> dict:
-    if not isinstance(multiplayer, dict) or set(multiplayer) != {"2", "3"}:
-        raise ValueError("Both player-count result sets are required")
+    if not isinstance(multiplayer, dict) or set(multiplayer) != {"2", "3", "4"}:
+        raise ValueError("All three player-count result sets are required")
     margins = {}
-    for count in (2, 3):
+    for count in PLAYER_COUNTS:
         raw = multiplayer[str(count)]
         values = raw.get("seed_block_margins")
         if not isinstance(values, (list, tuple)) or len(values) != blocks:
@@ -101,11 +109,18 @@ def evidence_metrics(
             raise ValueError("Solo outcomes must contain one binary verdict per game")
     if solo.get("candidate_wins") != sum(candidate) or solo.get("champion_wins") != sum(champion):
         raise ValueError("Solo win counts disagree with their raw outcomes")
-    combined = [(left + right) / 2 for left, right in zip(margins[2], margins[3])]
+    combined = [
+        sum(values) / len(PLAYER_COUNTS)
+        for values in zip(*(margins[count] for count in PLAYER_COUNTS))
+    ]
     differences = [left - right for left, right in zip(candidate, champion)]
     return {
         "multiplayer_gain": sum(combined) / blocks,
         "multiplayer_ci95": clustered_interval(combined, samples, seed + 91827),
+        "multiplayer_ci95_by_count": {
+            str(count): clustered_interval(margins[count], samples, seed + 91827 + count)
+            for count in PLAYER_COUNTS
+        },
         "solo_gain": sum(differences) / games,
         "solo_ci95": clustered_interval(differences, samples, seed + 88181),
     }
@@ -123,9 +138,11 @@ def gate_accepted(
         and metrics["multiplayer_gain"] >= 0.05
         and metrics["multiplayer_ci95"][0] > 0
         and all(
-            value["candidate_minus_champion"] >= 0
+            value["candidate_minus_champion"] > 0
             for value in multiplayer.values()
         )
+        and set(metrics["multiplayer_ci95_by_count"]) == {"2", "3", "4"}
+        and all(interval[0] > 0 for interval in metrics["multiplayer_ci95_by_count"].values())
         and metrics["solo_gain"] >= 0
         and metrics["solo_ci95"][0] >= -0.03
     )
@@ -148,20 +165,29 @@ def validate_gate_evidence(
         raise ValueError(
             "%s evidence must accept these exact models" % phase
         )
-    if tuple(evidence.get("player_counts", ())) != (2, 3):
+    if (
+        evidence.get("gate_schema_version") != GATE_SCHEMA_VERSION
+        or evidence.get("encoding_version") != ENCODING_VERSION
+        or evidence.get("architecture") != ARCHITECTURE
+    ):
+        raise ValueError("%s evidence requires the current dynamic gate schema" % phase)
+    if tuple(evidence.get("player_counts", ())) != PLAYER_COUNTS:
         raise ValueError(
-            "%s evidence requires two- and three-player results" % phase
+            "%s evidence requires two-, three-, and four-player results" % phase
         )
     rules = evidence.get("rules")
     if not isinstance(rules, dict) or rules.get("recycle_discard") is not True:
         raise ValueError(
             "%s evidence must use discard-recycling rules" % phase
         )
+    game = GameConfig.from_dict(rules)
+    if (game.num_decks, game.cards_in_hand, game.required_sequences, game.max_turns) != (3, 21, 5, 60):
+        raise ValueError("%s evidence requires full21 60-turn rules" % phase)
     multiplayer = evidence.get("multiplayer")
     solo = evidence.get("solo")
     if (
         not isinstance(multiplayer, dict)
-        or set(multiplayer) != {"2", "3"}
+        or set(multiplayer) != {"2", "3", "4"}
         or not isinstance(solo, dict)
     ):
         raise ValueError(
@@ -226,19 +252,34 @@ def validate_gate_evidence(
         seed,
         samples,
     )
-    for name, computed in recomputed.items():
-        declared = evidence[name]
+    pairs_to_check = [
+        (name, evidence.get(name), computed) for name, computed in recomputed.items()
+        if name != "multiplayer_ci95_by_count"
+    ]
+    declared_counts = evidence.get("multiplayer_ci95_by_count")
+    if not isinstance(declared_counts, dict) or set(declared_counts) != {"2", "3", "4"}:
+        raise ValueError("%s evidence needs independent player-count intervals" % phase)
+    pairs_to_check.extend(
+        ("multiplayer_ci95_by_count.%s" % count, declared_counts[count], interval)
+        for count, interval in recomputed["multiplayer_ci95_by_count"].items()
+    )
+    for name, declared, computed in pairs_to_check:
+        if isinstance(computed, list) and (
+            not isinstance(declared, (list, tuple)) or len(declared) != 2
+        ):
+            raise ValueError("%s evidence has invalid %s" % (phase, name))
         pairs = (
             zip(declared, computed)
             if isinstance(computed, list)
             else ((declared, computed),)
         )
         if any(
-            not math.isclose(left, right, abs_tol=1e-12)
+            type(left) not in (int, float) or not math.isfinite(left)
+            or not math.isclose(left, right, abs_tol=1e-12)
             for left, right in pairs
         ):
             raise ValueError(
-                "%s summary disagrees with raw evidence: %s"
+                "%s summary disagrees with raw evidence for %s"
                 % (phase, name)
             )
     if not gate_accepted(

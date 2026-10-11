@@ -9,6 +9,8 @@ from typing import Any, Dict, Optional, Sequence
 
 from src.checkpoints import evidence as gate_evidence
 from src.checkpoints.io import atomic_write_json, file_metadata, file_sha256
+from src.game.environment import ENCODING_VERSION
+from src.model.spec import ARCHITECTURE, CHECKPOINT_VERSION, ModelSpec
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,15 @@ class ModelRegistry:
             or any(character not in "0123456789abcdef" for character in record.sha256)
         ):
             raise ValueError("Invalid model record: %s" % record_id)
+        if (
+            record.metadata.get("architecture") != ARCHITECTURE
+            or record.metadata.get("encoding_version") != ENCODING_VERSION
+            or record.metadata.get("checkpoint_version") != CHECKPOINT_VERSION
+            or set(record.metadata.get("model_spec", {})) != {"width", "heads"}
+            or "state_dim" in record.metadata
+        ):
+            raise ValueError("Model record is not a current dynamic checkpoint; register fresh weights")
+        ModelSpec.from_dict(record.metadata["model_spec"])
         return record
 
     def model_path(self, record_id: str) -> Path:
@@ -94,7 +105,9 @@ class ModelRegistry:
             identifier, digest, filename, origin,
             {
                 "architecture": network.architecture,
-                "state_dim": network.state_dim,
+                "checkpoint_version": CHECKPOINT_VERSION,
+                "encoding_version": ENCODING_VERSION,
+                "model_spec": network.spec.to_dict(),
                 "num_actions": network.num_actions,
                 "game_config": config.to_dict(),
             },

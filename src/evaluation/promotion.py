@@ -10,8 +10,9 @@ from src.checkpoints import evidence
 from src.checkpoints.io import file_sha256
 from src.evaluation.arena import CheckpointPolicy, RandomPolicy, play_match
 from src.evaluation.benchmark import evaluate_games
-from src.game.environment import GameConfig
+from src.game.environment import ENCODING_VERSION, GameConfig
 from src.game.multiplayer import MatchConfig
+from src.model.spec import ARCHITECTURE
 
 
 class GateInterrupted(RuntimeError):
@@ -26,7 +27,7 @@ def evaluate_gate(
     seed_blocks: int,
     solo_games: int,
     max_turns: int = 60,
-    player_counts: Tuple[int, ...] = (2, 3),
+    player_counts: Tuple[int, ...] = (2, 3, 4),
     samples: int = 2000,
     deadline=None,
     recycle_discard: bool = True,
@@ -38,8 +39,8 @@ def evaluate_gate(
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError("%s must be a positive integer" % name)
-    if tuple(player_counts) != (2, 3):
-        raise ValueError("The current promotion gate covers two- and three-player matches")
+    if tuple(player_counts) != evidence.PLAYER_COUNTS:
+        raise ValueError("The current promotion gate requires two-, three-, and four-player matches")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise TypeError("seed must be an integer")
 
@@ -128,13 +129,16 @@ def evaluate_gate(
             seed,
             samples,
         )
-        accepted = evidence.gate_accepted(
+        accepted = max_turns == 60 and recycle_discard and evidence.gate_accepted(
             by_player_count,
             metrics,
             seed_blocks,
             solo_games,
         )
         return {
+            "gate_schema_version": evidence.GATE_SCHEMA_VERSION,
+            "encoding_version": ENCODING_VERSION,
+            "architecture": ARCHITECTURE,
             "candidate_sha256": file_sha256(Path(candidate_path)),
             "champion_sha256": file_sha256(Path(champion_path)),
             "opponent_sha256": [
@@ -144,7 +148,7 @@ def evaluate_gate(
             "seed": seed,
             "seed_blocks": seed_blocks,
             "bootstrap_samples": samples,
-            "seating": "Cyclic rotations with mirrored contender order",
+            "seating": "Cyclic/mirrored 2/3 seats and all 24 four-player permutations",
             "player_counts": list(player_counts),
             "max_turns": max_turns,
             **metrics,
@@ -152,7 +156,7 @@ def evaluate_gate(
             "solo": solo,
             "rules": rules.to_dict(),
             "scope": (
-                "Two-/three-player seat-clustered league gate with "
+                "Two-/three-/four-player seat-clustered league gate with "
                 "ordinary full21 solo retention."
             ),
         }

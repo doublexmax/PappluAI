@@ -8,12 +8,12 @@ from numbers import Real
 import random
 import time
 from typing import List, Optional, Protocol, Sequence, Tuple
+import torch
 
 from src.game.environment import (
     GameConfig,
     Observation,
     Phase,
-    encode_observation,
     legal_action_mask,
 )
 from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv, TerminalSnapshot
@@ -24,7 +24,7 @@ from src.model.network import (
 )
 
 
-EpisodeStep = Tuple[Tuple[float, ...], int, float]
+EpisodeStep = Tuple[Observation, int, float]
 
 
 class Policy(Protocol):
@@ -163,14 +163,13 @@ def play_match(
         observation = env.observe()
         action = policies[seat].act(observation, seat_rngs[seat])
         _check_deadline(deadline)
-        state = encode_observation(observation) if record_trajectories else ()
         next_view = env.step(action)
         reward = float(
             observation.phase is Phase.DISCARD
             and next_view.winner == seat
         )
         if record_trajectories:
-            trajectories[seat].append((state, action, reward))
+            trajectories[seat].append((observation, action, reward))
         action_count += 1
         view = next_view
 

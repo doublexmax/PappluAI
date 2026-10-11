@@ -27,6 +27,7 @@ from src.evaluation.arena import MatchInterrupted
 from src.evaluation.promotion import GateInterrupted, evaluate_gate
 from src.game.environment import ENCODING_VERSION, GameConfig
 from src.model.network import CHECKPOINT_VERSION, build_checkpoint
+from src.model.spec import ARCHITECTURE
 from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
 from src.training.curriculum import (
     STATUS_SCHEMA_VERSION,
@@ -35,7 +36,7 @@ from src.training.curriculum import (
 )
 
 
-IMPROVEMENT_STATE_VERSION = 1
+IMPROVEMENT_STATE_VERSION = 2
 ALGORITHM = "champion_league_mc"
 PHASES = ("training", "selection", "confirmation")
 
@@ -51,7 +52,7 @@ class ImproveConfig:
     solo_games: int = evidence.MIN_SOLO_GAMES
     checkpoint_every: int = 16
     max_turns: int = 60
-    player_counts: Tuple[int, ...] = (2, 3)
+    player_counts: Tuple[int, ...] = (2, 3, 4)
     gate_samples: int = 2_000
     recycle_discard: bool = True
 
@@ -72,27 +73,14 @@ class ImproveConfig:
             require_checkpoint_int(getattr(self, name), name, minimum=1)
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
             raise TypeError("seed must be an int")
-        if self.max_turns != 60:
-            raise ValueError("improvement cycles require 60-turn matches")
-        if (
-            not isinstance(self.player_counts, tuple)
-            or not self.player_counts
-            or any(
-                isinstance(count, bool)
-                or not isinstance(count, int)
-                or count not in (2, 3)
-                for count in self.player_counts
-            )
-        ):
-            raise ValueError("the first promotion scope supports players 2 and 3")
+        if self.player_counts != (2, 3, 4):
+            raise ValueError("promotion requires independent results for players 2/3/4")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ImproveConfig":
-        if isinstance(raw, dict) and set(raw) == set(cls.__dataclass_fields__) - {"recycle_discard"}:
-            raw = {**raw, "recycle_discard": False}
         if not isinstance(raw, dict) or set(raw) != set(cls.__dataclass_fields__):
             raise ValueError("improve_config fields do not match this controller")
         values = dict(raw)
@@ -146,7 +134,7 @@ class ImprovementController:
             baseline_path,
             league_paths,
             config=LeagueConfig(
-                game=GameConfig(max_turns=60, recycle_discard=self.config.recycle_discard),
+                game=GameConfig(max_turns=self.config.max_turns, recycle_discard=self.config.recycle_discard),
                 player_counts=self.config.player_counts,
             ),
             seed=self.config.seed,
@@ -837,7 +825,7 @@ def _research_config(config: ImproveConfig) -> TrainingConfig:
     return TrainingConfig(
         learning_rate=1e-4,
         curriculum_fraction=0.25,
-        max_turns=60,
+        max_turns=config.max_turns,
         replay_capacity=10_000,
         batch_size=64,
         updates_per_episode=4,
@@ -898,6 +886,12 @@ def _initial_evidence(
     if not path.is_file():
         return {}
     result = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        result.get("encoding_version") != ENCODING_VERSION
+        or result.get("checkpoint_version") != CHECKPOINT_VERSION
+        or result.get("architecture") != ARCHITECTURE
+    ):
+        raise ValueError("Initial model evaluation requires the current dynamic schema")
     checkpoint_sha256 = file_sha256(model)
     if result.get("checkpoint_sha256") != checkpoint_sha256:
         raise ValueError("Initial model evaluation belongs to a different checkpoint")
@@ -915,13 +909,10 @@ def _initial_evidence(
         ) != (3, 21, 5, 60)
     ):
         raise ValueError("Initial model evaluation must contain complete ordinary full21 outcomes")
-    label = (
-        "current_solo_reference"
-        if evaluated_rules.recycle_discard == current_recycle_discard
-        else "legacy_solo_reference"
-    )
+    if evaluated_rules.recycle_discard != current_recycle_discard:
+        raise ValueError("Initial model evaluation rules must match the current training rules")
     return {
-        label: {
+        "current_solo_reference": {
             "checkpoint_sha256": checkpoint_sha256,
             "games": games,
             "wins": wins,
@@ -934,7 +925,7 @@ def _initial_evidence(
             "rule_regime": (
                 "discard_recycling"
                 if evaluated_rules.recycle_discard
-                else "legacy_nonrecycling"
+                else "stock_exhaustion"
             ),
         },
     }

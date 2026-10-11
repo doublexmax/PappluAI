@@ -15,7 +15,7 @@ python -m venv .venv
 ```
 
 Command-line entry points live in `src.cli`. They parse `--help` before loading
-PyTorch. Game rules are in `src.game`, networks in `src.model`, training
+PyTorch. Game rules are in `src.game`, the current network is in `src.model`, training
 implementations in `src.training`, evaluation in `src.evaluation`, and
 persistent state operations in `src.checkpoints`.
 
@@ -42,7 +42,8 @@ To fine-tune those weights with fresh optimizer and replay state:
 ## Train and resume full 21-card play
 
 The curriculum trainer defaults to three decks, 21 cards, five required pure
-sequences, discard recycling, a 60-turn limit, and the `suit_conv` network.
+sequences, discard recycling, a 60-turn limit, and the `dynamic_table` network.
+This is a one-player curriculum for the same model that plays multiplayer.
 
 ```powershell
 .\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21
@@ -60,9 +61,19 @@ Resume the exact run and then benchmark its latest model:
 .\.venv\Scripts\python -m src.cli.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
 ```
 
-`src.model.network.load_checkpoint` accepts version 1 and version 2 model
-checkpoints. Historical version 1 checkpoints retain the nonrecycling rule
-when that field is absent.
+Start this architecture with fresh weights in a new output directory.
+Checkpoint version 3, information encoding version 2, and replay version 2
+are the only supported formats. Historical checkpoints, old replay, and old
+registry records fail explicitly. No conversion path remains.
+
+Decision observations retain their complete visible histories.
+The current and initial own hand, public draws and discards, and own stock
+draw faces feed the shared history encoder. Peers' stock faces and hidden
+stock order never enter it. Inference reconstructs history without a cached
+private recurrent state. Replay uses the same collation.
+Checkpoints store one journal per episode and a history-prefix length for each
+decision. Resume validates that each snapshot matches its history prefix and
+restores shared event objects.
 
 ## Run shared-deck arena matches
 
@@ -114,16 +125,23 @@ cases for recovery.
 Only the challenger is updated. The initial model, checkpoint opponents, and
 random policy remain frozen. Copy the generated full-hand model to make the
 opponent snapshot explicit.
+Training defaults to two, three, and four players.
 
 ```powershell
 New-Item -ItemType Directory -Force checkpoints
 Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
-.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --players 2 3 4 --matches 128 --max-seconds 3600 --checkpoint-every 16
 .\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
 ```
 
 League checkpoints are published only at match boundaries and preserve the
 opponent-pool identity, replay, optimizer, counters, and random streams.
+Count and challenger-seat schedules are independent and deterministic.
+Replay samples counts equally before episodes and decisions.
+Resume restores the saved count selection and schedule cursors.
+An explicit count selection must match the saved configuration.
+Starting without `--resume` rejects a directory that already contains a league
+model or state checkpoint. Use a new output directory for a fresh run.
 
 ## Run finite improvement cycles
 
@@ -138,22 +156,37 @@ both candidates, and promotes only through the guarded evidence gate.
 `champion.json` is the sole champion pointer. Registered model snapshots are
 immutable. `status.json` describes the latest stable published state.
 
-## Migrate to discard recycling
+Selection needs at least 32 independent seed blocks for each player count.
+Confirmation needs at least 128 blocks for each count on disjoint seeds.
+Four-player blocks contain all 24 seat permutations.
+Each count needs a positive lower 95% confidence bound.
+The aggregate gain threshold remains 0.05.
+The paired solo retention check still needs 256 games.
 
-The fresh run above already uses discard recycling, so it does not need
-migration. If you own a historical nonrecycling improvement directory, set its
-path explicitly and migrate it into a new directory:
+Keep full 21-card, 60-turn recycling rules for promotion.
+Smaller `--selection-blocks`, `--confirmation-blocks`, and `--solo-games`
+values exercise the workflow but cannot authorize promotion.
+An explicit reduced `--max-turns` cap also cannot promote.
+Fresh random weights or a few updates do not establish trained strength.
+
+## Verify the complete current lifecycle
+
+Use a temporary output directory for a bounded local check.
 
 ```powershell
-$legacyRun = "C:\path\to\historical-nonrecycling-run"
-if (-not (Test-Path "$legacyRun\latest-state.pt")) { throw "latest-state.pt not found" }
-.\.venv\Scripts\python -m src.cli.rule_migration --source $legacyRun --output runs\recycling
+.\.venv\Scripts\python tools\verify_dynamic_model.py --output-dir "$env:TEMP\papplu-dynamic-verification"
 ```
 
-The migration preserves model weights, counters, random streams, and champion
-identity. It clears old-rule replay, optimizer moments, candidates, and
-evaluation evidence. Repeating the command against a completed destination is
-idempotent.
+The script runs full 60-turn legal games at each supported player count.
+Separate one-turn smoke games exercise mixed-count updates, exact full-state
+resume, a rejected improvement cycle, and persisted tournaments and reports.
+The resume check compares an uninterrupted learner's actual matches and updates
+with the checkpoint restored by the CLI.
+Each invocation creates a new timestamped directory, so repeated checks
+preserve earlier artifacts.
+Read `evidence.json` for the commands, exit codes, checkpoint identities, and
+actual output paths. Inspect the provisional rating report without treating
+one deal block as strength evidence.
 
 ## What Training CI checks
 
@@ -165,8 +198,6 @@ resume workflows.
 
 Every pull request runs the `portable` and `training` jobs before merge. Push
 path filters do not affect pull requests and apply only to direct pushes.
-`workflow_dispatch`
-remains available when the complete gate needs to be started manually. Set its
-optional `baseline_ref` input only for a one-off package or serialization
-migration. That separate job compares deterministic model, replay, checkpoint,
-and full-state behavior with the selected baseline and uploads both reports.
+`workflow_dispatch` remains available for a manual run.
+CI uses the current-only verification script instead of old-format
+compatibility comparisons. It uploads lifecycle evidence and reports.

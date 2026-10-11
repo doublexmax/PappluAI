@@ -45,6 +45,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--model must be repeated 2 through 6 times")
     try:
         runtime = load_runtime("src.evaluation.arena")
+        runtime.torch.set_num_threads(1)
     except MissingTrainingDependency as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2

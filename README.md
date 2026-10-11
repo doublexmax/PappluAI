@@ -256,17 +256,46 @@ responsibility:
 
 | Package | Responsibility |
 |---|---|
-| `src.game` | Rules, state encoding, stock handling, and multiplayer state |
-| `src.model` | Network architectures and model checkpoints |
+| `src.game` | Rules, immutable information observations, stock handling, and multiplayer state |
+| `src.model` | Dynamic collation, one history-aware network, and model checkpoints |
 | `src.training` | Replay, optimization, solo, curriculum, league, and improvement training |
-| `src.evaluation` | Benchmarks, policy comparison, arena matches, and promotion gates |
-| `src.checkpoints` | Atomic files, tensor validation, evidence, registries, and rule migration |
+| `src.evaluation` | Benchmarks, arena matches, ratings, and promotion gates |
+| `src.checkpoints` | Atomic files, tensor validation, evidence, and registries |
 
 `src.cli.solo` runs episodic Monte Carlo Q-value regression. It does not use
 DQN, tree search, or genetic algorithms. See [TRAINING.md](TRAINING.md) for a
 fresh-clone walkthrough of every training workflow.
 See [RATINGS.md](RATINGS.md) for persistent multiplayer tournaments,
 point-based placements, uncertainty, and capped-game evidence.
+
+### Current model contract
+
+`dynamic_table` is the only supported architecture. `Observation` contains the
+observer's current hand, public player views, and complete visible event history.
+Seats are relative to the observer. Public stock draws reveal the source and
+hand count, not the face. The observer retains their initial hand and own drawn
+faces after those cards leave their hand.
+
+The network reconstructs history with a shared causal GRU. Shared card features
+and card attention model meld relationships. Relative next-player and
+previous-player relations feed player attention. Each candidate action attends
+to those players and cards before a shared scalar scorer values it.
+The stock action has no hidden drawn-card input.
+
+`src.model.encoding.collate_observations` pads actual player counts and history
+lengths for a batch. Masks exclude padding. There is no fixed opponent slot or
+history window. `ModelSpec` defaults to width 64 and four attention heads.
+Shared policies cache weights, not private recurrent state.
+Replay keeps immutable decision observations and uses the same collation.
+Replay checkpoints store each episode's visible history once, with a prefix
+length for each decision. Resume restores shared immutable events without
+discarding earlier knowledge or exposing later events.
+
+Model checkpoints use checkpoint version 3 and information encoding version 2.
+Replay uses version 2. Loaders reject old models and replay explicitly.
+There is no checkpoint conversion or old architecture selector.
+Historical artifacts can remain on disk, but they cannot seed a current run.
+Fresh weights and tiny updates establish working software, not competitive play.
 
 ### Run a short discard-puzzle smoke test
 
@@ -290,7 +319,7 @@ and replay buffer.
 
 `src.cli.curriculum` trains from scratch when you omit both `--initial-model` and
 `--resume`. The default configuration uses three decks, 21 cards, five pure
-sequences, a 60-turn limit, and the `suit_conv` network.
+sequences, a 60-turn limit, and the same `dynamic_table` network used in multiplayer.
 
 ```powershell
 .\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21
@@ -306,11 +335,11 @@ continue the same run exactly.
 .\.venv\Scripts\python -m src.cli.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
 ```
 
-`src.model.network.load_checkpoint` accepts generated version 1 and version 2 model
-checkpoints. Version 1 uses the `mlp` architecture and the historical
-nonrecycling discard rule when the saved game settings omit
-`recycle_discard`. Version 2 records the architecture and all five game
-settings.
+`src.model.network.load_checkpoint` accepts only current model checkpoints.
+It validates the model spec, tensor keys, shapes, types, and finite values before
+changing a supplied network. Saved game settings must contain all five fields.
+Curriculum is a one-player scenario of the same architecture.
+Its history starts at the actual constructed deal, without the construction target.
 
 ### Compare policies in shared-deck matches
 
@@ -342,6 +371,13 @@ network, Adam state, replay, counters, opponent-pool identity, and random
 number generator states. A pool refresh freezes the new snapshots and keeps
 the replay.
 
+League training defaults to two, three, and four players. Counts cycle
+deterministically. Challenger seats cycle independently within each count.
+`--players 2 3 4` selects the counts explicitly. Replay samples a count first,
+then an episode and decision within that count. Checkpoints retain both
+schedule cursors. Resume preserves saved settings unless you supply a matching
+explicit setting.
+
 ### Run finite improvement cycles
 
 `src.cli.improve` alternates league matches and independent research episodes. It
@@ -353,27 +389,19 @@ then evaluates both candidates against the frozen champion.
 ```
 
 `champion.json` is the only champion authority. Model snapshots are immutable.
-Selection uses at least 32 independent seed blocks. Confirmation uses a fresh
-bank of at least 128 blocks and confirms only the selected nominee. Promotion
-also requires 256 paired solo games. Training updates are stochastic and are
+Selection uses at least 32 independent seed blocks per player count.
+Confirmation uses a fresh bank of at least 128 blocks per count and confirms
+only the selected nominee. Four-player evaluation uses all 24 seat permutations.
+Promotion requires positive lower 95% confidence bounds for each count,
+an aggregate gain of at least 0.05, and 256 paired solo retention games.
+Reduced-cap or undersized smoke evidence cannot promote.
+Training updates are stochastic and are
 not an atomic group, so published metrics need not improve monotonically.
 `status.json` is written last and describes the stable published snapshot.
 
-Current runs already use discard recycling. To migrate a historical
-nonrecycling improvement run, point to its output and use a separate
-destination.
-
-```powershell
-$legacyRun = "C:\path\to\historical-nonrecycling-run"
-if (-not (Test-Path "$legacyRun\latest-state.pt")) { throw "latest-state.pt not found" }
-.\.venv\Scripts\python -m src.cli.rule_migration --source $legacyRun --output runs\recycling
-```
-
-Migration preserves model weights, counters, random number generator states,
-and the champion pointer. It clears replay, Adam moments, pending candidates,
-and old-rule validations. `rule-migration.json` records the transition.
-Re-running against an already migrated destination makes no changes. The
-migration does not compare scores across the two rule regimes.
+New current runs require fresh weights. Old champion conversion and rule
+migration commands are removed. Use a new output directory rather than resume
+an incompatible historical run.
 
 ## Verification
 
@@ -382,7 +410,16 @@ From the repository root, the standard-library test command is:
 ```powershell
 python -m unittest discover -s tests -v
 node --test tests\simulator.test.mjs tests\card_art.test.mjs
+.\.venv\Scripts\python tools\check_training_architecture.py
+.\.venv\Scripts\python tools\verify_dynamic_model.py --output-dir "$env:TEMP\papplu-dynamic-verification"
 ```
+
+The dynamic verification script creates a timestamped output directory.
+It runs legal full 21-card, 60-turn games for two, three, and four players.
+It also checks bounded training, exact resume, current snapshots, and a
+persisted tournament with restart and reporting. `evidence.json` records the
+commands, exit codes, output paths, and strength limitations.
+The shorter lifecycle games use explicit one-turn caps, not promotion evidence.
 
 The tests cover the house rules and compare the evaluator with an independent
 brute-force partition oracle on small hands. Valid results are also checked

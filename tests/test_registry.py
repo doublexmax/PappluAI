@@ -6,13 +6,17 @@ import tempfile
 import unittest
 
 from src.checkpoints.io import atomic_write_json
-from src.checkpoints.evidence import evidence_metrics
+from src.checkpoints.evidence import GATE_SCHEMA_VERSION, evidence_metrics
 from src.checkpoints.registry import ModelRecord, ModelRegistry
 
 
 def install_record(registry, data, origin):
     digest = hashlib.sha256(data).hexdigest()
-    record = ModelRecord(digest[:20], digest, "model-" + digest + ".pt", origin, {}, {}, ())
+    metadata = {
+        "architecture": "dynamic_table", "checkpoint_version": 3, "encoding_version": 2,
+        "model_spec": {"width": 64, "heads": 4},
+    }
+    record = ModelRecord(digest[:20], digest, "model-" + digest + ".pt", origin, metadata, {}, ())
     (registry.root / record.filename).write_bytes(data)
     database = json.loads(registry.path.read_text(encoding="utf-8"))
     database["models"][record.id] = asdict(record)
@@ -36,6 +40,11 @@ def gate_evidence(candidate, champion, blocks, seed):
             "seed_block_margins": margins,
             "games": blocks * 6,
         },
+        "4": {
+            "candidate_minus_champion": margin,
+            "seed_block_margins": margins,
+            "games": blocks * 24,
+        },
     }
     solo = {
         "games": 256,
@@ -48,7 +57,10 @@ def gate_evidence(candidate, champion, blocks, seed):
         "accepted": True,
         "candidate_sha256": candidate.sha256,
         "champion_sha256": champion.sha256,
-        "player_counts": [2, 3],
+        "gate_schema_version": GATE_SCHEMA_VERSION,
+        "encoding_version": 2,
+        "architecture": "dynamic_table",
+        "player_counts": [2, 3, 4],
         "seed_blocks": blocks,
         "seed": seed,
         "bootstrap_samples": 100,
@@ -77,6 +89,34 @@ def evidence(candidate, champion):
 
 
 class TestChampionProtection(unittest.TestCase):
+    def test_old_registry_fast_path_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            record = install_record(registry, b"old", "initial")
+            database = json.loads(registry.path.read_text(encoding="utf-8"))
+            database["models"][record.id]["metadata"] = {"architecture": "mlp", "encoding_version": 1}
+            atomic_write_json(database, registry.path)
+            with self.assertRaisesRegex(ValueError, "current dynamic"):
+                registry.get(record.id)
+
+    def test_four_player_failure_cannot_be_hidden_by_other_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            champion = install_record(registry, b"champion", "initial")
+            candidate = install_record(registry, b"candidate", "league")
+            registry.initialize_champion(champion.id)
+            bad = evidence(candidate, champion)
+            for count, margin in (("2", 0.5), ("3", 0.5), ("4", -0.1)):
+                raw = bad["multiplayer"][count]
+                raw["seed_block_margins"] = [margin] * 128
+                raw["candidate_minus_champion"] = margin
+            bad.update(evidence_metrics(bad["multiplayer"], bad["solo"], 128, bad["seed"], 100))
+            self.assertGreater(bad["multiplayer_gain"], 0.05)
+            self.assertGreater(bad["multiplayer_ci95"][0], 0)
+            with self.assertRaisesRegex(ValueError, "gate did not pass"):
+                registry.promote(candidate.id, champion.id, bad)
+            self.assertEqual(registry.champion().id, champion.id)
+
     def test_atomic_registry_json_rejects_nonfinite_values(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "registry.json"

@@ -27,7 +27,6 @@ from src.game.environment import (
     GameConfig,
     Observation,
     PappluEnv,
-    encode_observation,
 )
 from src.model.network import (
     CHECKPOINT_VERSION,
@@ -39,7 +38,7 @@ from src.model.network import (
     select_random_legal,
 )
 
-EpisodeStep = Tuple[Tuple[float, ...], int, float]
+EpisodeStep = Tuple[Observation, int, float]
 
 
 def run_episode(
@@ -54,7 +53,7 @@ def run_episode(
     steps: List[EpisodeStep] = []
     while not obs.done:
         action = select_action(network, obs, epsilon=epsilon, rng=rng, device=device)
-        state = encode_observation(obs)
+        state = obs
         obs = env.step(action)
         steps.append((state, action, float(obs.last_reward)))
     return steps, obs
@@ -81,7 +80,6 @@ def train(
     eval_episodes: int = 0,
     eval_seed: int = 12345,
     log_every: int = 10,
-    architecture: Optional[str] = None,
     replay_sampling: str = "transition",
 ) -> Dict[str, object]:
     """Train Q via episodic Monte Carlo regression. Returns summary metrics."""
@@ -129,12 +127,9 @@ def train(
             load_path,
             device=torch_device,
             expected_config=config,
-            expected_architecture=architecture,
         )
     else:
-        network = QNetwork(
-            architecture="mlp" if architecture is None else architecture
-        ).to(torch_device)
+        network = QNetwork().to(torch_device)
     if warm_start_fraction and cfg.cards_in_hand < 3:
         raise ValueError("warm starts require at least three cards")
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)

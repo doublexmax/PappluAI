@@ -16,12 +16,11 @@ from unittest import mock
 from src.game.environment import (
     ACTION_DRAW_STOCK,
     NUM_ACTIONS,
-    STATE_DIM,
     GameConfig,
     PappluEnv,
     Phase,
     discard_action,
-    encode_observation,
+    Observation,
 )
 from src.training.curriculum import (
     STATUS_SCHEMA_VERSION,
@@ -116,21 +115,18 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
         self.assertEqual(config.game_config, GameConfig(max_turns=60))
         self.assertTrue(config.recycle_discard)
         self.assertTrue(config.to_dict()["recycle_discard"])
-        self.assertEqual(config.architecture, "suit_conv")
         self.assertEqual(config.curriculum_distances, (1, 2, 4, 8))
         self.assertEqual(config.replay_capacity, 10_000)
         self.assertEqual(config.batch_size, 64)
         self.assertEqual(config.updates_per_episode, 4)
 
-    def test_legacy_config_shape_restores_historical_rule(self):
+    def test_incomplete_training_config_is_rejected(self):
         current = TrainingConfig().to_dict()
         self.assertTrue(TrainingConfig.from_dict(current).recycle_discard)
         legacy = dict(current)
         del legacy["recycle_discard"]
-        restored = TrainingConfig.from_dict(legacy)
-        self.assertFalse(restored.recycle_discard)
-        self.assertFalse(restored.game_config.recycle_discard)
-        self.assertFalse(restored.to_dict()["recycle_discard"])
+        with self.assertRaisesRegex(ValueError, "fields"):
+            TrainingConfig.from_dict(legacy)
 
         missing_other_field = dict(legacy)
         del missing_other_field["max_turns"]
@@ -155,15 +151,22 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
 class TestEpisodeReplayState(unittest.TestCase):
     @staticmethod
     def transition(index, action, target):
-        state = (float(index),) + (0.0,) * (STATE_DIM - 1)
+        env = PappluEnv()
+        state = env.reset(seed=index)
+        if action >= 2:
+            state = env.step(0)
+            action = discard_action(next(face for face, count in enumerate(state.hand) if count))
         return (state, action, target)
 
     def test_roundtrip_preserves_episode_sampling(self):
         replay = EpisodeReplay(capacity=8)
+        env = PappluEnv()
+        first = env.reset(seed=0)
+        second = env.step(1)
         replay.append(
             (
-                self.transition(0, 1, 0.5),
-                self.transition(1, 2, 1.0),
+                (first, 1, 0.5),
+                (second, discard_action(next(i for i, n in enumerate(second.hand) if n)), 1.0),
             )
         )
         replay.append((self.transition(2, 3, 0.25),))
@@ -181,17 +184,21 @@ class TestEpisodeReplayState(unittest.TestCase):
         before = replay.state_dict()
         short = (0.0,)
         wrong_length = (0.0, 1.0)
-        nonfinite = (float("nan"),) + (0.0,) * (STATE_DIM - 1)
-        valid = (0.0,) * STATE_DIM
+        journal = before["episodes"][0]
+        valid, prefix, _action, target = journal["transitions"][0]
+        nonfinite = {**valid, "last_reward": float("nan")}
         bad_states = (
             {**before, "version": 999},
             {**before, "capacity": 5},
-            {**before, "episodes": (((short, 1, 0.0),),)},
-            {**before, "episodes": (((wrong_length, 1, 0.0),),)},
-            {**before, "episodes": (((nonfinite, 1, 0.0),),)},
-            {**before, "episodes": (((valid, True, 0.0),),)},
-            {**before, "episodes": (((valid, NUM_ACTIONS, 0.0),),)},
-            {**before, "episodes": (((valid, 999, 0.0),),)},
+            *(
+                {**before, "episodes": ({
+                    **journal, "transitions": ((snapshot, prefix, action, target),),
+                },)}
+                for snapshot, action in (
+                    (short, 1), (wrong_length, 1), (nonfinite, 1),
+                    (valid, True), (valid, NUM_ACTIONS), (valid, 999),
+                )
+            ),
         )
         for state in bad_states:
             with self.subTest(state=state), self.assertRaises(
@@ -240,36 +247,34 @@ class TestTrainingSession(unittest.TestCase):
             self.assertEqual(left, right)
 
     def test_initial_model_allows_turn_budget_change_only(self):
-        from src.model.network import QNetwork, save_checkpoint
+        from src.model.network import QNetwork, build_checkpoint, save_checkpoint
 
         config = self.small_config()
         with tempfile.TemporaryDirectory() as tmp:
             compatible = os.path.join(tmp, "compatible.pt")
             save_checkpoint(
                 compatible,
-                QNetwork(architecture="suit_conv"),
+                QNetwork(),
                 GameConfig(max_turns=30, recycle_discard=False),
             )
             session = TrainingSession(config, seed=41, initial_model=compatible)
             self.assertEqual(session.config.max_turns, 1)
             self.assertTrue(session.config.recycle_discard)
-            self.assertEqual(session.network.architecture, "suit_conv")
+            self.assertEqual(session.network.architecture, "dynamic_table")
 
             wrong_hand = os.path.join(tmp, "wrong-hand.pt")
             save_checkpoint(
                 wrong_hand,
-                QNetwork(architecture="suit_conv"),
+                QNetwork(),
                 GameConfig(cards_in_hand=18, required_sequences=5),
             )
             with self.assertRaisesRegex(ValueError, "3 decks, 21 cards"):
                 TrainingSession(config, seed=41, initial_model=wrong_hand)
 
             wrong_architecture = os.path.join(tmp, "wrong-architecture.pt")
-            save_checkpoint(
-                wrong_architecture,
-                QNetwork(architecture="mlp"),
-                GameConfig(max_turns=30),
-            )
+            payload = build_checkpoint(QNetwork(), GameConfig(max_turns=30))
+            payload["architecture"] = "mlp"
+            torch.save(payload, wrong_architecture)
             with self.assertRaisesRegex(ValueError, "architecture"):
                 TrainingSession(
                     config, seed=41, initial_model=wrong_architecture
@@ -384,6 +389,7 @@ class TestTrainingSession(unittest.TestCase):
                 self._last_reward = 0.0
                 self._won = False
                 self._warm_start = False
+                self._start_history()
                 return self.observe()
 
         config = self.small_config(
@@ -417,17 +423,20 @@ class TestTrainingSession(unittest.TestCase):
                 )
                 == 1.0
             )
-            state = encode_observation(observation)
+            from src.model.encoding import collate_observations
+            state = observation
             with torch.no_grad():
                 value = network(
-                    torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+                    collate_observations([state], torch.device("cpu"))
                 )[0, action]
             captured.update(state=state, action=action, before=float(value))
             return action
 
         def final_transition(_rng, _batch_size):
-            episode = session.replay.state_dict()["episodes"][0]
-            return [episode[-1]]
+            state = session.replay.state_dict()
+            restored = EpisodeReplay(state["capacity"])
+            restored.load_state_dict(state)
+            return [restored._episodes[0][-1]]
 
         with mock.patch(
             "src.training.curriculum.PappluEnv",
@@ -443,16 +452,14 @@ class TestTrainingSession(unittest.TestCase):
             result = session.run_episode()
 
         with torch.no_grad():
+            from src.model.encoding import collate_observations
             after = session.network(
-                torch.tensor(
-                    captured["state"],
-                    dtype=torch.float32,
-                ).unsqueeze(0)
+                collate_observations([captured["state"]], torch.device("cpu"))
             )[0, captured["action"]]
-        transitions = session.replay.state_dict()["episodes"][0]
+        transitions = session.replay.state_dict()["episodes"][0]["transitions"]
         self.assertEqual(result["source"], "ordinary_full21")
         self.assertTrue(result["won"])
-        self.assertEqual(transitions[-1][2], 1.0)
+        self.assertEqual(transitions[-1][3], 1.0)
         self.assertLess(
             abs(float(after) - 1.0),
             abs(captured["before"] - 1.0),
@@ -504,14 +511,18 @@ class TestTrainingSession(unittest.TestCase):
 
     def test_failed_resume_preserves_torch_rng_and_rejects_invalid_replay(self):
         session = TrainingSession(self.small_config(), seed=41)
+        replay = EpisodeReplay(session.config.replay_capacity)
+        replay.append(((PappluEnv().reset(seed=1), 0, 0.0),))
+        journal = replay.state_dict()["episodes"][0]
+        snapshot, prefix, _action, target = journal["transitions"][0]
         cases = (
-            ((0.0,), 0, "must contain 164 values"),
-            ((0.0,) * STATE_DIM, NUM_ACTIONS, "must be in 0..53"),
+            ((0.0,), 0, "current information schema"),
+            (snapshot, NUM_ACTIONS, "must be in 0..53"),
         )
         for state, action, message in cases:
             payload = copy.deepcopy(session.state_dict())
             payload["replay_state_dict"]["episodes"] = (
-                ((state, action, 0.0),),
+                {**journal, "transitions": ((state, prefix, action, target),)},
             )
             torch.manual_seed(8128)
             before = torch.get_rng_state().clone()
@@ -522,23 +533,15 @@ class TestTrainingSession(unittest.TestCase):
                 TrainingSession.from_state_dict(payload)
             self.assertTrue(torch.equal(torch.get_rng_state(), before))
 
-    def test_legacy_state_shape_roundtrips_as_nonrecycling(self):
+    def test_old_state_config_shape_is_rejected(self):
         config = self.small_config(recycle_discard=False)
         session = TrainingSession(config, seed=41)
         payload = session.state_dict()
         del payload["training_config"]["recycle_discard"]
         del payload["source_trace"]["rules"]["recycle_discard"]
 
-        restored = TrainingSession.from_state_dict(
-            payload,
-            expected_config=config,
-        )
-        self.assertFalse(restored.config.recycle_discard)
-        rewritten = restored.state_dict()
-        self.assertFalse(rewritten["training_config"]["recycle_discard"])
-        self.assertFalse(
-            rewritten["source_trace"]["rules"]["recycle_discard"]
-        )
+        with self.assertRaisesRegex(ValueError, "fields"):
+            TrainingSession.from_state_dict(payload, expected_config=config)
 
     def test_new_state_metadata_names_recycling_rule(self):
         session = TrainingSession(self.small_config(), seed=41)
@@ -790,7 +793,7 @@ class TestTrainingSession(unittest.TestCase):
             }
             for name, episodes in expected_episodes.items():
                 network, game, meta = load_checkpoint(str(output / name))
-                self.assertEqual(network.architecture, "suit_conv")
+                self.assertEqual(network.architecture, "dynamic_table")
                 self.assertEqual(game, session.config.game_config)
                 self.assertEqual(meta["role"], name.removesuffix("-model.pt"))
                 self.assertEqual(meta["episodes"], episodes)

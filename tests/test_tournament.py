@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
-import json
+import os
 from pathlib import Path
+import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -23,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def snapshot(directory, seed):
     torch.manual_seed(seed)
     temporary = directory / ("seed-%d.pt" % seed)
-    save_checkpoint(str(temporary), QNetwork(architecture="suit_conv"), GameConfig(max_turns=1))
+    save_checkpoint(str(temporary), QNetwork(), GameConfig(max_turns=1))
     digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
     temporary.rename(directory / ("model-" + digest + ".pt"))
     return digest
@@ -78,24 +81,43 @@ class TestTournament(unittest.TestCase):
         ]
         log_path = self.directory / "continuous.log"
         log = log_path.open("w", encoding="utf-8")
-        process = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(
+            command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=os.name != "nt",
+        )
         try:
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     self.fail(log_path.read_text(encoding="utf-8"))
-                path = self.root / "standings.json"
+                path = self.root / "ratings.sqlite3"
                 if path.exists():
-                    reports = json.loads(path.read_text(encoding="utf-8"))["reports"]
-                    if reports and reports[0]["completed_blocks"] >= 1:
-                        break
+                    with closing(sqlite3.connect(
+                        path.resolve().as_uri() + "?mode=ro", uri=True,
+                    )) as database:
+                        initialized = database.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+                        ).fetchone()
+                        if initialized and database.execute(
+                            "SELECT COUNT(*) FROM jobs WHERE block=0 AND status='complete'"
+                        ).fetchone()[0] == 2:
+                            break
                 time.sleep(0.05)
             else:
-                self.fail("continuous tournament did not publish a complete block")
+                self.fail("continuous tournament did not persist a complete block")
         finally:
-            process.terminate()
-            process.wait(timeout=5)
-            log.close()
+            try:
+                if process.poll() is None:
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                            check=True, capture_output=True, timeout=10,
+                        )
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+            finally:
+                log.close()
         with RatingStore(self.root / "ratings.sqlite3", read_only=True) as store:
             profile = next(iter(store.protocols()))
             target = len(store.blocks(profile)) + 1

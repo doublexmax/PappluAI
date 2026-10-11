@@ -16,6 +16,7 @@ from src.game.environment import (
 from src.evaluate import NUM_FACES, hand_reward
 from src.game.reward_cache import RewardCache
 from src.game.stock import refill_stock
+from src.game.information import EventKind, InformationJournal, player_views
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ class MultiplayerEnv:
         self._refill_turns: List[int] = []
         self._last_reward = 0.0
         self._reward_cache = RewardCache()
+        self._journal = InformationJournal(config.players)
 
     def reset(self, seed: int) -> MatchView:
         if isinstance(seed, bool) or not isinstance(seed, int):
@@ -121,6 +123,9 @@ class MultiplayerEnv:
         self._discard_draws = [0] * self.config.players
         self._refill_turns = []
         self._last_reward = 0.0
+        self._journal.start(
+            self._hands, self._turns_remaining, len(self._stock), self._discard[-1],
+        )
         return self.view()
 
     def observe(self) -> Observation:
@@ -133,6 +138,8 @@ class MultiplayerEnv:
             turns_remaining=self._turns_remaining[seat],
             stock_remaining=len(self._stock),
             config=self.config.game,
+            players=player_views(self._hands, self._turns_remaining, seat),
+            history=self._journal.observe(seat),
             last_reward=self._last_reward,
             won=self._winner == seat,
             warm_start=False,
@@ -155,16 +162,20 @@ class MultiplayerEnv:
 
         hand = self._hands[self._current_seat]
         if self._phase is Phase.DRAW:
+            offered_top = self._discard[-1] if self._discard else None
             if action == ACTION_DRAW_STOCK:
                 self._refill_stock()
                 card = self._stock.pop()
                 self._stock_draws[self._current_seat] += 1
+                kind = EventKind.DRAW_STOCK
             else:
                 card = self._discard.pop()
                 self._discard_draws[self._current_seat] += 1
+                kind = EventKind.TAKE_DISCARD
             hand[card] += 1
             self._phase = Phase.DISCARD
             self._last_reward = 0.0
+            self._record(kind, face=card, offered_top=offered_top)
             return self.view()
 
         face = action_to_discard_face(action)
@@ -183,16 +194,19 @@ class MultiplayerEnv:
         self._discard.append(face)
         self._turns_remaining[seat] -= 1
         self._last_reward = float(reward)
+        self._record(EventKind.DISCARD, face=face)
         if reward == 1.0:
             self._winner = seat
             self._terminal_reason = "win"
             self._phase = Phase.TERMINAL
+            self._record(EventKind.TERMINAL)
             return self.view()
 
         next_seat = self._next_active_seat(seat)
         if next_seat is None:
             self._terminal_reason = "turns_exhausted"
             self._phase = Phase.TERMINAL
+            self._record(EventKind.TERMINAL)
         else:
             self._refill_stock()
             self._current_seat = next_seat
@@ -236,6 +250,21 @@ class MultiplayerEnv:
                     for remaining in self._turns_remaining
                 )
             )
+            self._record(EventKind.REFILL)
+
+    def _record(
+        self,
+        kind: EventKind,
+        face: Optional[int] = None,
+        offered_top: Optional[int] = None,
+    ) -> None:
+        seat = self._current_seat
+        next_seat = self._next_active_seat(seat)
+        self._journal.record(
+            kind, seat, sum(self._hands[seat]), self._turns_remaining[seat],
+            len(self._stock), seat if next_seat is None else next_seat,
+            face, offered_top,
+        )
 
     def _next_active_seat(self, seat: int) -> Optional[int]:
         for offset in range(1, self.config.players + 1):

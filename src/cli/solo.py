@@ -49,12 +49,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="CPU threads for the small network (default 1).",
     )
     parser.add_argument(
-        "--architecture",
-        choices=("mlp", "wide_mlp", "suit_conv"),
-        default=None,
-        help="Model architecture. A loaded checkpoint supplies the default.",
-    )
-    parser.add_argument(
         "--num-decks",
         type=int,
         help="Decks (default 3, or loaded checkpoint).",
@@ -123,7 +117,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.load and game_settings:
             _, saved_config, _ = runtime.load_checkpoint(
                 args.load,
-                expected_architecture=args.architecture,
             )
             config = runtime.GameConfig(
                 **{**saved_config.to_dict(), **game_settings}
@@ -156,7 +149,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             eval_episodes=args.eval_episodes,
             eval_seed=args.eval_seed,
             log_every=args.log_every,
-            architecture=args.architecture,
         )
     except MissingTrainingDependency as exc:
         print("error: %s" % exc, file=sys.stderr)

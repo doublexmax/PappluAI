@@ -74,10 +74,10 @@ as established competitive evidence.
 The calibration command and its evidence rules are described in
 [TRAINING.md](TRAINING.md#calibrate-multiplayer-draw-limits).
 
-A frozen-pool study selected 60 turns per player for two- and three-player
-games and 30 for four-player games. Those choices were checked against a
-180-turn guard on independent confirmation deals. They are specific to those
-bot snapshots and house rules, not universal human-game limits.
+Earlier frozen-pool cap studies do not establish limits for the new dynamic
+architecture. Its checkpoints use information encoding version 2.
+Current tournament registration rejects old model schemas and old registry
+records. Keep historical evidence separate and use a new root for current models.
 
 Caps below are explicit arguments. Changing a cap creates a separate protocol
 instead of merging incompatible evidence.
@@ -93,7 +93,7 @@ rating is anchored at 1500 by convention, not by comparison with chess players.
 
 ```powershell
 $reference = "replace-with-checkpoint-sha-or-unique-prefix"
-.\.venv\Scripts\python -m src.cli.tournament --root runs\ratings --snapshots runs\improve --cap 2:60 --cap 3:60 --cap 4:30 --reference $reference --continuous --workers 4 --cap-policy weighted-points --cap-weight 0.25
+.\.venv\Scripts\python -m src.cli.tournament --root runs\ratings --snapshots runs\improve --cap 2:60 --cap 3:60 --cap 4:60 --reference $reference --continuous --workers 4 --cap-policy weighted-points --cap-weight 0.25
 ```
 
 To run a bounded campaign instead, replace `--continuous` with `--blocks 128`.
@@ -160,3 +160,6 @@ one-sided results, and experimental cap discounts remain provisional.
 
 This service does not modify model weights or promote a champion. Training
 and protected promotion remain separate from the rating ladder.
+The protected gate evaluates two-, three-, and four-player results
+independently, with all 24 four-player seat permutations.
+Fresh or smoke-trained current models have no established competitive strength.

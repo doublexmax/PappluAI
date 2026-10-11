@@ -19,7 +19,7 @@ def protocol(players=2):
     return {
         "players": players,
         "game": GameConfig(num_decks=3, cards_in_hand=3, required_sequences=1, max_turns=2).to_dict(),
-        "encoding_version": 1, "scoring_version": 1,
+        "encoding_version": 2, "scoring_version": 1,
         "policy": "greedy-v1", "seating_design": "all-permutations-v1", "seed": 41,
     }
 

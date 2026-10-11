@@ -16,7 +16,7 @@ from openskill.models import PlackettLuce
 
 from src.checkpoints.locking import exclusive_writer
 from src.checkpoints.io import atomic_write_json
-from src.game.environment import GameConfig
+from src.game.environment import ENCODING_VERSION, GameConfig
 from src.game.multiplayer import MatchConfig
 
 
@@ -205,6 +205,8 @@ class RatingStore:
         for name in ("encoding_version", "scoring_version"):
             if type(config[name]) is not int or config[name] < 1:
                 raise ValueError("%s must be a positive integer" % name)
+        if config["encoding_version"] != ENCODING_VERSION:
+            raise ValueError("rating protocol requires the current information encoding")
         if type(config["seed"]) is not int or not 0 <= config["seed"] < 2 ** 53:
             raise ValueError("protocol seed must be an exactly representable nonnegative integer")
         if config["policy"] != "greedy-v1" or config["seating_design"] != "all-permutations-v1":
