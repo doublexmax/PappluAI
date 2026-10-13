@@ -90,6 +90,16 @@ refill. A refill does not reset the turn budget.
 
 ## Calibrate multiplayer draw limits
 
+This study measures extra completion probability only. It does not validate
+winners, loser placements, rating rankings, or the provisional capped-game
+weight of 0.25. A supported cap is not evidence that those outcomes agree
+with the guard.
+
+The cap and remaining turn budgets are part of policy observations before
+the cutoff. Matching seeds therefore do not guarantee identical action
+prefixes. The study compares cap-conditioned play, not one fixed trajectory
+truncated at different turns.
+
 Use a directory containing immutable `model-<sha256>.pt` snapshots, such as
 an improvement run's registry. The calibration adds a seeded random baseline.
 The pool must contain enough distinct competitors for the largest table.
@@ -115,6 +125,12 @@ binomial bounds account for the compared caps and table sizes. An incomplete
 or underpowered study does not select a cap, and the largest guard is never
 chosen as a fallback. This is evidence about the frozen model pool, not a
 universal human-game limit.
+
+The default budget is 128 independent blocks per table size. The default
+caps and table sizes make six comparisons. Even with zero extra completions,
+at least 94 complete blocks are needed to bring the upper bound below 5%.
+Explicit smaller budgets remain available for smoke tests and can return
+`insufficient_evidence`.
 
 Workers have coordinator-enforced deadlines. A timeout is an execution failure,
 not a game draw. The command stops on a worker failure and retains completed

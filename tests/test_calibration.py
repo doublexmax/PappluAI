@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import copy
+import io
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from src.checkpoints.locking import exclusive_writer
+from src.cli.calibration import main
 from src.evaluation.calibration import (
     CalibrationConfig,
+    _engine_fingerprint,
     calibration_cases,
     summarize_calibration,
     upper_event_probability,
@@ -69,6 +76,73 @@ class TestCalibrationSchedule(unittest.TestCase):
 
 
 class TestCalibrationEvidence(unittest.TestCase):
+    def test_default_budget_can_support_each_table_size_with_zero_extra_events(self):
+        config = CalibrationConfig()
+        cases = calibration_cases(config, ("a", "b", "c", "d"))
+        records = [completed_record(case) for case in cases]
+        for case, record in zip(cases, records):
+            validate_case_result(record, case)
+        report = summarize_calibration(records, config)
+        self.assertEqual(
+            [(row["players"], row["cap"], row["status"]) for row in report["recommendations"]],
+            [(2, 30, "supported_for_recorded_pool"), (3, 30, "supported_for_recorded_pool"),
+             (4, 30, "supported_for_recorded_pool")],
+        )
+        for row in report["groups"]:
+            if row["cap"] != 120:
+                self.assertAlmostEqual(
+                    row["extra_completion_probability_upper"], 0.03671145359002909, places=15,
+                )
+
+    def test_six_comparison_zero_event_boundary_is_94_blocks(self):
+        for blocks, upper, status, cap in (
+            (93, 0.05017583960091102, "insufficient_evidence", None),
+            (94, 0.04965553295561134, "supported_for_recorded_pool", 30),
+        ):
+            with self.subTest(blocks=blocks):
+                self.assertAlmostEqual(upper_event_probability(0, blocks, 6), upper, places=15)
+                config = CalibrationConfig(blocks=blocks)
+                records = [
+                    completed_record(case)
+                    for case in calibration_cases(config, ("a", "b", "c", "d"))
+                ]
+                report = summarize_calibration(records, config)
+                self.assertEqual(
+                    [(row["players"], row["cap"], row["status"]) for row in report["recommendations"]],
+                    [(2, cap, status), (3, cap, status), (4, cap, status)],
+                )
+
+    def test_winner_reversals_are_accepted_as_completion_only_evidence(self):
+        config = CalibrationConfig(caps=(1, 2), player_counts=(2,), blocks=128)
+        records = [
+            completed_record(case, winner=0 if case.cap == 1 else 1)
+            for case in calibration_cases(config, ("a", "b"))
+        ]
+        report = summarize_calibration(records, config)
+        self.assertEqual(report["recommendations"][0]["cap"], 1)
+        self.assertEqual(report["groups"][0]["extra_completion_blocks"], 0)
+        self.assertEqual(report["selection_rule"]["scope"], "completion_only")
+        self.assertEqual(
+            report["selection_rule"]["not_validated"],
+            ["winner", "placement", "ranking", "capped_game_weight"],
+        )
+        self.assertTrue(report["selection_rule"]["cap_conditions_policy"])
+        self.assertFalse(report["selection_rule"]["identical_action_prefix_guaranteed"])
+
+    def test_both_all_capped_runs_are_accepted_without_any_declarations(self):
+        config = CalibrationConfig(caps=(1, 2), player_counts=(2,), blocks=128)
+        records = [
+            completed_record(case, winner=None)
+            for case in calibration_cases(config, ("a", "b"))
+        ]
+        report = summarize_calibration(records, config)
+        self.assertEqual(
+            [(row["declarations"], row["capped_games"]) for row in report["groups"]],
+            [(0, 128), (0, 128)],
+        )
+        self.assertEqual(report["recommendations"][0]["cap"], 1)
+        self.assertEqual(report["recommendations"][0]["status"], "supported_for_recorded_pool")
+
     def test_one_successful_block_does_not_establish_a_safe_cap(self):
         config = CalibrationConfig(caps=(1, 2), player_counts=(2,), blocks=1)
         cases = calibration_cases(config, ("a", "b"))
@@ -135,6 +209,82 @@ class TestCalibrationEvidence(unittest.TestCase):
             change(broken)
             with self.assertRaises(ValueError):
                 validate_case_result(broken, case)
+
+
+class TestCalibrationCLI(unittest.TestCase):
+    def test_cli_default_matches_a_viable_config_default(self):
+        configs = []
+
+        def run_synthetic(models_dir, output_dir, config):
+            self.assertEqual((models_dir, output_dir), (Path("models"), Path("results")))
+            configs.append(config)
+            records = [
+                completed_record(case)
+                for case in calibration_cases(config, ("a", "b", "c", "d"))
+            ]
+            return {**summarize_calibration(records, config), "execution_complete": True}
+
+        runtime = SimpleNamespace(CalibrationConfig=CalibrationConfig, run_calibration=run_synthetic)
+        with mock.patch("src.cli.calibration.load_runtime", return_value=runtime), mock.patch(
+            "sys.stdout", new_callable=io.StringIO,
+        ) as output:
+            self.assertEqual(main(["--models-dir", "models", "--output-dir", "results"]), 0)
+        self.assertEqual(configs, [CalibrationConfig()])
+        for players in (2, 3, 4):
+            self.assertIn(
+                "%d players: supported_for_recorded_pool, cap=30" % players, output.getvalue(),
+            )
+
+    def test_help_does_not_import_torch(self):
+        script = (
+            "import builtins,runpy,sys;"
+            "real=builtins.__import__;"
+            "builtins.__import__=lambda name,*a,**k: "
+            "(_ for _ in ()).throw(AssertionError('help imported torch')) "
+            "if name=='torch' or name.startswith('torch.') else real(name,*a,**k);"
+            "sys.argv=['src.cli.calibration','--help'];"
+            "runpy.run_module('src.cli.calibration',run_name='__main__')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--blocks", result.stdout)
+
+
+class TestCalibrationProvenance(unittest.TestCase):
+    def test_representation_sources_change_the_stable_engine_fingerprint(self):
+        names = (
+            "evaluate.py", "game/environment.py", "game/multiplayer.py",
+            "game/stock.py", "game/reward_cache.py", "model/network.py",
+            "evaluation/arena.py", "evaluation/calibration.py", "evaluation/execution.py",
+            "game/information.py", "model/encoding.py", "model/spec.py",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "src"
+            for name in names:
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(("source " + name + "\n").encode("utf-8"))
+            with mock.patch(
+                "src.evaluation.calibration.__file__", str(source / "evaluation/calibration.py"),
+            ):
+                baseline = "58642b74469743481577c06ae70ab28105fb109f0d100ec2622a40f9618442fc"
+                self.assertEqual(_engine_fingerprint(), baseline)
+                self.assertEqual(_engine_fingerprint(), baseline)
+                for name, expected in (
+                    ("game/information.py", "9c73b28aa294d5c5d69098e39c8588deb265a5010398d279504f599941a759d9"),
+                    ("model/encoding.py", "6e2b829f80465c141d8ac8cfc0274523a720dea8d9dd5d35b7008feb8dd8defe"),
+                    ("model/spec.py", "f3c6ead3d068a2fd3e0ba02c81da505d3d5a6e39573e1646ad4244a857c4a679"),
+                ):
+                    with self.subTest(name=name):
+                        path = source / name
+                        original = path.read_bytes()
+                        path.write_bytes(original + b"changed\n")
+                        self.assertEqual(_engine_fingerprint(), expected)
+                        path.write_bytes(original)
+                        self.assertEqual(_engine_fingerprint(), baseline)
 
 
 class TestWriterOwnership(unittest.TestCase):

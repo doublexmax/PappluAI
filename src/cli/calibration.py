@@ -16,7 +16,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--caps", type=int, nargs="+", default=[30, 60, 120])
     parser.add_argument("--players", type=int, nargs="+", default=[2, 3, 4])
-    parser.add_argument("--blocks", type=int, default=32)
+    parser.add_argument("--blocks", type=int, default=128)
     parser.add_argument("--seed", type=int, default=9_040_500_000)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--match-seconds", type=float, default=120)

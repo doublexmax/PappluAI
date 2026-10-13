@@ -28,7 +28,7 @@ from src.game.multiplayer import MatchConfig
 class CalibrationConfig:
     caps: Tuple[int, ...] = (30, 60, 120)
     player_counts: Tuple[int, ...] = (2, 3, 4)
-    blocks: int = 32
+    blocks: int = 128
     seed: int = 9_040_500_000
     workers: int = 4
     match_seconds: float = 120.0
@@ -301,12 +301,16 @@ def summarize_calibration(records: list[dict], config: CalibrationConfig) -> dic
         "version": 2, "kind": "draw_limit_calibration",
         "requested_blocks": config.blocks, "completed_games": len(records),
         "selection_rule": {
+            "scope": "completion_only",
             "event": "a paired match gains a declaration under the guard when the candidate cap did not",
             "max_probability": config.max_extra_completion_rate,
             "familywise_confidence": 0.95,
             "method": "one-sided exact binomial upper bound with Bonferroni correction",
             "uncertainty_unit": "independent deal with a randomized lineup and seating",
             "guard_is_not_a_recommendation": True,
+            "not_validated": ["winner", "placement", "ranking", "capped_game_weight"],
+            "cap_conditions_policy": True,
+            "identical_action_prefix_guaranteed": False,
         },
         "groups": rows, "recommendations": decisions,
     }
@@ -315,14 +319,9 @@ def summarize_calibration(records: list[dict], config: CalibrationConfig) -> dic
 def _engine_fingerprint() -> str:
     source = Path(__file__).resolve().parents[1]
     digest = hashlib.sha256()
-    for name in (
-        "evaluate.py", "game/environment.py", "game/multiplayer.py",
-        "game/stock.py", "game/reward_cache.py", "model/network.py",
-        "evaluation/arena.py", "evaluation/calibration.py",
-        "evaluation/execution.py",
-    ):
-        digest.update(name.encode("ascii"))
-        digest.update((source / name).read_bytes())
+    for path in sorted(source.rglob("*.py")):
+        digest.update(path.relative_to(source).as_posix().encode("utf-8"))
+        digest.update(path.read_bytes())
     return digest.hexdigest()
 
 

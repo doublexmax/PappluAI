@@ -71,6 +71,15 @@ as established competitive evidence.
 
 ## Calibrate a cap before using it
 
+Cap calibration tests extra completion probability only. It does not validate
+winners, loser placements, rating rankings, or the provisional capped-game
+weight of 0.25. Runs that always declare different winners, or never declare
+at either cap, can still support the completion-only bound.
+
+The cap is part of policy observations before the cutoff. Matching seeds do
+not guarantee identical action prefixes. The calibration compares
+cap-conditioned play rather than a shared trajectory with different cutoffs.
+
 The calibration command and its evidence rules are described in
 [TRAINING.md](TRAINING.md#calibrate-multiplayer-draw-limits).
 
