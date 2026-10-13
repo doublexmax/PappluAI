@@ -11,6 +11,7 @@ substitute only in melds that do not count toward the pure-sequence quota.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import chain
 from numbers import Integral
 from typing import Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 
@@ -112,9 +113,7 @@ def _subtract(counts: Tuple[int, ...], used: Sequence[int]) -> Tuple[int, ...]:
     return tuple(next_counts)
 
 
-def _wild_faces(joker: int, pure: bool) -> Tuple[int, ...]:
-    if pure:
-        return (joker,)
+def _wild_faces(joker: int) -> Tuple[int, ...]:
     rank = joker % NUM_RANKS
     return tuple(_face(suit, rank) for suit in range(NUM_SUITS))
 
@@ -123,18 +122,15 @@ def _iter_allocations(
     counts: Tuple[int, ...],
     represented: Sequence[int],
     joker: int,
-    pure: bool,
-    require_actual: Optional[int] = None,
 ) -> Iterator[Tuple[int, ...]]:
-    wilds = _wild_faces(joker, pure)
+    wilds = _wild_faces(joker)
     n = len(represented)
     actuals = [0] * n
     pool = list(counts)
 
-    def place(slot: int, used_required: bool) -> Iterator[Tuple[int, ...]]:
+    def place(slot: int) -> Iterator[Tuple[int, ...]]:
         if slot == n:
-            if require_actual is None or used_required:
-                yield tuple(actuals)
+            yield tuple(actuals)
             return
 
         target = represented[slot]
@@ -148,11 +144,10 @@ def _iter_allocations(
         for card in candidates:
             pool[card] -= 1
             actuals[slot] = card
-            next_used = used_required or (require_actual is not None and card == require_actual)
-            yield from place(slot + 1, next_used)
+            yield from place(slot + 1)
             pool[card] += 1
 
-    return place(0, False)
+    return place(0)
 
 
 def _meld_from(
@@ -171,40 +166,23 @@ def _meld_from(
 def _iter_sequences(
     counts: Tuple[int, ...],
     joker: int,
-    pure_only: bool,
-    anchor: Optional[int] = None,
-) -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
+) -> Iterator[Meld]:
     total = sum(counts)
-    wilds = _wild_faces(joker, pure_only)
+    wilds = _wild_faces(joker)
     wild_count = sum(counts[face] for face in wilds)
-    anchor_is_wild = anchor in wilds
     natural = tuple(count > 0 and face not in wilds for face, count in enumerate(counts))
     for represented in _IRREDUCIBLE_SEQUENCES:
         if len(represented) > total:
             continue
-        if anchor is not None and anchor not in represented and not anchor_is_wild:
-            continue
         if len(represented) - sum(natural[face] for face in represented) > wild_count:
             continue
-        for actuals in _iter_allocations(
-            counts, represented, joker, pure_only, require_actual=anchor,
-        ):
-            meld = _meld_from("sequence", actuals, represented, joker)
-            yield meld, _subtract(counts, actuals)
+        for actuals in _iter_allocations(counts, represented, joker):
+            yield _meld_from("sequence", actuals, represented, joker)
 
 
 def _iter_sets(
-    counts: Tuple[int, ...], joker: int, anchor: Optional[int] = None,
-) -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
-    wilds = set(_wild_faces(joker, pure=False))
-    anchor_is_wild = anchor in wilds
-
-    ranks: Sequence[int]
-    if anchor is None or anchor_is_wild:
-        ranks = range(NUM_RANKS)
-    else:
-        ranks = (anchor % NUM_RANKS,)
-
+    counts: Tuple[int, ...], joker: int,
+) -> Iterator[Meld]:
     suit_combos = (
         (0, 1, 2),
         (0, 1, 3),
@@ -213,26 +191,23 @@ def _iter_sets(
         (0, 1, 2, 3),
     )
 
-    for rank in ranks:
+    for rank in range(NUM_RANKS):
         for suits in suit_combos:
             represented = tuple(_face(suit, rank) for suit in suits)
-            if anchor is not None and not anchor_is_wild and anchor not in represented:
-                continue
-            for actuals in _iter_allocations(counts, represented, joker, pure=False, require_actual=anchor):
-                meld = _meld_from("set", actuals, represented, joker)
-                yield meld, _subtract(counts, actuals)
+            for actuals in _iter_allocations(counts, represented, joker):
+                yield _meld_from("set", actuals, represented, joker)
 
 
 def _search(
     counts: Tuple[int, ...],
     pure_needed: int,
     joker: int,
-    memo: Dict[Tuple[Tuple[int, ...], int], Optional[Tuple[Meld, ...]]],
 ) -> Optional[Tuple[Meld, ...]]:
     if sum(counts) < pure_needed * MIN_MELD:
         return None
     faces, options = _compile_meld_options(counts, joker)
     initial = tuple(counts[face] for face in faces)
+    memo: Dict[Tuple[Tuple[int, ...], int], Optional[Tuple[Meld, ...]]] = {}
 
     def visit(state: Tuple[int, ...], needed: int) -> Optional[Tuple[Meld, ...]]:
         key = (state, needed)
@@ -273,7 +248,7 @@ class _MeldOption:
 def _compile_meld_options(
     counts: Tuple[int, ...], joker: int,
 ) -> Tuple[Tuple[int, ...], Tuple[Tuple[_MeldOption, ...], ...]]:
-    wilds = _wild_faces(joker, pure=False)
+    wilds = _wild_faces(joker)
     faces = tuple(sorted(
         (face for face, count in enumerate(counts) if count),
         key=lambda face: (face in wilds, face),
@@ -281,13 +256,7 @@ def _compile_meld_options(
     positions = {face: index for index, face in enumerate(faces)}
     best: Dict[Tuple[Tuple[int, int], ...], Meld] = {}
 
-    def candidates() -> Iterator[Meld]:
-        for meld, _ in _iter_sequences(counts, joker, pure_only=False):
-            yield meld
-        for meld, _ in _iter_sets(counts, joker):
-            yield meld
-
-    for meld in candidates():
+    for meld in chain(_iter_sequences(counts, joker), _iter_sets(counts, joker)):
         used: Dict[int, int] = {}
         for face in meld.cards:
             position = positions[face]
@@ -327,7 +296,7 @@ def evaluate_hand(
     if sum(counts) != target_cards:
         return HandEvaluation(is_valid=False)
 
-    melds = _search(counts, pure_needed, joker_face, {})
+    melds = _search(counts, pure_needed, joker_face)
     if melds is None:
         return HandEvaluation(is_valid=False)
     return HandEvaluation(is_valid=True, melds=melds)

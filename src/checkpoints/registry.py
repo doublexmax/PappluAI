@@ -79,12 +79,16 @@ class ModelRegistry:
         origin: str,
         evidence: Optional[dict] = None,
         parents: Sequence[str] = (),
+        *,
+        expected_sha256: Optional[str] = None,
     ) -> ModelRecord:
         # Registry reads stay Torch-free; registration validates model files.
         from src.model.network import load_checkpoint
 
         source = Path(path)
         digest = file_sha256(source)
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise ValueError("Model source checksum mismatch")
         identifier = digest[:20]
         database = self._read()
         if identifier in database["models"]:

@@ -28,6 +28,9 @@ RATING_PARAMETERS = {
     "mu": 25.0, "sigma": 25.0 / 3, "beta": 25.0 / 6, "kappa": 0.0001,
     "tau": 0.0, "margin": 0.0, "limit_sigma": False, "balance": False,
 }
+_JOB_QUERY = """SELECT j.*,b.seed,p.config,r.raw,r.winner,r.ending
+                FROM jobs j JOIN blocks b ON b.protocol=j.protocol AND b.ordinal=j.block
+                JOIN protocols p ON p.id=j.protocol LEFT JOIN results r ON r.job=j.id"""
 
 
 def _json(value) -> str:
@@ -39,6 +42,18 @@ def _identity(value: str) -> None:
         return
     if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
         raise ValueError("competitor identity must be a checkpoint SHA-256 or random-v1")
+
+
+def _decode_job(row: sqlite3.Row) -> dict:
+    raw = None if row["raw"] is None else {
+        **json.loads(row["raw"]), "winner": row["winner"], "terminal_reason": row["ending"],
+    }
+    return {
+        "id": row["id"], "protocol": row["protocol"], "block": row["block"],
+        "position": row["position"], "seed": row["seed"], "status": row["status"],
+        "participants": json.loads(row["participants"]), "seat_order": json.loads(row["seat_order"]),
+        "config": json.loads(row["config"]), "raw": raw,
+    }
 
 
 def placements(points: Sequence[int], winner: Optional[int], ending: str, cap_policy: str) -> Optional[tuple[int, ...]]:
@@ -287,30 +302,16 @@ class RatingStore:
             clauses.append("j.status IN ('pending','raw')")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self.connection.execute(
-            """SELECT j.*,b.seed,p.config,r.raw,r.winner,r.ending
-               FROM jobs j JOIN blocks b ON b.protocol=j.protocol AND b.ordinal=j.block
-               JOIN protocols p ON p.id=j.protocol LEFT JOIN results r ON r.job=j.id"""
-            + where + " ORDER BY j.protocol,j.block,j.position",
+            _JOB_QUERY + where + " ORDER BY j.protocol,j.block,j.position",
             parameters,
         )
-        result = []
-        for row in rows:
-            raw = None if row["raw"] is None else {
-                **json.loads(row["raw"]), "winner": row["winner"], "terminal_reason": row["ending"],
-            }
-            result.append({
-                "id": row["id"], "protocol": row["protocol"], "block": row["block"],
-                "position": row["position"], "seed": row["seed"], "status": row["status"],
-                "participants": json.loads(row["participants"]), "seat_order": json.loads(row["seat_order"]),
-                "config": json.loads(row["config"]), "raw": raw,
-            })
-        return result
+        return [_decode_job(row) for row in rows]
 
     def _job(self, identity: str) -> dict:
-        row = self.connection.execute("SELECT protocol,block FROM jobs WHERE id=?", (identity,)).fetchone()
+        row = self.connection.execute(_JOB_QUERY + " WHERE j.id=?", (identity,)).fetchone()
         if row is None:
             raise ValueError("unknown tournament job")
-        return next(job for job in self.jobs(row["protocol"], row["block"]) if job["id"] == identity)
+        return _decode_job(row)
 
     def start_attempt(self, identity: str) -> str:
         self._write()

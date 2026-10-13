@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -121,6 +122,53 @@ class TestRatingStore(unittest.TestCase):
         self.assertEqual([job["id"] for job in jobs], [job["id"] for job in self.jobs(profile=profile, lineup=IDENTITIES)])
         with self.assertRaisesRegex(ValueError, "conflicts"):
             self.store.schedule_block(profile, 0, 999, IDENTITIES)
+
+    def test_single_four_player_job_decodes_only_its_row_and_roundtrips_results(self):
+        profile = self.store.ensure_protocol(protocol(4))
+        jobs = self.jobs(profile=profile, lineup=IDENTITIES)
+        job = jobs[11]
+        raw, penalties = evidence(job)
+        with mock.patch("src.evaluation.ratings.json.loads", wraps=json.loads) as decoder:
+            self.assertEqual(self.store.start_attempt(job["id"]), "play")
+        self.assertEqual(decoder.call_count, 3)
+        self.assertEqual(self.store._job(job["id"]), job)
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute("SELECT job,phase,status FROM attempts")],
+            [(job["id"], "play", "running")],
+        )
+        self.assertTrue(self.store.record_raw(job["id"], raw))
+        with mock.patch("src.evaluation.ratings.json.loads", wraps=json.loads) as decoder:
+            self.assertEqual(self.store.start_attempt(job["id"]), "score")
+        self.assertEqual(decoder.call_count, 4)
+        self.assertTrue(self.store.record_scores(job["id"], penalties, 1))
+        expected = {**job, "status": "complete", "raw": raw}
+        self.assertEqual(self.store._job(job["id"]), expected)
+        self.assertEqual(
+            [row["status"] for row in self.store.jobs(profile, 0)],
+            ["complete" if index == 11 else "pending" for index in range(24)],
+        )
+        self.store.close()
+        with RatingStore(self.path, read_only=True) as reader:
+            self.assertEqual(reader._job(job["id"]), expected)
+            self.assertEqual(reader.jobs(profile, 0)[11], expected)
+            scores = reader.connection.execute(
+                "SELECT points,proofs FROM results WHERE job=?", (job["id"],),
+            ).fetchone()
+            self.assertEqual(json.loads(scores["points"]), [penalty["points"] for penalty in penalties])
+            self.assertEqual(
+                json.loads(scores["proofs"]),
+                [{key: value for key, value in penalty.items() if key != "points"} for penalty in penalties],
+            )
+
+    def test_unknown_job_does_not_start_an_attempt(self):
+        job = self.jobs()[0]
+        with self.assertRaisesRegex(ValueError, "unknown tournament job"):
+            self.store.start_attempt("unknown")
+        self.assertEqual(self.store.start_attempt(job["id"]), "play")
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute("SELECT job,phase,status FROM attempts")],
+            [(job["id"], "play", "running")],
+        )
 
     def test_partial_blocks_are_not_published_as_balanced_evidence(self):
         jobs = self.jobs()

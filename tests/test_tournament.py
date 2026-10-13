@@ -2,22 +2,27 @@ from __future__ import annotations
 
 from contextlib import closing
 import hashlib
+import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import torch
 
+from src.checkpoints.io import file_sha256
+from src.checkpoints.registry import ModelRegistry
 from src.evaluation.ratings import RatingStore
-from src.evaluation.tournament import _initialize_worker, choose_lineup, run_tournament
+from src.evaluation.tournament import _execute_job, _initialize_worker, choose_lineup, discover_snapshots, run_tournament
 from src.game.environment import GameConfig
-from src.model.network import QNetwork, save_checkpoint
+from src.model.network import QNetwork, load_checkpoint, save_checkpoint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +35,158 @@ def snapshot(directory, seed):
     digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
     temporary.rename(directory / ("model-" + digest + ".pt"))
     return digest
+
+
+class TestSnapshotDiscovery(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name)
+        self.sources = self.directory / "snapshots"
+        self.sources.mkdir()
+        self.identity = snapshot(self.sources, 81)
+        self.source = self.sources / ("model-" + self.identity + ".pt")
+        self.registry = ModelRegistry(self.directory / "owned")
+        self.store = RatingStore(self.directory / "ratings.sqlite3").__enter__()
+
+    def tearDown(self):
+        self.store.close()
+        self.temporary.cleanup()
+
+    def test_rediscovery_verifies_owned_bytes_once_and_survives_source_deletion(self):
+        discover_snapshots((self.sources,), self.registry, self.store)
+        before = self.store.competitors()
+        owned = self.registry.root / self.source.name
+        hashed = []
+
+        def counted_hash(path):
+            hashed.append(Path(path))
+            return file_sha256(path)
+
+        with mock.patch("src.evaluation.tournament.file_sha256", side_effect=counted_hash), mock.patch(
+            "src.checkpoints.registry.file_sha256", side_effect=counted_hash,
+        ):
+            discover_snapshots((self.sources,), self.registry, self.store)
+        self.assertEqual(hashed, [owned])
+        self.assertEqual(self.store.competitors(), before)
+        self.assertEqual(owned.read_bytes(), self.source.read_bytes())
+        self.source.unlink()
+        discover_snapshots((self.sources,), self.registry, self.store)
+        self.assertEqual(self.store.competitors(), before)
+        self.assertEqual(file_sha256(self.registry.model_path(self.identity[:20])), self.identity)
+        newcomer = snapshot(self.sources, 82)
+        discover_snapshots((self.sources,), self.registry, self.store)
+        self.assertEqual(set(self.store.competitors()), {"random-v1", self.identity, newcomer})
+        self.assertEqual(file_sha256(self.registry.model_path(newcomer[:20])), newcomer)
+
+    def test_duplicate_new_sources_admit_one_verified_snapshot(self):
+        duplicate = self.directory / "duplicate"
+        duplicate.mkdir()
+        shutil.copyfile(self.source, duplicate / self.source.name)
+        hashed = []
+
+        def counted_hash(path):
+            hashed.append(Path(path))
+            return file_sha256(path)
+
+        with mock.patch.object(self.registry, "register", wraps=self.registry.register) as register, mock.patch(
+            "src.evaluation.tournament.file_sha256", side_effect=counted_hash,
+        ), mock.patch("src.checkpoints.registry.file_sha256", side_effect=counted_hash):
+            discover_snapshots((self.sources, duplicate, self.sources), self.registry, self.store)
+        self.assertEqual(register.call_count, 1)
+        self.assertEqual(len(hashed), 2)
+        self.assertEqual(set(self.store.competitors()), {"random-v1", self.identity})
+        self.assertEqual(
+            set(json.loads(self.registry.path.read_text(encoding="utf-8"))["models"]),
+            {self.identity[:20]},
+        )
+        self.assertEqual(self.registry.model_path(self.identity[:20]).read_bytes(), self.source.read_bytes())
+
+    def test_corrupt_or_missing_owned_files_are_not_repaired_from_the_source(self):
+        discover_snapshots((self.sources,), self.registry, self.store)
+        before = self.store.competitors()
+        owned = self.registry.root / self.source.name
+        original = owned.read_bytes()
+        owned.write_bytes(b"corrupted")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            discover_snapshots((self.sources,), self.registry, self.store)
+        self.assertEqual(owned.read_bytes(), b"corrupted")
+        self.assertEqual(self.store.competitors(), before)
+        owned.unlink()
+        for source_present in (True, False):
+            if not source_present:
+                self.source.unlink()
+            with self.subTest(source_present=source_present), self.assertRaises(FileNotFoundError):
+                discover_snapshots((self.sources,), self.registry, self.store)
+            self.assertEqual(self.store.competitors(), before)
+        owned.write_bytes(original)
+        discover_snapshots((self.sources,), self.registry, self.store)
+        self.assertEqual(file_sha256(owned), self.identity)
+
+    def test_new_invalid_filenames_or_checksums_do_not_mutate_ratings(self):
+        before = self.store.competitors()
+        revision = self.store.connection.execute("SELECT revision FROM state").fetchone()[0]
+        for name in ("model-short.pt", "model-" + "0" * 64 + ".pt"):
+            path = self.sources / name
+            path.write_bytes(b"not the named checkpoint")
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "filename|checksum"):
+                discover_snapshots((self.sources,), self.registry, self.store)
+            self.assertEqual(self.store.competitors(), before)
+            self.assertEqual(
+                self.store.connection.execute("SELECT revision FROM state").fetchone()[0], revision,
+            )
+            path.unlink()
+        discover_snapshots((self.sources,), self.registry, self.store)
+        self.assertEqual(set(self.store.competitors()), {"random-v1", self.identity})
+
+    def test_expected_checksum_rejects_source_before_registry_writes(self):
+        before = self.registry.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            self.registry.register(str(self.source), origin="rating", expected_sha256="0" * 64)
+        self.assertEqual(self.registry.path.read_bytes(), before)
+        self.assertEqual({path.name for path in self.registry.root.iterdir()}, {"registry.json"})
+        self.assertEqual(file_sha256(self.source), self.identity)
+
+    def test_arbitrary_source_names_still_register_and_load(self):
+        arbitrary = self.directory / "weights.pt"
+        self.source.rename(arbitrary)
+        record = self.registry.register(str(arbitrary), origin="test")
+        self.assertEqual(record.sha256, self.identity)
+        network, config, _ = load_checkpoint(str(self.registry.model_path(record.id)))
+        self.assertEqual(network.architecture, "dynamic_table")
+        self.assertEqual(config, GameConfig(max_turns=1))
+
+    def test_copy_checksum_still_rejects_changed_bytes(self):
+        copyfile = shutil.copyfile
+
+        def corrupt_copy(source, destination):
+            copyfile(source, destination)
+            Path(destination).write_bytes(b"changed during copy")
+
+        before = self.registry.path.read_bytes()
+        with mock.patch("src.checkpoints.registry.shutil.copyfile", side_effect=corrupt_copy):
+            with self.assertRaisesRegex(ValueError, "snapshot was being copied"):
+                self.registry.register(str(self.source), origin="rating", expected_sha256=self.identity)
+        self.assertEqual(self.registry.path.read_bytes(), before)
+        self.assertFalse((self.registry.root / self.source.name).exists())
+        self.assertEqual(file_sha256(self.source), self.identity)
+
+    def test_loading_an_owned_policy_rechecks_its_checksum(self):
+        discover_snapshots((self.sources,), self.registry, self.store)
+        owned = self.registry.root / self.source.name
+        original = owned.read_bytes()
+        job = {
+            "raw": None, "participants": [self.identity, "random-v1"],
+            "config": {"game": GameConfig(max_turns=1).to_dict()}, "seed": 123,
+        }
+        with mock.patch.dict("src.evaluation.tournament._POLICIES", clear=True):
+            owned.write_bytes(b"corrupted after admission")
+            with self.assertRaisesRegex(ValueError, "tournament-owned model checksum"):
+                _execute_job(job, str(self.registry.root), 30, "0" * 64)
+            owned.write_bytes(original)
+            outcome = _execute_job(job, str(self.registry.root), 30, "0" * 64)
+        self.assertEqual(outcome["phase"], "play")
+        self.assertEqual(outcome["raw"]["seed"], 123)
+        self.assertEqual(outcome["raw"]["seat_turns"], (1, 1))
 
 
 class TestTournament(unittest.TestCase):

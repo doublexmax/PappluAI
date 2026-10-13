@@ -8,6 +8,7 @@ from itertools import combinations
 import math
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import time
@@ -85,18 +86,33 @@ def _source_fingerprint() -> str:
 
 
 def discover_snapshots(sources: Sequence[Path], model_registry: ModelRegistry, store: RatingStore) -> None:
-    store.register_competitor("random-v1", "Random legal", {"kind": "random", "version": 1})
-    paths = set(model_registry.root.glob("model-*.pt"))
+    known = {}
+    for identifier in model_registry._read()["models"]:
+        record = model_registry.get(identifier)
+        known[record.sha256] = record
+    paths = {model_registry.root / record.filename for record in known.values()}
+    paths.update(model_registry.root.glob("model-*.pt"))
     for source in sources:
         source = Path(source)
         if not source.is_dir():
             raise FileNotFoundError(source)
         paths.update(source.glob("model-*.pt"))
+    candidates = {}
     for path in sorted(paths):
-        digest = file_sha256(path)
-        if path.name != "model-" + digest + ".pt":
-            raise ValueError("snapshot filename does not match its checksum: %s" % path)
-        record = model_registry.register(str(path), origin="rating")
+        match = re.fullmatch(r"model-([0-9a-f]{64})\.pt", path.name)
+        if match is None:
+            raise ValueError("snapshot filename must contain its full SHA-256: %s" % path)
+        candidates.setdefault(match.group(1), path)
+    records = []
+    for digest, path in candidates.items():
+        record = known.get(digest)
+        if record is None:
+            record = model_registry.register(str(path), origin="rating", expected_sha256=digest)
+        else:
+            model_registry.model_path(record.id)
+        records.append(record)
+    store.register_competitor("random-v1", "Random legal", {"kind": "random", "version": 1})
+    for record in records:
         store.register_competitor(
             record.sha256,
             "%s %s" % (record.metadata["architecture"], record.sha256[:10]),
