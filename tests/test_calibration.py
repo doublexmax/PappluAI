@@ -213,6 +213,18 @@ class TestCalibrationEvidence(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_case_result(broken, case)
 
+    def test_declaration_requires_a_completed_winner_turn(self):
+        case = calibration_cases(
+            CalibrationConfig(caps=(2,), player_counts=(2,), blocks=1), ("a", "b"),
+        )[0]
+        record = completed_record(case)
+        record["result"].update(
+            winner=0, action_count=0, seat_turns=[0, 0],
+            telemetry={"stock_draws": [0, 0], "discard_draws": [0, 0], "refill_turns": []},
+        )
+        with self.assertRaisesRegex(ValueError, "winning seat"):
+            validate_case_result(record, case)
+
 
 class TestCalibrationCLI(unittest.TestCase):
     def test_cli_default_matches_a_viable_config_default(self):

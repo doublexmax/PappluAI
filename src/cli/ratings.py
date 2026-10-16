@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from typing import Optional, Sequence
 
-from src.cli._runtime import MissingTrainingDependency, load_runtime
+from src.cli._runtime import load_runtime
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -21,13 +21,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         runtime = load_runtime("src.evaluation.ratings")
-    except MissingTrainingDependency as error:
-        print(error, file=sys.stderr)
+        result = runtime.write_rating_report(
+            args.database, args.output, args.reference, args.cap_policy,
+            args.protocol, args.samples, args.seed, args.cap_weight,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError) as error:
+        print("error: %s" % error, file=sys.stderr, flush=True)
         return 2
-    result = runtime.write_rating_report(
-        args.database, args.output, args.reference, args.cap_policy,
-        args.protocol, args.samples, args.seed, args.cap_weight,
-    )
     for report in result["reports"]:
         print("%d players, cap %d, %s" % (
             report["config"]["players"], report["config"]["game"]["max_turns"], report["scope"],

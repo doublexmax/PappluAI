@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import itertools
+from dataclasses import asdict
 import random
 import unittest
 
-from src.evaluate import evaluate_hand, minimum_penalty
+from src.evaluate import evaluate_hand, minimum_penalty, validate_hand_penalty
 from tests.test_evaluate_oracle import group_quality
 
 
@@ -95,6 +96,9 @@ def dealt_hand(randomizer):
 
 class PenaltyTests(unittest.TestCase):
     def assert_witness(self, hand, joker, required, penalty):
+        self.assertEqual(validate_hand_penalty(hand, joker, {
+            **asdict(penalty), "qualifying_sequences": penalty.qualifying_sequences,
+        }, required), penalty)
         covered = [0] * 52
         for meld in penalty.exempt_melds:
             quality = group_quality(tuple(sorted(meld.cards)), joker)
@@ -206,6 +210,16 @@ class PenaltyTests(unittest.TestCase):
             evaluate_hand(hand, card("8s"), required_sequences=2, cards_in_hand=6).is_valid
         )
         self.assertEqual(minimum_penalty(hand, card("8s"), 2).points, 0)
+
+    def test_winner_witness_can_leave_zero_point_cards_only_if_the_hand_declares(self):
+        hand = counts(map(card, "2s 3s 4s Kd Kd Kd".split()))
+        penalty = minimum_penalty(hand, card("Kc"), 1)
+        self.assertEqual(penalty.points, 0)
+        self.assertEqual(penalty.counted_cards, tuple(counts([card("Kd")] * 3)))
+        verified = validate_hand_penalty(hand, card("Kc"), {
+            **asdict(penalty), "qualifying_sequences": penalty.qualifying_sequences,
+        }, 1, declared_winner=True, cards_in_hand=6)
+        self.assertEqual(verified, penalty)
 
     def test_a_tie_reports_the_grouping_that_meets_the_quota(self):
         penalty = score("4h 5h 6h 8s 8s 8s", "8s", 2)

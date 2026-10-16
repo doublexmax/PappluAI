@@ -68,20 +68,12 @@ def persisted_tournament(path: Path) -> dict:
 
 
 def verify(output: Path) -> dict:
-    torch.set_num_threads(1)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = output.resolve() / run_id
     output.mkdir(parents=True)
     evidence = {
         "status": "RUNNING",
         "output_dir": str(output),
-        "python": sys.version, "torch": str(torch.__version__),
-        "openskill": version("openskill"),
-        "platform": platform.platform(), "torch_threads": torch.get_num_threads(),
-        "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-        "source_changes": subprocess.check_output(
-            ["git", "--no-pager", "status", "--short"], cwd=ROOT, text=True,
-        ).splitlines(),
         "commands": [],
         "strength": "Fresh random weights and tiny CPU updates. No competitive strength claim.",
     }
@@ -101,6 +93,18 @@ def verify(output: Path) -> dict:
             raise RuntimeError("%s failed\n%s\n%s" % (name, completed.stdout, completed.stderr))
 
     try:
+        torch.set_num_threads(1)
+        evidence.update({
+            "python": sys.version, "torch": str(torch.__version__),
+            "openskill": version("openskill"),
+            "platform": platform.platform(), "torch_threads": torch.get_num_threads(),
+        })
+        evidence["head"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+        ).strip()
+        evidence["source_changes"] = subprocess.check_output(
+            ["git", "--no-pager", "status", "--short"], cwd=ROOT, text=True,
+        ).splitlines()
         player_counts = (2, 3, 4)
         snapshots = output / "snapshots"
         snapshots.mkdir()

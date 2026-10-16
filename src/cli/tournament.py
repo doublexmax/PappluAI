@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from typing import Optional, Sequence
 
-from src.cli._runtime import MissingTrainingDependency, load_runtime
+from src.cli._runtime import load_runtime
 
 
 def _cap(value: str) -> tuple[int, int]:
@@ -39,16 +39,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("each player count must have exactly one cap")
     try:
         runtime = load_runtime("src.evaluation.tournament")
-    except MissingTrainingDependency as error:
-        print(error, file=sys.stderr)
+        result = runtime.run_tournament(
+            args.root, args.snapshots, dict(args.cap), args.reference,
+            workers=args.workers, blocks=None if args.continuous else args.blocks,
+            max_seconds=args.max_seconds, match_seconds=args.match_seconds,
+            poll_seconds=args.poll_seconds, seed=args.seed,
+            cap_policy=args.cap_policy, cap_weight=args.cap_weight,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError) as error:
+        print("error: %s" % error, file=sys.stderr, flush=True)
         return 2
-    result = runtime.run_tournament(
-        args.root, args.snapshots, dict(args.cap), args.reference,
-        workers=args.workers, blocks=None if args.continuous else args.blocks,
-        max_seconds=args.max_seconds, match_seconds=args.match_seconds,
-        poll_seconds=args.poll_seconds, seed=args.seed,
-        cap_policy=args.cap_policy, cap_weight=args.cap_weight,
-    )
     print("%s: %d scored games, %d awaiting scores, %d failed jobs" % (
         result["phase"], result["scored_games"], result["awaiting_scores"], result["failed_jobs"],
     ))

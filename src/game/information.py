@@ -171,10 +171,22 @@ class InformationHistory:
                 known_hand = list(initial)
                 hand = initial
                 hand_sizes[0] = sum(initial)
-                turns[0] = event.turns_remaining
                 if hand_sizes[0] not in (config.cards_in_hand, config.cards_in_hand + 1):
                     raise ValueError("observation own card history has an invalid initial hand")
-                pending_actor = 0 if hand_sizes[0] == config.cards_in_hand + 1 else None
+                if event.turns_remaining != config.max_turns:
+                    raise ValueError("observation initial turns must equal the configured budget")
+                warm_start = hand_sizes[0] == config.cards_in_hand + 1
+                if warm_start:
+                    if player_count != 1 or event.offered_top is not None:
+                        raise ValueError("observation initial extra card requires a solo warm start")
+                    expected_stock = config.num_decks * NUM_FACES - hand_sizes[0] - 1
+                else:
+                    if event.offered_top is None:
+                        raise ValueError("observation initial ordinary deal requires a discard")
+                    expected_stock = config.num_decks * NUM_FACES - player_count * config.cards_in_hand - 2
+                if event.stock_remaining != expected_stock:
+                    raise ValueError("observation initial stock does not match the deal")
+                pending_actor = 0 if warm_start else None
                 stock = event.stock_remaining
                 discard = () if event.offered_top is None else (event.offered_top,)
             else:

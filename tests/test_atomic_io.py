@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from src.checkpoints.io import atomic_copy, atomic_write_json
+from src.checkpoints.io import atomic_copy, atomic_replace, atomic_write_json
 
 
 class TestAtomicPublication(unittest.TestCase):
@@ -56,6 +56,16 @@ class TestAtomicPublication(unittest.TestCase):
             source.write_bytes(b"immutable checkpoint")
             atomic_copy(source, destination)
             self.assertEqual(destination.read_bytes(), source.read_bytes())
+
+    def test_atomic_replace_publishes_the_stage_and_removes_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "verified.tmp"
+            target = Path(directory) / "model.pt"
+            stage.write_bytes(b"verified checkpoint")
+            target.write_bytes(b"old checkpoint")
+            atomic_replace(stage, target)
+            self.assertEqual(target.read_bytes(), b"verified checkpoint")
+            self.assertFalse(stage.exists())
 
 
 if __name__ == "__main__":

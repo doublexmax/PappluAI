@@ -353,6 +353,8 @@ once per seat. Use `random` for a random legal policy.
 The report records each seat order, winner label, terminal reason, action
 count, and remaining stock. Checkpoint policies load lazily and must match the
 saved deck, hand, and sequence rules.
+Each game's `telemetry` records per-seat stock draws, discard pickups, and
+refill turns.
 
 ### Train a challenger against a frozen league
 
@@ -377,6 +379,13 @@ deterministically. Challenger seats cycle independently within each count.
 then an episode and decision within that count. Checkpoints retain both
 schedule cursors. Resume preserves saved settings unless you supply a matching
 explicit setting.
+
+`--max-turns` sets the per-seat turn budget and defaults to 60.
+`--batch-size` caps replay samples per optimizer update and defaults to 64.
+`--updates-per-match` sets updates after a match with challenger actions and defaults to 4.
+On resume, omit these options to restore their saved values, or supply the same values.
+Changed values for these options, `--players`, or `--seed` fail before checkpoint publication.
+Player counts must be sorted and distinct.
 
 ### Run finite improvement cycles
 

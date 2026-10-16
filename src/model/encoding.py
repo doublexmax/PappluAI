@@ -128,5 +128,5 @@ def collate_observations(
         cards, initial_hand, top, context, player_values, player_mask,
         next_player, previous_player, event_kind, event_face, offered_top,
         event_features, event_actor, history_mask,
-        torch.tensor(lengths, dtype=torch.long),
+        torch.tensor(lengths, dtype=torch.int64, device="cpu"),
     )

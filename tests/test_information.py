@@ -122,6 +122,52 @@ class TestInformationHistory(unittest.TestCase):
             self.assertEqual(obs.players[0].hand_size, sum(obs.hand))
             self.assertEqual(Observation.from_dict(obs.to_dict()), obs)
 
+    def test_initial_history_rejects_consistently_corrupted_reset_state(self):
+        original = self.make_match(players=2).observe().to_dict()
+        wrong_stock = copy.deepcopy(original)
+        wrong_stock["stock_remaining"] -= 1
+        wrong_stock["history"][0]["stock_remaining"] -= 1
+        reduced_turns = copy.deepcopy(original)
+        reduced_turns["turns_remaining"] -= 1
+        reduced_turns["players"][0]["turns_remaining"] -= 1
+        reduced_turns["history"][0]["turns_remaining"] -= 1
+        extra_card = copy.deepcopy(original)
+        cards = list(extra_card["hand"])
+        cards[next(face for face, count in enumerate(cards) if count == 0)] += 1
+        extra_card["hand"] = extra_card["history"][0]["initial_hand"] = tuple(cards)
+        extra_card["players"][0]["hand_size"] += 1
+        extra_card["history"][0]["hand_size"] += 1
+        extra_card["discard_pile"] = ()
+        extra_card["history"][0]["offered_top"] = None
+        extra_card["phase"] = 1
+        for name, corrupted in (
+            ("stock", wrong_stock), ("turns", reduced_turns), ("multiplayer warm start", extra_card),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "initial"):
+                Observation.from_dict(corrupted)
+
+    def test_initial_discard_shape_matches_the_start_type(self):
+        env = PappluEnv(GameConfig(max_turns=5))
+        ordinary = env.reset(17).to_dict()
+        ordinary["discard_pile"] = ()
+        ordinary["history"][0]["offered_top"] = None
+        warm = env.reset_warm_start(17).to_dict()
+        warm["discard_pile"] = (0,)
+        warm["history"][0]["offered_top"] = 0
+        for corrupted in (ordinary, warm):
+            with self.subTest(warm=corrupted["warm_start"]), self.assertRaisesRegex(ValueError, "initial"):
+                Observation.from_dict(corrupted)
+
+    def test_ordinary_start_with_zero_stock_roundtrips(self):
+        env = MultiplayerEnv(MatchConfig(
+            GameConfig(num_decks=1, cards_in_hand=25, required_sequences=1), 2,
+        ))
+        env.reset(73)
+        observation = env.observe()
+        self.assertEqual(observation.stock_remaining, 0)
+        self.assertIsNotNone(observation.discard_top)
+        self.assertEqual(Observation.from_dict(observation.to_dict()), observation)
+
     def test_replay_eviction_does_not_cut_history_or_expose_future_events(self):
         env = self.make_match(players=2)
         replay = EpisodeReplay(2)

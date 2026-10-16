@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
-import os
 from pathlib import Path
 import shutil
 from typing import Any, Dict, Optional, Sequence
 
 from src.checkpoints import evidence as gate_evidence
-from src.checkpoints.io import atomic_write_json, file_metadata, file_sha256
+from src.checkpoints.io import atomic_replace, atomic_write_json, file_metadata, file_sha256
 from src.game.environment import ENCODING_VERSION
 from src.model.spec import ARCHITECTURE, CHECKPOINT_VERSION, ModelSpec
 
@@ -126,7 +125,7 @@ class ModelRegistry:
             shutil.copyfile(source, temporary)
             if file_sha256(temporary) != digest:
                 raise ValueError("Model changed while its snapshot was being copied")
-            os.replace(temporary, destination)
+            atomic_replace(temporary, destination)
         database["models"][identifier] = asdict(record)
         atomic_write_json(database, self.path)
         return record

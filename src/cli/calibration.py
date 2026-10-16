@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from typing import Optional, Sequence
 
-from src.cli._runtime import MissingTrainingDependency, load_runtime
+from src.cli._runtime import load_runtime
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -24,16 +24,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         runtime = load_runtime("src.evaluation.calibration")
-    except MissingTrainingDependency as error:
-        print(error, file=sys.stderr)
+        config = runtime.CalibrationConfig(
+            caps=tuple(args.caps), player_counts=tuple(args.players),
+            blocks=args.blocks, seed=args.seed, workers=args.workers,
+            match_seconds=args.match_seconds,
+            max_extra_completion_rate=args.max_extra_completion_rate,
+        )
+        report = runtime.run_calibration(args.models_dir, args.output_dir, config)
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError) as error:
+        print("error: %s" % error, file=sys.stderr, flush=True)
         return 2
-    config = runtime.CalibrationConfig(
-        caps=tuple(args.caps), player_counts=tuple(args.players),
-        blocks=args.blocks, seed=args.seed, workers=args.workers,
-        match_seconds=args.match_seconds,
-        max_extra_completion_rate=args.max_extra_completion_rate,
-    )
-    report = runtime.run_calibration(args.models_dir, args.output_dir, config)
     for row in report["groups"]:
         print(
             "%d players, cap %d: %d/%d declarations, %d capped, %d games with refills"

@@ -143,9 +143,14 @@ The coordinator publishes:
 
 - `status.json` with activity and completed, pending, and failed job counts.
 - `standings.json` with the selected rating view.
-- `standings-completed-only.json` as the declared-game control.
+- `standings-completed-only.json` with the declared-game control when `--cap-policy` is not `exclude`.
 - `ratings.sqlite3` with immutable schedules, terminal hands, scores, and attempt history.
 - `executions` with source fingerprints, runtime versions, and run settings.
+
+With `--cap-policy exclude`, `standings.json` already contains the completed-only
+control. The coordinator does not refresh the secondary file in that mode.
+After changing cap policy, do not use an older `standings-completed-only.json`
+as the current control.
 
 Generate a separate uncertainty report while the coordinator runs:
 

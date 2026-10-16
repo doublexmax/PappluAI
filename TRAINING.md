@@ -150,12 +150,21 @@ Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
 .\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
 ```
 
+League options have these defaults.
+
+- `--max-turns 60` limits each seat's completed draw-discard turns.
+- `--batch-size 64` caps the replay samples in each optimizer update.
+- `--updates-per-match 4` sets the updates after a match with challenger actions.
+
 League checkpoints are published only at match boundaries and preserve the
 opponent-pool identity, replay, optimizer, counters, and random streams.
 Count and challenger-seat schedules are independent and deterministic.
 Replay samples counts equally before episodes and decisions.
 Resume restores the saved count selection and schedule cursors.
-An explicit count selection must match the saved configuration.
+On resume, omit `--max-turns`, `--batch-size`, and `--updates-per-match` to keep
+their saved values, or supply the same values.
+Changes to those options, `--players`, or `--seed` fail before checkpoint publication.
+Player counts must be sorted and distinct.
 Starting without `--resume` rejects a directory that already contains a league
 model or state checkpoint. Use a new output directory for a fresh run.
 
@@ -204,16 +213,20 @@ Read `evidence.json` for the commands, exit codes, checkpoint identities, and
 actual output paths. Inspect the provisional rating report without treating
 one deal block as strength evidence.
 
-## What Training CI checks
+## What training CI checks
 
 `.github\workflows\training-ci.yml` is a CPU regression gate, not deployment
 automation or a long-running training job. It keeps evaluator and browser
 simulator checks free of PyTorch, verifies CLI help at the optional-dependency
-boundary, runs the focused training tests, and exercises short checkpoint and
-resume workflows.
+boundary, and runs `python -m unittest discover -s tests -v` across the complete
+Python suite.
+The training job then runs `tools/verify_dynamic_model.py` for play, checkpoint
+publication, exact resume, improvement, and persisted ratings verification.
 
 Every pull request runs the `portable` and `training` jobs before merge. Push
 path filters do not affect pull requests and apply only to direct pushes.
 `workflow_dispatch` remains available for a manual run.
 CI uses the current-only verification script instead of old-format
-compatibility comparisons. It uploads lifecycle evidence and reports.
+compatibility comparisons.
+Artifact upload runs even when verification fails.
+It includes `evidence.json`, `rating-report.json`, and `benchmark.json`.

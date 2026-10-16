@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
+from src.cli import calibration as calibration_cli, ratings as ratings_cli, tournament as tournament_cli
+from src.cli._runtime import MissingTrainingDependency
 from src.evaluation.ratings import RatingStore, discounted_posterior, placements, write_rating_report
 from src.game.environment import GameConfig
 
@@ -163,6 +168,103 @@ class TestRatingStore(unittest.TestCase):
             [(job["id"], "play", "running")],
         )
 
+    def test_scores_reject_tampered_witnesses_before_persistence(self):
+        job = self.jobs()[0]
+        raw, penalties = evidence(job)
+        loser = 1 - raw["winner"]
+        penalty = penalties[loser]
+        illegal_sequence = {
+            "kind": "sequence", "cards": [6, 19, 38],
+            "represented_cards": [6, 19, 38], "is_pure": True,
+        }
+        ungated_set = {
+            "kind": "set", "cards": [6, 19, 38],
+            "represented_cards": [6, 19, 32], "is_pure": False,
+        }
+        cases = (
+            ("points only", {"points": 14}),
+            ("wrong points", {**penalty, "points": 13}),
+            ("boolean points", {**penalty, "points": True}),
+            ("missing cards", {**penalty, "counted_cards": hand((6, 19))}),
+            ("extra cards", {**penalty, "counted_cards": hand((6, 6, 19, 38))}),
+            ("wrong sequence count", {**penalty, "qualifying_sequences": 1}),
+            ("illegal meld", {
+                "points": 0, "counted_cards": [0] * 52,
+                "exempt_melds": [illegal_sequence], "qualifying_sequences": 1,
+            }),
+            ("ungated set", {
+                "points": 0, "counted_cards": [0] * 52,
+                "exempt_melds": [ungated_set], "qualifying_sequences": 0,
+            }),
+            ("false purity", {
+                "points": 0, "counted_cards": [0] * 52,
+                "exempt_melds": [{**ungated_set, "is_pure": True}], "qualifying_sequences": 1,
+            }),
+            ("meld card reuse", {
+                "points": 0, "counted_cards": [0] * 52,
+                "exempt_melds": [ungated_set, ungated_set], "qualifying_sequences": 0,
+            }),
+        )
+        for block, (name, corrupted) in enumerate(cases):
+            with self.subTest(name=name):
+                job = self.jobs(block=block)[0]
+                raw, penalties = evidence(job)
+                self.store.start_attempt(job["id"])
+                self.store.record_raw(job["id"], raw)
+                self.store.start_attempt(job["id"])
+                before = self.store.connection.execute("SELECT revision FROM state").fetchone()[0]
+                broken = copy.deepcopy(penalties)
+                broken[1 - raw["winner"]] = corrupted
+                with self.assertRaises(ValueError):
+                    self.store.record_scores(job["id"], broken, 1)
+                self.assertEqual(self.store._job(job["id"])["status"], "raw")
+                self.assertIsNone(self.store.connection.execute(
+                    "SELECT points FROM results WHERE job=?", (job["id"],),
+                ).fetchone()[0])
+                self.assertEqual(
+                    self.store.connection.execute("SELECT revision FROM state").fetchone()[0], before,
+                )
+                self.assertTrue(self.store.record_scores(job["id"], penalties, 1))
+                self.assertEqual(self.store._job(job["id"])["status"], "complete")
+
+    def test_declared_winner_needs_a_declaration_not_just_zero_points(self):
+        job = self.jobs()[0]
+        raw, penalties = evidence(job)
+        winner = raw["winner"]
+        raw["terminal_snapshot"]["hands"][winner] = hand((12, 25, 38))
+        penalties[winner] = {
+            "points": 0, "counted_cards": hand((12, 25, 38)),
+            "exempt_melds": [], "qualifying_sequences": 0,
+        }
+        self.store.start_attempt(job["id"])
+        self.store.record_raw(job["id"], raw)
+        self.store.start_attempt(job["id"])
+        with self.assertRaisesRegex(ValueError, "declaration"):
+            self.store.record_scores(job["id"], penalties, 1)
+        self.assertEqual(self.store._job(job["id"])["status"], "raw")
+
+    def test_unsupported_scores_cannot_be_written_but_historical_protocols_can_be_read(self):
+        historical = {**protocol(), "scoring_version": 2}
+        with self.assertRaisesRegex(ValueError, "scoring version"):
+            self.store.ensure_protocol(historical)
+        self.assertEqual(self.store.protocols(), {self.profile: protocol()})
+        body = json.dumps(historical, sort_keys=True, separators=(",", ":"))
+        identity = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        with self.store.connection:
+            self.store.connection.execute("INSERT INTO protocols VALUES (?,?)", (identity, body))
+        job = self.jobs(profile=identity)[0]
+        raw, penalties = evidence(job)
+        self.store.start_attempt(job["id"])
+        self.store.record_raw(job["id"], raw)
+        self.store.start_attempt(job["id"])
+        with self.assertRaisesRegex(ValueError, "scoring version"):
+            self.store.record_scores(job["id"], penalties, 2)
+        with RatingStore(self.path, read_only=True) as reader:
+            self.assertEqual(reader.protocols()[identity], historical)
+            report = reader.report(identity, IDENTITIES[0], "points")
+            self.assertEqual(report["config"], historical)
+            self.assertEqual(report["completed_blocks"], 0)
+
     def test_partial_blocks_are_not_published_as_balanced_evidence(self):
         jobs = self.jobs()
         complete(self.store, jobs[1])
@@ -293,6 +395,39 @@ class TestRatingStore(unittest.TestCase):
         self.assertIsNone(rows[IDENTITIES[1]]["interval95"])
         self.assertEqual(rows[IDENTITIES[1]]["status"], "anchor")
         self.assertEqual(report, self.store.report(self.profile, IDENTITIES[1], "points", samples=100, seed=94))
+
+    def test_cli_writes_reports_and_formats_boundary_errors(self):
+        self.jobs()
+        self.store.close()
+        before = self.path.read_bytes()
+        output = self.path.parent / "cli-report.json"
+        arguments = [
+            "--database", str(self.path), "--output", str(output), "--reference", IDENTITIES[0],
+            "--cap-policy", "points", "--samples", "0",
+        ]
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(ratings_cli.main(arguments), 0)
+        self.assertIn("2 players, cap 2", stdout.getvalue())
+        self.assertIn("model-1  unrated  pending  games=0 blocks=0 unrated", stdout.getvalue())
+        published = output.read_bytes()
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["reports"][0]["completed_blocks"], 0)
+        self.assertEqual(self.path.read_bytes(), before)
+
+        for module, bad_args in (
+            (ratings_cli, [*arguments, "--samples", "-1"]),
+            (calibration_cli, ["--models-dir", str(self.path.parent), "--output-dir", str(self.path.parent), "--blocks", "0"]),
+            (tournament_cli, ["--root", str(self.path.parent / "out"), "--snapshots", str(self.path.parent / "missing"), "--cap", "2:2", "--reference", IDENTITIES[0]]),
+        ):
+            with self.subTest(command=module.__name__), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                self.assertEqual(module.main(bad_args), 2)
+                self.assertTrue(error.getvalue().startswith("error: "))
+            with self.subTest(command=module.__name__, missing_dep=True), mock.patch.object(
+                module, "load_runtime", side_effect=MissingTrainingDependency("training dependency missing"),
+            ), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                self.assertEqual(module.main(bad_args), 2)
+                self.assertEqual(error.getvalue(), "error: training dependency missing\n")
+        self.assertEqual(output.read_bytes(), published)
+        self.assertEqual(self.path.read_bytes(), before)
 
 
 if __name__ == "__main__":

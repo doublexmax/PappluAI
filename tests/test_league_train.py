@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from collections import Counter
-from src.game.environment import GameConfig
+from src.game.environment import GameConfig, Phase, discard_action
 from src.game.multiplayer import MultiplayerEnv
 from src.training.league import (
     LeagueConfig,
@@ -189,24 +189,43 @@ class TestLeagueSession(unittest.TestCase):
             self.assertEqual(session.total_updates, 0)
             self.assertEqual(len(session.replay), 0)
 
-    def test_opponent_win_overwrites_challenger_terminal_reward_with_zero(self):
+    def test_match_outcome_overwrites_recorded_rewards_with_discounted_targets(self):
+        from types import SimpleNamespace
+
         with tempfile.TemporaryDirectory() as temporary:
             champion = Path(temporary) / "champion.pt"
             self.make_model(champion)
-            session = LeagueSession(
-                str(champion),
-                config=LeagueConfig(
-                    player_counts=(2,),
-                    batch_size=1,
-                    updates_per_match=1,
-                ),
-            )
-            with mock.patch("src.training.league.play_match", side_effect=fake_match):
-                session.train_match()
-                result = session.train_match()
-            self.assertEqual(result["challenger_seat"], 1)
-            newest = session.replay.state_dict()["episodes"][-1]["transitions"]
-            self.assertEqual(newest[-1][3], 0.0)
+            for winner, expected in ((0, [0.5, 1.0]), (1, [0.0, 0.0]), (None, [0.0, 0.0])):
+                with self.subTest(winner=winner):
+                    session = LeagueSession(str(champion), config=LeagueConfig(
+                        game=GameConfig(max_turns=1), player_counts=(2,),
+                        batch_size=1, updates_per_match=1, gamma=0.5,
+                    ))
+
+                    def recorded_match(policies, config, seed, **kwargs):
+                        env = MultiplayerEnv(config)
+                        env.reset(seed)
+                        trajectories = [[] for _ in policies]
+                        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
+                            while not env.view().done:
+                                seat = env.view().current_seat
+                                observation = env.observe()
+                                action = (
+                                    0 if observation.phase is Phase.DRAW
+                                    else discard_action(next(face for face, count in enumerate(observation.hand) if count))
+                                )
+                                trajectories[seat].append((observation, action, 1.0))
+                                env.step(action)
+                        return SimpleNamespace(
+                            seed=seed, winner=winner, trajectories=trajectories,
+                            terminal_reason="turns_exhausted" if winner is None else "win",
+                        )
+
+                    with mock.patch("src.training.league.play_match", side_effect=recorded_match):
+                        result = session.train_match()
+                    self.assertEqual(result["challenger_seat"], 0)
+                    transitions = session.replay.state_dict()["episodes"][-1]["transitions"]
+                    self.assertEqual([step[3] for step in transitions], expected)
 
     def test_changed_opponent_pool_is_rejected_on_resume(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -392,7 +411,7 @@ class TestLeagueCli(unittest.TestCase):
                 self.assertEqual(main([
                     *args, "--players", "2", "3", "4", "--updates-per-match", "1",
                 ]), 0)
-            before = (output / "latest-state.pt").read_bytes()
+            before = {name: (output / name).read_bytes() for name in ("latest-state.pt", "latest-model.pt")}
             for options in (
                 ["--players", "2"], ["--players", "3", "2", "4"],
                 ["--players", "2", "3", "3", "4"], ["--max-turns", "60"],
@@ -404,7 +423,8 @@ class TestLeagueCli(unittest.TestCase):
                 ) as error:
                     self.assertEqual(main([*args, *options]), 2)
                     self.assertIn("resume cannot change", error.getvalue())
-                self.assertEqual((output / "latest-state.pt").read_bytes(), before)
+                    self.assertTrue(error.getvalue().startswith("error: "))
+                self.assertEqual({name: (output / name).read_bytes() for name in before}, before)
 
 
 if __name__ == "__main__":

@@ -56,6 +56,20 @@ class TestDynamicNetwork(unittest.TestCase):
         self.assertEqual(values.shape, (6, 54))
         self.assertTrue(torch.isfinite(values).all())
 
+    def test_history_lengths_stay_on_cpu_with_a_non_cpu_default_device(self):
+        observations = [self.observation(2, 1), self.observation(3, 2)]
+        previous = torch.get_default_device()
+        try:
+            torch.set_default_device("meta")
+            batch = collate_observations(observations, self.device)
+            self.assertEqual(batch.history_lengths.device.type, "cpu")
+            self.assertEqual(batch.history_lengths.tolist(), [3, 5])
+            values = self.network(batch)
+            self.assertEqual(values.shape, (2, 54))
+            self.assertTrue(torch.isfinite(values).all())
+        finally:
+            torch.set_default_device(previous)
+
     def test_training_reduces_selected_action_error_on_a_controlled_batch(self):
         observations = [self.observation(players, turns=10) for players in (2, 3, 4)]
         targets = torch.tensor([1.0, 0.5, 0.0])

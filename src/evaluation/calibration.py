@@ -191,8 +191,8 @@ def validate_case_result(record: dict, case: CalibrationCase) -> None:
     winner = result["winner"]
     reason = result["terminal_reason"]
     if reason == "win":
-        if type(winner) is not int or not 0 <= winner < case.players:
-            raise ValueError("a declaration must identify its winning seat")
+        if type(winner) is not int or not 0 <= winner < case.players or turns[winner] < 1:
+            raise ValueError("a declaration must identify its winning seat after a completed turn")
     elif reason == "turns_exhausted":
         if winner is not None or any(turn != case.cap for turn in turns):
             raise ValueError("a capped match must exhaust every seat without a winner")

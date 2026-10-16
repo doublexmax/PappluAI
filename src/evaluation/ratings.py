@@ -16,6 +16,7 @@ from openskill.models import PlackettLuce
 
 from src.checkpoints.locking import exclusive_writer
 from src.checkpoints.io import atomic_write_json
+from src.evaluate import SCORING_VERSION, validate_hand_penalty
 from src.game.environment import ENCODING_VERSION, GameConfig
 from src.game.multiplayer import MatchConfig
 
@@ -222,6 +223,8 @@ class RatingStore:
                 raise ValueError("%s must be a positive integer" % name)
         if config["encoding_version"] != ENCODING_VERSION:
             raise ValueError("rating protocol requires the current information encoding")
+        if config["scoring_version"] != SCORING_VERSION:
+            raise ValueError("unsupported scoring version")
         if type(config["seed"]) is not int or not 0 <= config["seed"] < 2 ** 53:
             raise ValueError("protocol seed must be an exactly representable nonnegative integer")
         if config["policy"] != "greedy-v1" or config["seating_design"] != "all-permutations-v1":
@@ -397,13 +400,21 @@ class RatingStore:
         job = self._job(identity)
         if job["raw"] is None:
             raise ValueError("cannot score a match that has not completed")
-        if type(scoring_version) is not int or scoring_version != job["config"]["scoring_version"]:
+        if type(scoring_version) is not int or scoring_version != SCORING_VERSION:
+            raise ValueError("unsupported scoring version")
+        if scoring_version != job["config"]["scoring_version"]:
             raise ValueError("scoring version does not match the protocol")
         if len(penalties) != len(job["participants"]):
             raise ValueError("one penalty is required for every participant")
-        points = [penalty["points"] for penalty in penalties]
-        if any(type(point) is not int or not 0 <= point <= 10 * job["config"]["game"]["cards_in_hand"] for point in points):
-            raise ValueError("invalid penalty points")
+        snapshot = job["raw"]["terminal_snapshot"]
+        game = job["config"]["game"]
+        points = [
+            validate_hand_penalty(
+                hand, snapshot["joker"], penalty, game["required_sequences"],
+                declared_winner=seat == job["raw"]["winner"], cards_in_hand=game["cards_in_hand"],
+            ).points
+            for seat, (hand, penalty) in enumerate(zip(snapshot["hands"], penalties))
+        ]
         placements(points, job["raw"]["winner"], job["raw"]["terminal_reason"], "undecided")
         proofs = [{key: value for key, value in penalty.items() if key != "points"} for penalty in penalties]
         old = self.connection.execute("SELECT points,proofs FROM results WHERE job=?", (identity,)).fetchone()

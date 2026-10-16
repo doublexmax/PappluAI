@@ -1,6 +1,7 @@
 from dataclasses import asdict
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -141,6 +142,29 @@ class TestModelRegistration(unittest.TestCase):
         self.assertEqual(self.registry.path.read_bytes(), before)
         self.assertFalse((self.registry.root / ("model-" + self.identity + ".pt")).exists())
         self.assertEqual(file_sha256(self.source), self.identity)
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
+    def test_registration_retries_a_transient_snapshot_sharing_violation(self):
+        destination = self.registry.root / ("model-" + self.identity + ".pt")
+        replace = os.replace
+        blocked = False
+
+        def replace_after_reader(stage, target):
+            nonlocal blocked
+            if Path(target) == destination and not blocked:
+                blocked = True
+                error = PermissionError("snapshot briefly locked")
+                error.winerror = 32
+                raise error
+            replace(stage, target)
+
+        with mock.patch("src.checkpoints.io.os.replace", side_effect=replace_after_reader):
+            record = self.registry.register(str(self.source), origin="rating", expected_sha256=self.identity)
+        self.assertEqual(self.registry.model_path(record.id).read_bytes(), self.source.read_bytes())
+        self.assertEqual(self.registry.get(record.id).sha256, self.identity)
+        self.assertEqual(
+            {path.name for path in self.registry.root.iterdir()}, {"registry.json", destination.name},
+        )
 
 
 class TestChampionProtection(unittest.TestCase):

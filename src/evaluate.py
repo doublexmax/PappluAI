@@ -345,6 +345,95 @@ class HandPenalty:
         return sum(meld.kind == "sequence" and meld.is_pure for meld in self.exempt_melds)
 
 
+def validate_hand_penalty(
+    hand: Sequence[int],
+    joker: int,
+    witness: object,
+    required_sequences: int = 5,
+    *,
+    declared_winner: bool = False,
+    cards_in_hand: int = 21,
+) -> HandPenalty:
+    """Validate a serialized penalty witness without recomputing its optimum."""
+    counts = _parse_hand(hand)
+    joker_face = _parse_joker(joker)
+    quota = _require_nonnegative_integral(required_sequences, "required_sequences")
+    target_cards = _require_positive_integral(cards_in_hand, "cards_in_hand")
+    fields = set(HandPenalty.__dataclass_fields__) | {"qualifying_sequences"}
+    if not isinstance(witness, dict) or not fields <= witness.keys():
+        raise ValueError("penalty witness fields do not match the schema")
+    points = witness["points"]
+    if type(points) is not int or points < 0:
+        raise ValueError("penalty points must be a nonnegative integer")
+    counted = witness["counted_cards"]
+    if (
+        not isinstance(counted, (list, tuple)) or len(counted) != NUM_FACES
+        or any(type(count) is not int or count < 0 for count in counted)
+    ):
+        raise ValueError("penalty counted_cards must contain 52 nonnegative integer counts")
+    raw_melds = witness["exempt_melds"]
+    if not isinstance(raw_melds, (list, tuple)):
+        raise ValueError("penalty exempt_melds must be a sequence")
+    remaining = list(counts)
+    melds = []
+    for raw in raw_melds:
+        if not isinstance(raw, dict) or set(raw) != set(Meld.__dataclass_fields__):
+            raise ValueError("penalty meld fields do not match the schema")
+        actuals, represented = raw["cards"], raw["represented_cards"]
+        if (
+            raw["kind"] not in ("sequence", "set") or type(raw["is_pure"]) is not bool
+            or not isinstance(actuals, (list, tuple))
+            or not isinstance(represented, (list, tuple))
+            or len(actuals) != len(represented) or len(actuals) < MIN_MELD
+            or any(type(face) is not int or not 0 <= face < NUM_FACES
+                   for faces in (actuals, represented) for face in faces)
+        ):
+            raise ValueError("penalty meld has invalid cards or kind")
+        actuals, represented = tuple(actuals), tuple(represented)
+        if raw["kind"] == "sequence":
+            legal = (
+                len({face // NUM_RANKS for face in represented}) == 1
+                and tuple(face % NUM_RANKS for face in represented) in RANK_PATTERNS
+            )
+        else:
+            legal = (
+                len(represented) in (3, 4) and len(set(represented)) == len(represented)
+                and len({face % NUM_RANKS for face in represented}) == 1
+            )
+        if not legal or any(
+            actual != target and actual % NUM_RANKS != joker_face % NUM_RANKS
+            for actual, target in zip(actuals, represented)
+        ):
+            raise ValueError("penalty meld is not legal under the selected joker")
+        meld = _meld_from(raw["kind"], actuals, represented, joker_face)
+        if meld.is_pure != raw["is_pure"]:
+            raise ValueError("penalty meld purity does not match its cards")
+        for face in actuals:
+            remaining[face] -= 1
+            if remaining[face] < 0:
+                raise ValueError("penalty melds exceed the terminal hand")
+        melds.append(meld)
+    penalty = HandPenalty(points, tuple(melds), tuple(counted))
+    qualifying = witness["qualifying_sequences"]
+    if type(qualifying) is not int or qualifying != penalty.qualifying_sequences:
+        raise ValueError("penalty qualifying sequence count does not match its melds")
+    if qualifying < quota and any(not meld.is_pure for meld in melds):
+        raise ValueError("penalty non-pure melds require the qualifying sequence quota")
+    if tuple(remaining) != penalty.counted_cards:
+        raise ValueError("penalty witness does not conserve the terminal hand")
+    if points != sum(_card_points(face, joker_face) * count for face, count in enumerate(remaining)):
+        raise ValueError("penalty points do not match the unmatched cards")
+    if declared_winner and (
+        points != 0 or sum(counts) != target_cards
+        or (
+            (any(remaining) or qualifying < quota)
+            and not evaluate_hand(counts, joker_face, quota, target_cards).is_valid
+        )
+    ):
+        raise ValueError("declared winner needs a valid complete declaration")
+    return penalty
+
+
 def minimum_penalty(
     hand: Sequence[int], joker: int, required_sequences: int = 5,
 ) -> HandPenalty:
