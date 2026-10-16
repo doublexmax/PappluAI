@@ -83,6 +83,41 @@ class TestDynamicNetwork(unittest.TestCase):
         after = torch.nn.functional.mse_loss(self.values(*observations)[:, 0], targets).item()
         self.assertLess(after, before)
 
+    def test_warm_start_training_generalizes_to_unseen_deals(self):
+        config = GameConfig(
+            num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3,
+        )
+        env = PappluEnv(config)
+        transitions = []
+        training_deals = set()
+        for seed in range(64):
+            obs = env.reset_warm_start(seed)
+            training_deals.add((obs.hand, obs.joker))
+            for face, count in enumerate(obs.hand):
+                if count:
+                    env.reset_warm_start(seed)
+                    action = discard_action(face)
+                    transitions.append((obs, action, env.step(action).last_reward))
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=1e-3)
+        rng = random.Random(47)
+        for _ in range(64):
+            train_batch(
+                self.network, optimizer, torch.nn.MSELoss(),
+                rng.sample(transitions, 64), self.device, 1.0,
+            )
+        greedy_wins = 0
+        random_wins = 0
+        evaluation_rng = random.Random(600000)
+        for seed in range(600000, 600100):
+            obs = env.reset_warm_start(seed)
+            self.assertNotIn((obs.hand, obs.joker), training_deals)
+            greedy_wins += env.step(select_greedy_action(self.network, obs)).won
+            obs = env.reset_warm_start(seed)
+            action = select_action(self.network, obs, 1.0, evaluation_rng)
+            random_wins += env.step(action).won
+        self.assertGreaterEqual(greedy_wins, 80)
+        self.assertGreater(greedy_wins, random_wins)
+
     def test_history_and_player_padding_do_not_change_values(self):
         short = self.observation(2, 1)
         long = self.observation(6, 20)
@@ -177,6 +212,32 @@ class TestDynamicNetwork(unittest.TestCase):
         delta = self.values(obs)[0] - self.values(changed)[0]
         self.assertGreater(float(delta.abs().max()), 1e-7)
         self.assertGreater(float(delta[2:].std()), 1e-7)
+
+    def test_suit_permutation_relabels_action_values(self):
+        obs = self.observation(4, 12)
+        suits = (2, 0, 3, 1)
+
+        def face(index):
+            return None if index is None else suits[index // 13] * 13 + index % 13
+
+        def counts(hand):
+            result = [0] * 52
+            for index, count in enumerate(hand):
+                result[face(index)] = count
+            return tuple(result)
+
+        changed = replace(
+            obs, hand=counts(obs.hand), joker=face(obs.joker),
+            discard_pile=tuple(face(index) for index in obs.discard_pile),
+            history=tuple(replace(
+                event, face=face(event.face), offered_top=face(event.offered_top),
+                initial_hand=counts(event.initial_hand) if event.initial_hand else (),
+            ) for event in obs.history),
+        )
+        actions = [0, 1] + [discard_action(face(index)) for index in range(52)]
+        torch.testing.assert_close(
+            self.values(obs), self.values(changed)[:, actions], rtol=1e-5, atol=1e-6,
+        )
 
     def test_model_has_no_stochastic_or_running_inference_state(self):
         obs = self.observation(3, 5)
