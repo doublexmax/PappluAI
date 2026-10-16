@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 import multiprocessing
 from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
 import os
+from pathlib import Path
 import threading
 import time
 from typing import Callable, Generic, Iterable, Iterator, Optional, TypeVar, Union
@@ -13,6 +15,15 @@ from typing import Callable, Generic, Iterable, Iterator, Optional, TypeVar, Uni
 
 Job = TypeVar("Job")
 Result = TypeVar("Result")
+
+
+def source_fingerprint(root: Path | None = None) -> str:
+    source = Path(__file__).resolve().parents[1] if root is None else root
+    digest = hashlib.sha256()
+    for path in sorted(source.rglob("*.py")):
+        digest.update(path.relative_to(source).as_posix().encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)

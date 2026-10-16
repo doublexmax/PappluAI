@@ -37,10 +37,17 @@ class TestAtomicPublication(unittest.TestCase):
     def test_unrelated_permission_errors_are_not_hidden(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "status.json"
-            with mock.patch("src.checkpoints.io.os.replace", side_effect=PermissionError("denied")) as replace:
+            with mock.patch("src.checkpoints.io.os.replace", side_effect=PermissionError("denied")):
                 with self.assertRaises(PermissionError):
                     atomic_write_json({"generation": 1}, path)
-            self.assertEqual(replace.call_count, 1)
+            self.assertFalse(path.exists())
+
+    def test_nonfinite_values_are_not_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "registry.json"
+            with self.assertRaises(ValueError):
+                atomic_write_json({"score": float("nan")}, path)
+            self.assertFalse(path.exists())
 
     def test_atomic_copy_preserves_bytes(self):
         with tempfile.TemporaryDirectory() as directory:

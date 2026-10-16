@@ -17,7 +17,6 @@ from src.game.environment import (
     Phase,
     build_warm_start_deal,
     discard_action,
-    Observation,
     legal_action_mask,
 )
 
@@ -104,15 +103,6 @@ class TestEnvironmentCore(unittest.TestCase):
         before = obs.hand
         env.step(ACTION_DRAW_STOCK)
         self.assertEqual(before, obs.hand)
-
-    def test_information_roundtrip_preserves_initial_knowledge(self):
-        env = PappluEnv(GameConfig(cards_in_hand=6, required_sequences=1, max_turns=5))
-        obs = env.reset(seed=3)
-        restored = Observation.from_dict(obs.to_dict())
-        self.assertEqual(restored, obs)
-        self.assertEqual(restored.history[0].initial_hand, obs.hand)
-        self.assertEqual(restored.players[0].hand_size, 6)
-        self.assertEqual(restored.players[0].next_player, 0)
 
     def test_draw_and_discard_legality(self):
         env = PappluEnv(GameConfig(cards_in_hand=6, required_sequences=1, max_turns=8))
@@ -374,29 +364,6 @@ class TestEnvironmentCore(unittest.TestCase):
         self.assertFalse(legal_action_mask(obs)[ACTION_DRAW_STOCK])
         self.assertTrue(legal_action_mask(obs)[ACTION_TAKE_DISCARD])
 
-    def test_manual_draw_state_refills_before_stock_pop(self):
-        env = PappluEnv(
-            GameConfig(
-                num_decks=1,
-                cards_in_hand=3,
-                required_sequences=1,
-                max_turns=5,
-            )
-        )
-        env.reset(seed=13)
-        env._stock = []
-        env._discard = [7, 8, 9]
-        env._hand = [0] * 52
-        env._hand[0] = env._hand[1] = env._hand[2] = 1
-        env._phase = Phase.DRAW
-
-        self.assertTrue(legal_action_mask(env.observe())[ACTION_DRAW_STOCK])
-        obs = env.step(ACTION_DRAW_STOCK)
-        self.assertEqual(obs.phase, Phase.DISCARD)
-        self.assertEqual(obs.discard_pile, (9,))
-        self.assertEqual(obs.stock_remaining, 1)
-        self.assertEqual(sum(obs.hand), 4)
-
     def test_invalid_stock_source_preserves_rng_and_cards(self):
         env = PappluEnv(
             GameConfig(
@@ -496,8 +463,6 @@ class TestWarmStart(unittest.TestCase):
                 found = True
                 break
         self.assertTrue(found)
-        self.assertEqual(obs.history[0].initial_hand, obs.hand)
-        self.assertEqual(len(obs.history), 1)
 
     def test_warm_start_default_size(self):
         cfg = GameConfig(num_decks=3, cards_in_hand=21, required_sequences=5, max_turns=10)

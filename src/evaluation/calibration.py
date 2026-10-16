@@ -19,8 +19,8 @@ from src.checkpoints.io import atomic_write_json, file_sha256
 from src.checkpoints.locking import exclusive_writer
 from src.checkpoints.registry import ModelRegistry
 from src.evaluation.arena import CheckpointPolicy, MatchInterrupted, Policy, RandomPolicy, play_match
-from src.evaluation.execution import BoundedWorkers, WorkerFailure
-from src.game.environment import GameConfig
+from src.evaluation.execution import BoundedWorkers, WorkerFailure, source_fingerprint
+from src.game.environment import NUM_FACES, GameConfig
 from src.game.multiplayer import MatchConfig
 
 
@@ -163,7 +163,7 @@ def validate_case_result(record: dict, case: CalibrationCase) -> None:
         type(result["seed"]) is not int
         or type(result["action_count"]) is not int
         or type(result["stock_remaining"]) is not int
-        or not 0 <= result["stock_remaining"] <= 156
+        or not 0 <= result["stock_remaining"] <= GameConfig().num_decks * NUM_FACES
     ):
         raise ValueError("invalid scalar calibration counters")
     turns = result["seat_turns"]
@@ -316,15 +316,6 @@ def summarize_calibration(records: list[dict], config: CalibrationConfig) -> dic
     }
 
 
-def _engine_fingerprint() -> str:
-    source = Path(__file__).resolve().parents[1]
-    digest = hashlib.sha256()
-    for path in sorted(source.rglob("*.py")):
-        digest.update(path.relative_to(source).as_posix().encode("utf-8"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
 def _run_calibration(models_dir: Path, output_dir: Path, config: CalibrationConfig) -> dict:
     sources = sorted(Path(models_dir).glob("model-*.pt"))
     if not sources:
@@ -345,7 +336,7 @@ def _run_calibration(models_dir: Path, output_dir: Path, config: CalibrationConf
         "caps": list(config.caps), "player_counts": list(config.player_counts),
         "blocks": config.blocks, "seed": config.seed, "policies": identities,
         "rules": GameConfig().to_dict(),
-        "engine_sha256": _engine_fingerprint(), "torch_version": str(torch.__version__),
+        "engine_sha256": source_fingerprint(), "torch_version": str(torch.__version__),
         "max_extra_completion_rate": config.max_extra_completion_rate,
     }
     del protocol["rules"]["max_turns"]

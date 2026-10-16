@@ -10,7 +10,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from src.checkpoints.tensor import validate_model_state
 from src.game.environment import (
-    ENCODING_VERSION, NUM_ACTIONS, GameConfig, Observation, legal_action_mask,
+    ENCODING_VERSION, NUM_ACTIONS, NUM_FACES, GameConfig, Observation, legal_action_mask,
 )
 from src.game.information import EventKind
 from src.model.encoding import (
@@ -56,7 +56,7 @@ class QNetwork(nn.Module):
         device = batch.cards.device
         width = self.spec.width
         size = batch.cards.shape[0]
-        faces = torch.arange(52, device=device)
+        faces = torch.arange(NUM_FACES, device=device)
         base_cards = self.face_embedding(
             self.rank_embedding(faces % 13) + self.suit_embedding(faces // 13)
         )
@@ -66,7 +66,7 @@ class QNetwork(nn.Module):
         suit_rows = torch.cat((suit_rows, suit_rows[:, :, :1]), dim=2)
         local = torch.relu(self.card_conv(suit_rows)).transpose(1, 2)
         ace = 0.5 * (local[:, 0] + local[:, 13])
-        local = torch.cat((ace[:, None, :], local[:, 1:13]), dim=1).reshape(size, 52, width)
+        local = torch.cat((ace[:, None, :], local[:, 1:13]), dim=1).reshape(size, NUM_FACES, width)
         cards = cards + local
         interactions, _ = self.card_attention(cards, cards, cards, need_weights=False)
         cards = self.card_norm(cards + interactions)
@@ -120,10 +120,10 @@ class QNetwork(nn.Module):
         players = self.player_norm(players + relations)
 
         top_cards = cards.gather(
-            1, batch.top.clamp_max(51)[:, None, None].expand(-1, 1, width),
-        ) * (batch.top < 52)[:, None, None]
+            1, batch.top.clamp_max(NUM_FACES - 1)[:, None, None].expand(-1, 1, width),
+        ) * (batch.top < NUM_FACES)[:, None, None]
         action_cards = torch.cat((cards.new_zeros(size, 1, width), top_cards, cards), dim=1)
-        action_kinds = torch.tensor([0, 1] + [2] * 52, device=device)
+        action_kinds = torch.tensor([0, 1] + [2] * NUM_FACES, device=device)
         actions = self.action_query(torch.cat((
             action_cards,
             self.action_embedding(action_kinds)[None, :, :].expand(size, -1, -1),

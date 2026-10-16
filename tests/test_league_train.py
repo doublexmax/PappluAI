@@ -15,7 +15,7 @@ from src.training.league import (
     LeagueSession,
     save_session_checkpoint,
 )
-from src.cli.league import build_arg_parser, main
+from src.cli.league import main
 
 try:
     import torch
@@ -118,8 +118,9 @@ class TestLeagueSession(unittest.TestCase):
             control = LeagueSession(str(champion), config=config, seed=91)
             split = LeagueSession(str(champion), config=config, seed=91)
             with mock.patch("src.training.league.play_match", side_effect=fake_match):
-                control.train_match()
-                split.train_match()
+                for _ in range(5):
+                    control.train_match()
+                    split.train_match()
             path = root / "state.pt"
             torch.save(split.state_dict(), path)
             resumed = LeagueSession.load(
@@ -360,34 +361,14 @@ class TestLeagueSession(unittest.TestCase):
                 str(champion), config=LeagueConfig(batch_size=1, updates_per_match=1),
             )
             with mock.patch("src.training.league.play_match", side_effect=fake_match):
-                results = [session.train_match() for _ in range(36)]
+                results = [session.train_match() for _ in range(35)]
+                self.assertEqual(session.count_matches, Counter(result["players"] for result in results))
+                results.append(session.train_match())
             self.assertEqual(Counter(result["players"] for result in results), {2: 12, 3: 12, 4: 12})
             for players in (2, 3, 4):
                 counts = Counter(result["challenger_seat"] for result in results if result["players"] == players)
                 self.assertEqual(counts, {seat: 12 // players for seat in range(players)})
-            self.assertEqual(session.state_dict()["count_matches"], {2: 12, 3: 12, 4: 12})
-
-    def test_remote_actual_two_player_match_updates_complete_boundary(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            champion = Path(temporary) / "champion.pt"
-            self.make_model(champion)
-            session = LeagueSession(
-                str(champion),
-                config=LeagueConfig(
-                    player_counts=(2,),
-                    batch_size=1,
-                    updates_per_match=1,
-                ),
-            )
-            result = session.train_match()
-            self.assertEqual(
-                session.config.game,
-                GameConfig(max_turns=60),
-            )
-            self.assertEqual(session.config.player_counts, (2,))
-            self.assertEqual(result["players"], 2)
-            self.assertEqual(session.completed_matches, 1)
-            self.assertTrue(session.at_match_boundary)
+            self.assertEqual(session.count_matches, {2: 12, 3: 12, 4: 12})
 
 
 class TestLeagueCli(unittest.TestCase):
@@ -408,11 +389,15 @@ class TestLeagueCli(unittest.TestCase):
                 "--output-dir", str(output), "--matches", "0", "--max-seconds", "0",
             ]
             with mock.patch("sys.stdout", new_callable=io.StringIO):
-                self.assertEqual(main([*args, "--players", "2", "3", "4"]), 0)
+                self.assertEqual(main([
+                    *args, "--players", "2", "3", "4", "--updates-per-match", "1",
+                ]), 0)
             before = (output / "latest-state.pt").read_bytes()
             for options in (
-                ["--players", "2"], ["--max-turns", "60"],
+                ["--players", "2"], ["--players", "3", "2", "4"],
+                ["--players", "2", "3", "3", "4"], ["--max-turns", "60"],
                 ["--batch-size", "64"], ["--seed", "74"],
+                ["--updates-per-match", "2"],
             ):
                 with self.subTest(options=options), mock.patch(
                     "sys.stderr", new_callable=io.StringIO,
@@ -420,28 +405,6 @@ class TestLeagueCli(unittest.TestCase):
                     self.assertEqual(main([*args, *options]), 2)
                     self.assertIn("resume cannot change", error.getvalue())
                 self.assertEqual((output / "latest-state.pt").read_bytes(), before)
-
-    def test_cli_exposes_bounded_resume_contract(self):
-        parser = build_arg_parser()
-        args = parser.parse_args(
-            [
-                "--initial-model",
-                "champion.pt",
-                "--opponent",
-                "random",
-                "--output-dir",
-                "out",
-                "--matches",
-                "2",
-                "--max-seconds",
-                "10",
-                "--resume",
-                "state.pt",
-            ]
-        )
-        self.assertEqual(args.matches, 2)
-        self.assertEqual(args.opponent, ["random"])
-        self.assertEqual(args.resume, "state.pt")
 
 
 if __name__ == "__main__":

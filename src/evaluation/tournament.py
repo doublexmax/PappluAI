@@ -20,7 +20,7 @@ from src.checkpoints.io import atomic_write_json, file_sha256
 from src.checkpoints.registry import ModelRegistry
 from src.evaluate import SCORING_VERSION, minimum_penalty
 from src.evaluation.arena import CheckpointPolicy, Policy, RandomPolicy, play_match
-from src.evaluation.execution import BoundedWorkers, WorkerFailure
+from src.evaluation.execution import BoundedWorkers, WorkerFailure, source_fingerprint
 from src.evaluation.ratings import CAP_POLICIES, RatingStore
 from src.game.environment import ENCODING_VERSION, GameConfig
 from src.game.multiplayer import MatchConfig
@@ -34,7 +34,7 @@ class TournamentPaused(RuntimeError):
 
 
 def _initialize_worker(expected_source: str) -> None:
-    if _source_fingerprint() != expected_source:
+    if source_fingerprint() != expected_source:
         raise RuntimeError("worker source changed; use the original frozen source or begin a new execution")
     torch.set_num_threads(1)
     _POLICIES.clear()
@@ -74,15 +74,6 @@ def _execute_job(job: dict, models_dir: str, match_seconds: float, source_sha256
         raise RuntimeError("tournament match omitted its terminal snapshot")
     raw["source_sha256"] = source_sha256
     return {"phase": "play", "raw": raw}
-
-
-def _source_fingerprint() -> str:
-    source = Path(__file__).resolve().parents[1]
-    digest = hashlib.sha256()
-    for path in sorted(source.rglob("*.py")):
-        digest.update(path.relative_to(source).as_posix().encode("utf-8"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
 
 
 def discover_snapshots(sources: Sequence[Path], model_registry: ModelRegistry, store: RatingStore) -> None:
@@ -221,7 +212,7 @@ def run_tournament(
             })
             for players, cap in sorted(caps.items())
         ]
-        source_sha256 = _source_fingerprint()
+        source_sha256 = source_fingerprint()
         atomic_write_json({
             "source_sha256": source_sha256, "python_version": sys.version,
             "torch_version": str(torch.__version__), "started_unix_time": time.time(),

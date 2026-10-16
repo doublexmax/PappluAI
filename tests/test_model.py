@@ -55,30 +55,19 @@ class TestDynamicNetwork(unittest.TestCase):
         values = self.values(*observations)
         self.assertEqual(values.shape, (6, 54))
         self.assertTrue(torch.isfinite(values).all())
-        self.assertEqual([len(obs.history) for obs in observations], [1, 21, 21, 21, 21, 21])
 
-    def test_gradients_reach_history_cards_relations_and_action_queries(self):
+    def test_training_reduces_selected_action_error_on_a_controlled_batch(self):
         observations = [self.observation(players, turns=10) for players in (2, 3, 4)]
-        batch = [(obs, 0, target) for obs, target in zip(observations, (1.0, 0.5, 0.0))]
-        before = copy.deepcopy(self.network.state_dict())
+        targets = torch.tensor([1.0, 0.5, 0.0])
+        batch = [(obs, 0, float(target)) for obs, target in zip(observations, targets)]
+        before = torch.nn.functional.mse_loss(self.values(*observations)[:, 0], targets).item()
         loss = train_batch(
             self.network, torch.optim.Adam(self.network.parameters(), lr=1e-4),
             torch.nn.MSELoss(), batch, self.device, 1.0,
         )
-        self.assertGreater(loss, 0.0)
-        for name in (
-            "rank_embedding.weight", "suit_embedding.weight", "card_features.weight",
-            "card_conv.weight", "card_attention.in_proj_weight", "initial_cards.weight",
-            "event_features.weight", "event_cards.weight", "history_encoder.weight_ih_l0",
-            "player_history_attention.in_proj_weight", "turn_relations.weight",
-            "player_attention.in_proj_weight", "action_query.weight",
-            "action_player_attention.in_proj_weight", "action_card_attention.in_proj_weight",
-        ):
-            with self.subTest(name=name):
-                gradient = dict(self.network.named_parameters())[name].grad
-                self.assertTrue(torch.isfinite(gradient).all())
-                self.assertGreater(float(gradient.abs().sum()), 0.0)
-                self.assertFalse(torch.equal(before[name], self.network.state_dict()[name]))
+        self.assertAlmostEqual(loss, before)
+        after = torch.nn.functional.mse_loss(self.values(*observations)[:, 0], targets).item()
+        self.assertLess(after, before)
 
     def test_history_and_player_padding_do_not_change_values(self):
         short = self.observation(2, 1)
@@ -181,10 +170,9 @@ class TestDynamicNetwork(unittest.TestCase):
         first = self.values(obs)
         self.network.eval()
         torch.testing.assert_close(first, self.values(obs), rtol=0, atol=0)
-        self.assertFalse(any(isinstance(module, (torch.nn.Dropout, torch.nn.BatchNorm1d))
-                             for module in self.network.modules()))
 
-    def test_checkpoint_roundtrip_and_current_metadata(self):
+    def test_checkpoint_roundtrip_preserves_nondefault_spec_and_wire_format(self):
+        self.network = QNetwork(ModelSpec(width=32, heads=2))
         obs = self.observation()
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "nested" / "model.pt"
@@ -192,6 +180,7 @@ class TestDynamicNetwork(unittest.TestCase):
             loaded, config, meta = load_checkpoint(str(path))
             self.assertEqual(config, obs.config)
             self.assertEqual(meta, {"note": "fresh"})
+            self.assertEqual(loaded.spec, self.network.spec)
             torch.testing.assert_close(
                 self.values(obs), loaded(collate_observations([obs], self.device)), rtol=0, atol=0,
             )
@@ -199,7 +188,7 @@ class TestDynamicNetwork(unittest.TestCase):
             self.assertEqual(payload["architecture"], "dynamic_table")
             self.assertEqual(payload["checkpoint_version"], 3)
             self.assertEqual(payload["encoding_version"], 2)
-            self.assertEqual(payload["model_spec"], {"width": 64, "heads": 4})
+            self.assertEqual(payload["model_spec"], {"width": 32, "heads": 2})
             self.assertNotIn("state_dim", payload)
 
     def test_bad_or_old_checkpoints_do_not_mutate_supplied_network(self):

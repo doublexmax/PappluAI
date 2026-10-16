@@ -2,12 +2,20 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
+from unittest import mock
 
-from src.checkpoints.io import atomic_write_json
+from src.checkpoints.io import atomic_write_json, file_sha256
 from src.checkpoints.evidence import GATE_SCHEMA_VERSION, evidence_metrics
 from src.checkpoints.registry import ModelRecord, ModelRegistry
+from src.game.environment import GameConfig
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 def install_record(registry, data, origin):
@@ -88,6 +96,53 @@ def evidence(candidate, champion):
     }
 
 
+@unittest.skipIf(torch is None, "PyTorch not installed")
+class TestModelRegistration(unittest.TestCase):
+    def setUp(self):
+        from src.model.network import QNetwork, save_checkpoint
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.source = self.directory / "weights.pt"
+        save_checkpoint(str(self.source), QNetwork(), GameConfig(max_turns=1))
+        self.identity = file_sha256(self.source)
+        self.registry = ModelRegistry(self.directory / "owned")
+
+    def test_expected_checksum_rejects_source_before_registry_writes(self):
+        before = self.registry.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            self.registry.register(str(self.source), origin="rating", expected_sha256="0" * 64)
+        self.assertEqual(self.registry.path.read_bytes(), before)
+        self.assertEqual({path.name for path in self.registry.root.iterdir()}, {"registry.json"})
+        self.assertEqual(file_sha256(self.source), self.identity)
+
+    def test_arbitrary_source_names_still_register_and_load(self):
+        from src.model.network import load_checkpoint
+
+        record = self.registry.register(str(self.source), origin="test")
+        self.assertEqual(record.sha256, self.identity)
+        self.assertEqual(record.filename, "model-" + self.identity + ".pt")
+        network, config, _ = load_checkpoint(str(self.registry.model_path(record.id)))
+        self.assertEqual(network.spec.to_dict(), record.metadata["model_spec"])
+        self.assertEqual(config, GameConfig(max_turns=1))
+
+    def test_copy_checksum_still_rejects_changed_bytes(self):
+        copyfile = shutil.copyfile
+
+        def corrupt_copy(source, destination):
+            copyfile(source, destination)
+            Path(destination).write_bytes(b"changed during copy")
+
+        before = self.registry.path.read_bytes()
+        with mock.patch("src.checkpoints.registry.shutil.copyfile", side_effect=corrupt_copy):
+            with self.assertRaisesRegex(ValueError, "snapshot was being copied"):
+                self.registry.register(str(self.source), origin="rating", expected_sha256=self.identity)
+        self.assertEqual(self.registry.path.read_bytes(), before)
+        self.assertFalse((self.registry.root / ("model-" + self.identity + ".pt")).exists())
+        self.assertEqual(file_sha256(self.source), self.identity)
+
+
 class TestChampionProtection(unittest.TestCase):
     def test_old_registry_fast_path_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -116,13 +171,6 @@ class TestChampionProtection(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "gate did not pass"):
                 registry.promote(candidate.id, champion.id, bad)
             self.assertEqual(registry.champion().id, champion.id)
-
-    def test_atomic_registry_json_rejects_nonfinite_values(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "registry.json"
-            with self.assertRaises(ValueError):
-                atomic_write_json({"score": float("nan")}, path)
-            self.assertFalse(path.exists())
 
     def test_promotion_changes_only_pointer_and_preserves_old_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

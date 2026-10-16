@@ -284,21 +284,6 @@ class TestMultiplayerTurns(unittest.TestCase):
         self.assertEqual(self.env._discard, [7])
         self.assertTrue(legal_action_mask(self.env.observe())[ACTION_DRAW_STOCK])
 
-    def test_manual_draw_state_refills_before_stock_pop(self):
-        self.env._stock = []
-        self.env._discard = [7, 8, 9]
-        self.env._hands[0] = [0] * 52
-        self.env._hands[0][0] = 1
-        self.env._hands[0][1] = 1
-        self.env._hands[0][2] = 1
-        self.env._phase = Phase.DRAW
-        self.assertTrue(legal_action_mask(self.env.observe())[ACTION_DRAW_STOCK])
-        view = self.env.step(ACTION_DRAW_STOCK)
-        self.assertEqual(view.phase, Phase.DISCARD)
-        self.assertEqual(view.stock_remaining, 1)
-        self.assertEqual(self.env._discard, [9])
-        self.assertEqual(sum(self.env._hands[0]), 4)
-
     def test_terminal_round_does_not_refill_or_reset_budget(self):
         game = GameConfig(
             num_decks=1,
@@ -338,22 +323,24 @@ class TestMultiplayerRecycling(unittest.TestCase):
                 first.reset(seed=200 + players)
                 second.reset(seed=200 + players)
                 for env in (first, second):
-                    env._discard = env._stock + env._discard
-                    env._stock = []
-                    hand_before = env.observe().hand
-                    env.step(ACTION_DRAW_STOCK)
-                    drawn = next(
-                        face
-                        for face, (before, after) in enumerate(
-                            zip(hand_before, env.observe().hand)
-                        )
-                        if after == before + 1
-                    )
+                    stock_count = env.observe().stock_remaining
                     with mock.patch(
                         "src.game.multiplayer.hand_reward",
                         return_value=0.0,
                     ):
-                        env.step(discard_action(drawn))
+                        for _ in range(stock_count):
+                            hand_before = env.observe().hand
+                            env.step(ACTION_DRAW_STOCK)
+                            drawn = next(
+                                face
+                                for face, (before, after) in enumerate(
+                                    zip(hand_before, env.observe().hand)
+                                )
+                                if after == before + 1
+                            )
+                            env.step(discard_action(drawn))
+                    self.assertEqual(env.telemetry().refill_turns, (stock_count,))
+                    self.assertEqual(env.observe().stock_remaining, stock_count)
 
                 self.assertEqual(snapshot(first), snapshot(second))
                 counts = Counter(first._stock)

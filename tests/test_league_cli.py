@@ -1,4 +1,5 @@
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -43,11 +44,11 @@ class TestFreshLeagueOutputs(unittest.TestCase):
                     {path.name for path in output.iterdir()}, {name},
                 )
                 existing.unlink()
-            with mock.patch("sys.stdout", new_callable=io.StringIO):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
                 self.assertEqual(main(arguments), 0)
+            self.assertEqual(json.loads(stdout.getvalue())["count_matches"], {"2": 0, "3": 0, "4": 0})
             state = torch.load(output / "latest-state.pt", weights_only=True)
             self.assertEqual(state["counters"]["completed_matches"], 0)
-            self.assertEqual(state["encoding_version"], 2)
 
 
 if __name__ == "__main__":

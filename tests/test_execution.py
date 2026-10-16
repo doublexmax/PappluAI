@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import multiprocessing
+from pathlib import Path
+import tempfile
 import time
 import unittest
 
-from src.evaluation.execution import BoundedWorkers, WorkerFailure, WorkerResult
+from src.evaluation.execution import BoundedWorkers, WorkerFailure, WorkerResult, source_fingerprint
 
 
 def square(value):
@@ -20,6 +22,37 @@ def sleep_or_return(value):
 
 def exit_worker(value):
     os._exit(7)
+
+
+class TestSourceFingerprint(unittest.TestCase):
+    def test_source_paths_and_contents_affect_the_stable_fingerprint(self):
+        names = (
+            "evaluate.py", "game/environment.py", "game/multiplayer.py",
+            "game/stock.py", "game/reward_cache.py", "model/network.py",
+            "evaluation/arena.py", "evaluation/calibration.py", "evaluation/execution.py",
+            "game/information.py", "model/encoding.py", "model/spec.py",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "src"
+            for name in names:
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(("source " + name + "\n").encode("utf-8"))
+            baseline = source_fingerprint(source)
+            self.assertEqual(source_fingerprint(source), baseline)
+            for name in names:
+                with self.subTest(name=name):
+                    path = source / name
+                    original = path.read_bytes()
+                    path.write_bytes(original + b"changed\n")
+                    self.assertNotEqual(source_fingerprint(source), baseline)
+                    path.write_bytes(original)
+                    self.assertEqual(source_fingerprint(source), baseline)
+            path = source / "model/spec.py"
+            moved = path.rename(source / "model/renamed.py")
+            self.assertNotEqual(source_fingerprint(source), baseline)
+            moved.rename(path)
+            self.assertEqual(source_fingerprint(source), baseline)
 
 
 class TestBoundedWorkers(unittest.TestCase):

@@ -129,6 +129,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "status": reason,
                     "matches": session.completed_matches,
                     "updates": session.total_updates,
+                    "count_matches": session.count_matches,
                 },
                 sort_keys=True,
             ),

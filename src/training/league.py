@@ -39,7 +39,7 @@ from src.training.core import EpisodeReplay, discounted_returns
 from src.training.optimization import train_batch
 
 
-LEAGUE_STATE_VERSION = 2
+LEAGUE_STATE_VERSION = 3
 ALGORITHM = "champion_league_monte_carlo_q_regression"
 RANDOM_OPPONENT = "random"
 TRAINING_SEED_BASE = 1_000_000_000_000
@@ -183,8 +183,15 @@ class LeagueSession:
         self.draws = 0
         self.no_action_matches = 0
         self.epsilon_progress = 0
-        self.count_matches = {count: 0 for count in self.config.player_counts}
         self.at_match_boundary = True
+
+    @property
+    def count_matches(self) -> Dict[int, int]:
+        cycles, remainder = divmod(self.completed_matches, len(self.config.player_counts))
+        return {
+            count: cycles + int(index < remainder)
+            for index, count in enumerate(self.config.player_counts)
+        }
 
     @property
     def current_epsilon(self) -> float:
@@ -205,10 +212,9 @@ class LeagueSession:
         self.at_match_boundary = False
         match_complete = False
         try:
-            players = self.config.player_counts[
-                self.completed_matches % len(self.config.player_counts)
-            ]
-            challenger_seat = self.count_matches[players] % players
+            occurrence, index = divmod(self.completed_matches, len(self.config.player_counts))
+            players = self.config.player_counts[index]
+            challenger_seat = occurrence % players
             epsilon = self.current_epsilon
             policies = [
                 self.opponent_rng.choice(self._opponents).policy
@@ -272,7 +278,6 @@ class LeagueSession:
             self.no_action_matches += 1
 
         self.completed_matches += 1
-        self.count_matches[players] += 1
         self.epsilon_progress += 1
         if result.winner is None:
             self.draws += 1
@@ -305,7 +310,6 @@ class LeagueSession:
             "algorithm": ALGORITHM,
             "league_config": self.config.to_dict(),
             "model_spec": self.network.spec.to_dict(),
-            "count_matches": dict(self.count_matches),
             "initial_seed": self.initial_seed,
             "parent_sha256": self.parent_sha256,
             "opponent_hashes": self.opponent_hashes,
@@ -339,7 +343,6 @@ class LeagueSession:
             "algorithm",
             "league_config",
             "model_spec",
-            "count_matches",
             "initial_seed",
             "parent_sha256",
             "opponent_hashes",
@@ -399,19 +402,6 @@ class LeagueSession:
             for name, value in counters.items()
         }
         completed = validated_counters["completed_matches"]
-        expected_count_matches = {
-            count: completed // len(self.config.player_counts)
-            + int(index < completed % len(self.config.player_counts))
-            for index, count in enumerate(self.config.player_counts)
-        }
-        count_matches = payload["count_matches"]
-        if (
-            not isinstance(count_matches, dict)
-            or any(type(key) is not int or type(value) is not int
-                   for key, value in count_matches.items())
-            or count_matches != expected_count_matches
-        ):
-            raise ValueError("league checkpoint count schedule is inconsistent")
         if (
             validated_counters["wins"]
             + validated_counters["losses"]
@@ -476,7 +466,6 @@ class LeagueSession:
         self.replay_rng.setstate(candidate_rngs["replay"].getstate())
         self.torch_rng_state = torch_state.clone()
         self.opponent_pool_generation = pool_generation
-        self.count_matches = expected_count_matches
         for name, value in validated_counters.items():
             setattr(self, name, value)
         self.network.train()

@@ -189,14 +189,8 @@ class EpisodeReplay:
                     )
                 if not legal_action_mask(observation)[raw_action]:
                     raise ValueError("replay contains an illegal action")
-                next_index = prefix
-                if (
-                    next_index < len(history.events)
-                    and history.events[next_index].kind is EventKind.REFILL
-                ):
-                    next_index += 1
-                if next_index < len(history.events):
-                    event = history.events[next_index]
+                if prefix < len(history.events):
+                    event = history.events[prefix]
                     expected_action = (
                         ACTION_DRAW_STOCK if event.kind is EventKind.DRAW_STOCK
                         else ACTION_TAKE_DISCARD if event.kind is EventKind.TAKE_DISCARD

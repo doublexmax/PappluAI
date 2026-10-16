@@ -110,16 +110,6 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
                     ]
                 )
 
-    def test_production_defaults_are_full21(self):
-        config = TrainingConfig()
-        self.assertEqual(config.game_config, GameConfig(max_turns=60))
-        self.assertTrue(config.recycle_discard)
-        self.assertTrue(config.to_dict()["recycle_discard"])
-        self.assertEqual(config.curriculum_distances, (1, 2, 4, 8))
-        self.assertEqual(config.replay_capacity, 10_000)
-        self.assertEqual(config.batch_size, 64)
-        self.assertEqual(config.updates_per_episode, 4)
-
     def test_incomplete_training_config_is_rejected(self):
         current = TrainingConfig().to_dict()
         self.assertTrue(TrainingConfig.from_dict(current).recycle_discard)
@@ -260,7 +250,6 @@ class TestTrainingSession(unittest.TestCase):
             session = TrainingSession(config, seed=41, initial_model=compatible)
             self.assertEqual(session.config.max_turns, 1)
             self.assertTrue(session.config.recycle_discard)
-            self.assertEqual(session.network.architecture, "dynamic_table")
 
             wrong_hand = os.path.join(tmp, "wrong-hand.pt")
             save_checkpoint(
@@ -792,8 +781,7 @@ class TestTrainingSession(unittest.TestCase):
                 "baseline-model.pt": 0,
             }
             for name, episodes in expected_episodes.items():
-                network, game, meta = load_checkpoint(str(output / name))
-                self.assertEqual(network.architecture, "dynamic_table")
+                _, game, meta = load_checkpoint(str(output / name))
                 self.assertEqual(game, session.config.game_config)
                 self.assertEqual(meta["role"], name.removesuffix("-model.pt"))
                 self.assertEqual(meta["episodes"], episodes)

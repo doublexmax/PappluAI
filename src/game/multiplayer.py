@@ -164,7 +164,6 @@ class MultiplayerEnv:
         if self._phase is Phase.DRAW:
             offered_top = self._discard[-1] if self._discard else None
             if action == ACTION_DRAW_STOCK:
-                self._refill_stock()
                 card = self._stock.pop()
                 self._stock_draws[self._current_seat] += 1
                 kind = EventKind.DRAW_STOCK

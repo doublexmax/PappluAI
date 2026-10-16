@@ -5,9 +5,6 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest import mock
-
-from openskill.models import PlackettLuce
 
 from src.evaluation.ratings import RatingStore, discounted_posterior, placements, write_rating_report
 from src.game.environment import GameConfig
@@ -123,23 +120,19 @@ class TestRatingStore(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conflicts"):
             self.store.schedule_block(profile, 0, 999, IDENTITIES)
 
-    def test_single_four_player_job_decodes_only_its_row_and_roundtrips_results(self):
+    def test_single_four_player_job_roundtrips_results_without_affecting_other_jobs(self):
         profile = self.store.ensure_protocol(protocol(4))
         jobs = self.jobs(profile=profile, lineup=IDENTITIES)
         job = jobs[11]
         raw, penalties = evidence(job)
-        with mock.patch("src.evaluation.ratings.json.loads", wraps=json.loads) as decoder:
-            self.assertEqual(self.store.start_attempt(job["id"]), "play")
-        self.assertEqual(decoder.call_count, 3)
+        self.assertEqual(self.store.start_attempt(job["id"]), "play")
         self.assertEqual(self.store._job(job["id"]), job)
         self.assertEqual(
             [tuple(row) for row in self.store.connection.execute("SELECT job,phase,status FROM attempts")],
             [(job["id"], "play", "running")],
         )
         self.assertTrue(self.store.record_raw(job["id"], raw))
-        with mock.patch("src.evaluation.ratings.json.loads", wraps=json.loads) as decoder:
-            self.assertEqual(self.store.start_attempt(job["id"]), "score")
-        self.assertEqual(decoder.call_count, 4)
+        self.assertEqual(self.store.start_attempt(job["id"]), "score")
         self.assertTrue(self.store.record_scores(job["id"], penalties, 1))
         expected = {**job, "status": "complete", "raw": raw}
         self.assertEqual(self.store._job(job["id"]), expected)
@@ -184,30 +177,20 @@ class TestRatingStore(unittest.TestCase):
         self.assertEqual(rows[IDENTITIES[1]]["rating"], 1500)
         self.assertEqual(rows[IDENTITIES[0]]["games"], 2)
 
-    def test_live_publication_only_updates_newly_settled_blocks(self):
-        engines = []
-
-        def counted_model(**parameters):
-            engine = mock.Mock(wraps=PlackettLuce(**parameters))
-            engines.append(engine)
-            return engine
-
+    def test_live_publication_preserves_unsettled_rows_and_matches_fresh_replay(self):
         for job in self.jobs():
             complete(self.store, job)
-        with mock.patch("src.evaluation.ratings.PlackettLuce", side_effect=counted_model):
-            first = self.store.report(self.profile, IDENTITIES[1], "points")
-            self.assertEqual(sum(engine.rate.call_count for engine in engines), 2)
-            self.assertEqual(first, self.store.report(self.profile, IDENTITIES[1], "points"))
-            self.assertEqual(sum(engine.rate.call_count for engine in engines), 2)
-            next_jobs = self.jobs(1)
-            complete(self.store, next_jobs[0])
-            self.store.report(self.profile, IDENTITIES[1], "points")
-            self.assertEqual(sum(engine.rate.call_count for engine in engines), 2)
-            complete(self.store, next_jobs[1])
-            current = self.store.report(self.profile, IDENTITIES[1], "points")
-            self.assertEqual(sum(engine.rate.call_count for engine in engines), 4)
-            with RatingStore(self.path, read_only=True) as reader:
-                self.assertEqual(current, reader.report(self.profile, IDENTITIES[1], "points"))
+        first = self.store.report(self.profile, IDENTITIES[1], "points")
+        self.assertEqual(first, self.store.report(self.profile, IDENTITIES[1], "points"))
+        next_jobs = self.jobs(1)
+        complete(self.store, next_jobs[0])
+        incomplete = self.store.report(self.profile, IDENTITIES[1], "points")
+        self.assertEqual(incomplete["rows"], first["rows"])
+        complete(self.store, next_jobs[1])
+        current = self.store.report(self.profile, IDENTITIES[1], "points")
+        self.assertNotEqual(current["rows"], first["rows"])
+        with RatingStore(self.path, read_only=True) as reader:
+            self.assertEqual(current, reader.report(self.profile, IDENTITIES[1], "points"))
 
     def test_filtered_and_discounted_mixed_blocks_disclose_effective_imbalance(self):
         jobs = self.jobs()

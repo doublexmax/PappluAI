@@ -4,14 +4,6 @@ import random
 from typing import List
 
 
-def stock_draw_available(
-    stock_count: int,
-    discard_count: int,
-    recycle_discard: bool,
-) -> bool:
-    return stock_count > 0 or recycle_discard and discard_count > 1
-
-
 def refill_stock(
     stock: List[int],
     discard: List[int],

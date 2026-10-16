@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import io
+import json
 import os
 import random
 import subprocess
@@ -87,16 +88,10 @@ runpy.run_module("src.cli.solo", run_name="__main__")
             with self.assertRaises(SystemExit):
                 parser.parse_args(["--architecture", "mlp"])
 
-    def test_replay_sampling_argument_contract(self):
+    def test_unknown_replay_sampling_mode_is_rejected(self):
         from src.cli.solo import build_arg_parser
 
         parser = build_arg_parser()
-        self.assertEqual(parser.parse_args([]).replay_sampling, "transition")
-        for sampling in ("transition", "episode"):
-            self.assertEqual(
-                parser.parse_args(["--replay-sampling", sampling]).replay_sampling,
-                sampling,
-            )
         with mock.patch("sys.stderr", new_callable=io.StringIO):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["--replay-sampling", "unknown"])
@@ -254,11 +249,10 @@ class TestTrainLearning(unittest.TestCase):
             path = os.path.join(tmp, "current.pt")
             summary = train(episodes=0, seed=7, config=cfg, checkpoint_path=path)
             loaded, _, _ = load_checkpoint(path)
-            self.assertEqual(summary["architecture"], "dynamic_table")
-            self.assertEqual(loaded.architecture, "dynamic_table")
+            self.assertEqual(summary["architecture"], loaded.architecture)
             self.assertEqual(summary["param_count"], sum(p.numel() for p in loaded.parameters()))
             inferred = train(episodes=0, seed=7, load_path=path)
-            self.assertEqual(inferred["architecture"], "dynamic_table")
+            self.assertEqual(inferred["architecture"], summary["architecture"])
 
     def test_old_checkpoint_is_a_clean_training_error(self):
         from src.training.solo import train
@@ -439,37 +433,40 @@ class TestTrainLearning(unittest.TestCase):
     def test_cli_short_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "checkpoints", "cli.pt")
-            code = train_main(
-                [
-                    "--episodes",
-                    "2",
-                    "--cards-in-hand",
-                    "3",
-                    "--required-sequences",
-                    "1",
-                    "--num-decks",
-                    "2",
-                    "--max-turns",
-                    "3",
-                    "--warm-start-fraction",
-                    "1",
-                    "--replay-sampling",
-                    "episode",
-                    "--log-every",
-                    "0",
-                    "--checkpoint",
-                    path,
-                    "--seed",
-                    "0",
-                ]
-            )
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                code = train_main(
+                    [
+                        "--episodes",
+                        "2",
+                        "--cards-in-hand",
+                        "3",
+                        "--required-sequences",
+                        "1",
+                        "--num-decks",
+                        "2",
+                        "--max-turns",
+                        "3",
+                        "--warm-start-fraction",
+                        "1",
+                        "--replay-sampling",
+                        "episode",
+                        "--log-every",
+                        "0",
+                        "--checkpoint",
+                        path,
+                        "--seed",
+                        "0",
+                    ]
+                )
             self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.getvalue())["replay_sampling"], "episode")
             self.assertTrue(os.path.isfile(path))
-            with mock.patch("sys.stdout", new_callable=io.StringIO):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
                 self.assertEqual(train_main([
                     "--load", path, "--episodes", "1", "--warm-start-fraction", "1",
                     "--max-turns", "3", "--checkpoint", path,
                 ]), 0)
+            self.assertEqual(json.loads(output.getvalue())["replay_sampling"], "transition")
             with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 self.assertEqual(train_main([
                     "--load", path, "--episodes", "0", "--cards-in-hand", "6",

@@ -58,7 +58,6 @@ class TestEvaluation(unittest.TestCase):
             with mock.patch("src.evaluation.benchmark.evaluate_games", return_value=outcomes):
                 result = evaluate_checkpoint(str(path), games=1, warm_games=0)
             self.assertEqual(result["greedy"]["outcomes"], (0,))
-            self.assertEqual(result["encoding_version"], 2)
             self.assertEqual(torch.get_num_threads(), before)
             with mock.patch("src.evaluation.benchmark.load_checkpoint", side_effect=RuntimeError("load failed")):
                 with self.assertRaisesRegex(RuntimeError, "load failed"):

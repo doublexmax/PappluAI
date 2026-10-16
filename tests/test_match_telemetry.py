@@ -106,15 +106,21 @@ class TestMatchTelemetry(unittest.TestCase):
         env = self.make_match()
         with self.assertRaisesRegex(ValueError, "only after"):
             env.terminal_snapshot()
+        hands = {}
+        joker = env.observe().joker
         with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             for _ in range(4):
+                seat = env.view().current_seat
+                hands.setdefault(seat, list(env.observe().hand))
                 env.step(ACTION_DRAW_STOCK)
-                self.discard_first(env)
+                hands[seat][env.observe().history[-1].face] += 1
+                face = next(face for face, count in enumerate(env.observe().hand) if count)
+                env.step(discard_action(face))
+                hands[seat][face] -= 1
         snapshot = env.terminal_snapshot()
-        expected = tuple(tuple(hand) for hand in env._hands)
+        expected = tuple(tuple(hands[seat]) for seat in range(env.config.players))
         self.assertEqual(snapshot.hands, expected)
-        self.assertEqual(snapshot.joker, env._joker)
-        self.assertFalse(hasattr(env.observe(), "opponent_hands"))
+        self.assertEqual(snapshot.joker, joker)
         env.reset(seed=999)
         self.assertEqual(snapshot.hands, expected)
 

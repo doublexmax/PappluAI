@@ -4,8 +4,7 @@ Phases are DRAW -> DISCARD -> (DRAW | TERMINAL). Actions are a fixed 54-slot
 mask: 0 draw stock, 1 take discard top, 2..53 discard face 0..51. Terminal
 reward is the evaluator binary hand_reward on the post-discard hand of size
 cards_in_hand. Illegal actions and bad config raise without mutating state.
-Older discards refill an empty stock after a nonterminal discard. A manually
-assembled DRAW state refills only when a stock draw is chosen.
+Older discards refill an empty stock after a nonterminal discard.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from typing import List, Optional, Tuple
 
 from src.evaluate import NUM_FACES, NUM_RANKS, NUM_SUITS, RANK_PATTERNS, hand_reward, is_valid_hand
 from src.game.reward_cache import RewardCache
-from src.game.stock import refill_stock, stock_draw_available
+from src.game.stock import refill_stock
 from src.game.information import (
     EventKind,
     InformationEvent,
@@ -286,12 +285,7 @@ def legal_action_mask(obs: Observation) -> Tuple[bool, ...]:
     if obs.phase is Phase.TERMINAL:
         return tuple(mask)
     if obs.phase is Phase.DRAW:
-        if stock_draw_available(
-            obs.stock_remaining,
-            len(obs.discard_pile),
-            obs.config.recycle_discard,
-        ):
-            mask[ACTION_DRAW_STOCK] = True
+        mask[ACTION_DRAW_STOCK] = bool(obs.stock_remaining)
         if obs.discard_pile:
             mask[ACTION_TAKE_DISCARD] = True
         return tuple(mask)
@@ -495,7 +489,6 @@ class PappluEnv:
         if self._phase is Phase.DRAW:
             offered_top = self._discard[-1] if self._discard else None
             if action == ACTION_DRAW_STOCK:
-                self._refill_stock()
                 card = self._stock.pop()
                 kind = EventKind.DRAW_STOCK
             else:
