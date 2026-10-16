@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import Path
 import random
 import time
-from typing import List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
-from src.game.environment import GameConfig, PappluEnv, Phase, discard_action
+from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv, Phase, discard_action
 from src.evaluate import hand_reward
 from src.model.network import (
     load_checkpoint,
     select_greedy_action,
     select_random_legal,
 )
+from src.model.spec import CHECKPOINT_VERSION
+from src.checkpoints.io import file_sha256
 
 
 @dataclass(frozen=True)
@@ -107,11 +110,16 @@ def evaluate_checkpoint(
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
+        checkpoint_sha256 = file_sha256(Path(path))
         network, config, _ = load_checkpoint(path)
         result = {
             "checkpoint": path,
+            "checkpoint_sha256": checkpoint_sha256,
             "game_config": config.to_dict(),
             "architecture": network.architecture,
+            "checkpoint_version": CHECKPOINT_VERSION,
+            "encoding_version": ENCODING_VERSION,
+            "model_spec": network.spec.to_dict(),
             "parameter_count": sum(
                 parameter.numel() for parameter in network.parameters()
             ),
@@ -151,6 +159,8 @@ def evaluate_checkpoint(
                     raise RuntimeError(
                         "discard-puzzle ruler does not separate random play"
                     )
+        if file_sha256(Path(path)) != checkpoint_sha256:
+            raise ValueError("checkpoint changed during evaluation")
         return result
     finally:
         torch.set_num_threads(previous_threads)

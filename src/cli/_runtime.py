@@ -12,9 +12,10 @@ def load_runtime(module: str) -> ModuleType:
     try:
         return importlib.import_module(module)
     except ModuleNotFoundError as exc:
-        if exc.name != "torch":
+        if exc.name not in ("torch", "openskill"):
             raise
+        dependency = "PyTorch" if exc.name == "torch" else "OpenSkill"
         raise MissingTrainingDependency(
-            "PyTorch is required. Run python -m pip install "
+            dependency + " is required. Run python -m pip install "
             "-r requirements-training.txt"
         ) from exc

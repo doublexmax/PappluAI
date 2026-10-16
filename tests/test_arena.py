@@ -21,7 +21,7 @@ from src.game.environment import (
     GameConfig,
     legal_action_mask,
 )
-from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv
 
 try:
     import torch
@@ -76,13 +76,18 @@ class TestArenaMatches(unittest.TestCase):
         self.assertEqual(result.terminal_reason, "turns_exhausted")
         self.assertEqual(result.seat_turns, (2, 2, 2))
         self.assertEqual(result.action_count, 12)
+        self.assertEqual(result.telemetry.stock_draws, (2, 2, 2))
+        self.assertEqual(result.telemetry.discard_draws, (0, 0, 0))
+        self.assertEqual(result.telemetry.refill_turns, ())
         self.assertEqual(tuple(map(len, result.trajectories)), (4, 4, 4))
         for trajectory in result.trajectories:
             for state, action, reward in trajectory:
-                self.assertIsInstance(state, tuple)
-                self.assertEqual(len(state), 164)
-                self.assertIsInstance(action, int)
+                self.assertEqual(len(state.players), 3)
+                self.assertEqual(state.history[0].initial_hand, trajectory[0][0].hand)
+                self.assertTrue(legal_action_mask(state)[action])
                 self.assertEqual(reward, 0.0)
+        for policy, trajectory in zip(policies, result.trajectories):
+            self.assertEqual(policy.observations, [step[0] for step in trajectory])
 
     def test_only_winning_discard_receives_reward(self):
         config = MatchConfig(game=self.game, players=2)
@@ -101,6 +106,18 @@ class TestArenaMatches(unittest.TestCase):
             [0.0, 1.0],
         )
         self.assertEqual(result.trajectories[1], ())
+        self.assertIsNone(result.terminal_snapshot)
+
+    def test_terminal_capture_is_opt_in_and_keeps_every_hand(self):
+        config = MatchConfig(game=self.game, players=2)
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
+            result = play_match(
+                [FirstLegalPolicy(), FirstLegalPolicy()],
+                config, seed=711, record_terminal=True,
+            )
+        self.assertIsNotNone(result.terminal_snapshot)
+        self.assertEqual(len(result.terminal_snapshot.hands), 2)
+        self.assertEqual(tuple(sum(hand) for hand in result.terminal_snapshot.hands), (3, 3))
 
     def test_policies_receive_only_their_own_hand_and_public_state(self):
         game = GameConfig(
@@ -219,6 +236,7 @@ class TestArenaMatches(unittest.TestCase):
             seat_turns=(2, 2, 2),
             action_count=12,
             stock_remaining=30,
+            telemetry=MatchTelemetry((2, 2, 2), (0, 0, 0), ()),
             trajectories=((), (), ()),
         )
         with mock.patch("src.evaluation.arena.play_match", return_value=result) as play:
@@ -259,6 +277,7 @@ class TestArenaCli(unittest.TestCase):
             seat_turns=(1, 0),
             action_count=2,
             stock_remaining=110,
+            telemetry=MatchTelemetry((1, 0), (0, 0), ()),
             trajectories=((), ()),
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -302,71 +321,43 @@ class TestArenaCli(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class TestArenaCheckpoints(unittest.TestCase):
-    def test_v1_v2_mlp_wide_and_cnn_checkpoints_load_in_eval_mode(self):
-        from src.model.network import QNetwork, build_checkpoint, save_checkpoint
-
-        checkpoint_config = GameConfig(max_turns=40)
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = []
-            v1_path = os.path.join(tmp, "v1.pt")
-            v1_payload = build_checkpoint(QNetwork(), checkpoint_config)
-            v1_payload["checkpoint_version"] = 1
-            del v1_payload["architecture"]
-            torch.save(v1_payload, v1_path)
-            paths.append((v1_path, "mlp"))
-            for architecture in ("mlp", "wide_mlp", "suit_conv"):
-                path = os.path.join(tmp, architecture + ".pt")
-                save_checkpoint(
-                    path,
-                    QNetwork(architecture=architecture),
-                    checkpoint_config,
-                )
-                paths.append((path, architecture))
-
-            for path, architecture in paths:
-                with self.subTest(path=path):
-                    policy = CheckpointPolicy(path)
-                    self.assertIsNone(policy._network)
-                    self.assertEqual(
-                        policy.game_config.to_dict(),
-                        checkpoint_config.to_dict(),
-                    )
-                    self.assertEqual(policy.network.architecture, architecture)
-                    self.assertFalse(policy.network.training)
-
-    def test_mlp_and_cnn_checkpoints_play_matched_full21_random_smoke(self):
+    def test_current_checkpoint_loads_lazily_in_eval_mode(self):
         from src.model.network import QNetwork, save_checkpoint
 
         checkpoint_config = GameConfig(max_turns=40)
-        match_config = MatchConfig(
-            game=GameConfig(max_turns=60),
-            players=2,
-        )
         with tempfile.TemporaryDirectory() as tmp:
-            for architecture in ("mlp", "suit_conv"):
-                with self.subTest(architecture=architecture):
-                    path = os.path.join(tmp, architecture + ".pt")
-                    save_checkpoint(
-                        path,
-                        QNetwork(architecture=architecture),
-                        checkpoint_config,
-                    )
+            path = os.path.join(tmp, "current.pt")
+            save_checkpoint(path, QNetwork(), checkpoint_config)
+            policy = CheckpointPolicy(path)
+            self.assertIsNone(policy._network)
+            self.assertEqual(policy.game_config, checkpoint_config)
+            self.assertEqual(policy.network.architecture, "dynamic_table")
+            self.assertFalse(policy.network.training)
+
+    def test_current_checkpoint_plays_all_supported_full21_tables(self):
+        from src.model.network import QNetwork, save_checkpoint
+
+        checkpoint_config = GameConfig(max_turns=40)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "current.pt")
+            save_checkpoint(path, QNetwork(), checkpoint_config)
+            for players in (2, 3, 4):
+                with self.subTest(players=players):
                     with mock.patch(
                         "src.game.multiplayer.hand_reward",
-                        side_effect=(0.0, 1.0),
+                        side_effect=[0.0] * (players - 1) + [1.0],
                     ):
                         result = play_match(
-                            [RandomPolicy(), CheckpointPolicy(path)],
-                            match_config,
+                            [RandomPolicy()] * (players - 1) + [CheckpointPolicy(path)],
+                            MatchConfig(GameConfig(max_turns=60), players),
                             seed=900,
                             record_trajectories=True,
                         )
-                    self.assertEqual(result.winner, 1)
-                    self.assertEqual(result.action_count, 4)
-                    self.assertEqual(
-                        len(result.trajectories[1][0][0]),
-                        164,
-                    )
+                    self.assertEqual(result.winner, players - 1)
+                    self.assertEqual(result.action_count, players * 2)
+                    observation = result.trajectories[-1][0][0]
+                    self.assertEqual(len(observation.players), players)
+                    self.assertEqual(len(observation.history), 2 * players - 1)
 
     def test_epsilon_boundaries_select_legal_actions_without_changing_mode(self):
         from src.model.network import QNetwork

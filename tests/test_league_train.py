@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import io
 import tempfile
 import unittest
 from unittest import mock
 
-from src.game.environment import GameConfig, STATE_DIM
+from collections import Counter
+from src.game.environment import GameConfig, Phase, discard_action
+from src.game.multiplayer import MultiplayerEnv
 from src.training.league import (
     LeagueConfig,
     LeagueSession,
     save_session_checkpoint,
 )
-from src.cli.league import build_arg_parser
+from src.cli.league import main
 
 try:
     import torch
@@ -26,7 +29,12 @@ TORCH_REASON = "PyTorch not installed (see requirements-training.txt)"
 def fake_match(policies, config, seed, record_trajectories=False, deadline=None):
     from types import SimpleNamespace
 
-    step = ((0.0,) * STATE_DIM, 0, 0.0)
+    env = MultiplayerEnv(config)
+    env.reset(seed)
+    trajectories = []
+    for seat in range(config.players):
+        env._current_seat = seat
+        trajectories.append(((env.observe(), 0, 0.0),))
     return SimpleNamespace(
         seed=seed,
         winner=0,
@@ -34,7 +42,7 @@ def fake_match(policies, config, seed, record_trajectories=False, deadline=None)
         seat_turns=tuple(1 for _ in policies),
         action_count=len(policies),
         stock_remaining=100,
-        trajectories=tuple((step,) for _ in policies),
+        trajectories=tuple(trajectories),
     )
 
 
@@ -45,7 +53,7 @@ class TestLeagueSession(unittest.TestCase):
 
         save_checkpoint(
             str(path),
-            QNetwork(architecture="suit_conv"),
+            QNetwork(),
             GameConfig(max_turns=max_turns),
         )
 
@@ -110,8 +118,9 @@ class TestLeagueSession(unittest.TestCase):
             control = LeagueSession(str(champion), config=config, seed=91)
             split = LeagueSession(str(champion), config=config, seed=91)
             with mock.patch("src.training.league.play_match", side_effect=fake_match):
-                control.train_match()
-                split.train_match()
+                for _ in range(5):
+                    control.train_match()
+                    split.train_match()
             path = root / "state.pt"
             torch.save(split.state_dict(), path)
             resumed = LeagueSession.load(
@@ -180,24 +189,43 @@ class TestLeagueSession(unittest.TestCase):
             self.assertEqual(session.total_updates, 0)
             self.assertEqual(len(session.replay), 0)
 
-    def test_opponent_win_overwrites_challenger_terminal_reward_with_zero(self):
+    def test_match_outcome_overwrites_recorded_rewards_with_discounted_targets(self):
+        from types import SimpleNamespace
+
         with tempfile.TemporaryDirectory() as temporary:
             champion = Path(temporary) / "champion.pt"
             self.make_model(champion)
-            session = LeagueSession(
-                str(champion),
-                config=LeagueConfig(
-                    player_counts=(2,),
-                    batch_size=1,
-                    updates_per_match=1,
-                ),
-            )
-            with mock.patch("src.training.league.play_match", side_effect=fake_match):
-                session.train_match()
-                result = session.train_match()
-            self.assertEqual(result["challenger_seat"], 1)
-            newest = session.replay.state_dict()["episodes"][-1]
-            self.assertEqual(newest[-1][2], 0.0)
+            for winner, expected in ((0, [0.5, 1.0]), (1, [0.0, 0.0]), (None, [0.0, 0.0])):
+                with self.subTest(winner=winner):
+                    session = LeagueSession(str(champion), config=LeagueConfig(
+                        game=GameConfig(max_turns=1), player_counts=(2,),
+                        batch_size=1, updates_per_match=1, gamma=0.5,
+                    ))
+
+                    def recorded_match(policies, config, seed, **kwargs):
+                        env = MultiplayerEnv(config)
+                        env.reset(seed)
+                        trajectories = [[] for _ in policies]
+                        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
+                            while not env.view().done:
+                                seat = env.view().current_seat
+                                observation = env.observe()
+                                action = (
+                                    0 if observation.phase is Phase.DRAW
+                                    else discard_action(next(face for face, count in enumerate(observation.hand) if count))
+                                )
+                                trajectories[seat].append((observation, action, 1.0))
+                                env.step(action)
+                        return SimpleNamespace(
+                            seed=seed, winner=winner, trajectories=trajectories,
+                            terminal_reason="turns_exhausted" if winner is None else "win",
+                        )
+
+                    with mock.patch("src.training.league.play_match", side_effect=recorded_match):
+                        result = session.train_match()
+                    self.assertEqual(result["challenger_seat"], 0)
+                    transitions = session.replay.state_dict()["episodes"][-1]["transitions"]
+                    self.assertEqual([step[3] for step in transitions], expected)
 
     def test_changed_opponent_pool_is_rejected_on_resume(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -256,12 +284,12 @@ class TestLeagueSession(unittest.TestCase):
             wrong = root / "wrong.pt"
             from src.model.network import QNetwork, save_checkpoint
 
-            with self.assertRaisesRegex(ValueError, "60 turns"):
-                LeagueConfig(game=GameConfig(max_turns=1))
+            with self.assertRaisesRegex(ValueError, "21 cards"):
+                LeagueConfig(game=GameConfig(cards_in_hand=18))
 
             save_checkpoint(
                 str(wrong),
-                QNetwork(architecture="suit_conv"),
+                QNetwork(),
                 GameConfig(cards_in_hand=18, required_sequences=5),
             )
             with self.assertRaisesRegex(ValueError, "21 cards"):
@@ -308,12 +336,11 @@ class TestLeagueSession(unittest.TestCase):
                 session.train_match()
             network_before = copy.deepcopy(session.network.state_dict())
             payload = copy.deepcopy(session.state_dict())
-            episode = list(
-                payload["replay_state_dict"]["episodes"][0]
-            )
-            state, _action, target = episode[0]
-            episode[0] = (state, 54, target)
-            payload["replay_state_dict"]["episodes"] = (tuple(episode),)
+            journal = payload["replay_state_dict"]["episodes"][0]
+            episode = list(journal["transitions"])
+            state, prefix, _action, target = episode[0]
+            episode[0] = (state, prefix, 54, target)
+            journal["transitions"] = tuple(episode)
             first_parameter = next(
                 iter(payload["network_state_dict"].values())
             )
@@ -345,51 +372,59 @@ class TestLeagueSession(unittest.TestCase):
                 session.state_dict()["counters"],
             )
 
-    def test_remote_actual_two_player_match_updates_complete_boundary(self):
+    def test_count_and_seat_schedules_are_independently_balanced(self):
         with tempfile.TemporaryDirectory() as temporary:
             champion = Path(temporary) / "champion.pt"
             self.make_model(champion)
             session = LeagueSession(
-                str(champion),
-                config=LeagueConfig(
-                    player_counts=(2,),
-                    batch_size=1,
-                    updates_per_match=1,
-                ),
+                str(champion), config=LeagueConfig(batch_size=1, updates_per_match=1),
             )
-            result = session.train_match()
-            self.assertEqual(
-                session.config.game,
-                GameConfig(max_turns=60),
-            )
-            self.assertEqual(session.config.player_counts, (2,))
-            self.assertEqual(result["players"], 2)
-            self.assertEqual(session.completed_matches, 1)
-            self.assertTrue(session.at_match_boundary)
+            with mock.patch("src.training.league.play_match", side_effect=fake_match):
+                results = [session.train_match() for _ in range(35)]
+                self.assertEqual(session.count_matches, Counter(result["players"] for result in results))
+                results.append(session.train_match())
+            self.assertEqual(Counter(result["players"] for result in results), {2: 12, 3: 12, 4: 12})
+            for players in (2, 3, 4):
+                counts = Counter(result["challenger_seat"] for result in results if result["players"] == players)
+                self.assertEqual(counts, {seat: 12 // players for seat in range(players)})
+            self.assertEqual(session.count_matches, {2: 12, 3: 12, 4: 12})
 
 
 class TestLeagueCli(unittest.TestCase):
-    def test_cli_exposes_bounded_resume_contract(self):
-        parser = build_arg_parser()
-        args = parser.parse_args(
-            [
-                "--initial-model",
-                "champion.pt",
-                "--opponent",
-                "random",
-                "--output-dir",
-                "out",
-                "--matches",
-                "2",
-                "--max-seconds",
-                "10",
-                "--resume",
-                "state.pt",
+    @unittest.skipIf(torch is None, TORCH_REASON)
+    def test_resume_accepts_partial_matching_options_and_rejects_changes_before_publish(self):
+        from src.model.network import QNetwork, save_checkpoint
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model.pt"
+            save_checkpoint(str(model), QNetwork(), GameConfig())
+            session = LeagueSession(str(model), config=LeagueConfig(
+                game=GameConfig(max_turns=1), batch_size=2, updates_per_match=1,
+            ), seed=73)
+            output = root / "league"
+            save_session_checkpoint(session, output)
+            args = [
+                "--initial-model", str(model), "--resume", str(output / "latest-state.pt"),
+                "--output-dir", str(output), "--matches", "0", "--max-seconds", "0",
             ]
-        )
-        self.assertEqual(args.matches, 2)
-        self.assertEqual(args.opponent, ["random"])
-        self.assertEqual(args.resume, "state.pt")
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(main([
+                    *args, "--players", "2", "3", "4", "--updates-per-match", "1",
+                ]), 0)
+            before = {name: (output / name).read_bytes() for name in ("latest-state.pt", "latest-model.pt")}
+            for options in (
+                ["--players", "2"], ["--players", "3", "2", "4"],
+                ["--players", "2", "3", "3", "4"], ["--max-turns", "60"],
+                ["--batch-size", "64"], ["--seed", "74"],
+                ["--updates-per-match", "2"],
+            ):
+                with self.subTest(options=options), mock.patch(
+                    "sys.stderr", new_callable=io.StringIO,
+                ) as error:
+                    self.assertEqual(main([*args, *options]), 2)
+                    self.assertIn("resume cannot change", error.getvalue())
+                    self.assertTrue(error.getvalue().startswith("error: "))
+                self.assertEqual({name: (output / name).read_bytes() for name in before}, before)
 
 
 if __name__ == "__main__":

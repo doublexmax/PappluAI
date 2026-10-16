@@ -1,4 +1,4 @@
-"""Papplu hand validity and binary declaration reward.
+"""
 
 Card encoding is a length-52 count vector. Index = suit * 13 + rank_offset with
 suit order s, h, d, c (0..3) and ranks A,2,3,4,5,6,7,8,9,10,J,Q,K (offset 0..12).
@@ -11,6 +11,7 @@ substitute only in melds that do not count toward the pure-sequence quota.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import chain
 from numbers import Integral
 from typing import Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 
@@ -95,6 +96,12 @@ def _rank_patterns() -> Tuple[Tuple[int, ...], ...]:
 
 
 RANK_PATTERNS = _rank_patterns()
+_IRREDUCIBLE_SEQUENCES = tuple(
+    tuple(_face(suit, rank) for rank in pattern)
+    for suit in range(NUM_SUITS)
+    for pattern in RANK_PATTERNS
+    if len(pattern) < 2 * MIN_MELD
+)
 
 
 def _subtract(counts: Tuple[int, ...], used: Sequence[int]) -> Tuple[int, ...]:
@@ -106,9 +113,7 @@ def _subtract(counts: Tuple[int, ...], used: Sequence[int]) -> Tuple[int, ...]:
     return tuple(next_counts)
 
 
-def _wild_faces(joker: int, pure: bool) -> Tuple[int, ...]:
-    if pure:
-        return (joker,)
+def _wild_faces(joker: int) -> Tuple[int, ...]:
     rank = joker % NUM_RANKS
     return tuple(_face(suit, rank) for suit in range(NUM_SUITS))
 
@@ -117,18 +122,15 @@ def _iter_allocations(
     counts: Tuple[int, ...],
     represented: Sequence[int],
     joker: int,
-    pure: bool,
-    require_actual: Optional[int] = None,
 ) -> Iterator[Tuple[int, ...]]:
-    wilds = _wild_faces(joker, pure)
+    wilds = _wild_faces(joker)
     n = len(represented)
     actuals = [0] * n
     pool = list(counts)
 
-    def place(slot: int, used_required: bool) -> Iterator[Tuple[int, ...]]:
+    def place(slot: int) -> Iterator[Tuple[int, ...]]:
         if slot == n:
-            if require_actual is None or used_required:
-                yield tuple(actuals)
+            yield tuple(actuals)
             return
 
         target = represented[slot]
@@ -142,11 +144,10 @@ def _iter_allocations(
         for card in candidates:
             pool[card] -= 1
             actuals[slot] = card
-            next_used = used_required or (require_actual is not None and card == require_actual)
-            yield from place(slot + 1, next_used)
+            yield from place(slot + 1)
             pool[card] += 1
 
-    return place(0, False)
+    return place(0)
 
 
 def _meld_from(
@@ -165,38 +166,23 @@ def _meld_from(
 def _iter_sequences(
     counts: Tuple[int, ...],
     joker: int,
-    pure_only: bool,
-    anchor: Optional[int] = None,
-) -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
+) -> Iterator[Meld]:
     total = sum(counts)
-    anchor_is_wild = anchor in _wild_faces(joker, pure_only)
-    for suit in range(NUM_SUITS):
-        for pattern in RANK_PATTERNS:
-            if len(pattern) > total:
-                continue
-            represented = tuple(_face(suit, rank) for rank in pattern)
-            if anchor is not None and anchor not in represented and not anchor_is_wild:
-                continue
-            for actuals in _iter_allocations(
-                counts, represented, joker, pure_only, require_actual=anchor,
-            ):
-                meld = _meld_from("sequence", actuals, represented, joker)
-                yield meld, _subtract(counts, actuals)
+    wilds = _wild_faces(joker)
+    wild_count = sum(counts[face] for face in wilds)
+    natural = tuple(count > 0 and face not in wilds for face, count in enumerate(counts))
+    for represented in _IRREDUCIBLE_SEQUENCES:
+        if len(represented) > total:
+            continue
+        if len(represented) - sum(natural[face] for face in represented) > wild_count:
+            continue
+        for actuals in _iter_allocations(counts, represented, joker):
+            yield _meld_from("sequence", actuals, represented, joker)
 
 
 def _iter_sets(
-    counts: Tuple[int, ...], joker: int, anchor: int,
-) -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
-    wilds = set(_wild_faces(joker, pure=False))
-    anchor_rank = anchor % NUM_RANKS
-    anchor_is_wild = anchor in wilds
-
-    ranks: Sequence[int]
-    if anchor_is_wild:
-        ranks = range(NUM_RANKS)
-    else:
-        ranks = (anchor_rank,)
-
+    counts: Tuple[int, ...], joker: int,
+) -> Iterator[Meld]:
     suit_combos = (
         (0, 1, 2),
         (0, 1, 3),
@@ -205,72 +191,89 @@ def _iter_sets(
         (0, 1, 2, 3),
     )
 
-    for rank in ranks:
+    for rank in range(NUM_RANKS):
         for suits in suit_combos:
             represented = tuple(_face(suit, rank) for suit in suits)
-            if not anchor_is_wild and anchor not in represented:
-                continue
-            for actuals in _iter_allocations(counts, represented, joker, pure=False, require_actual=anchor):
-                meld = _meld_from("set", actuals, represented, joker)
-                yield meld, _subtract(counts, actuals)
-
-
-def _collapse_candidates(
-    items: Iterator[Tuple[Meld, Tuple[int, ...]]],
-) -> List[Tuple[Meld, Tuple[int, ...]]]:
-    best = {}
-    for meld, remaining in items:
-        key = (remaining, meld.is_pure)
-        best.setdefault(key, (meld, remaining))
-    ordered = list(best.values())
-    ordered.sort(key=lambda item: (len(item[0].cards), item[0].kind, item[0].represented_cards))
-    return ordered
+            for actuals in _iter_allocations(counts, represented, joker):
+                yield _meld_from("set", actuals, represented, joker)
 
 
 def _search(
     counts: Tuple[int, ...],
     pure_needed: int,
     joker: int,
-    memo: Dict[Tuple[Tuple[int, ...], int], Optional[Tuple[Meld, ...]]],
 ) -> Optional[Tuple[Meld, ...]]:
-    key = (counts, pure_needed)
-    if key in memo:
-        return memo[key]
-
-    total = sum(counts)
-    if total == 0:
-        result: Optional[Tuple[Meld, ...]] = () if pure_needed == 0 else None
-        memo[key] = result
-        return result
-    if total < MIN_MELD:
-        memo[key] = None
+    if sum(counts) < pure_needed * MIN_MELD:
         return None
-    if pure_needed * MIN_MELD > total:
-        memo[key] = None
-        return None
+    faces, options = _compile_meld_options(counts, joker)
+    initial = tuple(counts[face] for face in faces)
+    memo: Dict[Tuple[Tuple[int, ...], int], Optional[Tuple[Meld, ...]]] = {}
 
-    if pure_needed > 0:
-        # Do not pin the global lowest card: it may belong only in a later set.
-        raw = _iter_sequences(counts, joker, pure_only=True, anchor=None)
-    else:
-        anchor = next(face for face, count in enumerate(counts) if count)
-
-        def all_melds() -> Iterator[Tuple[Meld, Tuple[int, ...]]]:
-            yield from _iter_sequences(counts, joker, pure_only=False, anchor=anchor)
-            yield from _iter_sets(counts, joker, anchor=anchor)
-
-        raw = all_melds()
-
-    for meld, remaining in _collapse_candidates(raw):
-        next_pure = max(0, pure_needed - meld.is_pure)
-        suffix = _search(remaining, next_pure, joker, memo)
-        if suffix is not None:
-            result = (meld,) + suffix
+    def visit(state: Tuple[int, ...], needed: int) -> Optional[Tuple[Meld, ...]]:
+        key = (state, needed)
+        if key in memo:
+            return memo[key]
+        total = sum(state)
+        if not total:
+            result: Optional[Tuple[Meld, ...]] = () if needed == 0 else None
             memo[key] = result
             return result
+        if total < MIN_MELD or total < needed * MIN_MELD:
+            memo[key] = None
+            return None
+        anchor = next(index for index, count in enumerate(state) if count)
+        for option in options[anchor]:
+            if any(state[position] < copies for position, copies in option.take):
+                continue
+            remaining = list(state)
+            for position, copies in option.take:
+                remaining[position] -= copies
+            suffix = visit(tuple(remaining), max(0, needed - option.meld.is_pure))
+            if suffix is not None:
+                result = (option.meld,) + suffix
+                memo[key] = result
+                return result
+        memo[key] = None
+        return None
 
-    memo[key] = None
-    return None
+    return visit(initial, pure_needed)
+
+
+@dataclass(frozen=True)
+class _MeldOption:
+    meld: Meld
+    take: Tuple[Tuple[int, int], ...]
+
+
+def _compile_meld_options(
+    counts: Tuple[int, ...], joker: int,
+) -> Tuple[Tuple[int, ...], Tuple[Tuple[_MeldOption, ...], ...]]:
+    wilds = _wild_faces(joker)
+    faces = tuple(sorted(
+        (face for face, count in enumerate(counts) if count),
+        key=lambda face: (face in wilds, face),
+    ))
+    positions = {face: index for index, face in enumerate(faces)}
+    best: Dict[Tuple[Tuple[int, int], ...], Meld] = {}
+
+    for meld in chain(_iter_sequences(counts, joker), _iter_sets(counts, joker)):
+        used: Dict[int, int] = {}
+        for face in meld.cards:
+            position = positions[face]
+            used[position] = used.get(position, 0) + 1
+        take = tuple(sorted(used.items()))
+        previous = best.get(take)
+        if previous is None or meld.is_pure and not previous.is_pure:
+            best[take] = meld
+    by_anchor: List[List[_MeldOption]] = [[] for _ in faces]
+    for take, meld in best.items():
+        by_anchor[take[0][0]].append(_MeldOption(meld, take))
+    for options in by_anchor:
+        options.sort(key=lambda option: (
+            not option.meld.is_pure, len(option.meld.cards),
+            option.meld.kind, option.meld.represented_cards, option.take,
+        ))
+    return faces, tuple(tuple(options) for options in by_anchor)
 
 
 def evaluate_hand(
@@ -293,7 +296,7 @@ def evaluate_hand(
     if sum(counts) != target_cards:
         return HandEvaluation(is_valid=False)
 
-    melds = _search(counts, pure_needed, joker_face, {})
+    melds = _search(counts, pure_needed, joker_face)
     if melds is None:
         return HandEvaluation(is_valid=False)
     return HandEvaluation(is_valid=True, melds=melds)
@@ -315,3 +318,225 @@ def hand_reward(
     cards_in_hand: int = 21,
 ) -> float:
     return 1.0 if is_valid_hand(hand, joker, required_sequences, cards_in_hand) else 0.0
+
+
+SCORING_VERSION = 1
+
+_RANK_POINTS = (10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10)
+_UNREACHABLE = float("inf")
+
+
+@dataclass(frozen=True)
+class HandPenalty:
+    """Lowest sequence-gated penalty of a hand and one grouping that attains it.
+
+    Every card is in exactly one exempt meld or in counted_cards, a 52-count
+    vector like the hand. points is the card points of counted_cards. When the
+    grouping holds fewer qualifying sequences than required, every exempt meld
+    is a qualifying sequence.
+    """
+
+    points: int
+    exempt_melds: Tuple[Meld, ...]
+    counted_cards: Tuple[int, ...]
+
+    @property
+    def qualifying_sequences(self) -> int:
+        return sum(meld.kind == "sequence" and meld.is_pure for meld in self.exempt_melds)
+
+
+def validate_hand_penalty(
+    hand: Sequence[int],
+    joker: int,
+    witness: object,
+    required_sequences: int = 5,
+    *,
+    declared_winner: bool = False,
+    cards_in_hand: int = 21,
+) -> HandPenalty:
+    """Validate a serialized penalty witness without recomputing its optimum."""
+    counts = _parse_hand(hand)
+    joker_face = _parse_joker(joker)
+    quota = _require_nonnegative_integral(required_sequences, "required_sequences")
+    target_cards = _require_positive_integral(cards_in_hand, "cards_in_hand")
+    fields = set(HandPenalty.__dataclass_fields__) | {"qualifying_sequences"}
+    if not isinstance(witness, dict) or not fields <= witness.keys():
+        raise ValueError("penalty witness fields do not match the schema")
+    points = witness["points"]
+    if type(points) is not int or points < 0:
+        raise ValueError("penalty points must be a nonnegative integer")
+    counted = witness["counted_cards"]
+    if (
+        not isinstance(counted, (list, tuple)) or len(counted) != NUM_FACES
+        or any(type(count) is not int or count < 0 for count in counted)
+    ):
+        raise ValueError("penalty counted_cards must contain 52 nonnegative integer counts")
+    raw_melds = witness["exempt_melds"]
+    if not isinstance(raw_melds, (list, tuple)):
+        raise ValueError("penalty exempt_melds must be a sequence")
+    remaining = list(counts)
+    melds = []
+    for raw in raw_melds:
+        if not isinstance(raw, dict) or set(raw) != set(Meld.__dataclass_fields__):
+            raise ValueError("penalty meld fields do not match the schema")
+        actuals, represented = raw["cards"], raw["represented_cards"]
+        if (
+            raw["kind"] not in ("sequence", "set") or type(raw["is_pure"]) is not bool
+            or not isinstance(actuals, (list, tuple))
+            or not isinstance(represented, (list, tuple))
+            or len(actuals) != len(represented) or len(actuals) < MIN_MELD
+            or any(type(face) is not int or not 0 <= face < NUM_FACES
+                   for faces in (actuals, represented) for face in faces)
+        ):
+            raise ValueError("penalty meld has invalid cards or kind")
+        actuals, represented = tuple(actuals), tuple(represented)
+        if raw["kind"] == "sequence":
+            legal = (
+                len({face // NUM_RANKS for face in represented}) == 1
+                and tuple(face % NUM_RANKS for face in represented) in RANK_PATTERNS
+            )
+        else:
+            legal = (
+                len(represented) in (3, 4) and len(set(represented)) == len(represented)
+                and len({face % NUM_RANKS for face in represented}) == 1
+            )
+        if not legal or any(
+            actual != target and actual % NUM_RANKS != joker_face % NUM_RANKS
+            for actual, target in zip(actuals, represented)
+        ):
+            raise ValueError("penalty meld is not legal under the selected joker")
+        meld = _meld_from(raw["kind"], actuals, represented, joker_face)
+        if meld.is_pure != raw["is_pure"]:
+            raise ValueError("penalty meld purity does not match its cards")
+        for face in actuals:
+            remaining[face] -= 1
+            if remaining[face] < 0:
+                raise ValueError("penalty melds exceed the terminal hand")
+        melds.append(meld)
+    penalty = HandPenalty(points, tuple(melds), tuple(counted))
+    qualifying = witness["qualifying_sequences"]
+    if type(qualifying) is not int or qualifying != penalty.qualifying_sequences:
+        raise ValueError("penalty qualifying sequence count does not match its melds")
+    if qualifying < quota and any(not meld.is_pure for meld in melds):
+        raise ValueError("penalty non-pure melds require the qualifying sequence quota")
+    if tuple(remaining) != penalty.counted_cards:
+        raise ValueError("penalty witness does not conserve the terminal hand")
+    if points != sum(_card_points(face, joker_face) * count for face, count in enumerate(remaining)):
+        raise ValueError("penalty points do not match the unmatched cards")
+    if declared_winner and (
+        points != 0 or sum(counts) != target_cards
+        or (
+            (any(remaining) or qualifying < quota)
+            and not evaluate_hand(counts, joker_face, quota, target_cards).is_valid
+        )
+    ):
+        raise ValueError("declared winner needs a valid complete declaration")
+    return penalty
+
+
+def minimum_penalty(
+    hand: Sequence[int], joker: int, required_sequences: int = 5,
+) -> HandPenalty:
+    """Return the lowest unmatched-card penalty over every legal grouping of hand.
+
+    Cards 2 through 10 score their face value, A, J, Q, and K score 10, and
+    every card of the joker's rank scores 0. Qualifying sequences are the pure
+    sequences that count toward required_sequences, and they always exempt their
+    cards. Other melds exempt theirs only in a grouping that also holds the
+    required qualifying sequences. The returned grouping meets the quota
+    whenever some optimal grouping does. Any hand size is scored. Malformed
+    arguments raise like evaluate_hand.
+    """
+    counts = _parse_hand(hand)
+    joker_face = _parse_joker(joker)
+    quota = _require_nonnegative_integral(required_sequences, "required_sequences")
+    faces, options = _compile_meld_options(counts, joker_face)
+    start = tuple(counts[face] for face in faces)
+    points = tuple(_card_points(face, joker_face) for face in faces)
+
+    quota_search = _PenaltySearch(points, options)
+    quota_score = quota_search.cost(start, quota)
+    selected_search, selected_need, best = quota_search, quota, quota_score
+    if quota_score:
+        qualifying_only_search = _PenaltySearch(points, tuple(
+            tuple(option for option in anchored if option.meld.is_pure)
+            for anchored in options
+        ))
+        qualifying_score = qualifying_only_search.cost(start, 0)
+        if qualifying_score < quota_score:
+            selected_search, selected_need, best = qualifying_only_search, 0, qualifying_score
+
+    melds = selected_search.witness(start, selected_need)
+    counted = counts
+    for meld in melds:
+        counted = _subtract(counted, meld.cards)
+    total = sum(_card_points(face, joker_face) * count for face, count in enumerate(counted))
+    if total != best:
+        raise RuntimeError("internal penalty witness mismatch")
+    return HandPenalty(points=total, exempt_melds=melds, counted_cards=counted)
+
+
+def _card_points(face: int, joker: int) -> int:
+    rank = face % NUM_RANKS
+    return 0 if rank == joker % NUM_RANKS else _RANK_POINTS[rank]
+
+
+class _PenaltySearch:
+    def __init__(
+        self,
+        points: Tuple[int, ...],
+        options: Tuple[Tuple[_MeldOption, ...], ...],
+    ) -> None:
+        self._points = points
+        self._scoring = tuple(position for position, value in enumerate(points) if value)
+        self._options = options
+        self._memo: Dict[Tuple[Tuple[int, ...], int], float] = {}
+
+    def cost(self, state: Tuple[int, ...], need: int) -> float:
+        key = (state, need)
+        if key not in self._memo:
+            self._memo[key] = self._solve(state, need)
+        return self._memo[key]
+
+    def witness(self, state: Tuple[int, ...], need: int) -> Tuple[Meld, ...]:
+        melds: List[Meld] = []
+        while not self._settled(state, need):
+            target = self.cost(state, need)
+            for meld, rest, rest_need, points in self._branches(state, need):
+                if points + self.cost(rest, rest_need) == target:
+                    break
+            else:
+                raise RuntimeError("internal penalty witness mismatch")
+            if meld is not None:
+                melds.append(meld)
+            state, need = rest, rest_need
+        return tuple(melds)
+
+    def _settled(self, state: Tuple[int, ...], need: int) -> bool:
+        return need == 0 and not any(state[position] for position in self._scoring)
+
+    def _solve(self, state: Tuple[int, ...], need: int) -> float:
+        if self._settled(state, need):
+            return 0
+        if sum(state) < need * MIN_MELD:
+            return _UNREACHABLE
+        best = _UNREACHABLE
+        for _, rest, rest_need, points in self._branches(state, need):
+            best = min(best, points + self.cost(rest, rest_need))
+            if not best:
+                break
+        return best
+
+    def _branches(
+        self, state: Tuple[int, ...], need: int,
+    ) -> Iterator[Tuple[Optional[Meld], Tuple[int, ...], int, int]]:
+        anchor = next(position for position, count in enumerate(state) if count)
+        for option in self._options[anchor]:
+            if all(state[position] >= copies for position, copies in option.take):
+                rest = list(state)
+                for position, copies in option.take:
+                    rest[position] -= copies
+                yield option.meld, tuple(rest), max(0, need - option.meld.is_pure), 0
+        rest = list(state)
+        rest[anchor] -= 1
+        yield None, tuple(rest), need, self._points[anchor]

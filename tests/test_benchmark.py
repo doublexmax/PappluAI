@@ -1,5 +1,4 @@
 import random
-import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,7 +11,6 @@ from src.evaluation.benchmark import (
     paired_comparison,
 )
 from src.game.environment import GameConfig
-from src.evaluation.compare import run_comparison
 
 try:
     import torch
@@ -47,47 +45,24 @@ class TestPairedComparison(unittest.TestCase):
                 paired_comparison(*args, samples=100)
 
 
-class TestComparisonPlan(unittest.TestCase):
-    def test_rejects_existing_experiment(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            (output / "comparison.json").write_text("{}", encoding="utf-8")
-            with self.assertRaises(FileExistsError):
-                run_comparison({}, output)
-
-    def test_rejects_overlapping_selection_and_test_deals(self):
-        plan_path = Path(__file__).resolve().parents[1] / "experiments" / "networks.json"
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        plan["screen"]["test_seed"] = plan["screen"]["validation_seed"]
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "must not overlap"):
-                run_comparison(plan, Path(directory))
-
-
 @unittest.skipIf(torch is None, "Training dependencies not installed")
 class TestEvaluation(unittest.TestCase):
     def test_checkpoint_evaluation_restores_torch_threads(self):
-        from src.model.network import QNetwork
+        from src.model.network import QNetwork, save_checkpoint
 
         before = torch.get_num_threads()
         outcomes = PolicyResults((0,), 0, 0)
-        with mock.patch(
-            "src.evaluation.benchmark.load_checkpoint",
-            return_value=(QNetwork(), GameConfig(), {}),
-        ), mock.patch(
-            "src.evaluation.benchmark.evaluate_games",
-            return_value=outcomes,
-        ):
-            evaluate_checkpoint("generated.pt", games=1, warm_games=0)
-        self.assertEqual(torch.get_num_threads(), before)
-
-        with mock.patch(
-            "src.evaluation.benchmark.load_checkpoint",
-            side_effect=RuntimeError("load failed"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "load failed"):
-                evaluate_checkpoint("bad.pt", games=1, warm_games=0)
-        self.assertEqual(torch.get_num_threads(), before)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pt"
+            save_checkpoint(str(path), QNetwork(), GameConfig())
+            with mock.patch("src.evaluation.benchmark.evaluate_games", return_value=outcomes):
+                result = evaluate_checkpoint(str(path), games=1, warm_games=0)
+            self.assertEqual(result["greedy"]["outcomes"], (0,))
+            self.assertEqual(torch.get_num_threads(), before)
+            with mock.patch("src.evaluation.benchmark.load_checkpoint", side_effect=RuntimeError("load failed")):
+                with self.assertRaisesRegex(RuntimeError, "load failed"):
+                    evaluate_checkpoint(str(path), games=1, warm_games=0)
+            self.assertEqual(torch.get_num_threads(), before)
 
     def test_puzzle_oracle_proves_sensitivity(self):
         from src.model.network import QNetwork

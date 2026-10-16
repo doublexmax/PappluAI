@@ -1,162 +1,165 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence, Tuple
 from pathlib import Path
 import random
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from src.checkpoints.tensor import validate_model_state
 from src.game.environment import (
-    ENCODING_VERSION,
-    NUM_ACTIONS,
-    STATE_DIM,
-    GameConfig,
-    Observation,
-    encode_observation,
-    legal_action_mask,
+    ENCODING_VERSION, NUM_ACTIONS, NUM_FACES, GameConfig, Observation, legal_action_mask,
 )
-
-CHECKPOINT_VERSION = 2
-SUPPORTED_ARCHITECTURES = ("mlp", "wide_mlp", "suit_conv")
+from src.game.information import EventKind
+from src.model.encoding import (
+    CONTEXT_FEATURES, EVENT_FEATURES, PLAYER_FEATURES,
+    ObservationBatch, collate_observations,
+)
+from src.model.spec import ARCHITECTURE, CHECKPOINT_VERSION, ModelSpec
 
 
 class QNetwork(nn.Module):
-    def __init__(
-        self,
-        state_dim: int = STATE_DIM,
-        num_actions: int = NUM_ACTIONS,
-        architecture: str = "mlp",
-    ) -> None:
+    architecture = ARCHITECTURE
+    num_actions = NUM_ACTIONS
+
+    def __init__(self, spec: ModelSpec = ModelSpec()) -> None:
         super().__init__()
-        self.state_dim = state_dim
-        self.num_actions = num_actions
-        self.architecture = _validate_architecture(architecture)
+        self.spec = spec
+        width = spec.width
+        self.rank_embedding = nn.Embedding(13, width)
+        self.suit_embedding = nn.Embedding(4, width)
+        self.face_embedding = nn.Sequential(nn.Linear(width, width), nn.GELU())
+        self.card_features = nn.Linear(5, width)
+        self.card_conv = nn.Conv1d(width, width, 3, padding=1)
+        self.card_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
+        self.card_norm = nn.LayerNorm(width)
+        self.event_embedding = nn.Embedding(len(EventKind), width)
+        self.event_features = nn.Linear(EVENT_FEATURES, width)
+        self.event_cards = nn.Linear(width * 2, width)
+        self.initial_cards = nn.Linear(width, width)
+        self.history_encoder = nn.GRU(width, width, batch_first=True)
+        self.context_features = nn.Linear(CONTEXT_FEATURES, width)
+        self.player_features = nn.Linear(PLAYER_FEATURES, width)
+        self.player_history_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
+        self.turn_relations = nn.Linear(width * 3, width)
+        self.player_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
+        self.player_norm = nn.LayerNorm(width)
+        self.action_embedding = nn.Embedding(3, width)
+        self.action_query = nn.Linear(width * 3, width)
+        self.action_player_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
+        self.action_card_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
+        self.score = nn.Sequential(nn.Linear(width * 3, width), nn.GELU(), nn.Linear(width, 1))
 
-        if self.architecture == "mlp":
-            self.fc1 = nn.Linear(state_dim, 128)
-            self.fc2 = nn.Linear(128, 64)
-            self.fc3 = nn.Linear(64, num_actions)
-        elif self.architecture == "wide_mlp":
-            self.fc1 = nn.Linear(state_dim, 256)
-            self.fc2 = nn.Linear(256, 128)
-            self.fc3 = nn.Linear(128, 64)
-            self.fc4 = nn.Linear(64, num_actions)
-        else:
-            if state_dim != STATE_DIM or num_actions != NUM_ACTIONS:
-                raise ValueError(
-                    "suit_conv requires state_dim=%d and num_actions=%d"
-                    % (STATE_DIM, NUM_ACTIONS)
-                )
-            channels = 32
-            self.suit_conv1 = nn.Conv1d(4, channels, kernel_size=3, padding=1)
-            self.suit_conv2 = nn.Conv1d(
-                channels, channels, kernel_size=3, padding=1
-            )
-            self.face_fc1 = nn.Linear(channels * 3 + 8 + 13, 64)
-            self.face_fc2 = nn.Linear(64, 1)
-            self.draw_fc1 = nn.Linear(channels * 2 + 8, 64)
-            self.draw_fc2 = nn.Linear(64, 2)
-            self.register_buffer(
-                "_rank_one_hot", torch.eye(13, dtype=torch.float32), persistent=False
-            )
-
-    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-        if self.architecture == "mlp":
-            x = torch.relu(self.fc1(x))
-            x = torch.relu(self.fc2(x))
-            return self.fc3(x)
-        if self.architecture == "wide_mlp":
-            x = torch.relu(self.fc1(x))
-            x = torch.relu(self.fc2(x))
-            x = torch.relu(self.fc3(x))
-            return self.fc4(x)
-        return self._forward_suit_conv(x)
-
-    def _forward_suit_conv(self, x: "torch.Tensor") -> "torch.Tensor":
-        batch_size = x.shape[0]
-        hand = x[:, :52].reshape(batch_size, 4, 13)
-        top_discard = x[:, 52:104].reshape(batch_size, 4, 13)
-        exact_joker = x[:, 104:156].reshape(batch_size, 4, 13)
-        context = x[:, 156:164]
-
-        cards_in_hand = context[:, 6].reshape(batch_size, 1, 1) * 30.0
-        num_decks = context[:, 5].reshape(batch_size, 1, 1) * 6.0
-        hand_per_deck = hand * cards_in_hand / num_decks.clamp_min(1.0)
-        wildcard_rank = exact_joker.amax(dim=1, keepdim=True).expand(-1, 4, -1)
-        card_features = torch.stack(
-            (hand_per_deck, top_discard, exact_joker, wildcard_rank), dim=2
+    def forward(self, batch: ObservationBatch) -> torch.Tensor:
+        device = batch.cards.device
+        width = self.spec.width
+        size = batch.cards.shape[0]
+        faces = torch.arange(NUM_FACES, device=device)
+        base_cards = self.face_embedding(
+            self.rank_embedding(faces % 13) + self.suit_embedding(faces // 13)
         )
-
-        suit_rows = card_features.reshape(batch_size * 4, 4, 13)
+        visible_faces = torch.cat((base_cards, base_cards.new_zeros(1, width)), dim=0)
+        cards = base_cards.unsqueeze(0) + self.card_features(batch.cards)
+        suit_rows = cards.reshape(size * 4, 13, width).transpose(1, 2)
         suit_rows = torch.cat((suit_rows, suit_rows[:, :, :1]), dim=2)
-        local = torch.relu(self.suit_conv1(suit_rows))
-        local = torch.relu(self.suit_conv2(local))
-        local = local.transpose(1, 2).reshape(batch_size, 4, 14, 32)
+        local = torch.relu(self.card_conv(suit_rows)).transpose(1, 2)
+        ace = 0.5 * (local[:, 0] + local[:, 13])
+        local = torch.cat((ace[:, None, :], local[:, 1:13]), dim=1).reshape(size, NUM_FACES, width)
+        cards = cards + local
+        interactions, _ = self.card_attention(cards, cards, cards, need_weights=False)
+        cards = self.card_norm(cards + interactions)
 
-        ace = 0.5 * (local[:, :, 0] + local[:, :, 13])
-        local = torch.cat((ace.unsqueeze(2), local[:, :, 1:13]), dim=2)
-        set_features = local.mean(dim=1, keepdim=True).expand(-1, 4, -1, -1)
-        global_features = local.mean(dim=(1, 2))
-        top_features = (local * top_discard.unsqueeze(-1)).sum(dim=(1, 2))
-
-        global_faces = global_features[:, None, None, :].expand(-1, 4, 13, -1)
-        context_faces = context[:, None, None, :].expand(-1, 4, 13, -1)
-        rank_faces = self._rank_one_hot[None, None, :, :].expand(
-            batch_size, 4, -1, -1
+        event_cards = torch.cat((
+            visible_faces[batch.event_face], visible_faces[batch.offered_top],
+        ), dim=-1)
+        events = (
+            self.event_embedding(batch.event_kind)
+            + self.event_features(batch.event_features)
+            + self.event_cards(event_cards)
         )
-        face_features = torch.cat(
-            (local, set_features, global_faces, context_faces, rank_faces), dim=3
+        initial = self.initial_cards(batch.initial_hand @ base_cards / 30.0)
+        events = events + (
+            torch.arange(events.shape[1], device=device)[None, :, None] == 0
+        ) * initial[:, None, :]
+        packed = pack_padded_sequence(
+            events, batch.history_lengths, batch_first=True, enforce_sorted=False,
         )
-        discard_values = self.face_fc2(
-            torch.relu(self.face_fc1(face_features))
-        ).reshape(batch_size, 52)
-
-        draw_features = torch.cat((global_features, top_features, context), dim=1)
-        draw_values = self.draw_fc2(torch.relu(self.draw_fc1(draw_features)))
-        return torch.cat((draw_values, discard_values), dim=1)
-
-
-def _validate_architecture(architecture: object) -> str:
-    if architecture not in SUPPORTED_ARCHITECTURES:
-        raise ValueError(
-            "unknown architecture %r (expected one of %s)"
-            % (architecture, ", ".join(SUPPORTED_ARCHITECTURES))
+        packed_history, final = self.history_encoder(packed)
+        history, _ = pad_packed_sequence(
+            packed_history, batch_first=True, total_length=events.shape[1],
         )
-    return str(architecture)
+        context = self.context_features(batch.context) + final[0]
+        players = self.player_features(batch.players) + context[:, None, :]
+        player_history, _ = self.player_history_attention(
+            players, history, history, key_padding_mask=~batch.history_mask,
+            need_weights=False,
+        )
+        positions = torch.arange(events.shape[1], device=device)[None, :, None]
+        actor_matches = (
+            batch.event_actor[:, :, None]
+            == torch.arange(players.shape[1], device=device)[None, None, :]
+        ) & batch.history_mask[:, :, None]
+        last_positions = positions.expand(size, -1, players.shape[1]).masked_fill(
+            ~actor_matches, -1,
+        ).amax(dim=1)
+        last_history = history.gather(
+            1, last_positions.clamp_min(0)[:, :, None].expand(-1, -1, width),
+        ) * (last_positions >= 0)[:, :, None]
+        players = players + player_history + last_history
+        next_players = players.gather(1, batch.next_player[:, :, None].expand(-1, -1, width))
+        previous_players = players.gather(1, batch.previous_player[:, :, None].expand(-1, -1, width))
+        players = players + torch.relu(self.turn_relations(
+            torch.cat((players, next_players, previous_players), dim=-1),
+        ))
+        relations, _ = self.player_attention(
+            players, players, players, key_padding_mask=~batch.player_mask,
+            need_weights=False,
+        )
+        players = self.player_norm(players + relations)
+
+        top_cards = cards.gather(
+            1, batch.top.clamp_max(NUM_FACES - 1)[:, None, None].expand(-1, 1, width),
+        ) * (batch.top < NUM_FACES)[:, None, None]
+        action_cards = torch.cat((cards.new_zeros(size, 1, width), top_cards, cards), dim=1)
+        action_kinds = torch.tensor([0, 1] + [2] * NUM_FACES, device=device)
+        actions = self.action_query(torch.cat((
+            action_cards,
+            self.action_embedding(action_kinds)[None, :, :].expand(size, -1, -1),
+            context[:, None, :].expand(-1, NUM_ACTIONS, -1),
+        ), dim=-1))
+        player_context, _ = self.action_player_attention(
+            actions, players, players, key_padding_mask=~batch.player_mask,
+            need_weights=False,
+        )
+        card_context, _ = self.action_card_attention(actions, cards, cards, need_weights=False)
+        return self.score(torch.cat((actions, player_context, card_context), dim=-1)).squeeze(-1)
 
 
 def masked_q_values(
-    network: "QNetwork",
-    state: Sequence[float],
+    network: QNetwork,
+    obs: Observation,
     mask: Sequence[bool],
-    device: Optional["torch.device"] = None,
-) -> "torch.Tensor":
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
     if device is None:
         device = next(network.parameters()).device
-    tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
-        q = network(tensor)[0]
-    illegal = [i for i, ok in enumerate(mask) if not ok]
-    if illegal:
-        q = q.clone()
-        q[illegal] = -torch.inf
-    return q
+        values = network(collate_observations([obs], device))[0]
+    return values.masked_fill(~torch.tensor(mask, dtype=torch.bool, device=device), -torch.inf)
 
 
 def select_action(
-    network: "QNetwork",
+    network: QNetwork,
     obs: Observation,
     epsilon: float,
     rng: random.Random,
-    device: Optional["torch.device"] = None,
+    device: Optional[torch.device] = None,
 ) -> int:
-    """Epsilon-greedy over the legal-action mask only."""
     if not 0.0 <= epsilon <= 1.0:
         raise ValueError("epsilon must be in [0, 1]")
-    mask = legal_action_mask(obs)
-    legal = [i for i, ok in enumerate(mask) if ok]
+    legal = [i for i, allowed in enumerate(legal_action_mask(obs)) if allowed]
     if not legal:
         raise ValueError("no legal actions")
     if rng.random() < epsilon:
@@ -165,38 +168,34 @@ def select_action(
 
 
 def select_greedy_action(
-    network: "QNetwork",
+    network: QNetwork,
     obs: Observation,
-    device: Optional["torch.device"] = None,
+    device: Optional[torch.device] = None,
 ) -> int:
     mask = legal_action_mask(obs)
-    legal = [i for i, ok in enumerate(mask) if ok]
-    if not legal:
+    if not any(mask):
         raise ValueError("no legal actions")
-    state = encode_observation(obs)
-    q = masked_q_values(network, state, mask, device=device)
-    return int(torch.argmax(q).item())
+    return int(masked_q_values(network, obs, mask, device=device).argmax().item())
 
 
 def select_random_legal(obs: Observation, rng: random.Random) -> int:
-    mask = legal_action_mask(obs)
-    legal = [i for i, ok in enumerate(mask) if ok]
+    legal = [i for i, allowed in enumerate(legal_action_mask(obs)) if allowed]
     if not legal:
         raise ValueError("no legal actions")
     return rng.choice(legal)
 
 
 def build_checkpoint(
-    network: "QNetwork",
+    network: QNetwork,
     config: GameConfig,
     meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
+    payload = {
         "checkpoint_version": CHECKPOINT_VERSION,
         "encoding_version": ENCODING_VERSION,
-        "architecture": network.architecture,
-        "state_dim": network.state_dim,
-        "num_actions": network.num_actions,
+        "architecture": ARCHITECTURE,
+        "model_spec": network.spec.to_dict(),
+        "num_actions": NUM_ACTIONS,
         "game_config": config.to_dict(),
         "model_state_dict": network.state_dict(),
     }
@@ -207,107 +206,55 @@ def build_checkpoint(
 
 def save_checkpoint(
     path: str,
-    network: "QNetwork",
+    network: QNetwork,
     config: GameConfig,
     meta: Optional[Dict[str, Any]] = None,
 ) -> None:
-    payload = build_checkpoint(network, config, meta=meta)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    torch.save(build_checkpoint(network, config, meta), path)
 
 
 def load_checkpoint(
     path: str,
-    device: Optional["torch.device"] = None,
+    device: Optional[torch.device] = None,
     expected_config: Optional[GameConfig] = None,
-    network: Optional["QNetwork"] = None,
-    expected_architecture: Optional[str] = None,
-) -> Tuple["QNetwork", GameConfig, Dict[str, Any]]:
-    """Load weights and config from version 1 or version 2 checkpoints."""
+    network: Optional[QNetwork] = None,
+) -> Tuple[QNetwork, GameConfig, Dict[str, Any]]:
     if device is None:
         device = torch.device("cpu")
     payload = torch.load(path, map_location=device, weights_only=True)
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must be a dict")
-
-    ckpt_ver = payload.get("checkpoint_version")
-    enc_ver = payload.get("encoding_version")
-    if ckpt_ver not in (1, CHECKPOINT_VERSION):
-        raise ValueError(
-            "unsupported checkpoint_version %r (expected 1 or %d)"
-            % (ckpt_ver, CHECKPOINT_VERSION)
-        )
-    if enc_ver != ENCODING_VERSION:
-        raise ValueError(
-            "incompatible encoding_version %r (expected %d)"
-            % (enc_ver, ENCODING_VERSION)
-        )
-
-    if "game_config" not in payload or "model_state_dict" not in payload:
-        raise ValueError("checkpoint missing game_config or model_state_dict")
-
-    if ckpt_ver == 1:
-        architecture = "mlp"
-    else:
-        if "architecture" not in payload:
-            raise ValueError("version 2 checkpoint missing architecture")
-        architecture = _validate_architecture(payload["architecture"])
-    if expected_architecture is not None:
-        _validate_architecture(expected_architecture)
-        if architecture != expected_architecture:
-            raise ValueError(
-                "checkpoint architecture %r does not match expected %r"
-                % (architecture, expected_architecture)
-            )
-
-    config = GameConfig.from_dict(payload["game_config"])
-    if expected_config is not None and config.to_dict() != expected_config.to_dict():
-        raise ValueError(
-            "checkpoint game_config %s does not match expected %s"
-            % (config.to_dict(), expected_config.to_dict())
-        )
-
-    state_dim = payload.get("state_dim")
-    num_actions = payload.get("num_actions")
-    if state_dim != STATE_DIM or num_actions != NUM_ACTIONS:
-        raise ValueError(
-            "checkpoint dims state=%r actions=%r incompatible with state=%d actions=%d"
-            % (state_dim, num_actions, STATE_DIM, NUM_ACTIONS)
-        )
-
+    if type(payload.get("checkpoint_version")) is not int or payload["checkpoint_version"] != CHECKPOINT_VERSION:
+        raise ValueError("unsupported checkpoint_version %r; fresh dynamic weights are required"
+                         % payload.get("checkpoint_version"))
+    if type(payload.get("encoding_version")) is not int or payload["encoding_version"] != ENCODING_VERSION:
+        raise ValueError("incompatible encoding_version; complete information history is required")
+    if payload.get("architecture") != ARCHITECTURE:
+        raise ValueError("unsupported architecture; expected dynamic_table")
+    required = {
+        "checkpoint_version", "encoding_version", "architecture", "model_spec",
+        "num_actions", "game_config", "model_state_dict",
+    }
+    if set(payload) not in (required, required | {"meta"}):
+        raise ValueError("checkpoint fields do not match the current model schema")
+    if type(payload["num_actions"]) is not int or payload["num_actions"] != NUM_ACTIONS:
+        raise ValueError("checkpoint uses an incompatible model input/action schema")
+    spec = ModelSpec.from_dict(payload.get("model_spec"))
+    config = GameConfig.from_dict(payload.get("game_config"))
+    if expected_config is not None and config != expected_config:
+        raise ValueError("checkpoint game_config does not match expected game_config")
     meta = payload.get("meta", {})
     if not isinstance(meta, dict):
         raise ValueError("checkpoint meta must be a dict")
-
     if network is None:
-        network = QNetwork(
-            state_dim=state_dim,
-            num_actions=num_actions,
-            architecture=architecture,
-        )
-    elif (
-        network.state_dim != state_dim
-        or network.num_actions != num_actions
-        or network.architecture != architecture
-    ):
-        raise ValueError(
-            "checkpoint model %s/%d/%d does not match network %s/%d/%d"
-            % (
-                architecture,
-                state_dim,
-                num_actions,
-                network.architecture,
-                network.state_dim,
-                network.num_actions,
-            )
-        )
+        network = QNetwork(spec)
+    elif network.spec != spec:
+        raise ValueError("checkpoint model_spec does not match network")
     model_state = validate_model_state(
-        payload["model_state_dict"],
-        network.state_dict(),
-        "checkpoint model_state_dict",
+        payload.get("model_state_dict"), network.state_dict(), "checkpoint model_state_dict",
     )
     network.load_state_dict(model_state)
     network.to(device)
     network.eval()
-
     return network, config, meta

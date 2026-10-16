@@ -11,15 +11,12 @@ from src.evaluate import hand_reward, is_valid_hand
 from src.game.environment import (
     ACTION_DRAW_STOCK,
     ACTION_TAKE_DISCARD,
-    ENCODING_VERSION,
     NUM_ACTIONS,
-    STATE_DIM,
     GameConfig,
     PappluEnv,
     Phase,
     build_warm_start_deal,
     discard_action,
-    encode_observation,
     legal_action_mask,
 )
 
@@ -50,7 +47,7 @@ class TestGameConfig(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(TypeError):
                 GameConfig(recycle_discard=value)
 
-    def test_rule_metadata_distinguishes_new_and_legacy_configs(self):
+    def test_rule_metadata_requires_complete_current_config(self):
         current = GameConfig()
         self.assertEqual(
             set(current.to_dict()),
@@ -66,11 +63,10 @@ class TestGameConfig(unittest.TestCase):
 
         legacy = current.to_dict()
         del legacy["recycle_discard"]
-        restored = GameConfig.from_dict(legacy)
-        self.assertFalse(restored.recycle_discard)
-        self.assertFalse(restored.to_dict()["recycle_discard"])
+        with self.assertRaisesRegex(ValueError, "five game settings"):
+            GameConfig.from_dict(legacy)
 
-        with self.assertRaisesRegex(ValueError, "five.*legacy four"):
+        with self.assertRaisesRegex(ValueError, "five game settings"):
             GameConfig.from_dict({"num_decks": 3})
 
 
@@ -107,20 +103,6 @@ class TestEnvironmentCore(unittest.TestCase):
         before = obs.hand
         env.step(ACTION_DRAW_STOCK)
         self.assertEqual(before, obs.hand)
-
-    def test_encoding_shape_and_joker_one_hot(self):
-        env = PappluEnv(GameConfig(cards_in_hand=6, required_sequences=1, max_turns=5))
-        obs = env.reset(seed=3)
-        vec = encode_observation(obs)
-        self.assertEqual(len(vec), STATE_DIM)
-        self.assertEqual(STATE_DIM, 164)
-        self.assertEqual(NUM_ACTIONS, 54)
-        self.assertEqual(ENCODING_VERSION, 1)
-        joker_slice = vec[104:156]
-        self.assertEqual(sum(joker_slice), 1.0)
-        self.assertEqual(joker_slice[obs.joker], 1.0)
-        self.assertEqual(vec[156], 1.0)
-        self.assertEqual(vec[157], 0.0)
 
     def test_draw_and_discard_legality(self):
         env = PappluEnv(GameConfig(cards_in_hand=6, required_sequences=1, max_turns=8))
@@ -294,9 +276,9 @@ class TestEnvironmentCore(unittest.TestCase):
         self.assertEqual(obs.stock_remaining, 47)
         self.assertEqual(obs.discard_pile, (last_drawn,))
         self.assertTrue(legal_action_mask(obs)[ACTION_DRAW_STOCK])
-        encoded = encode_observation(obs)
-        self.assertEqual(encoded[52 + last_drawn], 1.0)
-        self.assertEqual(encoded[160], 47 / 52)
+        self.assertEqual(obs.history[-1].kind.name, "REFILL")
+        self.assertEqual(obs.history[-1].stock_remaining, 47)
+        self.assertIsNone(obs.history[-1].face)
         counts = Counter(env._stock) + Counter(obs.discard_pile)
         counts.update({face: count for face, count in enumerate(obs.hand)})
         counts[obs.joker] += 1
@@ -381,29 +363,6 @@ class TestEnvironmentCore(unittest.TestCase):
         self.assertEqual(len(obs.discard_pile), 1)
         self.assertFalse(legal_action_mask(obs)[ACTION_DRAW_STOCK])
         self.assertTrue(legal_action_mask(obs)[ACTION_TAKE_DISCARD])
-
-    def test_manual_draw_state_refills_before_stock_pop(self):
-        env = PappluEnv(
-            GameConfig(
-                num_decks=1,
-                cards_in_hand=3,
-                required_sequences=1,
-                max_turns=5,
-            )
-        )
-        env.reset(seed=13)
-        env._stock = []
-        env._discard = [7, 8, 9]
-        env._hand = [0] * 52
-        env._hand[0] = env._hand[1] = env._hand[2] = 1
-        env._phase = Phase.DRAW
-
-        self.assertTrue(legal_action_mask(env.observe())[ACTION_DRAW_STOCK])
-        obs = env.step(ACTION_DRAW_STOCK)
-        self.assertEqual(obs.phase, Phase.DISCARD)
-        self.assertEqual(obs.discard_pile, (9,))
-        self.assertEqual(obs.stock_remaining, 1)
-        self.assertEqual(sum(obs.hand), 4)
 
     def test_invalid_stock_source_preserves_rng_and_cards(self):
         env = PappluEnv(
@@ -504,8 +463,6 @@ class TestWarmStart(unittest.TestCase):
                 found = True
                 break
         self.assertTrue(found)
-        vec = encode_observation(obs)
-        self.assertEqual(len(vec), STATE_DIM)
 
     def test_warm_start_default_size(self):
         cfg = GameConfig(num_decks=3, cards_in_hand=21, required_sequences=5, max_turns=10)

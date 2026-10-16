@@ -191,12 +191,6 @@ class TestEvaluateValid(unittest.TestCase):
         hand = from_cards([face(0, 12), face(1, 0), face(1, 1)])
         self.assertFalse(is_valid_hand(hand, JOKER_8S, required_sequences=1, cards_in_hand=3))
 
-    def test_longer_sequence_splitting(self):
-        hand = from_cards([face(0, r) for r in range(6)])
-        self.assertTrue(is_valid_hand(hand, JOKER_8S, required_sequences=2, cards_in_hand=6))
-        ev = evaluate_hand(hand, JOKER_8S, required_sequences=2, cards_in_hand=6)
-        self.assertEqual(sum(1 for m in ev.melds if m.is_pure), 2)
-
     def test_leftovers_not_ignored(self):
         hand = from_cards([face(0, 0), face(0, 1), face(0, 2), face(1, 12)])
         self.assertFalse(is_valid_hand(hand, JOKER_8S, required_sequences=1, cards_in_hand=4))

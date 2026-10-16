@@ -150,12 +150,51 @@ def check_cli_boundaries(
 class ModuleImportVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.nodes: list[ast.AST] = []
+        self.type_checking_names: set[str] = set()
+        self.typing_modules: set[str] = set()
 
     def visit_Import(self, node: ast.Import) -> None:
         self.nodes.append(node)
+        self.typing_modules.update(
+            alias.asname or alias.name
+            for alias in node.names if alias.name == "typing"
+        )
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         self.nodes.append(node)
+        if node.module == "typing" and not node.level:
+            self.type_checking_names.update(
+                alias.asname or alias.name
+                for alias in node.names if alias.name == "TYPE_CHECKING"
+            )
+
+    def visit_If(self, node: ast.If) -> None:
+        test = node.test
+        type_only = (
+            isinstance(test, ast.Name) and test.id in self.type_checking_names
+            or isinstance(test, ast.Attribute)
+            and test.attr == "TYPE_CHECKING"
+            and isinstance(test.value, ast.Name)
+            and test.value.id in self.typing_modules
+        )
+        if type_only:
+            for statement in node.orelse:
+                self.visit(statement)
+        else:
+            self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self.type_checking_names.discard(target.id)
+                self.typing_modules.discard(target.id)
+            elif (
+                isinstance(target, ast.Attribute)
+                and target.attr == "TYPE_CHECKING"
+                and isinstance(target.value, ast.Name)
+            ):
+                self.typing_modules.discard(target.value.id)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         return
@@ -218,6 +257,7 @@ def pure_modules(trees: dict[Path, ast.Module]) -> list[str]:
         "checkpoints/evidence.py",
         "checkpoints/io.py",
         "checkpoints/registry.py",
+        "model/spec.py",
     ):
         path = SRC / relative
         if path in trees:

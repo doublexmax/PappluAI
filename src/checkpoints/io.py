@@ -5,10 +5,12 @@ import os
 from pathlib import Path
 import shutil
 import hashlib
+import time
 from typing import AbstractSet, Any, Dict, Mapping, Optional
 
 __all__ = (
     "atomic_copy",
+    "atomic_replace",
     "atomic_write_json",
     "file_metadata",
     "file_sha256",
@@ -21,8 +23,7 @@ def atomic_copy(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name("." + destination.name + ".tmp")
     shutil.copyfile(source, temporary)
-    _fsync_file(temporary)
-    os.replace(temporary, destination)
+    atomic_replace(temporary, destination)
 
 
 def atomic_write_json(payload: Mapping[str, Any], path: Path) -> None:
@@ -38,8 +39,7 @@ def atomic_write_json(payload: Mapping[str, Any], path: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
-    _fsync_file(temporary)
-    os.replace(temporary, path)
+    atomic_replace(temporary, path)
 
 
 def file_metadata(path: Path) -> Dict[str, Any]:
@@ -81,6 +81,20 @@ def require_checkpoint_int(
     return value
 
 
-def _fsync_file(path: Path) -> None:
-    with path.open("rb+") as stream:
+def atomic_replace(stage: Path, target: Path) -> None:
+    with stage.open("rb+") as stream:
         os.fsync(stream.fileno())
+    deadline = time.monotonic() + 2
+    delay = 0.005
+    while True:
+        try:
+            os.replace(stage, target)
+            return
+        except PermissionError as error:
+            if os.name != "nt" or getattr(error, "winerror", None) not in (5, 32, 33):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.05)

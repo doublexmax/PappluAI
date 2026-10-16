@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
-import os
 from pathlib import Path
 import shutil
 from typing import Any, Dict, Optional, Sequence
 
 from src.checkpoints import evidence as gate_evidence
-from src.checkpoints.io import atomic_write_json, file_metadata, file_sha256
+from src.checkpoints.io import atomic_replace, atomic_write_json, file_metadata, file_sha256
+from src.game.environment import ENCODING_VERSION
+from src.model.spec import ARCHITECTURE, CHECKPOINT_VERSION, ModelSpec
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,15 @@ class ModelRegistry:
             or any(character not in "0123456789abcdef" for character in record.sha256)
         ):
             raise ValueError("Invalid model record: %s" % record_id)
+        if (
+            record.metadata.get("architecture") != ARCHITECTURE
+            or record.metadata.get("encoding_version") != ENCODING_VERSION
+            or record.metadata.get("checkpoint_version") != CHECKPOINT_VERSION
+            or set(record.metadata.get("model_spec", {})) != {"width", "heads"}
+            or "state_dim" in record.metadata
+        ):
+            raise ValueError("Model record is not a current dynamic checkpoint; register fresh weights")
+        ModelSpec.from_dict(record.metadata["model_spec"])
         return record
 
     def model_path(self, record_id: str) -> Path:
@@ -68,12 +78,16 @@ class ModelRegistry:
         origin: str,
         evidence: Optional[dict] = None,
         parents: Sequence[str] = (),
+        *,
+        expected_sha256: Optional[str] = None,
     ) -> ModelRecord:
         # Registry reads stay Torch-free; registration validates model files.
         from src.model.network import load_checkpoint
 
         source = Path(path)
         digest = file_sha256(source)
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise ValueError("Model source checksum mismatch")
         identifier = digest[:20]
         database = self._read()
         if identifier in database["models"]:
@@ -94,7 +108,9 @@ class ModelRegistry:
             identifier, digest, filename, origin,
             {
                 "architecture": network.architecture,
-                "state_dim": network.state_dim,
+                "checkpoint_version": CHECKPOINT_VERSION,
+                "encoding_version": ENCODING_VERSION,
+                "model_spec": network.spec.to_dict(),
                 "num_actions": network.num_actions,
                 "game_config": config.to_dict(),
             },
@@ -109,7 +125,7 @@ class ModelRegistry:
             shutil.copyfile(source, temporary)
             if file_sha256(temporary) != digest:
                 raise ValueError("Model changed while its snapshot was being copied")
-            os.replace(temporary, destination)
+            atomic_replace(temporary, destination)
         database["models"][identifier] = asdict(record)
         atomic_write_json(database, self.path)
         return record

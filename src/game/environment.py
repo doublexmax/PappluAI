@@ -4,8 +4,7 @@ Phases are DRAW -> DISCARD -> (DRAW | TERMINAL). Actions are a fixed 54-slot
 mask: 0 draw stock, 1 take discard top, 2..53 discard face 0..51. Terminal
 reward is the evaluator binary hand_reward on the post-discard hand of size
 cards_in_hand. Illegal actions and bad config raise without mutating state.
-Older discards refill an empty stock after a nonterminal discard. A manually
-assembled DRAW state refills only when a stock draw is chosen.
+Older discards refill an empty stock after a nonterminal discard.
 """
 
 from __future__ import annotations
@@ -13,34 +12,28 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from enum import Enum
 from itertools import combinations
+import math
 import random
 from typing import List, Optional, Tuple
 
 from src.evaluate import NUM_FACES, NUM_RANKS, NUM_SUITS, RANK_PATTERNS, hand_reward, is_valid_hand
 from src.game.reward_cache import RewardCache
-from src.game.stock import refill_stock, stock_draw_available
+from src.game.stock import refill_stock
+from src.game.information import (
+    EventKind,
+    InformationEvent,
+    InformationHistory,
+    InformationJournal,
+    PlayerView,
+    player_views,
+)
 
 ACTION_DRAW_STOCK = 0
 ACTION_TAKE_DISCARD = 1
 NUM_DISCARD_ACTIONS = NUM_FACES
 NUM_ACTIONS = 2 + NUM_DISCARD_ACTIONS
 
-# State layout (float32):
-#   [0:52]   hand counts / cards_in_hand
-#   [52:104] discard-top one-hot (all zero if empty)
-#   [104:156] joker face one-hot
-#   [156:159] phase one-hot DRAW, DISCARD, TERMINAL
-#   [159]    turns_remaining / max_turns
-#   [160]    stock_remaining / (num_decks * 52)
-#   [161]    num_decks / 6
-#   [162]    cards_in_hand / 30
-#   [163]    required_sequences / 10
-ENCODING_VERSION = 1
-STATE_DIM = NUM_FACES * 3 + 3 + 2 + 3
-
-_MAX_DECKS_NORM = 6.0
-_MAX_CARDS_NORM = 30.0
-_MAX_SEQ_NORM = 10.0
+ENCODING_VERSION = 2
 
 
 class Phase(Enum):
@@ -95,17 +88,12 @@ class GameConfig:
         fields = set(GameConfig.__dataclass_fields__)
         if set(data) == fields:
             return GameConfig(**data)
-        legacy_fields = fields - {"recycle_discard"}
-        if set(data) == legacy_fields:
-            return GameConfig(**data, recycle_discard=False)
-        raise ValueError(
-            "game_config must contain all five game settings or the legacy four settings"
-        )
+        raise ValueError("game_config must contain all five game settings")
 
 
 @dataclass(frozen=True)
 class Observation:
-    """Immutable public view of a solo game. Stock order is not exposed."""
+    """The observer's own cards, public table, and complete visible history."""
 
     hand: Tuple[int, ...]
     discard_pile: Tuple[int, ...]
@@ -114,6 +102,8 @@ class Observation:
     turns_remaining: int
     stock_remaining: int
     config: GameConfig
+    players: Tuple[PlayerView, ...]
+    history: Tuple[InformationEvent, ...]
     last_reward: float = 0.0
     won: bool = False
     warm_start: bool = False
@@ -127,6 +117,147 @@ class Observation:
     @property
     def done(self) -> bool:
         return self.phase is Phase.TERMINAL
+
+    def to_dict(self) -> dict:
+        return {
+            **self.to_snapshot(),
+            "config": self.config.to_dict(),
+            "joker": self.joker,
+            "history": tuple(event.to_dict() for event in self.history),
+        }
+
+    def to_snapshot(self) -> dict:
+        return {
+            "hand": self.hand,
+            "discard_pile": self.discard_pile,
+            "phase": self.phase.value,
+            "turns_remaining": self.turns_remaining,
+            "stock_remaining": self.stock_remaining,
+            "players": tuple(asdict(player) for player in self.players),
+            "last_reward": self.last_reward,
+            "won": self.won,
+            "warm_start": self.warm_start,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "Observation":
+        fields = set(Observation.__dataclass_fields__)
+        if not isinstance(data, dict) or set(data) != fields:
+            raise ValueError("observation must use the current information schema")
+        config = GameConfig.from_dict(data["config"])
+        if not isinstance(data["players"], tuple):
+            raise ValueError("observation needs 1..6 player views")
+        history = InformationHistory.from_dict(
+            data["history"], config, len(data["players"]),
+        )
+        snapshot = {
+            key: value for key, value in data.items()
+            if key not in {"config", "joker", "history"}
+        }
+        return Observation.from_snapshot(
+            snapshot, history=history, prefix=len(history.events), joker=data["joker"],
+        )
+
+    @staticmethod
+    def from_snapshot(
+        data: dict, *, history: InformationHistory, prefix: int, joker: int,
+    ) -> "Observation":
+        fields = set(Observation.__dataclass_fields__) - {"config", "joker", "history"}
+        if not isinstance(data, dict) or set(data) != fields:
+            raise ValueError("observation snapshot must use the current information schema")
+        if type(prefix) is not int or not 1 <= prefix <= len(history.events):
+            raise ValueError("observation history prefix must be in 1..%d" % len(history.events))
+        config = history.config
+        expected = history.states[prefix - 1]
+
+        def integer(value: object, lower: int, upper: int, name: str) -> int:
+            if type(value) is not int or not lower <= value <= upper:
+                raise ValueError("observation %s is invalid" % name)
+            return value
+
+        def hand_counts(value: object) -> Tuple[int, ...]:
+            if not isinstance(value, tuple) or len(value) != NUM_FACES:
+                raise ValueError("observation hand must contain 52 counts")
+            return tuple(integer(v, 0, config.num_decks, "card count") for v in value)
+
+        hand = hand_counts(data["hand"])
+        discard = data["discard_pile"]
+        if not isinstance(discard, tuple):
+            raise ValueError("observation discard_pile must be a tuple")
+        discard = tuple(integer(v, 0, NUM_FACES - 1, "discard") for v in discard)
+        raw_players = data["players"]
+        if not isinstance(raw_players, tuple) or len(raw_players) != history.player_count:
+            raise ValueError("observation snapshot changes journal player count")
+        count = len(raw_players)
+        players = []
+        for raw in raw_players:
+            if not isinstance(raw, dict) or set(raw) != set(PlayerView.__dataclass_fields__):
+                raise ValueError("observation player fields are invalid")
+            if type(raw["active"]) is not bool:
+                raise ValueError("observation player active must be a bool")
+            players.append(PlayerView(
+                integer(raw["hand_size"], 0, config.cards_in_hand + 1, "hand_size"),
+                integer(raw["turns_remaining"], 0, config.max_turns, "player turns"),
+                integer(raw["next_player"], 0, count - 1, "next_player"),
+                integer(raw["previous_player"], 0, count - 1, "previous_player"),
+                raw["active"],
+            ))
+        if players[0].hand_size != sum(hand):
+            raise ValueError("observation own player hand_size does not match hand")
+        if expected.hand != hand:
+            raise ValueError("observation own card history does not match current hand")
+        if players[0].turns_remaining != data["turns_remaining"]:
+            raise ValueError("observation own player turns do not match current turns")
+        if players[0].turns_remaining != expected.players[0].turns_remaining:
+            raise ValueError("observation own player turns do not match history")
+        if tuple(players) != expected.players:
+            raise ValueError("observation player views do not match history prefix")
+        if discard != expected.discard_pile or data["stock_remaining"] != expected.stock_remaining:
+            raise ValueError("observation public table does not match history prefix")
+        event = history.events[prefix - 1]
+        expected_phase = {
+            EventKind.INITIAL: (
+                Phase.DISCARD if sum(history.events[0].initial_hand) > config.cards_in_hand
+                else Phase.DRAW
+            ),
+            EventKind.DRAW_STOCK: Phase.DISCARD,
+            EventKind.TAKE_DISCARD: Phase.DISCARD,
+            EventKind.DISCARD: Phase.DRAW,
+            EventKind.REFILL: Phase.DRAW,
+            EventKind.TERMINAL: Phase.TERMINAL,
+        }[event.kind]
+        phase = Phase(integer(data["phase"], 0, 2, "phase"))
+        if phase is not expected_phase:
+            raise ValueError("observation phase does not match history prefix")
+        for name in ("won", "warm_start"):
+            if type(data[name]) is not bool:
+                raise ValueError("observation %s must be a bool" % name)
+        reward = data["last_reward"]
+        if type(reward) not in (int, float) or not math.isfinite(reward):
+            raise ValueError("observation last_reward must be finite")
+        warm_start = (
+            history.player_count == 1
+            and sum(history.events[0].initial_hand) == config.cards_in_hand + 1
+        )
+        if data["warm_start"] != warm_start:
+            raise ValueError("observation warm_start does not match initial history")
+        expected_reward = (
+            hand_reward(
+                hand, joker, required_sequences=config.required_sequences,
+                cards_in_hand=config.cards_in_hand,
+            )
+            if phase is Phase.TERMINAL and event.actor == 0 else 0.0
+        )
+        if reward != expected_reward or data["won"] != bool(expected_reward):
+            raise ValueError("observation reward and win state do not match history")
+        return Observation(
+            hand, discard,
+            integer(joker, 0, NUM_FACES - 1, "joker"), phase,
+            integer(data["turns_remaining"], 0, config.max_turns, "turns_remaining"),
+            integer(data["stock_remaining"], 0, config.num_decks * NUM_FACES, "stock_remaining"),
+            config, tuple(players), history.events[:prefix], float(reward),
+            data["won"], data["warm_start"],
+        )
 
 
 def _require_positive_int(value: object, name: str) -> int:
@@ -154,12 +285,7 @@ def legal_action_mask(obs: Observation) -> Tuple[bool, ...]:
     if obs.phase is Phase.TERMINAL:
         return tuple(mask)
     if obs.phase is Phase.DRAW:
-        if stock_draw_available(
-            obs.stock_remaining,
-            len(obs.discard_pile),
-            obs.config.recycle_discard,
-        ):
-            mask[ACTION_DRAW_STOCK] = True
+        mask[ACTION_DRAW_STOCK] = bool(obs.stock_remaining)
         if obs.discard_pile:
             mask[ACTION_TAKE_DISCARD] = True
         return tuple(mask)
@@ -167,33 +293,6 @@ def legal_action_mask(obs: Observation) -> Tuple[bool, ...]:
         if count > 0:
             mask[discard_action(face)] = True
     return tuple(mask)
-
-
-def encode_observation(obs: Observation) -> Tuple[float, ...]:
-    """Fixed-length network input. No hidden stock order."""
-    cfg = obs.config
-    hand_scale = float(cfg.cards_in_hand)
-    deck_scale = float(cfg.num_decks * NUM_FACES)
-    turn_scale = float(cfg.max_turns)
-
-    vec = [0.0] * STATE_DIM
-    for face, count in enumerate(obs.hand):
-        vec[face] = count / hand_scale
-
-    top = obs.discard_top
-    if top is not None:
-        vec[NUM_FACES + top] = 1.0
-
-    vec[NUM_FACES * 2 + obs.joker] = 1.0
-
-    phase_base = NUM_FACES * 3
-    vec[phase_base + int(obs.phase.value)] = 1.0
-    vec[phase_base + 3] = obs.turns_remaining / turn_scale
-    vec[phase_base + 4] = obs.stock_remaining / deck_scale
-    vec[phase_base + 5] = cfg.num_decks / _MAX_DECKS_NORM
-    vec[phase_base + 6] = cfg.cards_in_hand / _MAX_CARDS_NORM
-    vec[phase_base + 7] = cfg.required_sequences / _MAX_SEQ_NORM
-    return tuple(vec)
 
 
 class PappluEnv:
@@ -212,6 +311,7 @@ class PappluEnv:
         self._won = False
         self._warm_start = False
         self._reward_cache = RewardCache()
+        self._journal = InformationJournal(1)
 
     def seed(self, seed: int) -> None:
         self._rng.seed(seed)
@@ -239,6 +339,7 @@ class PappluEnv:
         self._last_reward = 0.0
         self._won = False
         self._warm_start = False
+        self._start_history()
         return self.observe()
 
     def reset_warm_start(self, seed: Optional[int] = None) -> Observation:
@@ -260,6 +361,7 @@ class PappluEnv:
         self._last_reward = 0.0
         self._won = False
         self._warm_start = True
+        self._start_history()
         return self.observe()
 
     def reset_curriculum(
@@ -338,6 +440,7 @@ class PappluEnv:
             self._last_reward = 0.0
             self._won = False
             self._warm_start = False
+            self._start_history()
             return self.observe()
 
         raise ValueError(
@@ -360,6 +463,8 @@ class PappluEnv:
             turns_remaining=self._turns_remaining,
             stock_remaining=len(self._stock),
             config=self.config,
+            players=player_views([self._hand], [self._turns_remaining], 0),
+            history=self._journal.observe(0),
             last_reward=self._last_reward,
             won=self._won,
             warm_start=self._warm_start,
@@ -382,19 +487,17 @@ class PappluEnv:
             )
 
         if self._phase is Phase.DRAW:
+            offered_top = self._discard[-1] if self._discard else None
             if action == ACTION_DRAW_STOCK:
-                refill_stock(
-                    self._stock,
-                    self._discard,
-                    self._rng,
-                    self.config.recycle_discard,
-                )
                 card = self._stock.pop()
+                kind = EventKind.DRAW_STOCK
             else:
                 card = self._discard.pop()
+                kind = EventKind.TAKE_DISCARD
             self._hand[card] += 1
             self._phase = Phase.DISCARD
             self._last_reward = 0.0
+            self._record(kind, face=card, offered_top=offered_top)
             return self.observe()
 
         face = action_to_discard_face(action)
@@ -413,18 +516,40 @@ class PappluEnv:
         self._turns_remaining -= 1
         self._last_reward = reward
         self._won = reward == 1.0
+        self._record(EventKind.DISCARD, face=face)
         done = self._won or self._warm_start or self._turns_remaining <= 0
         if done:
             self._phase = Phase.TERMINAL
+            self._record(EventKind.TERMINAL)
         else:
-            refill_stock(
-                self._stock,
-                self._discard,
-                self._rng,
-                self.config.recycle_discard,
-            )
+            self._refill_stock()
             self._phase = Phase.DRAW
         return self.observe()
+
+    def _start_history(self) -> None:
+        self._journal.start(
+            [self._hand],
+            [self._turns_remaining],
+            len(self._stock),
+            self._discard[-1] if self._discard else None,
+        )
+
+    def _record(
+        self,
+        kind: EventKind,
+        face: Optional[int] = None,
+        offered_top: Optional[int] = None,
+    ) -> None:
+        self._journal.record(
+            kind, 0, sum(self._hand), self._turns_remaining,
+            len(self._stock), 0, face, offered_top,
+        )
+
+    def _refill_stock(self) -> None:
+        if refill_stock(
+            self._stock, self._discard, self._rng, self.config.recycle_discard,
+        ):
+            self._record(EventKind.REFILL)
 
     def total_cards_in_play(self) -> int:
         """Physical cards still tracked (excludes removed joker indicator)."""

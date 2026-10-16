@@ -29,7 +29,7 @@ from src.checkpoints.tensor import (
     validate_checkpoint_tree,
     validate_model_state,
 )
-from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv, encode_observation
+from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv
 from src.model.network import (
     CHECKPOINT_VERSION,
     QNetwork,
@@ -41,9 +41,10 @@ from src.model.network import (
 )
 from src.training.core import EpisodeReplay, discounted_returns
 from src.training.optimization import train_batch
+from src.model.spec import ModelSpec
 
 
-TRAINING_STATE_VERSION = 1
+TRAINING_STATE_VERSION = 2
 STATUS_SCHEMA_VERSION = 1
 ALGORITHM = "full21_curriculum_monte_carlo_q_regression"
 ORDINARY_VALIDATION_SEED = 30_000_000
@@ -65,7 +66,6 @@ class ValidationInterrupted(RuntimeError):
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    architecture: str = "suit_conv"
     num_decks: int = 3
     cards_in_hand: int = 21
     required_sequences: int = 5
@@ -91,8 +91,6 @@ class TrainingConfig:
     torch_threads: int = 1
 
     def __post_init__(self) -> None:
-        if self.architecture != "suit_conv":
-            raise ValueError("long training requires suit_conv architecture")
         if (
             self.num_decks,
             self.cards_in_hand,
@@ -167,9 +165,6 @@ class TrainingConfig:
         fields = set(cls.__dataclass_fields__)
         if set(data) == fields:
             values = dict(data)
-        elif set(data) == fields - {"recycle_discard"}:
-            values = dict(data)
-            values["recycle_discard"] = False
         else:
             raise ValueError("training_config fields do not match this trainer")
         distances = values["curriculum_distances"]
@@ -185,6 +180,7 @@ class TrainingSession:
         seed: int,
         initial_model: Optional[str] = None,
         initial_stage_index: int = 0,
+        model_spec: ModelSpec = ModelSpec(),
     ) -> None:
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise TypeError("seed must be an int")
@@ -203,12 +199,11 @@ class TrainingSession:
         torch.manual_seed(seed)
 
         if initial_model is None:
-            self.network = QNetwork(architecture=config.architecture)
+            self.network = QNetwork(model_spec)
         else:
             network, saved_game, _ = load_checkpoint(
                 initial_model,
                 device=torch.device("cpu"),
-                expected_architecture=config.architecture,
             )
             expected = config.game_config
             if (
@@ -308,6 +303,7 @@ class TrainingSession:
             "model_checkpoint_version",
             "algorithm",
             "training_config",
+            "model_spec",
             "initial_seed",
             "network_state_dict",
             "optimizer_state_dict",
@@ -351,7 +347,7 @@ class TrainingSession:
             "source_trace",
         )
         expected_trace = {
-            "module": "src.long_train",
+            "module": "src.training.curriculum",
             "training_state_version": TRAINING_STATE_VERSION,
             "encoding_version": ENCODING_VERSION,
             "model_checkpoint_version": CHECKPOINT_VERSION,
@@ -368,7 +364,7 @@ class TrainingSession:
             payload["optimizer_state_dict"], "optimizer_state_dict"
         )
 
-        session = cls(config=config, seed=seed)
+        session = cls(config=config, seed=seed, model_spec=ModelSpec.from_dict(payload["model_spec"]))
         network_state = validate_model_state(
             payload["network_state_dict"],
             session.network.state_dict(),
@@ -535,6 +531,7 @@ class TrainingSession:
             "model_checkpoint_version": CHECKPOINT_VERSION,
             "algorithm": ALGORITHM,
             "training_config": self.config.to_dict(),
+            "model_spec": self.network.spec.to_dict(),
             "initial_seed": self.initial_seed,
             "network_state_dict": self.network.state_dict(),
             "optimizer_state_dict": optimizer_state,
@@ -572,7 +569,7 @@ class TrainingSession:
             "baseline_model_state_dict": self.baseline_model_state,
             "best_model_state_dict": self.best_model_state,
             "source_trace": {
-                "module": "src.long_train",
+                "module": "src.training.curriculum",
                 "training_state_version": TRAINING_STATE_VERSION,
                 "encoding_version": ENCODING_VERSION,
                 "model_checkpoint_version": CHECKPOINT_VERSION,
@@ -616,7 +613,7 @@ class TrainingSession:
                     rng=self.action_rng,
                     device=torch.device("cpu"),
                 )
-                state = encode_observation(obs)
+                state = obs
                 obs = env.step(action)
                 steps.append((state, action, float(obs.last_reward)))
 

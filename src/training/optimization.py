@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from src.model.network import QNetwork
+from src.model.encoding import collate_observations
 from src.training.core import Transition
 
 
@@ -17,11 +18,7 @@ def train_batch(
     device: torch.device,
     grad_clip: float,
 ) -> float:
-    states = torch.tensor(
-        [transition[0] for transition in batch],
-        dtype=torch.float32,
-        device=device,
-    )
+    states = collate_observations([transition[0] for transition in batch], device)
     actions = torch.tensor(
         [transition[1] for transition in batch],
         dtype=torch.long,

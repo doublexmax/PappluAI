@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import io
+import json
 import os
 import random
 import subprocess
@@ -14,9 +15,7 @@ from src.game.environment import (
     GameConfig,
     PappluEnv,
     Phase,
-    STATE_DIM,
     discard_action,
-    encode_observation,
 )
 from src.cli.solo import main as train_main
 from src.training.core import EpisodeReplay, discounted_returns
@@ -74,7 +73,6 @@ runpy.run_module("src.cli.solo", run_name="__main__")
             "--warm-start-fraction",
             "--checkpoint",
             "--load",
-            "--architecture",
             "--replay-sampling",
             "--eval-episodes",
             "--eval-seed",
@@ -82,30 +80,18 @@ runpy.run_module("src.cli.solo", run_name="__main__")
             self.assertIn(flag, completed.stdout)
         self.assertIn("fine-tune", completed.stdout.lower())
 
-    def test_architecture_argument_defaults_to_inference_and_has_choices(self):
+    def test_old_architecture_argument_is_rejected(self):
         from src.cli.solo import build_arg_parser
 
         parser = build_arg_parser()
-        self.assertIsNone(parser.parse_args([]).architecture)
-        for architecture in ("mlp", "wide_mlp", "suit_conv"):
-            self.assertEqual(
-                parser.parse_args(["--architecture", architecture]).architecture,
-                architecture,
-            )
         with mock.patch("sys.stderr", new_callable=io.StringIO):
             with self.assertRaises(SystemExit):
-                parser.parse_args(["--architecture", "unknown"])
+                parser.parse_args(["--architecture", "mlp"])
 
-    def test_replay_sampling_argument_contract(self):
+    def test_unknown_replay_sampling_mode_is_rejected(self):
         from src.cli.solo import build_arg_parser
 
         parser = build_arg_parser()
-        self.assertEqual(parser.parse_args([]).replay_sampling, "transition")
-        for sampling in ("transition", "episode"):
-            self.assertEqual(
-                parser.parse_args(["--replay-sampling", sampling]).replay_sampling,
-                sampling,
-            )
         with mock.patch("sys.stderr", new_callable=io.StringIO):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["--replay-sampling", "unknown"])
@@ -114,8 +100,8 @@ runpy.run_module("src.cli.solo", run_name="__main__")
 class TestEpisodeReplay(unittest.TestCase):
     @staticmethod
     def transition(index):
-        state = (float(index),) + (0.0,) * (STATE_DIM - 1)
-        return (state, index, float(index))
+        state = PappluEnv().reset(seed=index)
+        return (state, 0, float(index))
 
     def test_rejects_empty_episode_and_invalid_batch(self):
         replay = EpisodeReplay(capacity=3)
@@ -134,7 +120,7 @@ class TestEpisodeReplay(unittest.TestCase):
         rng = mock.Mock()
         rng.randrange.side_effect = [0, 0, 1, 0, 1, 1, 1, 2, 1, 3]
         sampled = replay.sample(rng, 5)
-        self.assertEqual([transition[1] for transition in sampled], [2, 3, 4, 5, 6])
+        self.assertEqual([transition[2] for transition in sampled], [2, 3, 4, 5, 6])
 
     def test_oversized_episode_keeps_last_capacity_transitions(self):
         replay = EpisodeReplay(capacity=3)
@@ -144,7 +130,7 @@ class TestEpisodeReplay(unittest.TestCase):
         rng = mock.Mock()
         rng.randrange.side_effect = [0, 0, 0, 1, 0, 2]
         sampled = replay.sample(rng, 3)
-        self.assertEqual([transition[1] for transition in sampled], [5, 6, 7])
+        self.assertEqual([transition[2] for transition in sampled], [5, 6, 7])
 
     def test_sampling_is_seeded_and_repeatable(self):
         replay = EpisodeReplay(capacity=20)
@@ -159,7 +145,7 @@ class TestEpisodeReplay(unittest.TestCase):
         replay.append((self.transition(0),))
         replay.append(tuple(self.transition(1) for _ in range(60)))
         sampled = replay.sample(random.Random(73), 2000)
-        short_episode_draws = sum(transition[1] == 0 for transition in sampled)
+        short_episode_draws = sum(transition[2] == 0 for transition in sampled)
         self.assertGreater(short_episode_draws, 900)
         self.assertLess(short_episode_draws, 1100)
 
@@ -170,7 +156,7 @@ class TestTrainLearning(unittest.TestCase):
         from src.training.solo import train
 
         def state(index):
-            return (float(index),) + (0.0,) * (STATE_DIM - 1)
+            return PappluEnv().reset(seed=index)
 
         episode_steps = (
             (
@@ -252,7 +238,7 @@ class TestTrainLearning(unittest.TestCase):
         self.assertEqual(captured, expected)
         self.assertEqual(summary["replay_sampling"], "transition")
 
-    def test_architecture_selection_summary_and_load_inference(self):
+    def test_current_model_summary_and_loaded_weights(self):
         from src.model.network import load_checkpoint
         from src.training.solo import train
 
@@ -260,48 +246,28 @@ class TestTrainLearning(unittest.TestCase):
             num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
         )
         with tempfile.TemporaryDirectory() as tmp:
-            for architecture in ("mlp", "wide_mlp", "suit_conv"):
-                with self.subTest(architecture=architecture):
-                    path = os.path.join(tmp, architecture + ".pt")
-                    summary = train(
-                        episodes=0,
-                        seed=7,
-                        config=cfg,
-                        architecture=architecture,
-                        checkpoint_path=path,
-                    )
-                    loaded, _, _ = load_checkpoint(path)
-                    self.assertEqual(summary["architecture"], architecture)
-                    self.assertEqual(loaded.architecture, architecture)
-                    self.assertEqual(
-                        summary["param_count"],
-                        sum(parameter.numel() for parameter in loaded.parameters()),
-                    )
-                    inferred = train(episodes=0, seed=7, load_path=path)
-                    self.assertEqual(inferred["architecture"], architecture)
+            path = os.path.join(tmp, "current.pt")
+            summary = train(episodes=0, seed=7, config=cfg, checkpoint_path=path)
+            loaded, _, _ = load_checkpoint(path)
+            self.assertEqual(summary["architecture"], loaded.architecture)
+            self.assertEqual(summary["param_count"], sum(p.numel() for p in loaded.parameters()))
+            inferred = train(episodes=0, seed=7, load_path=path)
+            self.assertEqual(inferred["architecture"], summary["architecture"])
 
-    def test_default_architecture_remains_mlp(self):
+    def test_old_checkpoint_is_a_clean_training_error(self):
         from src.training.solo import train
-
-        summary = train(episodes=0)
-        self.assertEqual(summary["architecture"], "mlp")
-
-    def test_explicit_architecture_mismatch_is_clean_error(self):
-        from src.training.solo import train
+        from src.model.network import QNetwork, build_checkpoint
 
         cfg = GameConfig(
             num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
         )
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "wide.pt")
-            train(
-                episodes=0,
-                config=cfg,
-                architecture="wide_mlp",
-                checkpoint_path=path,
-            )
-            with self.assertRaisesRegex(ValueError, "architecture"):
-                train(episodes=0, load_path=path, architecture="mlp")
+            path = os.path.join(tmp, "old.pt")
+            payload = build_checkpoint(QNetwork(), cfg)
+            payload["checkpoint_version"] = 2
+            torch.save(payload, path)
+            with self.assertRaisesRegex(ValueError, "fresh dynamic weights"):
+                train(episodes=0, load_path=path)
             with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 code = train_main(
                     [
@@ -309,16 +275,15 @@ class TestTrainLearning(unittest.TestCase):
                         path,
                         "--episodes",
                         "0",
-                        "--architecture",
-                        "suit_conv",
                     ]
                 )
             self.assertEqual(code, 2)
-            self.assertIn("architecture", err.getvalue())
+            self.assertIn("fresh dynamic weights", err.getvalue())
 
     def test_controlled_discard_task_raises_chosen_q(self):
         """Repeated warm-start 3-card puzzle: correct discard value should rise."""
         from src.model.network import load_checkpoint, select_greedy_action
+        from src.model.encoding import collate_observations
         from src.training.solo import train
 
         cfg = GameConfig(
@@ -348,7 +313,7 @@ class TestTrainLearning(unittest.TestCase):
             def reset_warm_start(self, seed=None):
                 return super().reset_warm_start(seed=99)
 
-        state_t = torch.tensor(encode_observation(obs), dtype=torch.float32).unsqueeze(0)
+        state_t = collate_observations([obs], torch.device("cpu"))
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "model.pt")
             train(episodes=0, seed=42, config=cfg, checkpoint_path=path)
@@ -468,37 +433,40 @@ class TestTrainLearning(unittest.TestCase):
     def test_cli_short_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "checkpoints", "cli.pt")
-            code = train_main(
-                [
-                    "--episodes",
-                    "2",
-                    "--cards-in-hand",
-                    "3",
-                    "--required-sequences",
-                    "1",
-                    "--num-decks",
-                    "2",
-                    "--max-turns",
-                    "3",
-                    "--warm-start-fraction",
-                    "1",
-                    "--replay-sampling",
-                    "episode",
-                    "--log-every",
-                    "0",
-                    "--checkpoint",
-                    path,
-                    "--seed",
-                    "0",
-                ]
-            )
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                code = train_main(
+                    [
+                        "--episodes",
+                        "2",
+                        "--cards-in-hand",
+                        "3",
+                        "--required-sequences",
+                        "1",
+                        "--num-decks",
+                        "2",
+                        "--max-turns",
+                        "3",
+                        "--warm-start-fraction",
+                        "1",
+                        "--replay-sampling",
+                        "episode",
+                        "--log-every",
+                        "0",
+                        "--checkpoint",
+                        path,
+                        "--seed",
+                        "0",
+                    ]
+                )
             self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.getvalue())["replay_sampling"], "episode")
             self.assertTrue(os.path.isfile(path))
-            with mock.patch("sys.stdout", new_callable=io.StringIO):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
                 self.assertEqual(train_main([
                     "--load", path, "--episodes", "1", "--warm-start-fraction", "1",
                     "--max-turns", "3", "--checkpoint", path,
                 ]), 0)
+            self.assertEqual(json.loads(output.getvalue())["replay_sampling"], "transition")
             with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 self.assertEqual(train_main([
                     "--load", path, "--episodes", "0", "--cards-in-hand", "6",

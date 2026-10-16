@@ -25,43 +25,36 @@ TORCH_REASON = "PyTorch not installed (see requirements-training.txt)"
 
 
 class TestMetricHistory(unittest.TestCase):
-    def test_initial_evidence_accepts_legacy_and_recycling_rules_with_explicit_labels(self):
+    def test_initial_evidence_requires_current_schema_and_matching_rules(self):
         from src.training.improve import _initial_evidence
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             model = root / "model.pt"
             model.write_bytes(b"same frozen weights")
-            for recycling in (None, True, False):
-                rules = {"num_decks": 3, "cards_in_hand": 21, "required_sequences": 5, "max_turns": 60}
-                if recycling is not None:
-                    rules["recycle_discard"] = recycling
-                (root / "final-best.json").write_text(json.dumps({
-                    "checkpoint_sha256": sha256(model),
-                    "game_config": rules,
-                    "greedy": {"games": 2, "wins": 1, "outcomes": [1, 0]},
-                }))
-                evidence = _initial_evidence(
-                    model,
-                    current_recycle_discard=True,
-                )
-                label = (
-                    "current_solo_reference"
-                    if recycling is True
-                    else "legacy_solo_reference"
-                )
-                verified = evidence[label]
-                self.assertEqual(set(evidence), {label})
-                self.assertEqual(verified["win_rate"], 0.5)
-                self.assertIs(verified["recycle_discard"], recycling is True)
-                self.assertEqual(
-                    verified["rule_regime"],
-                    (
-                        "discard_recycling"
-                        if recycling is True
-                        else "legacy_nonrecycling"
-                    ),
-                )
+            rules = {
+                "num_decks": 3, "cards_in_hand": 21, "required_sequences": 5,
+                "max_turns": 60, "recycle_discard": True,
+            }
+            result = {
+                "encoding_version": 2, "checkpoint_version": 3, "architecture": "dynamic_table",
+                "checkpoint_sha256": sha256(model),
+                "game_config": rules,
+                "greedy": {"games": 2, "wins": 1, "outcomes": [1, 0]},
+            }
+            path = root / "final-best.json"
+            path.write_text(json.dumps(result))
+            evidence = _initial_evidence(model, current_recycle_discard=True)
+            verified = evidence["current_solo_reference"]
+            self.assertEqual(verified["win_rate"], 0.5)
+            self.assertTrue(verified["recycle_discard"])
+            for bad in (
+                {**result, "encoding_version": 1},
+                {**result, "game_config": {**rules, "recycle_discard": False}},
+            ):
+                path.write_text(json.dumps(bad))
+                with self.assertRaises(ValueError):
+                    _initial_evidence(model, current_recycle_discard=True)
 
     def test_cached_event_index_avoids_rescanning_the_entire_log(self):
         from src.training.improve import _append_metric_once, _read_metric_ids
@@ -101,7 +94,7 @@ def gate_result(accepted):
                 "games": blocks * len(balanced_seat_orders(players)),
                 "seed_block_margins": [0.5 if accepted else 0.0] * blocks,
             }
-            for players in (2, 3)
+            for players in (2, 3, 4)
         }
         solo = {
             "seed": kwargs["seed"] + 100_000,
@@ -113,6 +106,9 @@ def gate_result(accepted):
         }
         samples = max(100, kwargs["samples"])
         return {
+            "gate_schema_version": 2,
+            "encoding_version": 2,
+            "architecture": "dynamic_table",
             "candidate_sha256": sha256(kwargs["candidate_path"]),
             "champion_sha256": sha256(kwargs["champion_path"]),
             "accepted": accepted,
@@ -148,7 +144,7 @@ class TestImprovementController(unittest.TestCase):
 
         save_checkpoint(
             str(path),
-            QNetwork(architecture="suit_conv"),
+            QNetwork(),
             GameConfig(max_turns=60),
             meta={"best_score": 164 / 256},
         )
@@ -214,7 +210,7 @@ class TestImprovementController(unittest.TestCase):
             )
             self.assertIsNone(controller.best_score)
 
-    def test_legacy_solo_reference_does_not_seed_current_best_score(self):
+    def test_other_rule_reference_cannot_seed_current_training(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             model = root / "champion-source.pt"
@@ -222,6 +218,9 @@ class TestImprovementController(unittest.TestCase):
             (root / "final-best.json").write_text(
                 json.dumps(
                     {
+                        "encoding_version": 2,
+                        "checkpoint_version": 3,
+                        "architecture": "dynamic_table",
                         "checkpoint_sha256": sha256(model),
                         "game_config": {
                             "num_decks": 3,
@@ -239,22 +238,8 @@ class TestImprovementController(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            controller = ImprovementController(
-                model,
-                root / "output",
-                config=ImproveConfig(
-                    max_cycles=1,
-                    league_matches_per_cycle=1,
-                    research_episodes_per_cycle=1,
-                    selection_blocks=32,
-                    confirmation_blocks=128,
-                    solo_games=256,
-                ),
-            )
-            baseline = controller.registry.get(controller.baseline_id)
-            self.assertIsNone(controller.best_score)
-            self.assertIn("legacy_solo_reference", baseline.evidence)
-            self.assertNotIn("current_solo_reference", baseline.evidence)
+            with self.assertRaisesRegex(ValueError, "rules must match"):
+                ImprovementController(model, root / "output", config=ImproveConfig())
 
     def test_weak_selection_keeps_current_champion_pointer(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -528,7 +513,7 @@ class TestImprovementController(unittest.TestCase):
             self.assertEqual(payload["baseline_id"], controller.baseline_id)
             self.assertIsInstance(payload["opponent_ids"], tuple)
 
-    def test_remote_one_cycle_smoke_keeps_champion_stable(self):
+    def test_actual_reduced_cap_cycle_keeps_champion_stable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             model = root / "champion-source.pt"
@@ -545,6 +530,7 @@ class TestImprovementController(unittest.TestCase):
                     solo_games=2,
                     checkpoint_every=2,
                     gate_samples=100,
+                    max_turns=1,
                 ),
             )
             original = controller.registry.champion().id
@@ -555,6 +541,9 @@ class TestImprovementController(unittest.TestCase):
             self.assertEqual(controller.research.total_episodes, 2)
             self.assertEqual(controller.registry.champion().id, original)
             self.assertEqual(controller.promotions, 0)
+            self.assertEqual(controller.league.config.game.max_turns, 1)
+            self.assertEqual(controller.research.config.game_config.max_turns, 1)
+            self.assertEqual(controller.last_gate["max_turns"], 1)
 
 
 class TestImproveCli(unittest.TestCase):

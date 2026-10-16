@@ -31,8 +31,6 @@ from src.evaluation.arena import (
 )
 from src.game.environment import (
     ENCODING_VERSION,
-    NUM_ACTIONS,
-    STATE_DIM,
     GameConfig,
 )
 from src.game.multiplayer import MatchConfig
@@ -41,7 +39,7 @@ from src.training.core import EpisodeReplay, discounted_returns
 from src.training.optimization import train_batch
 
 
-LEAGUE_STATE_VERSION = 1
+LEAGUE_STATE_VERSION = 3
 ALGORITHM = "champion_league_monte_carlo_q_regression"
 RANDOM_OPPONENT = "random"
 TRAINING_SEED_BASE = 1_000_000_000_000
@@ -59,18 +57,17 @@ class LeagueConfig:
     epsilon_start: float = 0.2
     epsilon_end: float = 0.05
     epsilon_decay_matches: int = 10_000
-    player_counts: Tuple[int, ...] = (2, 3)
+    player_counts: Tuple[int, ...] = (2, 3, 4)
 
     def __post_init__(self) -> None:
         if (
             self.game.num_decks,
             self.game.cards_in_hand,
             self.game.required_sequences,
-            self.game.max_turns,
-        ) != (3, 21, 5, 60):
+        ) != (3, 21, 5):
             raise ValueError(
                 "league training requires 3 decks, 21 cards, "
-                "5 pure sequences, and 60 turns"
+                "and 5 pure sequences"
             )
         for name in (
             "batch_size",
@@ -107,11 +104,13 @@ class LeagueConfig:
             or any(
                 isinstance(count, bool)
                 or not isinstance(count, int)
-                or not 2 <= count <= 6
+                or count not in (2, 3, 4)
                 for count in self.player_counts
             )
         ):
-            raise ValueError("player_counts must be a nonempty tuple in 2..6")
+            raise ValueError("player_counts must be a nonempty tuple drawn from 2/3/4")
+        if tuple(sorted(set(self.player_counts))) != self.player_counts:
+            raise ValueError("player_counts must be distinct and sorted")
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -187,6 +186,14 @@ class LeagueSession:
         self.at_match_boundary = True
 
     @property
+    def count_matches(self) -> Dict[int, int]:
+        cycles, remainder = divmod(self.completed_matches, len(self.config.player_counts))
+        return {
+            count: cycles + int(index < remainder)
+            for index, count in enumerate(self.config.player_counts)
+        }
+
+    @property
     def current_epsilon(self) -> float:
         fraction = min(
             1.0,
@@ -205,8 +212,9 @@ class LeagueSession:
         self.at_match_boundary = False
         match_complete = False
         try:
-            players = self.opponent_rng.choice(self.config.player_counts)
-            challenger_seat = self.completed_matches % players
+            occurrence, index = divmod(self.completed_matches, len(self.config.player_counts))
+            players = self.config.player_counts[index]
+            challenger_seat = occurrence % players
             epsilon = self.current_epsilon
             policies = [
                 self.opponent_rng.choice(self._opponents).policy
@@ -241,7 +249,7 @@ class LeagueSession:
             rewards[-1] = terminal_reward
             returns = discounted_returns(rewards, self.config.gamma)
             episode = tuple(
-                (_state_tuple(step[0]), _action(step[1]), target)
+                (step[0], step[1], target)
                 for step, target in zip(trajectory, returns)
             )
             self.replay.append(episode)
@@ -301,6 +309,7 @@ class LeagueSession:
             "encoding_version": ENCODING_VERSION,
             "algorithm": ALGORITHM,
             "league_config": self.config.to_dict(),
+            "model_spec": self.network.spec.to_dict(),
             "initial_seed": self.initial_seed,
             "parent_sha256": self.parent_sha256,
             "opponent_hashes": self.opponent_hashes,
@@ -333,6 +342,7 @@ class LeagueSession:
             "encoding_version",
             "algorithm",
             "league_config",
+            "model_spec",
             "initial_seed",
             "parent_sha256",
             "opponent_hashes",
@@ -354,6 +364,8 @@ class LeagueSession:
             raise ValueError("league checkpoint algorithm is incompatible")
         if LeagueConfig.from_dict(payload["league_config"]) != self.config:
             raise ValueError("league checkpoint config changed")
+        if payload["model_spec"] != self.network.spec.to_dict():
+            raise ValueError("league checkpoint model_spec changed")
         if payload["initial_seed"] != self.initial_seed:
             raise ValueError("league checkpoint seed changed")
         if payload["parent_sha256"] != self.parent_sha256:
@@ -565,25 +577,3 @@ def _load_opponents(
         opponents.append(_Opponent(str(path), digest, policy))
         seen.add(digest)
     return tuple(opponents)
-
-
-def _state_tuple(raw: Any) -> Tuple[float, ...]:
-    if not isinstance(raw, tuple) or len(raw) != STATE_DIM:
-        raise ValueError("arena trajectory state must be a 164-item tuple")
-    result = tuple(float(value) for value in raw)
-    if any(not math.isfinite(value) for value in result):
-        raise ValueError("arena trajectory state must contain finite values")
-    return result
-
-
-def _action(raw: Any) -> int:
-    if (
-        isinstance(raw, bool)
-        or not isinstance(raw, int)
-        or not 0 <= raw < NUM_ACTIONS
-    ):
-        raise ValueError(
-            "arena trajectory action must be in 0..%d"
-            % (NUM_ACTIONS - 1)
-        )
-    return raw

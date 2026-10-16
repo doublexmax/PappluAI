@@ -22,8 +22,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--matches", type=int, required=True)
     parser.add_argument("--max-seconds", type=float, default=82_800)
     parser.add_argument("--checkpoint-every", type=int, default=16)
-    parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--resume")
+    parser.add_argument("--players", type=int, nargs="+", choices=(2, 3, 4), default=None)
+    parser.add_argument("--max-turns", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--updates-per-match", type=int, default=None)
     return parser
 
 
@@ -36,6 +40,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         runtime = load_runtime("src.training.league")
+        runtime.torch.set_num_threads(1)
     except MissingTrainingDependency as exc:
         print("error: %s" % exc, file=sys.stderr, flush=True)
         return 2
@@ -62,20 +67,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ):
             raise ValueError("max_seconds must be finite and nonnegative")
         output_dir = Path(args.output_dir)
-        session = (
-            runtime.LeagueSession.load(
+        settings = {
+            name: getattr(args, name)
+            for name in ("batch_size", "updates_per_match")
+            if getattr(args, name) is not None
+        }
+        if args.players is not None:
+            settings["player_counts"] = tuple(args.players)
+        if args.resume:
+            session = runtime.LeagueSession.load(
                 args.resume,
                 args.initial_model,
                 args.opponent,
-                expected_config=runtime.LeagueConfig(),
             )
-            if args.resume
-            else runtime.LeagueSession(
+            for name, value in settings.items():
+                if value != getattr(session.config, name):
+                    raise ValueError("resume cannot change %s" % name)
+            if args.max_turns is not None and args.max_turns != session.config.game.max_turns:
+                raise ValueError("resume cannot change max_turns")
+            if args.seed is not None and args.seed != session.initial_seed:
+                raise ValueError("resume cannot change seed")
+        else:
+            if any(
+                (output_dir / name).exists()
+                for name in ("latest-state.pt", "latest-model.pt")
+            ):
+                raise ValueError(
+                    "output directory already has training outputs; use --resume"
+                )
+            if args.max_turns is not None:
+                settings["game"] = runtime.GameConfig(max_turns=args.max_turns)
+            session = runtime.LeagueSession(
                 args.initial_model,
                 opponent_paths=args.opponent,
-                seed=args.seed,
+                config=runtime.LeagueConfig(**settings),
+                seed=41 if args.seed is None else args.seed,
             )
-        )
         runtime.save_session_checkpoint(session, output_dir)
         target = session.completed_matches + args.matches
         deadline = time.monotonic() + float(args.max_seconds)
@@ -102,6 +129,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "status": reason,
                     "matches": session.completed_matches,
                     "updates": session.total_updates,
+                    "count_matches": session.count_matches,
                 },
                 sort_keys=True,
             ),
