@@ -1,11 +1,16 @@
 import random
 from collections import Counter
+from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
 from src.checkpoints.evidence import (
     balanced_seat_orders,
     clustered_interval,
+    evidence_metrics,
+    gate_accepted,
+    require_player_counts,
 )
 from src.evaluation.promotion import (
     evaluate_gate,
@@ -15,6 +20,92 @@ try:
     import torch
 except ImportError:
     torch = None
+
+
+class TestPlayerCountEvidence(unittest.TestCase):
+    def test_scope_requires_sorted_distinct_integer_counts(self):
+        for counts in ((2,), (3,), (4,), (2, 3), (2, 4), (3, 4), (2, 3, 4)):
+            with self.subTest(counts=counts):
+                self.assertEqual(require_player_counts(counts), counts)
+        for counts in ((), (1,), (5,), (True,), (2.0,), ("2",), (2, 2), (3, 2)):
+            with self.subTest(counts=counts), self.assertRaises(ValueError):
+                require_player_counts(counts)
+        for counts in (None, [2], "234", {2, 3, 4}):
+            with self.subTest(counts=counts), self.assertRaises(TypeError):
+                require_player_counts(counts)
+
+    def test_metrics_average_only_the_configured_counts(self):
+        multiplayer = {
+            "2": {
+                "candidate_minus_champion": 0.25,
+                "seed_block_margins": [0.25] * 32,
+                "games": 64,
+            },
+            "4": {
+                "candidate_minus_champion": 0.5,
+                "seed_block_margins": [0.5] * 32,
+                "games": 768,
+            },
+        }
+        solo = {
+            "games": 256,
+            "candidate_outcomes": [0] * 256,
+            "champion_outcomes": [0] * 256,
+            "candidate_wins": 0,
+            "champion_wins": 0,
+        }
+        metrics = evidence_metrics(multiplayer, solo, 32, 41, 100, player_counts=[2, 4])
+        self.assertEqual(metrics, {
+            "multiplayer_gain": 0.375,
+            "multiplayer_ci95": [0.375, 0.375],
+            "multiplayer_ci95_by_count": {"2": [0.25, 0.25], "4": [0.5, 0.5]},
+            "solo_gain": 0.0,
+            "solo_ci95": [0.0, 0.0],
+        })
+        self.assertTrue(gate_accepted(multiplayer, metrics, 32, 256, player_counts=(2, 4)))
+        self.assertFalse(gate_accepted(multiplayer, metrics, 32, 256))
+        specialist = evidence_metrics(
+            {"2": multiplayer["2"]}, solo, 32, 41, 100, player_counts=(2,),
+        )
+        self.assertEqual(specialist["multiplayer_gain"], 0.25)
+        self.assertEqual(specialist["multiplayer_ci95_by_count"], {"2": [0.25, 0.25]})
+        self.assertTrue(gate_accepted({"2": multiplayer["2"]}, specialist, 32, 256, (2,)))
+        for counts in ((2,), (2, 3, 4)):
+            with self.subTest(counts=counts), self.assertRaisesRegex(ValueError, "player_counts"):
+                evidence_metrics(multiplayer, solo, 32, 41, 100, player_counts=counts)
+
+    @unittest.skipIf(torch is None, "PyTorch not installed")
+    def test_real_specialist_gate_returns_only_its_configured_results(self):
+        from src.game.environment import GameConfig
+        from src.model.network import QNetwork, save_checkpoint
+
+        with tempfile.TemporaryDirectory() as temporary:
+            model = Path(temporary) / "model.pt"
+            save_checkpoint(str(model), QNetwork(), GameConfig())
+            for counts in ((2,), (3,), (4,), [2]):
+                with self.subTest(counts=counts):
+                    result = evaluate_gate(
+                        str(model), str(model), (), seed=41, seed_blocks=1,
+                        solo_games=1, max_turns=1, player_counts=counts, samples=100,
+                    )
+                    count = counts[0]
+                    self.assertEqual(result["player_counts"], [count])
+                    self.assertEqual(set(result["multiplayer"]), {str(count)})
+                    self.assertEqual(
+                        result["multiplayer"][str(count)]["games"],
+                        {2: 2, 3: 6, 4: 24}[count],
+                    )
+                    self.assertEqual(result["multiplayer_gain"], 0.0)
+                    self.assertEqual(result["multiplayer_ci95_by_count"], {str(count): [0.0, 0.0]})
+                    self.assertFalse(result["accepted"])
+
+    def test_gate_rejects_invalid_scopes_before_loading_models(self):
+        for counts in ((), (True,), (2.0,), (2, 2), (4, 2), (5,)):
+            with self.subTest(counts=counts), self.assertRaises(ValueError):
+                evaluate_gate("missing.pt", "missing.pt", (), 41, 1, 1, player_counts=counts)
+        for counts in (None, "234", {2, 3, 4}):
+            with self.subTest(counts=counts), self.assertRaises(TypeError):
+                evaluate_gate("missing.pt", "missing.pt", (), 41, 1, 1, player_counts=counts)
 
 
 class TestSeatClusterBootstrap(unittest.TestCase):

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
+import math
 from pathlib import Path
 import random
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from src.checkpoints.tensor import validate_model_state
 from src.game.environment import (
@@ -28,113 +29,201 @@ class QNetwork(nn.Module):
         super().__init__()
         self.spec = spec
         width = spec.width
-        self.rank_embedding = nn.Embedding(13, width)
-        self.suit_embedding = nn.Embedding(4, width)
-        self.face_embedding = nn.Sequential(nn.Linear(width, width), nn.GELU())
-        self.card_features = nn.Linear(5, width)
-        self.card_conv = nn.Conv1d(width, width, 3, padding=1)
+        self.suit_conv1 = nn.Conv1d(5, width, kernel_size=3, padding=1)
+        self.suit_conv2 = nn.Conv1d(width, width, kernel_size=3, padding=1)
         self.card_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
         self.card_norm = nn.LayerNorm(width)
-        self.event_embedding = nn.Embedding(len(EventKind), width)
-        self.event_features = nn.Linear(EVENT_FEATURES, width)
-        self.event_cards = nn.Linear(width * 2, width)
-        self.initial_cards = nn.Linear(width, width)
-        self.history_encoder = nn.GRU(width, width, batch_first=True)
+        self.history_proj = nn.Linear(5, 1)
         self.context_features = nn.Linear(CONTEXT_FEATURES, width)
         self.player_features = nn.Linear(PLAYER_FEATURES, width)
-        self.player_history_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
+        self.event_summary = nn.Linear(EVENT_FEATURES, width)
         self.turn_relations = nn.Linear(width * 3, width)
-        self.player_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
-        self.player_norm = nn.LayerNorm(width)
-        self.action_embedding = nn.Embedding(3, width)
-        self.action_query = nn.Linear(width * 3, width)
-        self.action_player_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
-        self.action_card_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
-        self.score = nn.Sequential(nn.Linear(width * 3, width), nn.GELU(), nn.Linear(width, 1))
+        self.context_gate = nn.Linear(width, 2)
+        self.register_buffer("_rank_one_hot", torch.eye(13, dtype=torch.float32), persistent=False)
+        face_dim = width * 3 + 5 + 13
+        draw_dim = width * 3 + 5
+        self.draw_head = nn.Sequential(nn.Linear(draw_dim, width), nn.ReLU(), nn.Linear(width, 2))
+        self.score = nn.Sequential(nn.Linear(face_dim, width), nn.ReLU(), nn.Linear(width, 1))
+
+    def _history_channels(self, batch: ObservationBatch) -> torch.Tensor:
+        size = batch.cards.shape[0]
+        device = batch.cards.device
+        steps = batch.event_kind.shape[1]
+        extra = torch.zeros((size, NUM_FACES + 1, 5), dtype=torch.float32, device=device)
+        extra[:, :NUM_FACES, 0] = batch.initial_hand - batch.cards[:, :, 0]
+        if steps > 0:
+            pos = torch.arange(1, steps + 1, dtype=torch.float32, device=device).unsqueeze(0)
+            denom = batch.history_lengths.to(device=device, dtype=torch.float32).clamp_min(1.0).unsqueeze(1)
+            recency = (0.5 + 0.5 * (pos / denom)) * batch.history_mask.to(torch.float32) / denom
+            own = (batch.event_actor == 0) & batch.history_mask
+            opp_next = (batch.event_actor == 1) & batch.history_mask
+            opp_other = (batch.event_actor > 1) & batch.history_mask
+            is_take = batch.event_kind == int(EventKind.TAKE_DISCARD)
+            is_disc = batch.event_kind == int(EventKind.DISCARD)
+            is_draw = batch.event_kind == int(EventKind.DRAW_STOCK)
+            face_idx = batch.event_face.clamp(0, NUM_FACES)
+            top_idx = batch.offered_top.clamp(0, NUM_FACES)
+            for channel, mask in enumerate((
+                own, opp_next & is_take, opp_next & is_disc,
+                opp_other & is_take, opp_other & is_disc,
+            )):
+                extra[:, :, channel].scatter_add_(1, face_idx, recency * mask.to(torch.float32))
+            for channel, opponent in ((2, opp_next), (4, opp_other)):
+                extra[:, :, channel].scatter_add_(
+                    1, top_idx, recency * (opponent & is_draw).to(torch.float32),
+                )
+        return extra[:, :NUM_FACES, :]
 
     def forward(self, batch: ObservationBatch) -> torch.Tensor:
         device = batch.cards.device
         width = self.spec.width
         size = batch.cards.shape[0]
-        faces = torch.arange(NUM_FACES, device=device)
-        base_cards = self.face_embedding(
-            self.rank_embedding(faces % 13) + self.suit_embedding(faces // 13)
-        )
-        visible_faces = torch.cat((base_cards, base_cards.new_zeros(1, width)), dim=0)
-        cards = base_cards.unsqueeze(0) + self.card_features(batch.cards)
-        suit_rows = cards.reshape(size * 4, 13, width).transpose(1, 2)
+        suit_rows = batch.cards.reshape(size * 4, 13, 5).transpose(1, 2)
         suit_rows = torch.cat((suit_rows, suit_rows[:, :, :1]), dim=2)
-        local = torch.relu(self.card_conv(suit_rows)).transpose(1, 2)
-        ace = 0.5 * (local[:, 0] + local[:, 13])
-        local = torch.cat((ace[:, None, :], local[:, 1:13]), dim=1).reshape(size, NUM_FACES, width)
-        cards = cards + local
-        interactions, _ = self.card_attention(cards, cards, cards, need_weights=False)
-        cards = self.card_norm(cards + interactions)
+        local = torch.relu(self.suit_conv1(suit_rows))
+        local = torch.relu(self.suit_conv2(local))
+        ace = 0.5 * (local[:, :, 0] + local[:, :, 13])
+        local_flat = torch.cat((ace[:, :, None], local[:, :, 1:13]), dim=2).transpose(1, 2)
+        local_flat = local_flat.reshape(size, NUM_FACES, width)
+        interactions, _ = self.card_attention(local_flat, local_flat, local_flat, need_weights=False)
+        local_flat = self.card_norm(local_flat + interactions)
+        local = local_flat.reshape(size, 4, 13, width)
+        set_features = local.mean(dim=1, keepdim=True).expand(-1, 4, -1, -1).reshape(size, NUM_FACES, width)
+        global_cards = local_flat.mean(dim=1)
 
-        event_cards = torch.cat((
-            visible_faces[batch.event_face], visible_faces[batch.offered_top],
-        ), dim=-1)
-        events = (
-            self.event_embedding(batch.event_kind)
-            + self.event_features(batch.event_features)
-            + self.event_cards(event_cards)
+        hist_bonus = 0.02 * torch.tanh(self.history_proj(self._history_channels(batch)).squeeze(-1))
+        players = self.player_features(
+            batch.players.masked_fill(~batch.player_mask[:, :, None], 0.0),
         )
-        initial = self.initial_cards(batch.initial_hand @ base_cards / 30.0)
-        events = events + (
-            torch.arange(events.shape[1], device=device)[None, :, None] == 0
-        ) * initial[:, None, :]
-        packed = pack_padded_sequence(
-            events, batch.history_lengths, batch_first=True, enforce_sorted=False,
-        )
-        packed_history, final = self.history_encoder(packed)
-        history, _ = pad_packed_sequence(
-            packed_history, batch_first=True, total_length=events.shape[1],
-        )
-        context = self.context_features(batch.context) + final[0]
-        players = self.player_features(batch.players) + context[:, None, :]
-        player_history, _ = self.player_history_attention(
-            players, history, history, key_padding_mask=~batch.history_mask,
-            need_weights=False,
-        )
-        positions = torch.arange(events.shape[1], device=device)[None, :, None]
-        actor_matches = (
-            batch.event_actor[:, :, None]
-            == torch.arange(players.shape[1], device=device)[None, None, :]
-        ) & batch.history_mask[:, :, None]
-        last_positions = positions.expand(size, -1, players.shape[1]).masked_fill(
-            ~actor_matches, -1,
-        ).amax(dim=1)
-        last_history = history.gather(
-            1, last_positions.clamp_min(0)[:, :, None].expand(-1, -1, width),
-        ) * (last_positions >= 0)[:, :, None]
-        players = players + player_history + last_history
         next_players = players.gather(1, batch.next_player[:, :, None].expand(-1, -1, width))
         previous_players = players.gather(1, batch.previous_player[:, :, None].expand(-1, -1, width))
-        players = players + torch.relu(self.turn_relations(
+        rel = torch.relu(self.turn_relations(
             torch.cat((players, next_players, previous_players), dim=-1),
         ))
-        relations, _ = self.player_attention(
-            players, players, players, key_padding_mask=~batch.player_mask,
-            need_weights=False,
+        events = batch.event_features.masked_fill(~batch.history_mask[:, :, None], 0.0)
+        pos = torch.arange(1, events.shape[1] + 1, dtype=torch.float32, device=device).unsqueeze(0)
+        lengths = batch.history_lengths.to(device=device, dtype=torch.float32).clamp_min(1.0).unsqueeze(1)
+        weights = (pos / lengths) * batch.history_mask.to(torch.float32)
+        ev_ctx = self.event_summary(
+            (events * weights[:, :, None]).sum(dim=1) / weights.sum(dim=1, keepdim=True).clamp_min(1.0),
         )
-        players = self.player_norm(players + relations)
+        table_ctx = self.context_features(batch.context) + rel[:, 0, :] + 0.1 * ev_ctx
+        ctx_mod = 0.02 * torch.tanh(self.context_gate(table_ctx))
 
-        top_cards = cards.gather(
-            1, batch.top.clamp_max(NUM_FACES - 1)[:, None, None].expand(-1, 1, width),
-        ) * (batch.top < NUM_FACES)[:, None, None]
-        action_cards = torch.cat((cards.new_zeros(size, 1, width), top_cards, cards), dim=1)
-        action_kinds = torch.tensor([0, 1] + [2] * NUM_FACES, device=device)
-        actions = self.action_query(torch.cat((
-            action_cards,
-            self.action_embedding(action_kinds)[None, :, :].expand(size, -1, -1),
-            context[:, None, :].expand(-1, NUM_ACTIONS, -1),
-        ), dim=-1))
-        player_context, _ = self.action_player_attention(
-            actions, players, players, key_padding_mask=~batch.player_mask,
-            need_weights=False,
+        top_idx = batch.top.clamp_max(NUM_FACES - 1)
+        has_top = (batch.top < NUM_FACES).to(torch.float32).unsqueeze(-1)
+        top_local = local_flat.gather(1, top_idx[:, None, None].expand(-1, 1, width)).squeeze(1) * has_top
+        top_set = set_features.gather(1, top_idx[:, None, None].expand(-1, 1, width)).squeeze(1) * has_top
+        top_raw = batch.cards.gather(1, top_idx[:, None, None].expand(-1, 1, 5)).squeeze(1) * has_top
+        raw_draw = self.draw_head(torch.cat((global_cards, top_local, top_set, top_raw), dim=-1)) + ctx_mod
+        v_draw = raw_draw[:, :1]
+        top_adv = 0.05 * torch.tanh(raw_draw[:, 1:2]) - 0.10
+        draw_values = torch.cat((v_draw, v_draw + top_adv), dim=1)
+
+        ranks = self._rank_one_hot.repeat(4, 1).unsqueeze(0).expand(size, -1, -1)
+        per_face = torch.cat((
+            local_flat,
+            set_features,
+            global_cards[:, None, :].expand(-1, NUM_FACES, -1),
+            batch.cards,
+            ranks,
+        ), dim=-1)
+        discard_values = self.score(per_face).squeeze(-1) + hist_bonus + ctx_mod[:, :1]
+        return torch.cat((draw_values, discard_values), dim=1)
+
+
+def expand_network_width(
+    source_net: QNetwork, target_spec: ModelSpec, *, seed: int = 41,
+) -> QNetwork:
+    source_spec = source_net.spec
+    if target_spec.width % source_spec.width:
+        raise ValueError("target width must be a multiple of source width")
+    if target_spec.heads < source_spec.heads:
+        raise ValueError("target heads cannot be fewer than source heads")
+    source_head = source_spec.width // source_spec.heads
+    target_head = target_spec.width // target_spec.heads
+    if target_head < source_head:
+        raise ValueError("target head dimensions cannot be smaller than source head dimensions")
+    if target_spec == source_spec:
+        return copy.deepcopy(source_net)
+
+    parameter = next(source_net.parameters())
+    device, dtype = parameter.device, parameter.dtype
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        target = QNetwork(target_spec).to(device=device, dtype=dtype)
+    width, copies = source_spec.width, target_spec.width // source_spec.width
+    units = torch.arange(width, device=device).repeat(copies)
+    shares = torch.rand((copies, width), generator=generator, device="cpu") + 0.1
+    alpha = (shares / shares.sum(dim=0, keepdim=True)).flatten().to(device=device, dtype=dtype)
+
+    def copy_linear(before, after, rows, columns, weights):
+        after.weight.copy_(before.weight[rows][:, columns] * weights[None, :])
+        after.bias.copy_(before.bias[rows])
+
+    with torch.no_grad():
+        target.suit_conv1.weight.copy_(source_net.suit_conv1.weight[units])
+        target.suit_conv1.bias.copy_(source_net.suit_conv1.bias[units])
+        target.suit_conv2.weight.copy_(
+            source_net.suit_conv2.weight[units][:, units] * alpha[None, :, None],
         )
-        card_context, _ = self.action_card_attention(actions, cards, cards, need_weights=False)
-        return self.score(torch.cat((actions, player_context, card_context), dim=-1)).squeeze(-1)
+        target.suit_conv2.bias.copy_(source_net.suit_conv2.bias[units])
+        target.card_norm.weight.copy_(source_net.card_norm.weight[units])
+        target.card_norm.bias.copy_(source_net.card_norm.bias[units])
+        target.history_proj.load_state_dict(source_net.history_proj.state_dict())
+        for name in ("context_features", "player_features", "event_summary"):
+            before, after = getattr(source_net, name), getattr(target, name)
+            columns = torch.arange(before.in_features, device=device)
+            copy_linear(before, after, units, columns, torch.ones_like(columns, dtype=dtype))
+        columns = torch.cat([units + section * width for section in range(3)])
+        copy_linear(
+            source_net.turn_relations, target.turn_relations, units, columns, alpha.repeat(3),
+        )
+        copy_linear(
+            source_net.context_gate, target.context_gate,
+            torch.arange(2, device=device), units, alpha,
+        )
+        for name in ("draw_head", "score"):
+            before, after = getattr(source_net, name), getattr(target, name)
+            raw_columns = torch.arange(width * 3, before[0].in_features, device=device)
+            head_columns = torch.cat((columns, raw_columns))
+            head_weights = torch.cat((alpha.repeat(3), torch.ones_like(raw_columns, dtype=dtype)))
+            copy_linear(before[0], after[0], units, head_columns, head_weights)
+            copy_linear(
+                before[2], after[2], torch.arange(before[2].out_features, device=device),
+                units, alpha,
+            )
+
+        before, after = source_net.card_attention, target.card_attention
+        wide = target_spec.width
+        after.in_proj_weight.zero_()
+        after.in_proj_bias.zero_()
+        for projection in (0, 2):
+            start = projection * wide
+            after.in_proj_weight[start:start + wide].copy_(
+                1e-3 * torch.randn((wide, wide), generator=generator, device="cpu").to(parameter),
+            )
+            after.in_proj_bias[start:start + wide].copy_(
+                1e-3 * torch.randn(wide, generator=generator, device="cpu").to(parameter),
+            )
+        live = torch.tensor([
+            head * target_head + dimension
+            for head in range(source_spec.heads) for dimension in range(source_head)
+        ], device=device)
+        for projection in range(3):
+            source_rows = torch.arange(width, device=device) + projection * width
+            target_rows = live + projection * wide
+            scale = math.sqrt(target_head / source_head) if projection == 0 else 1.0
+            after.in_proj_weight[target_rows] = (
+                before.in_proj_weight[source_rows][:, units] * alpha[None, :] * scale
+            )
+            after.in_proj_bias[target_rows] = before.in_proj_bias[source_rows] * scale
+        after.out_proj.weight.zero_()
+        after.out_proj.weight[:, live] = before.out_proj.weight[units]
+        after.out_proj.bias.copy_(before.out_proj.bias[units])
+    target.train(source_net.training)
+    return target
 
 
 def masked_q_values(

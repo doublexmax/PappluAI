@@ -68,9 +68,12 @@ registry records fail explicitly. No conversion path remains.
 
 Decision observations retain their complete visible histories.
 The current and initial own hand, public draws and discards, and own stock
-draw faces feed the shared history encoder. Peers' stock faces and hidden
-stock order never enter it. Inference reconstructs history without a cached
-private recurrent state. Replay uses the same collation.
+draw faces form direct card-history channels on a four-suit, 13-rank grid.
+Shared suit convolutions, card self-attention, and cross-suit rank pooling
+encode the grid without learned suit identities. A chronology-weighted event
+summary and player turn relations provide table context. Peers' stock faces
+and hidden stock order never enter the encoder. Inference reconstructs these
+features without private recurrent state. Replay uses the same collation.
 Checkpoints store one journal per episode and a history-prefix length for each
 decision. Resume validates that each snapshot matches its history prefix and
 restores shared event objects.

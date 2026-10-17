@@ -20,6 +20,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     source.add_argument("--resume")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--opponent", action="append", default=[])
+    parser.add_argument("--players", type=int, nargs="+", choices=(2, 3, 4), default=None)
+    parser.add_argument("--snapshots", type=Path, default=None)
     parser.add_argument("--max-seconds", type=float, required=True)
     parser.add_argument("--max-cycles", type=int, default=64)
     parser.add_argument(
@@ -75,6 +77,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             controller = runtime.ImprovementController.load(
                 args.resume,
                 output_dir,
+                snapshots_dir=args.snapshots,
             )
             _validate_resume_options(
                 runtime,
@@ -97,7 +100,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     solo_games=args.solo_games,
                     checkpoint_every=args.checkpoint_every,
                     max_turns=args.max_turns,
+                    player_counts=(2, 3, 4) if args.players is None else tuple(args.players),
                 ),
+                snapshots_dir=args.snapshots,
             )
         reason = controller.run(
             args.max_seconds,
@@ -150,6 +155,8 @@ def _validate_resume_options(
     for option, field in learning_options.items():
         if option in explicit and getattr(args, field) != getattr(controller.config, field):
             raise ValueError("Resume cannot change %s" % option)
+    if "--players" in explicit and tuple(args.players) != controller.config.player_counts:
+        raise ValueError("Resume cannot change --players")
     for path in args.opponent:
         if path == runtime.RANDOM_OPPONENT:
             continue

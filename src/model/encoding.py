@@ -68,6 +68,8 @@ def collate_observations(
     for row, obs in enumerate(observations):
         cfg = obs.config
         count = len(obs.players)
+        sins = [math.sin(2.0 * math.pi * i / count) for i in range(count)]
+        coss = [math.cos(2.0 * math.pi * i / count) for i in range(count)]
         history_length = len(obs.history)
         lengths.append(history_length)
         card_values = [[n / cfg.num_decks, 0.0, 0.0, 0.0, 0.0] for n in obs.hand]
@@ -90,11 +92,10 @@ def collate_observations(
             count / 6.0, cfg.max_turns / 60.0,
         ], device=device)
         for relative, player in enumerate(obs.players):
-            angle = 2.0 * math.pi * relative / count
             player_values[row, relative] = torch.tensor([
                 float(relative == 0), player.hand_size / cfg.cards_in_hand,
                 player.turns_remaining / cfg.max_turns, float(player.active),
-                math.sin(angle), math.cos(angle),
+                sins[relative], coss[relative],
             ], device=device)
             next_player[row, relative] = player.next_player
             previous_player[row, relative] = player.previous_player
@@ -114,13 +115,13 @@ def collate_observations(
         event_features[row, :history_length] = torch.tensor([
             [
                 float(event.actor == 0),
-                math.sin(2.0 * math.pi * event.actor / count),
-                math.cos(2.0 * math.pi * event.actor / count),
+                sins[event.actor],
+                coss[event.actor],
                 event.hand_size / cfg.cards_in_hand,
                 event.turns_remaining / cfg.max_turns,
                 event.stock_remaining / (cfg.num_decks * NUM_FACES),
-                math.sin(2.0 * math.pi * event.next_player / count),
-                math.cos(2.0 * math.pi * event.next_player / count),
+                sins[event.next_player],
+                coss[event.next_player],
             ] for event in obs.history
         ], device=device)
         history_mask[row, :history_length] = True

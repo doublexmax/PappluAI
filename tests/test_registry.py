@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from src.checkpoints.io import atomic_write_json, file_sha256
-from src.checkpoints.evidence import GATE_SCHEMA_VERSION, evidence_metrics
+from src.checkpoints.evidence import GATE_SCHEMA_VERSION, balanced_seat_orders, evidence_metrics
 from src.checkpoints.registry import ModelRecord, ModelRegistry
 from src.game.environment import GameConfig
 
@@ -33,27 +33,18 @@ def install_record(registry, data, origin):
     return record
 
 
-def gate_evidence(candidate, champion, blocks, seed):
+def gate_evidence(candidate, champion, blocks, seed, player_counts=(2, 3, 4)):
     margins = [0.5] * (blocks // 4) + [0.0] * (
         blocks - blocks // 4
     )
     margin = sum(margins) / blocks
     multiplayer = {
-        "2": {
+        str(count): {
             "candidate_minus_champion": margin,
             "seed_block_margins": margins,
-            "games": blocks * 2,
-        },
-        "3": {
-            "candidate_minus_champion": margin,
-            "seed_block_margins": margins,
-            "games": blocks * 6,
-        },
-        "4": {
-            "candidate_minus_champion": margin,
-            "seed_block_margins": margins,
-            "games": blocks * 24,
-        },
+            "games": blocks * len(balanced_seat_orders(count)),
+        }
+        for count in player_counts
     }
     solo = {
         "games": 256,
@@ -69,7 +60,7 @@ def gate_evidence(candidate, champion, blocks, seed):
         "gate_schema_version": GATE_SCHEMA_VERSION,
         "encoding_version": 2,
         "architecture": "dynamic_table",
-        "player_counts": [2, 3, 4],
+        "player_counts": list(player_counts),
         "seed_blocks": blocks,
         "seed": seed,
         "bootstrap_samples": 100,
@@ -77,19 +68,19 @@ def gate_evidence(candidate, champion, blocks, seed):
             "num_decks": 3, "cards_in_hand": 21, "required_sequences": 5,
             "max_turns": 60, "recycle_discard": True,
         },
-        **evidence_metrics(multiplayer, solo, blocks, seed, 100),
+        **evidence_metrics(multiplayer, solo, blocks, seed, 100, player_counts=player_counts),
         "solo": solo,
         "multiplayer": multiplayer,
     }
 
 
-def evidence(candidate, champion):
+def evidence(candidate, champion, player_counts=(2, 3, 4)):
     selection = {
-        **gate_evidence(candidate, champion, 32, 60_000_000),
+        **gate_evidence(candidate, champion, 32, 60_000_000, player_counts),
         "phase": "selection",
     }
     return {
-        **gate_evidence(candidate, champion, 128, 60_500_000),
+        **gate_evidence(candidate, champion, 128, 60_500_000, player_counts),
         "selection_passed": True,
         "phase": "confirmation",
         "selection_seed": selection["seed"],
@@ -168,6 +159,65 @@ class TestModelRegistration(unittest.TestCase):
 
 
 class TestChampionProtection(unittest.TestCase):
+    def test_specialists_can_promote_with_matching_scoped_evidence(self):
+        for count in (2, 3, 4):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                registry = ModelRegistry(Path(directory))
+                champion = install_record(registry, b"frozen", "initial")
+                candidate = install_record(registry, b"new", "league")
+                registry.initialize_champion(champion.id)
+                promoted = registry.promote(
+                    candidate.id, champion.id, evidence(candidate, champion, (count,)),
+                    player_counts=(count,),
+                )
+                self.assertEqual(promoted.id, candidate.id)
+                self.assertEqual(registry.champion().id, candidate.id)
+                pointer = json.loads(registry.champion_path.read_text(encoding="utf-8"))
+                self.assertEqual(pointer["history"][0]["evidence"]["player_counts"], [count])
+
+    def test_confirmation_scope_must_match_the_requested_promotion_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            champion = install_record(registry, b"frozen", "initial")
+            candidate = install_record(registry, b"new", "league")
+            registry.initialize_champion(champion.id)
+            before = registry.champion_path.read_bytes()
+            for actual, expected in (((2,), (2, 3, 4)), ((3,), (2,)), ((2, 3, 4), (2,))):
+                with self.subTest(actual=actual, expected=expected):
+                    with self.assertRaisesRegex(ValueError, "confirmation evidence player_counts"):
+                        registry.promote(
+                            candidate.id, champion.id, evidence(candidate, champion, actual),
+                            player_counts=expected,
+                        )
+                    self.assertEqual(registry.champion_path.read_bytes(), before)
+
+    def test_selection_and_confirmation_must_cover_the_same_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            champion = install_record(registry, b"frozen", "initial")
+            candidate = install_record(registry, b"new", "league")
+            registry.initialize_champion(champion.id)
+            bad = evidence(candidate, champion, (2,))
+            bad["selection"] = evidence(candidate, champion, (3,))["selection"]
+            with self.assertRaisesRegex(ValueError, "matching selection and confirmation player_counts"):
+                registry.promote(candidate.id, champion.id, bad)
+            with self.assertRaisesRegex(ValueError, "selection evidence player_counts"):
+                registry.promote(candidate.id, champion.id, bad, player_counts=(2,))
+            self.assertEqual(registry.champion().id, champion.id)
+
+    def test_malformed_declared_scopes_cannot_promote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            champion = install_record(registry, b"frozen", "initial")
+            candidate = install_record(registry, b"new", "league")
+            registry.initialize_champion(champion.id)
+            for counts in (None, "234", {"2": True}, [], [3, 2], [2, 2], [True], [2.0], [5]):
+                bad = evidence(candidate, champion)
+                bad["player_counts"] = counts
+                with self.subTest(counts=counts), self.assertRaises(ValueError):
+                    registry.promote(candidate.id, champion.id, bad)
+                self.assertEqual(registry.champion().id, champion.id)
+
     def test_old_registry_fast_path_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = ModelRegistry(Path(directory))

@@ -131,8 +131,8 @@ Both values are configurable. Every card must belong to exactly one legal group.
 
 | Group | Rule |
 | --- | --- |
-| Sequence | At least three consecutive ranks of one suit. Ace can be low in A-2-3 or high in Q-K-A, but K-A-2 is invalid. |
-| Required pure sequence | A sequence with no substitutions except by the exact selected joker card. This exception is specific to these house rules. |
+| Sequence | At least three consecutive ranks of one suit, or three identical natural copies of the exact same card. Ace can be low in A-2-3 or high in Q-K-A, but K-A-2 is invalid. |
+| Required pure sequence | A sequence with no substitutions except by the exact selected joker card, or three identical natural copies of the exact same card. |
 | Set | Three or four cards of one rank with distinct represented suits. Sets do not count toward the pure-sequence requirement. |
 
 A long sequence counts as one group. It can count as multiple sequences only if

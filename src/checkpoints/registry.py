@@ -149,7 +149,13 @@ class ModelRegistry:
         self.model_path(record.id)
         return record
 
-    def promote(self, candidate_id: str, expected_id: str, evidence: dict) -> ModelRecord:
+    def promote(
+        self,
+        candidate_id: str,
+        expected_id: str,
+        evidence: dict,
+        player_counts: Optional[Sequence[int]] = None,
+    ) -> ModelRecord:
         current = self.champion()
         candidate = self.get(candidate_id)
         self.model_path(candidate.id)
@@ -168,6 +174,7 @@ class ModelRegistry:
             candidate_sha256=candidate.sha256,
             champion_sha256=current.sha256,
             minimum_seed_blocks=gate_evidence.MIN_CONFIRMATION_SEED_BLOCKS,
+            player_counts=player_counts,
         )
         selection = gate_evidence.validate_gate_evidence(
             evidence.get("selection"),
@@ -175,7 +182,10 @@ class ModelRegistry:
             candidate_sha256=candidate.sha256,
             champion_sha256=current.sha256,
             minimum_seed_blocks=gate_evidence.MIN_SELECTION_SEED_BLOCKS,
+            player_counts=player_counts,
         )
+        if selection.player_counts != confirmation.player_counts:
+            raise ValueError("Promotion requires matching selection and confirmation player_counts")
         if (
             evidence.get("selection_seed") != selection.seed
             or selection.rules != confirmation.rules
