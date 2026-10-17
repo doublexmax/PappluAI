@@ -143,11 +143,17 @@ class ImprovementController:
 
         baseline_path = str(self.registry.model_path(self.baseline_id))
         league_paths = self._opponent_paths()
+        batch_size = max(1, int(os.environ.get("PAPPLU_BATCH_SIZE", "64")))
+        updates_per_step = max(1, int(os.environ.get("PAPPLU_UPDATES_PER_STEP", "4")))
+        replay_capacity = max(100, int(os.environ.get("PAPPLU_REPLAY_CAPACITY", "10000")))
         self.league = LeagueSession(
             baseline_path,
             league_paths,
             config=LeagueConfig(
                 game=GameConfig(max_turns=self.config.max_turns, recycle_discard=self.config.recycle_discard),
+                batch_size=batch_size,
+                replay_capacity=replay_capacity,
+                updates_per_match=updates_per_step,
                 player_counts=self.config.player_counts,
                 learning_rate=LEAGUE_FINETUNE_LR,
                 epsilon_start=LEAGUE_FINETUNE_EPSILON_START,
@@ -877,15 +883,18 @@ class ImprovementController:
 
 
 def _research_config(config: ImproveConfig) -> TrainingConfig:
+    batch_size = max(1, int(os.environ.get("PAPPLU_BATCH_SIZE", "64")))
+    updates_per_step = max(1, int(os.environ.get("PAPPLU_UPDATES_PER_STEP", "4")))
+    replay_capacity = max(100, int(os.environ.get("PAPPLU_REPLAY_CAPACITY", "10000")))
     return TrainingConfig(
         learning_rate=RESEARCH_FINETUNE_LR,
         epsilon_start=RESEARCH_FINETUNE_EPSILON_START,
         epsilon_end=RESEARCH_FINETUNE_EPSILON_END,
         curriculum_fraction=0.25,
         max_turns=config.max_turns,
-        replay_capacity=10_000,
-        batch_size=64,
-        updates_per_episode=4,
+        replay_capacity=replay_capacity,
+        batch_size=batch_size,
+        updates_per_episode=updates_per_step,
         validation_games=config.solo_games,
         recycle_discard=config.recycle_discard,
         shaping=DEFAULT_IMPROVE_SHAPING,
