@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import time
 from typing import Sequence, Tuple
@@ -46,7 +47,7 @@ def evaluate_gate(
         raise TypeError("seed must be an integer")
 
     previous_threads = torch.get_num_threads()
-    torch.set_num_threads(1)
+    torch.set_num_threads(max(1, int(os.environ.get("PAPPLU_CPU_THREADS", "1"))))
     try:
         rules = GameConfig(
             max_turns=max_turns,
