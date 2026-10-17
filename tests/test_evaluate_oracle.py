@@ -15,6 +15,8 @@ def counts(cards):
 
 
 def sequence_possible(cards, joker, pure):
+    if len(cards) == 3 and len(set(cards)) == 1:
+        return True
     fixed = [
         card for card in cards
         if (card != joker if pure else card % 13 != joker % 13)
@@ -88,7 +90,13 @@ class OracleTests(unittest.TestCase):
             actual = meld.cards
             represented = meld.represented_cards
             self.assertEqual(len(actual), len(represented))
-            self.assertEqual(len(set(represented)), len(represented))
+            if not (
+                meld.kind == "sequence"
+                and len(represented) == 3
+                and len(set(represented)) == 1
+                and actual == represented
+            ):
+                self.assertEqual(len(set(represented)), len(represented))
             for card, target in zip(actual, represented):
                 self.assertTrue(0 <= target < 52)
                 self.assertTrue(card == target or card % 13 == joker % 13)

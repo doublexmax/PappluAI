@@ -230,25 +230,49 @@ class TestEvaluateValid(unittest.TestCase):
         self.assertEqual(sum(len(m.cards) for m in ev.melds), 21)
         self._assert_witness(hand, ev)
 
-    def test_twenty_one_off_suit_wildcard_copies_invalid(self):
+    def test_three_identical_cards_count_as_pure_sequence(self):
         hand = empty_hand()
-        add(hand, JOKER_8H, 21)
-        self.assertFalse(is_valid_hand(hand, JOKER_8S))
-        self.assertEqual(hand_reward(hand, JOKER_8S), 0.0)
-        self.assertEqual(evaluate_hand(hand, JOKER_8S).melds, ())
+        add(hand, face(2, 4), 3)
+        ev = evaluate_hand(hand, JOKER_8S, required_sequences=1, cards_in_hand=3)
+        self.assertTrue(ev.is_valid)
+        self.assertEqual(len(ev.melds), 1)
+        self.assertEqual(ev.melds[0].kind, "sequence")
+        self.assertTrue(ev.melds[0].is_pure)
+        self.assertEqual(ev.melds[0].cards, (face(2, 4), face(2, 4), face(2, 4)))
+        self._assert_witness(hand, ev)
 
-    def test_three_exact_plus_eighteen_off_suit_invalid_for_default_quota(self):
-        hand = empty_hand()
-        add(hand, JOKER_8S, 3)
-        add(hand, JOKER_8H, 18)
-        self.assertFalse(is_valid_hand(hand, JOKER_8S))
-        self.assertEqual(hand_reward(hand, JOKER_8S), 0.0)
+    def test_user_deal_with_three_5d_tunnela_is_valid_21_card_win(self):
+        cards = [
+            19, 20, 21, 22,
+            30, 30, 30,
+            36, 37, 38, 26,
+            42, 43, 23,
+            46, 47, 48,
+            36, 23, 35, 34,
+        ]
+        hand = from_cards(cards)
+        joker_js = face(0, 10)
+        ev = evaluate_hand(hand, joker_js, required_sequences=5, cards_in_hand=21)
+        self.assertTrue(ev.is_valid)
+        self.assertGreaterEqual(sum(1 for m in ev.melds if m.is_pure), 5)
 
-    def test_twenty_one_non_joker_copies_invalid(self):
+    def test_mixed_off_suit_wildcards_without_three_identical_copies_invalid_for_pure_quota(self):
         hand = empty_hand()
-        add(hand, face(0, 0), 21)
-        self.assertFalse(is_valid_hand(hand, JOKER_8S))
-        self.assertEqual(hand_reward(hand, JOKER_8S), 0.0)
+        add(hand, JOKER_8H, 14)
+        add(hand, JOKER_8D, 7)
+        ev = evaluate_hand(hand, JOKER_8S)
+        self.assertTrue(ev.is_valid)
+        mixed_three = empty_hand()
+        add(mixed_three, JOKER_8H, 2)
+        add(mixed_three, JOKER_8D, 1)
+        self.assertFalse(is_valid_hand(mixed_three, JOKER_8S, required_sequences=1, cards_in_hand=3))
+
+    def test_two_identical_plus_wildcard_is_not_tunnela_sequence(self):
+        hand = empty_hand()
+        add(hand, face(2, 4), 2)
+        add(hand, JOKER_8S, 1)
+        self.assertFalse(is_valid_hand(hand, JOKER_8S, required_sequences=1, cards_in_hand=3))
+        self.assertFalse(is_valid_hand(hand, JOKER_8S, required_sequences=0, cards_in_hand=3))
 
     def test_residual_natural_sequence_stays_pure_after_quota(self):
         cards = [
@@ -379,7 +403,12 @@ class TestEvaluateValid(unittest.TestCase):
                 suits = {r // 13 for r in meld.represented_cards}
                 self.assertEqual(len(suits), 1)
                 ranks = [r % 13 for r in meld.represented_cards]
-                self.assertEqual(len(ranks), len(set(ranks)))
+                if not (
+                    len(meld.cards) == 3
+                    and len(set(meld.cards)) == 1
+                    and meld.cards == meld.represented_cards
+                ):
+                    self.assertEqual(len(ranks), len(set(ranks)))
             if meld.kind == "set":
                 ranks = {r % 13 for r in meld.represented_cards}
                 self.assertEqual(len(ranks), 1)
