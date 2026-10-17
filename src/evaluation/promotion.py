@@ -39,8 +39,9 @@ def evaluate_gate(
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError("%s must be a positive integer" % name)
-    if tuple(player_counts) != evidence.PLAYER_COUNTS:
-        raise ValueError("The current promotion gate requires two-, three-, and four-player matches")
+    if not isinstance(player_counts, (list, tuple)):
+        raise TypeError("player_counts must be a list or tuple")
+    counts = evidence.require_player_counts(tuple(player_counts))
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise TypeError("seed must be an integer")
 
@@ -65,7 +66,7 @@ def evaluate_gate(
                     "Promotion evaluation reached its time limit"
                 )
 
-        for players in player_counts:
+        for players in counts:
             raw = []
             for index in range(seed_blocks):
                 check_deadline()
@@ -128,12 +129,14 @@ def evaluate_gate(
             seed_blocks,
             seed,
             samples,
+            player_counts=counts,
         )
         accepted = max_turns == 60 and recycle_discard and evidence.gate_accepted(
             by_player_count,
             metrics,
             seed_blocks,
             solo_games,
+            player_counts=counts,
         )
         return {
             "gate_schema_version": evidence.GATE_SCHEMA_VERSION,
@@ -149,14 +152,14 @@ def evaluate_gate(
             "seed_blocks": seed_blocks,
             "bootstrap_samples": samples,
             "seating": "Cyclic/mirrored 2/3 seats and all 24 four-player permutations",
-            "player_counts": list(player_counts),
+            "player_counts": list(counts),
             "max_turns": max_turns,
             **metrics,
             "multiplayer": by_player_count,
             "solo": solo,
             "rules": rules.to_dict(),
             "scope": (
-                "Two-/three-/four-player seat-clustered league gate with "
+                "Configured player-count seat-clustered league gate with "
                 "ordinary full21 solo retention."
             ),
         }

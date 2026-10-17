@@ -5,7 +5,7 @@ import math
 from itertools import permutations
 from numbers import Real
 import random
-from typing import Sequence
+from typing import Optional, Sequence
 
 from src.game.environment import ENCODING_VERSION, GameConfig
 from src.model.spec import ARCHITECTURE
@@ -24,6 +24,20 @@ class ValidatedGateEvidence:
     solo_games: int
     seed: int
     rules: dict
+    player_counts: tuple[int, ...] = PLAYER_COUNTS
+
+
+def require_player_counts(value: object) -> tuple[int, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError("player_counts must be a tuple")
+    if not value or any(
+        isinstance(count, bool) or not isinstance(count, int) or count not in PLAYER_COUNTS
+        for count in value
+    ):
+        raise ValueError("player_counts must be a nonempty tuple drawn from 2/3/4")
+    if tuple(sorted(set(value))) != value:
+        raise ValueError("player_counts must be distinct and sorted")
+    return value
 
 
 def balanced_seat_orders(players: int) -> tuple:
@@ -69,11 +83,15 @@ def evidence_metrics(
     blocks: int,
     seed: int,
     samples: int,
+    player_counts: Sequence[int] = PLAYER_COUNTS,
 ) -> dict:
-    if not isinstance(multiplayer, dict) or set(multiplayer) != {"2", "3", "4"}:
-        raise ValueError("All three player-count result sets are required")
+    counts = require_player_counts(
+        tuple(player_counts) if isinstance(player_counts, (list, tuple)) else player_counts
+    )
+    if not isinstance(multiplayer, dict) or set(multiplayer) != {str(count) for count in counts}:
+        raise ValueError("Multiplayer results must match player_counts")
     margins = {}
-    for count in PLAYER_COUNTS:
+    for count in counts:
         raw = multiplayer[str(count)]
         values = raw.get("seed_block_margins")
         if not isinstance(values, (list, tuple)) or len(values) != blocks:
@@ -110,8 +128,8 @@ def evidence_metrics(
     if solo.get("candidate_wins") != sum(candidate) or solo.get("champion_wins") != sum(champion):
         raise ValueError("Solo win counts disagree with their raw outcomes")
     combined = [
-        sum(values) / len(PLAYER_COUNTS)
-        for values in zip(*(margins[count] for count in PLAYER_COUNTS))
+        sum(values) / len(counts)
+        for values in zip(*(margins[count] for count in counts))
     ]
     differences = [left - right for left, right in zip(candidate, champion)]
     return {
@@ -119,7 +137,7 @@ def evidence_metrics(
         "multiplayer_ci95": clustered_interval(combined, samples, seed + 91827),
         "multiplayer_ci95_by_count": {
             str(count): clustered_interval(margins[count], samples, seed + 91827 + count)
-            for count in PLAYER_COUNTS
+            for count in counts
         },
         "solo_gain": sum(differences) / games,
         "solo_ci95": clustered_interval(differences, samples, seed + 88181),
@@ -131,7 +149,9 @@ def gate_accepted(
     metrics: dict,
     seed_blocks: int,
     solo_games: int,
+    player_counts: Sequence[int] = PLAYER_COUNTS,
 ) -> bool:
+    counts = require_player_counts(tuple(player_counts))
     return (
         seed_blocks >= MIN_SELECTION_SEED_BLOCKS
         and solo_games >= MIN_SOLO_GAMES
@@ -141,7 +161,7 @@ def gate_accepted(
             value["candidate_minus_champion"] > 0
             for value in multiplayer.values()
         )
-        and set(metrics["multiplayer_ci95_by_count"]) == {"2", "3", "4"}
+        and set(metrics["multiplayer_ci95_by_count"]) == {str(count) for count in counts}
         and all(interval[0] > 0 for interval in metrics["multiplayer_ci95_by_count"].values())
         and metrics["solo_gain"] >= 0
         and metrics["solo_ci95"][0] >= -0.03
@@ -154,6 +174,7 @@ def validate_gate_evidence(
     candidate_sha256: str,
     champion_sha256: str,
     minimum_seed_blocks: int,
+    player_counts: Optional[Sequence[int]] = None,
 ) -> ValidatedGateEvidence:
     if (
         not isinstance(evidence, dict)
@@ -171,10 +192,12 @@ def validate_gate_evidence(
         or evidence.get("architecture") != ARCHITECTURE
     ):
         raise ValueError("%s evidence requires the current dynamic gate schema" % phase)
-    if tuple(evidence.get("player_counts", ())) != PLAYER_COUNTS:
-        raise ValueError(
-            "%s evidence requires two-, three-, and four-player results" % phase
-        )
+    raw_counts = evidence.get("player_counts")
+    if not isinstance(raw_counts, (list, tuple)):
+        raise ValueError("%s evidence requires player_counts as a list or tuple" % phase)
+    counts = require_player_counts(tuple(raw_counts))
+    if player_counts is not None and counts != require_player_counts(tuple(player_counts)):
+        raise ValueError("%s evidence player_counts do not match the promotion scope" % phase)
     rules = evidence.get("rules")
     if not isinstance(rules, dict) or rules.get("recycle_discard") is not True:
         raise ValueError(
@@ -187,7 +210,7 @@ def validate_gate_evidence(
     solo = evidence.get("solo")
     if (
         not isinstance(multiplayer, dict)
-        or set(multiplayer) != {"2", "3", "4"}
+        or set(multiplayer) != {str(count) for count in counts}
         or not isinstance(solo, dict)
     ):
         raise ValueError(
@@ -251,13 +274,17 @@ def validate_gate_evidence(
         seed_blocks,
         seed,
         samples,
+        player_counts=counts,
     )
     pairs_to_check = [
         (name, evidence.get(name), computed) for name, computed in recomputed.items()
         if name != "multiplayer_ci95_by_count"
     ]
     declared_counts = evidence.get("multiplayer_ci95_by_count")
-    if not isinstance(declared_counts, dict) or set(declared_counts) != {"2", "3", "4"}:
+    if (
+        not isinstance(declared_counts, dict)
+        or set(declared_counts) != {str(count) for count in counts}
+    ):
         raise ValueError("%s evidence needs independent player-count intervals" % phase)
     pairs_to_check.extend(
         ("multiplayer_ci95_by_count.%s" % count, declared_counts[count], interval)
@@ -287,11 +314,13 @@ def validate_gate_evidence(
         recomputed,
         seed_blocks,
         solo_games,
+        player_counts=counts,
     ):
         raise ValueError("%s gate did not pass" % phase)
     return ValidatedGateEvidence(
         seed_blocks=seed_blocks,
         solo_games=solo_games,
         seed=seed,
-        rules=dict(rules),
+        rules=game.to_dict(),
+        player_counts=counts,
     )
