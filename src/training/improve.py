@@ -146,6 +146,12 @@ class ImprovementController:
         batch_size = max(1, int(os.environ.get("PAPPLU_BATCH_SIZE", "64")))
         updates_per_step = max(1, int(os.environ.get("PAPPLU_UPDATES_PER_STEP", "4")))
         replay_capacity = max(100, int(os.environ.get("PAPPLU_REPLAY_CAPACITY", "10000")))
+        scale_lr = os.environ.get("PAPPLU_SCALE_LR_BY_WIDTH") == "1"
+        lr_scale = 1.0
+        if scale_lr:
+            from src.model.network import load_checkpoint
+            w = load_checkpoint(baseline_path)[0].spec.width
+            lr_scale = 64.0 / max(64.0, float(w))
         self.league = LeagueSession(
             baseline_path,
             league_paths,
@@ -155,7 +161,7 @@ class ImprovementController:
                 replay_capacity=replay_capacity,
                 updates_per_match=updates_per_step,
                 player_counts=self.config.player_counts,
-                learning_rate=LEAGUE_FINETUNE_LR,
+                learning_rate=LEAGUE_FINETUNE_LR * lr_scale,
                 epsilon_start=LEAGUE_FINETUNE_EPSILON_START,
                 epsilon_end=LEAGUE_FINETUNE_EPSILON_END,
                 shaping=DEFAULT_IMPROVE_SHAPING,
@@ -164,7 +170,7 @@ class ImprovementController:
         )
         self._ingest_snapshots()
         self.research = TrainingSession(
-            config=_research_config(self.config),
+            config=_research_config(self.config, lr_scale=lr_scale),
             seed=self.config.seed + 1,
             initial_model=baseline_path,
             initial_stage_index=2,
@@ -344,7 +350,7 @@ class ImprovementController:
         controller.league.load_state_dict(payload["league_state"])
         controller.research = TrainingSession.from_state_dict(
             payload["research_state"],
-            expected_config=_research_config(controller.config),
+            expected_config=TrainingConfig.from_dict(payload["research_state"]["training_config"]),
         )
         controller._validate_cursors()
         controller._reconcile_promotion()
@@ -882,12 +888,12 @@ class ImprovementController:
         }
 
 
-def _research_config(config: ImproveConfig) -> TrainingConfig:
+def _research_config(config: ImproveConfig, lr_scale: float = 1.0) -> TrainingConfig:
     batch_size = max(1, int(os.environ.get("PAPPLU_BATCH_SIZE", "64")))
     updates_per_step = max(1, int(os.environ.get("PAPPLU_UPDATES_PER_STEP", "4")))
     replay_capacity = max(100, int(os.environ.get("PAPPLU_REPLAY_CAPACITY", "10000")))
     return TrainingConfig(
-        learning_rate=RESEARCH_FINETUNE_LR,
+        learning_rate=RESEARCH_FINETUNE_LR * lr_scale,
         epsilon_start=RESEARCH_FINETUNE_EPSILON_START,
         epsilon_end=RESEARCH_FINETUNE_EPSILON_END,
         curriculum_fraction=0.25,
