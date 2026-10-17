@@ -31,17 +31,16 @@ class QNetwork(nn.Module):
         self.suit_conv2 = nn.Conv1d(width, width, kernel_size=3, padding=1)
         self.card_attention = nn.MultiheadAttention(width, spec.heads, batch_first=True)
         self.card_norm = nn.LayerNorm(width)
-        self.history_proj = nn.Linear(5, width)
+        self.history_proj = nn.Linear(5, 1)
         self.context_features = nn.Linear(CONTEXT_FEATURES, width)
         self.player_features = nn.Linear(PLAYER_FEATURES, width)
         self.event_summary = nn.Linear(EVENT_FEATURES, width)
         self.turn_relations = nn.Linear(width * 3, width)
+        self.context_gate = nn.Linear(width, 2)
         self.register_buffer("_rank_one_hot", torch.eye(13, dtype=torch.float32), persistent=False)
-        face_dim = width * 4 + 5 + 13
-        draw_dim = width * 4 + 5
+        face_dim = width * 3 + 5 + 13
+        draw_dim = width * 3 + 5
         self.draw_head = nn.Sequential(nn.Linear(draw_dim, width), nn.ReLU(), nn.Linear(width, 2))
-        with torch.no_grad():
-            self.draw_head[-1].bias.copy_(torch.tensor([0.1, -0.1]))
         self.score = nn.Sequential(nn.Linear(face_dim, width), nn.ReLU(), nn.Linear(width, 1))
 
     def _history_channels(self, batch: ObservationBatch) -> torch.Tensor:
@@ -90,7 +89,7 @@ class QNetwork(nn.Module):
         set_features = local.mean(dim=1, keepdim=True).expand(-1, 4, -1, -1).reshape(size, NUM_FACES, width)
         global_cards = local_flat.mean(dim=1)
 
-        hist = self.history_proj(self._history_channels(batch))
+        hist_bonus = 0.02 * torch.tanh(self.history_proj(self._history_channels(batch)).squeeze(-1))
         players = self.player_features(
             batch.players.masked_fill(~batch.player_mask[:, :, None], 0.0),
         )
@@ -107,25 +106,27 @@ class QNetwork(nn.Module):
             (events * weights[:, :, None]).sum(dim=1) / weights.sum(dim=1, keepdim=True).clamp_min(1.0),
         )
         table_ctx = self.context_features(batch.context) + rel[:, 0, :] + 0.1 * ev_ctx
+        ctx_mod = 0.02 * torch.tanh(self.context_gate(table_ctx))
 
         top_idx = batch.top.clamp_max(NUM_FACES - 1)
         has_top = (batch.top < NUM_FACES).to(torch.float32).unsqueeze(-1)
         top_local = local_flat.gather(1, top_idx[:, None, None].expand(-1, 1, width)).squeeze(1) * has_top
         top_set = set_features.gather(1, top_idx[:, None, None].expand(-1, 1, width)).squeeze(1) * has_top
         top_raw = batch.cards.gather(1, top_idx[:, None, None].expand(-1, 1, 5)).squeeze(1) * has_top
-        draw_values = self.draw_head(torch.cat((global_cards, top_local, top_set, top_raw, table_ctx + hist.mean(dim=1)), dim=-1))
+        raw_draw = self.draw_head(torch.cat((global_cards, top_local, top_set, top_raw), dim=-1)) + ctx_mod
+        v_draw = raw_draw[:, :1]
+        top_adv = 0.05 * torch.tanh(raw_draw[:, 1:2]) - 0.10
+        draw_values = torch.cat((v_draw, v_draw + top_adv), dim=1)
 
         ranks = self._rank_one_hot.repeat(4, 1).unsqueeze(0).expand(size, -1, -1)
-        face_ctx = table_ctx[:, None, :].expand(-1, NUM_FACES, -1) + 0.1 * hist
         per_face = torch.cat((
             local_flat,
             set_features,
             global_cards[:, None, :].expand(-1, NUM_FACES, -1),
-            face_ctx,
             batch.cards,
             ranks,
         ), dim=-1)
-        discard_values = self.score(per_face).squeeze(-1)
+        discard_values = self.score(per_face).squeeze(-1) + hist_bonus + ctx_mod[:, :1]
         return torch.cat((draw_values, discard_values), dim=1)
 
 
