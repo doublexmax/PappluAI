@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import math
 from pathlib import Path
 import random
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -128,6 +130,100 @@ class QNetwork(nn.Module):
         ), dim=-1)
         discard_values = self.score(per_face).squeeze(-1) + hist_bonus + ctx_mod[:, :1]
         return torch.cat((draw_values, discard_values), dim=1)
+
+
+def expand_network_width(
+    source_net: QNetwork, target_spec: ModelSpec, *, seed: int = 41,
+) -> QNetwork:
+    source_spec = source_net.spec
+    if target_spec.width % source_spec.width:
+        raise ValueError("target width must be a multiple of source width")
+    if target_spec.heads < source_spec.heads:
+        raise ValueError("target heads cannot be fewer than source heads")
+    source_head = source_spec.width // source_spec.heads
+    target_head = target_spec.width // target_spec.heads
+    if target_head < source_head:
+        raise ValueError("target head dimensions cannot be smaller than source head dimensions")
+    if target_spec == source_spec:
+        return copy.deepcopy(source_net)
+
+    parameter = next(source_net.parameters())
+    device, dtype = parameter.device, parameter.dtype
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        target = QNetwork(target_spec).to(device=device, dtype=dtype)
+    width, copies = source_spec.width, target_spec.width // source_spec.width
+    units = torch.arange(width, device=device).repeat(copies)
+    shares = torch.rand((copies, width), generator=generator, device="cpu") + 0.1
+    alpha = (shares / shares.sum(dim=0, keepdim=True)).flatten().to(device=device, dtype=dtype)
+
+    def copy_linear(before, after, rows, columns, weights):
+        after.weight.copy_(before.weight[rows][:, columns] * weights[None, :])
+        after.bias.copy_(before.bias[rows])
+
+    with torch.no_grad():
+        target.suit_conv1.weight.copy_(source_net.suit_conv1.weight[units])
+        target.suit_conv1.bias.copy_(source_net.suit_conv1.bias[units])
+        target.suit_conv2.weight.copy_(
+            source_net.suit_conv2.weight[units][:, units] * alpha[None, :, None],
+        )
+        target.suit_conv2.bias.copy_(source_net.suit_conv2.bias[units])
+        target.card_norm.weight.copy_(source_net.card_norm.weight[units])
+        target.card_norm.bias.copy_(source_net.card_norm.bias[units])
+        target.history_proj.load_state_dict(source_net.history_proj.state_dict())
+        for name in ("context_features", "player_features", "event_summary"):
+            before, after = getattr(source_net, name), getattr(target, name)
+            columns = torch.arange(before.in_features, device=device)
+            copy_linear(before, after, units, columns, torch.ones_like(columns, dtype=dtype))
+        columns = torch.cat([units + section * width for section in range(3)])
+        copy_linear(
+            source_net.turn_relations, target.turn_relations, units, columns, alpha.repeat(3),
+        )
+        copy_linear(
+            source_net.context_gate, target.context_gate,
+            torch.arange(2, device=device), units, alpha,
+        )
+        for name in ("draw_head", "score"):
+            before, after = getattr(source_net, name), getattr(target, name)
+            raw_columns = torch.arange(width * 3, before[0].in_features, device=device)
+            head_columns = torch.cat((columns, raw_columns))
+            head_weights = torch.cat((alpha.repeat(3), torch.ones_like(raw_columns, dtype=dtype)))
+            copy_linear(before[0], after[0], units, head_columns, head_weights)
+            copy_linear(
+                before[2], after[2], torch.arange(before[2].out_features, device=device),
+                units, alpha,
+            )
+
+        before, after = source_net.card_attention, target.card_attention
+        wide = target_spec.width
+        after.in_proj_weight.zero_()
+        after.in_proj_bias.zero_()
+        for projection in (0, 2):
+            start = projection * wide
+            after.in_proj_weight[start:start + wide].copy_(
+                1e-3 * torch.randn((wide, wide), generator=generator, device="cpu").to(parameter),
+            )
+            after.in_proj_bias[start:start + wide].copy_(
+                1e-3 * torch.randn(wide, generator=generator, device="cpu").to(parameter),
+            )
+        live = torch.tensor([
+            head * target_head + dimension
+            for head in range(source_spec.heads) for dimension in range(source_head)
+        ], device=device)
+        for projection in range(3):
+            source_rows = torch.arange(width, device=device) + projection * width
+            target_rows = live + projection * wide
+            scale = math.sqrt(target_head / source_head) if projection == 0 else 1.0
+            after.in_proj_weight[target_rows] = (
+                before.in_proj_weight[source_rows][:, units] * alpha[None, :] * scale
+            )
+            after.in_proj_bias[target_rows] = before.in_proj_bias[source_rows] * scale
+        after.out_proj.weight.zero_()
+        after.out_proj.weight[:, live] = before.out_proj.weight[units]
+        after.out_proj.bias.copy_(before.out_proj.bias[units])
+    target.train(source_net.training)
+    return target
 
 
 def masked_q_values(

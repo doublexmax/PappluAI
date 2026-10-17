@@ -35,7 +35,7 @@ from src.game.environment import (
 )
 from src.game.multiplayer import MatchConfig
 from src.model.network import build_checkpoint, load_checkpoint
-from src.training.core import EpisodeReplay, discounted_returns
+from src.training.core import EpisodeReplay, TerminalShaping, discounted_returns, terminal_reward
 from src.training.optimization import train_batch
 
 
@@ -58,6 +58,7 @@ class LeagueConfig:
     epsilon_end: float = 0.05
     epsilon_decay_matches: int = 10_000
     player_counts: Tuple[int, ...] = (2, 3, 4)
+    shaping: TerminalShaping = TerminalShaping()
 
     def __post_init__(self) -> None:
         if (
@@ -111,20 +112,29 @@ class LeagueConfig:
             raise ValueError("player_counts must be a nonempty tuple drawn from 2/3/4")
         if tuple(sorted(set(self.player_counts))) != self.player_counts:
             raise ValueError("player_counts must be distinct and sorted")
+        if not isinstance(self.shaping, TerminalShaping):
+            raise TypeError("shaping must be a TerminalShaping")
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["game"] = self.game.to_dict()
+        if self.shaping == TerminalShaping():
+            del payload["shaping"]
+        else:
+            payload["shaping"] = self.shaping.to_dict()
         return payload
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "LeagueConfig":
-        if not isinstance(raw, dict) or set(raw) != set(cls.__dataclass_fields__):
+        fields = set(cls.__dataclass_fields__)
+        if not isinstance(raw, dict) or set(raw) not in (fields, fields - {"shaping"}):
             raise ValueError("league_config fields do not match this trainer")
         values = dict(raw)
         values["game"] = GameConfig.from_dict(values["game"])
         if not isinstance(values["player_counts"], tuple):
             raise TypeError("player_counts must be a tuple")
+        if "shaping" in values:
+            values["shaping"] = TerminalShaping.from_dict(values["shaping"])
         return cls(**values)
 
 
@@ -230,6 +240,7 @@ class LeagueSession:
                 seed=match_seed,
                 record_trajectories=True,
                 deadline=deadline,
+                record_terminal=self.config.shaping != TerminalShaping(),
             )
             match_complete = True
         except MatchInterrupted:
@@ -243,10 +254,17 @@ class LeagueSession:
             raise
 
         trajectory = result.trajectories[challenger_seat]
-        terminal_reward = 1.0 if result.winner == challenger_seat else 0.0
         if trajectory:
+            snapshot = result.terminal_snapshot
             rewards = [0.0] * len(trajectory)
-            rewards[-1] = terminal_reward
+            rewards[-1] = terminal_reward(
+                self.config.shaping, won=result.winner == challenger_seat,
+                turns_remaining=self.config.game.max_turns - result.seat_turns[challenger_seat],
+                max_turns=self.config.game.max_turns,
+                hand=snapshot.hands[challenger_seat] if snapshot else trajectory[-1][0].hand,
+                joker=snapshot.joker if snapshot else trajectory[-1][0].joker,
+                required_sequences=self.config.game.required_sequences,
+            )
             returns = discounted_returns(rewards, self.config.gamma)
             episode = tuple(
                 (step[0], step[1], target)

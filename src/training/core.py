@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import asdict, dataclass
 import math
 from numbers import Real
 import random
 from typing import Any, Deque, Dict, List, Sequence, Tuple
 
+from src.evaluate import minimum_penalty
 from src.game.environment import (
     ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, GameConfig, NUM_ACTIONS,
     Observation, discard_action, legal_action_mask,
@@ -15,12 +17,58 @@ from src.game.information import EventKind, InformationHistory
 __all__ = (
     "Episode",
     "EpisodeReplay",
+    "TerminalShaping",
     "Transition",
     "discounted_returns",
+    "terminal_reward",
 )
 
 Transition = Tuple[Observation, int, float]
 Episode = Tuple[Transition, ...]
+
+
+@dataclass(frozen=True)
+class TerminalShaping:
+    speed: float = 0.0
+    margin: float = 0.0
+    points_cap: int = 100
+
+    def __post_init__(self) -> None:
+        for name in ("speed", "margin"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError("%s must be finite and nonnegative" % name)
+        if self.margin >= 1:
+            raise ValueError("margin must be less than 1")
+        if type(self.points_cap) is not int or self.points_cap < 1:
+            raise ValueError("points_cap must be a positive integer")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TerminalShaping":
+        if not isinstance(data, dict) or set(data) != set(cls.__dataclass_fields__):
+            raise ValueError("shaping must contain speed, margin, and points_cap")
+        return cls(**data)
+
+
+def terminal_reward(
+    shaping: TerminalShaping,
+    *,
+    won: bool,
+    turns_remaining: int,
+    max_turns: int,
+    hand: Sequence[int],
+    joker: int,
+    required_sequences: int,
+) -> float:
+    if won:
+        return 1.0 + shaping.speed * (turns_remaining / float(max_turns))
+    if shaping.margin == 0.0:
+        return 0.0
+    points = minimum_penalty(hand, joker, required_sequences).points
+    return shaping.margin * (1.0 - min(points, shaping.points_cap) / float(shaping.points_cap))
 
 
 class EpisodeReplay:

@@ -80,6 +80,8 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
             "--initial-model",
             "--resume",
             "--output-dir",
+            "--width",
+            "--heads",
             "--max-episodes",
             "--max-seconds",
             "--checkpoint-every",
@@ -136,6 +138,36 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
         self.assertFalse(
             parser.parse_args(base + ["--no-recycle-discard"]).recycle_discard
         )
+
+    @unittest.skipIf(torch is None, TORCH_REASON)
+    def test_capacity_flags_create_and_resume_the_requested_network(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "run"
+            command = [
+                sys.executable, "-m", "src.cli.curriculum", "--output-dir", str(output),
+                "--max-episodes", "0", "--max-seconds", "0",
+            ]
+            fresh = subprocess.run(
+                command + ["--width", "128", "--heads", "8"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(fresh.returncode, 0, fresh.stderr)
+            state_path = output / "latest-state.pt"
+            state = torch.load(state_path, weights_only=True)
+            self.assertEqual(state["model_spec"], {"width": 128, "heads": 8})
+            resumed = subprocess.run(
+                command + ["--resume", str(state_path), "--width", "128", "--heads", "8"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            for flag, value in (("--width", "192"), ("--heads", "4")):
+                with self.subTest(flag=flag):
+                    mismatch = subprocess.run(
+                        command + ["--resume", str(state_path), flag, value],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(mismatch.returncode, 2)
+                    self.assertIn("does not match model", mismatch.stderr)
 
 
 class TestEpisodeReplayState(unittest.TestCase):

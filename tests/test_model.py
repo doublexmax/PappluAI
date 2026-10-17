@@ -19,7 +19,7 @@ if torch is not None:
     from src.evaluation.arena import CheckpointPolicy
     from src.model.encoding import collate_observations
     from src.model.network import (
-        QNetwork, build_checkpoint, load_checkpoint, masked_q_values,
+        QNetwork, build_checkpoint, expand_network_width, load_checkpoint, masked_q_values,
         save_checkpoint, select_action, select_greedy_action,
     )
     from src.model.spec import ModelSpec
@@ -245,6 +245,87 @@ class TestDynamicNetwork(unittest.TestCase):
         first = self.values(obs)
         self.network.eval()
         torch.testing.assert_close(first, self.values(obs), rtol=0, atol=0)
+
+    def test_width_expansion_preserves_values_and_parameter_counts(self):
+        observations = [
+            PappluEnv().reset(41), PappluEnv().reset_warm_start(43),
+            self.observation(2, 4), self.observation(4, 12), self.observation(6, 8),
+        ]
+        batch = collate_observations(observations, self.device)
+        self.network.eval()
+        with torch.no_grad():
+            expected = self.network(batch)
+        source_state = copy.deepcopy(self.network.state_dict())
+        for width, count in ((128, 272_651), (192, 605_579)):
+            with self.subTest(width=width):
+                expanded = expand_network_width(self.network, ModelSpec(width, 8))
+                self.assertEqual(sum(p.numel() for p in expanded.parameters()), count)
+                self.assertFalse(expanded.training)
+                with torch.no_grad():
+                    actual = expanded(batch)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
+                self.assertLess(float((actual - expected).abs().max()), 1e-5)
+        for name, value in self.network.state_dict().items():
+            torch.testing.assert_close(value, source_state[name], rtol=0, atol=0)
+
+    def test_expanded_copies_diverge_on_the_first_adam_update(self):
+        batch = collate_observations(
+            [PappluEnv().reset(41), self.observation(4, 12)], self.device,
+        )
+        for width in (128, 192):
+            with self.subTest(width=width):
+                expanded = expand_network_width(self.network, ModelSpec(width, 8))
+                torch.testing.assert_close(
+                    expanded.suit_conv1.weight[:64], expanded.suit_conv1.weight[64:128],
+                    rtol=0, atol=0,
+                )
+                optimizer = torch.optim.Adam(expanded.parameters(), lr=1e-3)
+                target = torch.linspace(-0.7, 0.7, 54)
+                loss = (expanded(batch) - target).square().mean()
+                loss.backward()
+                head = width // 8
+                padded = [
+                    seat * head + dimension
+                    for seat in range(8) for dimension in range(head)
+                    if seat >= 4 or dimension >= 16
+                ]
+                gradient = expanded.card_attention.out_proj.weight.grad[:, padded]
+                self.assertGreater(float(gradient.abs().max()), 1e-8)
+                if width == 192:
+                    gradient = expanded.card_attention.in_proj_weight.grad[
+                        width + torch.tensor(padded)
+                    ]
+                    self.assertGreater(float(gradient.abs().max()), 1e-10)
+                optimizer.step()
+                divergence = (
+                    expanded.suit_conv1.weight[:64] - expanded.suit_conv1.weight[64:128]
+                ).detach().abs().max()
+                self.assertGreater(float(divergence), 1e-7)
+
+    def test_width_expansion_is_seeded_and_does_not_advance_global_rng(self):
+        state = torch.get_rng_state().clone()
+        first = expand_network_width(self.network, ModelSpec(128, 8), seed=17)
+        self.assertTrue(torch.equal(torch.get_rng_state(), state))
+        second = expand_network_width(self.network, ModelSpec(128, 8), seed=17)
+        third = expand_network_width(self.network, ModelSpec(128, 8), seed=19)
+        for name, value in first.state_dict().items():
+            torch.testing.assert_close(value, second.state_dict()[name], rtol=0, atol=0)
+        self.assertGreater(
+            float((first.suit_conv2.weight - third.suit_conv2.weight).detach().abs().max()), 1e-5,
+        )
+
+    def test_identity_expansion_is_an_independent_copy_and_invalid_specs_fail(self):
+        expanded = expand_network_width(self.network, self.network.spec)
+        obs = self.observation()
+        batch = collate_observations([obs], self.device)
+        with torch.no_grad():
+            expected = self.network(batch).clone()
+            torch.testing.assert_close(expanded(batch), expected, rtol=0, atol=0)
+            expanded.score[-1].bias.add_(1.0)
+            torch.testing.assert_close(self.network(batch), expected, rtol=0, atol=0)
+        for spec in (ModelSpec(32, 4), ModelSpec(128, 2), ModelSpec(128, 16), ModelSpec(96, 4)):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                expand_network_width(self.network, spec)
 
     def test_checkpoint_roundtrip_preserves_nondefault_spec_and_wire_format(self):
         self.network = QNetwork(ModelSpec(width=32, heads=2))

@@ -30,6 +30,7 @@ from src.evaluation.promotion import GateInterrupted, evaluate_gate
 from src.game.environment import ENCODING_VERSION, GameConfig
 from src.model.network import CHECKPOINT_VERSION, build_checkpoint
 from src.model.spec import ARCHITECTURE
+from src.training.core import TerminalShaping
 from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
 from src.training.curriculum import (
     STATUS_SCHEMA_VERSION,
@@ -47,6 +48,7 @@ LEAGUE_FINETUNE_EPSILON_END = 0.01
 RESEARCH_FINETUNE_LR = 2e-5
 RESEARCH_FINETUNE_EPSILON_START = 0.04
 RESEARCH_FINETUNE_EPSILON_END = 0.01
+DEFAULT_IMPROVE_SHAPING = TerminalShaping(speed=0.35, margin=0.25)
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,7 @@ class ImprovementController:
                 learning_rate=LEAGUE_FINETUNE_LR,
                 epsilon_start=LEAGUE_FINETUNE_EPSILON_START,
                 epsilon_end=LEAGUE_FINETUNE_EPSILON_END,
+                shaping=DEFAULT_IMPROVE_SHAPING,
             ),
             seed=self.config.seed,
         )
@@ -885,6 +888,7 @@ def _research_config(config: ImproveConfig) -> TrainingConfig:
         updates_per_episode=4,
         validation_games=config.solo_games,
         recycle_discard=config.recycle_discard,
+        shaping=DEFAULT_IMPROVE_SHAPING,
     )
 
 
