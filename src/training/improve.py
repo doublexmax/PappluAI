@@ -1013,6 +1013,9 @@ def _bounded_pool(record_ids: Sequence[str], baseline_id: str) -> Tuple[str, ...
     return (baseline_id, *others[-6:])
 
 
+_IMMUTABLE_MODEL_META: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+
+
 def _snapshot_manifest(output_dir: Path) -> Dict[str, Dict[str, Any]]:
     files = {}
     for path in sorted(output_dir.iterdir(), key=lambda item: item.name):
@@ -1026,7 +1029,16 @@ def _snapshot_manifest(output_dir: Path) -> Dict[str, Dict[str, Any]]:
             )
         ):
             continue
-        files[path.name] = file_metadata(path)
+        if path.name.startswith("model-") and path.name.endswith(".pt"):
+            st = path.stat()
+            cache_key = (str(path), st.st_size, st.st_mtime_ns)
+            meta = _IMMUTABLE_MODEL_META.get(cache_key)
+            if meta is None:
+                meta = file_metadata(path)
+                _IMMUTABLE_MODEL_META[cache_key] = meta
+            files[path.name] = dict(meta)
+        else:
+            files[path.name] = file_metadata(path)
     required = {
         "latest-state.pt",
         "latest-model.pt",
