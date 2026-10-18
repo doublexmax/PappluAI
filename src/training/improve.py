@@ -28,7 +28,7 @@ from src.checkpoints.tensor import atomic_torch_save
 from src.evaluation.arena import MatchInterrupted
 from src.evaluation.promotion import GateInterrupted, evaluate_gate
 from src.game.environment import ENCODING_VERSION, GameConfig
-from src.model.network import CHECKPOINT_VERSION, build_checkpoint
+from src.model.network import CHECKPOINT_VERSION, build_checkpoint, load_checkpoint
 from src.model.spec import ARCHITECTURE
 from src.training.core import TerminalShaping
 from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
@@ -149,7 +149,6 @@ class ImprovementController:
         scale_lr = os.environ.get("PAPPLU_SCALE_LR_BY_WIDTH") == "1"
         lr_scale = 1.0
         if scale_lr:
-            from src.model.network import load_checkpoint
             w = load_checkpoint(baseline_path)[0].spec.width
             lr_scale = 64.0 / max(64.0, float(w))
         self.league = LeagueSession(
