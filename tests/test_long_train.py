@@ -767,16 +767,39 @@ class TestTrainingSession(unittest.TestCase):
                 "best-model.pt",
                 "baseline-model.pt",
             }
+            staged = {
+                ".staged-latest-state.pt",
+                ".staged-latest-model.pt",
+                ".staged-best-model.pt",
+                ".staged-baseline-model.pt",
+            }
             self.assertEqual(
                 {path.name for path in output.iterdir()},
                 expected | {"metrics.jsonl"},
             )
             self.assertEqual(
                 {destination.name for _source, destination in replacements},
-                expected,
+                expected | staged,
+            )
+            self.assertEqual(
+                {
+                    (source.name, destination.name)
+                    for source, destination in replacements
+                    if destination.name in expected
+                },
+                {
+                    (".staged-latest-state.pt", "latest-state.pt"),
+                    (".staged-latest-model.pt", "latest-model.pt"),
+                    (".staged-best-model.pt", "best-model.pt"),
+                    (".staged-baseline-model.pt", "baseline-model.pt"),
+                },
             )
             self.assertTrue(
-                all(source.name.endswith(".tmp") for source, _ in replacements)
+                all(
+                    source.name.endswith(".tmp")
+                    for source, destination in replacements
+                    if destination.name in staged
+                )
             )
             self.assertEqual(
                 set(manifest),
