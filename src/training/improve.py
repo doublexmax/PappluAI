@@ -475,7 +475,12 @@ class ImprovementController:
             raise RuntimeError("cannot checkpoint partial learner work")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "metrics.jsonl").touch(exist_ok=True)
-        self.league.export_model(self.output_dir / "latest-model.pt")
+        staged_state = self.output_dir / ".staged-latest-state.pt"
+        staged_model = self.output_dir / ".staged-latest-model.pt"
+        atomic_torch_save(self.state_dict(), staged_state)
+        self.league.export_model(staged_model)
+        os.replace(str(staged_state), str(self.output_dir / "latest-state.pt"))
+        os.replace(str(staged_model), str(self.output_dir / "latest-model.pt"))
         atomic_copy(
             self.registry.model_path(self.registry.champion().id),
             self.output_dir / "best-model.pt",
@@ -483,9 +488,6 @@ class ImprovementController:
         atomic_copy(
             self.registry.model_path(self.baseline_id),
             self.output_dir / "baseline-model.pt",
-        )
-        atomic_torch_save(
-            self.state_dict(), self.output_dir / "latest-state.pt"
         )
         active_metrics = self.output_dir / ".active-metrics.jsonl"
         if active_metrics.exists():

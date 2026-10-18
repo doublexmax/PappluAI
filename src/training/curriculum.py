@@ -885,19 +885,27 @@ def save_session_checkpoint(
         raise RuntimeError("cannot checkpoint a partial episode")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "metrics.jsonl").touch(exist_ok=True)
+    staged_state = output_dir / ".staged-latest-state.pt"
+    staged_latest = output_dir / ".staged-latest-model.pt"
+    staged_best = output_dir / ".staged-best-model.pt"
+    staged_base = output_dir / ".staged-baseline-model.pt"
+    atomic_torch_save(session.state_dict(), staged_state)
     atomic_torch_save(
         _model_payload(session, session.network.state_dict(), "latest"),
-        output_dir / "latest-model.pt",
+        staged_latest,
     )
     atomic_torch_save(
         _model_payload(session, session.best_model_state, "best"),
-        output_dir / "best-model.pt",
+        staged_best,
     )
     atomic_torch_save(
         _model_payload(session, session.baseline_model_state, "baseline"),
-        output_dir / "baseline-model.pt",
+        staged_base,
     )
-    atomic_torch_save(session.state_dict(), output_dir / "latest-state.pt")
+    os.replace(str(staged_state), str(output_dir / "latest-state.pt"))
+    os.replace(str(staged_latest), str(output_dir / "latest-model.pt"))
+    os.replace(str(staged_best), str(output_dir / "best-model.pt"))
+    os.replace(str(staged_base), str(output_dir / "baseline-model.pt"))
     active_metrics = output_dir / ".active-metrics.jsonl"
     if active_metrics.exists():
         atomic_copy(active_metrics, output_dir / "metrics.jsonl")
