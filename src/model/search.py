@@ -238,6 +238,14 @@ def search(
         belief = BeliefState.from_observation(obs)
         values = network(collate_observations([obs], device))[0, 2:].tolist()
         faces = [action - 2 for action in legal]
+        if (
+            len(faces) > 1
+            and obs.history
+            and obs.history[-1].actor == 0
+            and obs.history[-1].kind is EventKind.TAKE_DISCARD
+            and obs.history[-1].face in faces
+        ):
+            faces = [f for f in faces if f != obs.history[-1].face]
         for face in faces:
             values[face] -= config.feed_weight * belief.feed_risk(face, 1)
         rows = 1
@@ -308,8 +316,11 @@ def search(
                 [config.feed_weight * belief.feed_risk(face, 1) for face in range(NUM_FACES)],
                 dtype=values.dtype, device=device,
             )
+            take_mask = list(legal_action_mask(children[0])[2:])
+            if sum(take_mask) > 1:
+                take_mask[obs.discard_top] = False
             allowed = torch.tensor(
-                [legal_action_mask(child)[2:] for child in children],
+                [take_mask, *(legal_action_mask(child)[2:] for child in children[1:])],
                 dtype=torch.bool, device=device,
             )
             best = (values - penalties).masked_fill(~allowed, -torch.inf).max(dim=1).values
