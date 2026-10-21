@@ -28,7 +28,7 @@ from src.checkpoints.tensor import atomic_torch_save
 from src.evaluation.arena import MatchInterrupted
 from src.evaluation.promotion import GateInterrupted, evaluate_gate
 from src.game.environment import ENCODING_VERSION, GameConfig
-from src.model.network import CHECKPOINT_VERSION, build_checkpoint, load_checkpoint
+from src.model.network import CHECKPOINT_VERSION, build_checkpoint
 from src.model.spec import ARCHITECTURE
 from src.training.core import TerminalShaping
 from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
@@ -143,24 +143,13 @@ class ImprovementController:
 
         baseline_path = str(self.registry.model_path(self.baseline_id))
         league_paths = self._opponent_paths()
-        batch_size = max(1, int(os.environ.get("PAPPLU_BATCH_SIZE", "64")))
-        updates_per_step = max(1, int(os.environ.get("PAPPLU_UPDATES_PER_STEP", "4")))
-        replay_capacity = max(100, int(os.environ.get("PAPPLU_REPLAY_CAPACITY", "10000")))
-        scale_lr = os.environ.get("PAPPLU_SCALE_LR_BY_WIDTH") == "1"
-        lr_scale = 1.0
-        if scale_lr:
-            w = load_checkpoint(baseline_path)[0].spec.width
-            lr_scale = 64.0 / max(64.0, float(w))
         self.league = LeagueSession(
             baseline_path,
             league_paths,
             config=LeagueConfig(
                 game=GameConfig(max_turns=self.config.max_turns, recycle_discard=self.config.recycle_discard),
-                batch_size=batch_size,
-                replay_capacity=replay_capacity,
-                updates_per_match=updates_per_step,
                 player_counts=self.config.player_counts,
-                learning_rate=LEAGUE_FINETUNE_LR * lr_scale,
+                learning_rate=LEAGUE_FINETUNE_LR,
                 epsilon_start=LEAGUE_FINETUNE_EPSILON_START,
                 epsilon_end=LEAGUE_FINETUNE_EPSILON_END,
                 shaping=DEFAULT_IMPROVE_SHAPING,
@@ -169,7 +158,7 @@ class ImprovementController:
         )
         self._ingest_snapshots()
         self.research = TrainingSession(
-            config=_research_config(self.config, lr_scale=lr_scale),
+            config=_research_config(self.config),
             seed=self.config.seed + 1,
             initial_model=baseline_path,
             initial_stage_index=2,
@@ -349,7 +338,7 @@ class ImprovementController:
         controller.league.load_state_dict(payload["league_state"])
         controller.research = TrainingSession.from_state_dict(
             payload["research_state"],
-            expected_config=TrainingConfig.from_dict(payload["research_state"]["training_config"]),
+            expected_config=_research_config(controller.config),
         )
         controller._validate_cursors()
         controller._reconcile_promotion()
@@ -889,19 +878,16 @@ class ImprovementController:
         }
 
 
-def _research_config(config: ImproveConfig, lr_scale: float = 1.0) -> TrainingConfig:
-    batch_size = max(1, int(os.environ.get("PAPPLU_BATCH_SIZE", "64")))
-    updates_per_step = max(1, int(os.environ.get("PAPPLU_UPDATES_PER_STEP", "4")))
-    replay_capacity = max(100, int(os.environ.get("PAPPLU_REPLAY_CAPACITY", "10000")))
+def _research_config(config: ImproveConfig) -> TrainingConfig:
     return TrainingConfig(
-        learning_rate=RESEARCH_FINETUNE_LR * lr_scale,
+        learning_rate=RESEARCH_FINETUNE_LR,
         epsilon_start=RESEARCH_FINETUNE_EPSILON_START,
         epsilon_end=RESEARCH_FINETUNE_EPSILON_END,
         curriculum_fraction=0.25,
         max_turns=config.max_turns,
-        replay_capacity=replay_capacity,
-        batch_size=batch_size,
-        updates_per_episode=updates_per_step,
+        replay_capacity=10_000,
+        batch_size=64,
+        updates_per_episode=4,
         validation_games=config.solo_games,
         recycle_discard=config.recycle_discard,
         shaping=DEFAULT_IMPROVE_SHAPING,

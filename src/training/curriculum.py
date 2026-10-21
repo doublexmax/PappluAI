@@ -205,7 +205,7 @@ class TrainingSession:
             )
         self.config = config
         self.initial_seed = seed
-        torch.set_num_threads(max(config.torch_threads, int(os.environ.get("PAPPLU_CPU_THREADS", str(config.torch_threads)))))
+        torch.set_num_threads(config.torch_threads)
         torch.manual_seed(seed)
 
         if initial_model is None:

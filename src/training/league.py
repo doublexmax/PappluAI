@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import asdict, dataclass, field
 import math
-import multiprocessing
-import os
 from pathlib import Path
 import random
 import time
@@ -37,51 +34,9 @@ from src.game.environment import (
     GameConfig,
 )
 from src.game.multiplayer import MatchConfig
-from src.model.network import build_checkpoint, load_checkpoint, select_random_legal
-from src.model.search import SearchConfig, select_search_action
+from src.model.network import build_checkpoint, load_checkpoint
 from src.training.core import EpisodeReplay, TerminalShaping, discounted_returns, terminal_reward
 from src.training.optimization import train_batch
-
-
-class _SearchEpsilonPolicy:
-    def __init__(self, network: Any, epsilon: float) -> None:
-        self.network = network
-        self.epsilon = float(epsilon)
-        self.game_config = getattr(network, "game_config", None)
-        self.search_config = SearchConfig(
-            exact_wins=True,
-            draw_lookahead=True,
-            rollout_depth=1,
-            feed_weight=0.03,
-            outs_weight=0.0,
-        )
-
-    def act(self, observation: Any, rng: random.Random) -> int:
-        if rng.random() < self.epsilon:
-            return select_random_legal(observation, rng)
-        return select_search_action(self.network, observation, self.search_config)
-
-
-_LEAGUE_WORKER_STATE: dict = {}
-
-
-def _run_prefetched_match(task: tuple[int, int, float, tuple[int, ...], int, bool]) -> Any:
-    players, challenger_seat, epsilon, opp_indices, match_seed, record_terminal = task
-    net = _LEAGUE_WORKER_STATE["network"]
-    opponents = _LEAGUE_WORKER_STATE["opponents"]
-    game_cfg = _LEAGUE_WORKER_STATE["game"]
-    use_search = _LEAGUE_WORKER_STATE["use_search"]
-    policies = [opponents[idx].policy for idx in opp_indices]
-    policies[challenger_seat] = (
-        _SearchEpsilonPolicy(net, epsilon) if use_search else EpsilonPolicy(net, epsilon)
-    )
-    return play_match(
-        tuple(policies),
-        MatchConfig(game=game_cfg, players=players),
-        seed=match_seed,
-        record_trajectories=True,
-        record_terminal=record_terminal,
-    )
 
 
 LEAGUE_STATE_VERSION = 3
@@ -239,7 +194,6 @@ class LeagueSession:
         self.no_action_matches = 0
         self.epsilon_progress = 0
         self.at_match_boundary = True
-        self._prefetched: deque = deque()
 
     @property
     def count_matches(self) -> Dict[int, int]:
@@ -267,82 +221,34 @@ class LeagueSession:
         )
         self.at_match_boundary = False
         match_complete = False
-        use_search = os.environ.get("PAPPLU_SEARCH_SELFPLAY") == "1"
-        train_workers = max(1, int(os.environ.get("PAPPLU_TRAIN_WORKERS", "1")))
-        record_terminal = self.config.shaping != TerminalShaping()
         try:
-            if (
-                not self._prefetched
-                and train_workers > 1
-                and "fork" in multiprocessing.get_all_start_methods()
-                and deadline is not None
-                and (deadline - time.monotonic()) > 120.0
-            ):
-                rem_in_block = 8 - (self.completed_matches % 8)
-                n_batch = min(train_workers, rem_in_block)
-                if n_batch > 1:
-                    for opp in self._opponents:
-                        if hasattr(opp.policy, "network"):
-                            _ = opp.policy.network
-                    tasks = []
-                    rng_snapshots_after = []
-                    for k in range(n_batch):
-                        occ, idx = divmod(self.completed_matches + k, len(self.config.player_counts))
-                        p_cnt = self.config.player_counts[idx]
-                        c_seat = occ % p_cnt
-                        frac = min(1.0, (self.epsilon_progress + k) / float(self.config.epsilon_decay_matches))
-                        eps = self.config.epsilon_start + (self.config.epsilon_end - self.config.epsilon_start) * frac
-                        opp_idxs = tuple(self.opponent_rng.randrange(len(self._opponents)) for _ in range(p_cnt))
-                        m_seed = TRAINING_SEED_BASE + self.deal_rng.getrandbits(39)
-                        tasks.append((p_cnt, c_seat, eps, opp_idxs, m_seed, record_terminal))
-                        rng_snapshots_after.append((self.deal_rng.getstate(), self.opponent_rng.getstate()))
-                    self._restore_rngs(rng_snapshot)
-                    _LEAGUE_WORKER_STATE["network"] = self.network
-                    _LEAGUE_WORKER_STATE["opponents"] = self._opponents
-                    _LEAGUE_WORKER_STATE["game"] = self.config.game
-                    _LEAGUE_WORKER_STATE["use_search"] = use_search
-                    ctx = multiprocessing.get_context("fork")
-                    with ctx.Pool(processes=n_batch, initializer=torch.set_num_threads, initargs=(1,)) as pool:
-                        results = list(pool.map(_run_prefetched_match, tasks))
-                    for (p_cnt, c_seat, eps, _, _, _), res, rng_after in zip(tasks, results, rng_snapshots_after):
-                        self._prefetched.append((res, p_cnt, c_seat, eps, rng_after))
-
-            if self._prefetched:
-                result, players, challenger_seat, epsilon, (deal_st, opp_st) = self._prefetched.popleft()
-                self.deal_rng.setstate(deal_st)
-                self.opponent_rng.setstate(opp_st)
-                match_complete = True
-            else:
-                occurrence, index = divmod(self.completed_matches, len(self.config.player_counts))
-                players = self.config.player_counts[index]
-                challenger_seat = occurrence % players
-                epsilon = self.current_epsilon
-                policies = [
-                    self.opponent_rng.choice(self._opponents).policy
-                    for _ in range(players)
-                ]
-                policies[challenger_seat] = (
-                    _SearchEpsilonPolicy(self.network, epsilon)
-                    if use_search else EpsilonPolicy(self.network, epsilon)
-                )
-                match_seed = TRAINING_SEED_BASE + self.deal_rng.getrandbits(39)
-                result = play_match(
-                    tuple(policies),
-                    MatchConfig(game=self.config.game, players=players),
-                    seed=match_seed,
-                    record_trajectories=True,
-                    deadline=deadline,
-                    record_terminal=record_terminal,
-                )
-                match_complete = True
+            occurrence, index = divmod(self.completed_matches, len(self.config.player_counts))
+            players = self.config.player_counts[index]
+            challenger_seat = occurrence % players
+            epsilon = self.current_epsilon
+            policies = [
+                self.opponent_rng.choice(self._opponents).policy
+                for _ in range(players)
+            ]
+            policies[challenger_seat] = EpsilonPolicy(
+                self.network, epsilon
+            )
+            match_seed = TRAINING_SEED_BASE + self.deal_rng.getrandbits(39)
+            result = play_match(
+                tuple(policies),
+                MatchConfig(game=self.config.game, players=players),
+                seed=match_seed,
+                record_trajectories=True,
+                deadline=deadline,
+                record_terminal=self.config.shaping != TerminalShaping(),
+            )
+            match_complete = True
         except MatchInterrupted:
-            self._prefetched.clear()
             self._restore_rngs(rng_snapshot)
             self.at_match_boundary = True
             raise
         except BaseException:
             if not match_complete:
-                self._prefetched.clear()
                 self._restore_rngs(rng_snapshot)
                 self.at_match_boundary = True
             raise
@@ -626,7 +532,6 @@ class LeagueSession:
     def refresh_opponent_pool(self, opponent_paths: Sequence[str]) -> None:
         if not self.at_match_boundary:
             raise RuntimeError("cannot refresh opponents during a match")
-        self._prefetched.clear()
         opponents = _load_opponents(
             self._parent_path, opponent_paths, self.config.game
         )

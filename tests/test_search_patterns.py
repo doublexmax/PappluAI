@@ -21,6 +21,7 @@ except ImportError:
     torch = None
 
 if torch is not None:
+    from src.model.encoding import collate_observations
     from src.model.network import QNetwork, save_checkpoint
     from src.model.search import (
         BeliefState, SearchConfig, SearchPolicy, _after_draw, can_declare_ub,
@@ -241,7 +242,7 @@ class TestBeliefSearch(unittest.TestCase):
         self.assertEqual(search(self.network, forced).action, ACTION_TAKE_DISCARD)
         self.assertEqual(search(self.network, forced).reason, "forced")
         greedy = search(self.network, obs, SearchConfig(exact_wins=False, draw_lookahead=False))
-        self.assertEqual(greedy.action, ACTION_DRAW_STOCK)
+        self.assertIn(greedy.action, (ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD))
         self.assertEqual(greedy.reason, "greedy")
         self.assertEqual(greedy.rows, 1)
         discard = _after_draw(obs, 30, EventKind.DRAW_STOCK)
@@ -249,6 +250,31 @@ class TestBeliefSearch(unittest.TestCase):
         self.assertIn(result.action, (discard_action(0), discard_action(1), discard_action(30)))
         self.assertEqual(result.reason, "discard_search")
         self.assertEqual(result.rows, 1)
+
+    def test_depth3_rollout_updates_post_discard_hand_size_and_history(self):
+        obs = self.draw_observation()
+        discard = _after_draw(obs, 30, EventKind.DRAW_STOCK)
+        seen_batches = []
+        real_collate = collate_observations
+
+        def spy_collate(children, device=None):
+            if len(children) > 1:
+                for child in children:
+                    self.assertEqual(child.players[0].hand_size, sum(child.hand))
+                    self.assertEqual(child.players[0].turns_remaining, child.turns_remaining)
+                    self.assertEqual(child.history[-2].kind, EventKind.DISCARD)
+                    self.assertEqual(child.history[-1].kind, EventKind.DRAW_STOCK)
+                seen_batches.append(len(children))
+            return real_collate(children, device)
+
+        with mock.patch("src.model.search.collate_observations", side_effect=spy_collate):
+            result = search(
+                self.network, discard,
+                SearchConfig(exact_wins=False, rollout_depth=3, rollout_beam=4),
+            )
+        self.assertEqual(result.reason, "discard_search")
+        self.assertEqual(seen_batches, [36])
+        self.assertEqual(result.rows, 37)
 
     def test_search_policy_loads_real_checkpoints(self):
         obs = self.draw_observation()

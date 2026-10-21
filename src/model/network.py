@@ -117,7 +117,7 @@ class QNetwork(nn.Module):
         top_raw = batch.cards.gather(1, top_idx[:, None, None].expand(-1, 1, 5)).squeeze(1) * has_top
         raw_draw = self.draw_head(torch.cat((global_cards, top_local, top_set, top_raw), dim=-1)) + ctx_mod
         v_draw = raw_draw[:, :1]
-        top_adv = 0.05 * torch.tanh(raw_draw[:, 1:2]) - 0.10
+        top_adv = 0.25 * torch.tanh(raw_draw[:, 1:2])
         draw_values = torch.cat((v_draw, v_draw + top_adv), dim=1)
 
         ranks = self._rank_one_hot.repeat(4, 1).unsqueeze(0).expand(size, -1, -1)

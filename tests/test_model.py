@@ -239,6 +239,17 @@ class TestDynamicNetwork(unittest.TestCase):
             self.values(obs), self.values(changed)[:, actions], rtol=1e-5, atol=1e-6,
         )
 
+    def test_draw_head_can_select_both_draw_stock_and_take_discard(self):
+        observations = [self.observation(2, turns) for turns in range(1, 9)]
+        selected = set()
+        for seed in range(8):
+            torch.manual_seed(100 + seed)
+            net = QNetwork()
+            net.eval()
+            for obs in observations:
+                selected.add(select_greedy_action(net, obs, device=self.device))
+        self.assertEqual(selected, {0, 1})
+
     def test_model_has_no_stochastic_or_running_inference_state(self):
         obs = self.observation(3, 5)
         self.network.train()

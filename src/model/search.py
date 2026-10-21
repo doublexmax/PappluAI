@@ -211,6 +211,26 @@ def _after_draw(obs: Observation, face: int, kind: EventKind) -> Observation:
     )
 
 
+def _after_discard(obs: Observation, face: int) -> Observation:
+    hand = list(obs.hand)
+    hand[face] -= 1
+    turns = obs.turns_remaining - 1
+    player = replace(
+        obs.players[0],
+        hand_size=obs.players[0].hand_size - 1,
+        turns_remaining=turns,
+    )
+    event = InformationEvent(
+        EventKind.DISCARD, 0, player.hand_size, turns, obs.stock_remaining,
+        player.next_player, face=face,
+    )
+    return replace(
+        obs, hand=tuple(hand), discard_pile=(*obs.discard_pile, face),
+        phase=Phase.DRAW, turns_remaining=turns, players=(player, *obs.players[1:]),
+        history=(*obs.history, event), last_reward=0.0,
+    )
+
+
 @torch.inference_mode()
 def search(
     network: QNetwork,
@@ -256,7 +276,12 @@ def search(
                 hand[face] -= 1
                 values[face] += config.outs_weight * outs_1ply(hand, belief, obs.config)
                 hand[face] += 1
-            if config.rollout_depth >= 3 and len(candidates) >= 2 and obs.turns_remaining > 1:
+            if (
+                config.rollout_depth >= 3
+                and len(candidates) >= 2
+                and obs.turns_remaining > 1
+                and obs.stock_remaining > 0
+            ):
                 probs = belief.stock_probabilities()
                 if probs:
                     top_draws = sorted(probs, key=lambda item: (-item[1], item[0]))[:12]
@@ -264,15 +289,7 @@ def search(
                     rollout_children = []
                     beam_cands = candidates[: min(3, len(candidates))]
                     for face in beam_cands:
-                        base_hand = list(obs.hand)
-                        base_hand[face] -= 1
-                        post_disc = replace(
-                            obs,
-                            hand=tuple(base_hand),
-                            discard_pile=(*obs.discard_pile, face),
-                            phase=Phase.DRAW,
-                            turns_remaining=obs.turns_remaining - 1,
-                        )
+                        post_disc = _after_discard(obs, face)
                         for draw_f, _ in top_draws:
                             rollout_children.append(_after_draw(post_disc, draw_f, EventKind.DRAW_STOCK))
                     r_vals = network(collate_observations(rollout_children, device))[:, 2:]
