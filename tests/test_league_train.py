@@ -26,7 +26,9 @@ except ImportError:
 TORCH_REASON = "PyTorch not installed (see requirements-training.txt)"
 
 
-def fake_match(policies, config, seed, record_trajectories=False, deadline=None):
+def fake_match(
+    policies, config, seed, record_trajectories=False, deadline=None, *, record_terminal=False,
+):
     from types import SimpleNamespace
 
     env = MultiplayerEnv(config)
@@ -43,6 +45,7 @@ def fake_match(policies, config, seed, record_trajectories=False, deadline=None)
         action_count=len(policies),
         stock_remaining=100,
         trajectories=tuple(trajectories),
+        terminal_snapshot=None,
     )
 
 
@@ -219,6 +222,8 @@ class TestLeagueSession(unittest.TestCase):
                         return SimpleNamespace(
                             seed=seed, winner=winner, trajectories=trajectories,
                             terminal_reason="turns_exhausted" if winner is None else "win",
+                            seat_turns=tuple(config.game.max_turns - n for n in env.view().turns_remaining),
+                            terminal_snapshot=None,
                         )
 
                     with mock.patch("src.training.league.play_match", side_effect=recorded_match):

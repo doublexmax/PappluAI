@@ -7,6 +7,8 @@ import json
 import math
 import os
 from pathlib import Path
+import pickle
+import re
 import time
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -28,6 +30,7 @@ from src.evaluation.promotion import GateInterrupted, evaluate_gate
 from src.game.environment import ENCODING_VERSION, GameConfig
 from src.model.network import CHECKPOINT_VERSION, build_checkpoint
 from src.model.spec import ARCHITECTURE
+from src.training.core import TerminalShaping
 from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
 from src.training.curriculum import (
     STATUS_SCHEMA_VERSION,
@@ -39,6 +42,13 @@ from src.training.curriculum import (
 IMPROVEMENT_STATE_VERSION = 2
 ALGORITHM = "champion_league_mc"
 PHASES = ("training", "selection", "confirmation")
+LEAGUE_FINETUNE_LR = 2e-5
+LEAGUE_FINETUNE_EPSILON_START = 0.04
+LEAGUE_FINETUNE_EPSILON_END = 0.01
+RESEARCH_FINETUNE_LR = 2e-5
+RESEARCH_FINETUNE_EPSILON_START = 0.04
+RESEARCH_FINETUNE_EPSILON_END = 0.01
+DEFAULT_IMPROVE_SHAPING = TerminalShaping(speed=0.35, margin=0.25)
 
 
 @dataclass(frozen=True)
@@ -73,8 +83,9 @@ class ImproveConfig:
             require_checkpoint_int(getattr(self, name), name, minimum=1)
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
             raise TypeError("seed must be an int")
-        if self.player_counts != (2, 3, 4):
-            raise ValueError("promotion requires independent results for players 2/3/4")
+        if not isinstance(self.player_counts, tuple):
+            raise TypeError("player_counts must be a tuple")
+        evidence.require_player_counts(self.player_counts)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -96,8 +107,10 @@ class ImprovementController:
         output_dir: Path,
         opponent_paths: Sequence[str] = (),
         config: Optional[ImproveConfig] = None,
+        snapshots_dir: Optional[Path] = None,
     ) -> None:
         self.config = ImproveConfig() if config is None else config
+        self.snapshots_dir = None if snapshots_dir is None else Path(snapshots_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if any((self.output_dir / name).exists() for name in ("latest-state.pt", "status.json")):
@@ -136,9 +149,14 @@ class ImprovementController:
             config=LeagueConfig(
                 game=GameConfig(max_turns=self.config.max_turns, recycle_discard=self.config.recycle_discard),
                 player_counts=self.config.player_counts,
+                learning_rate=LEAGUE_FINETUNE_LR,
+                epsilon_start=LEAGUE_FINETUNE_EPSILON_START,
+                epsilon_end=LEAGUE_FINETUNE_EPSILON_END,
+                shaping=DEFAULT_IMPROVE_SHAPING,
             ),
             seed=self.config.seed,
         )
+        self._ingest_snapshots()
         self.research = TrainingSession(
             config=_research_config(self.config),
             seed=self.config.seed + 1,
@@ -166,7 +184,12 @@ class ImprovementController:
         ).get("win_rate")
 
     @classmethod
-    def load(cls, path: str, output_dir: Path) -> "ImprovementController":
+    def load(
+        cls,
+        path: str,
+        output_dir: Path,
+        snapshots_dir: Optional[Path] = None,
+    ) -> "ImprovementController":
         payload = torch.load(path, map_location="cpu", weights_only=True)
         required = {
             "improvement_state_version",
@@ -197,6 +220,7 @@ class ImprovementController:
 
         controller = cls.__new__(cls)
         controller.config = ImproveConfig.from_dict(payload["config"])
+        controller.snapshots_dir = None if snapshots_dir is None else Path(snapshots_dir)
         controller.output_dir = Path(output_dir)
         if (controller.output_dir / "metrics.jsonl").exists():
             atomic_copy(
@@ -396,6 +420,12 @@ class ImprovementController:
         if started is None:
             started = time.monotonic()
         if self.phase == "training":
+            if (
+                self.league_in_cycle == 0
+                and self.research_in_cycle == 0
+                and self._ingest_snapshots()
+            ):
+                self.save_checkpoint("running", None, started)
             progressed = self._training_step(deadline)
             if not progressed:
                 return False
@@ -434,7 +464,12 @@ class ImprovementController:
             raise RuntimeError("cannot checkpoint partial learner work")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "metrics.jsonl").touch(exist_ok=True)
-        self.league.export_model(self.output_dir / "latest-model.pt")
+        staged_state = self.output_dir / ".staged-latest-state.pt"
+        staged_model = self.output_dir / ".staged-latest-model.pt"
+        atomic_torch_save(self.state_dict(), staged_state)
+        self.league.export_model(staged_model)
+        os.replace(str(staged_state), str(self.output_dir / "latest-state.pt"))
+        os.replace(str(staged_model), str(self.output_dir / "latest-model.pt"))
         atomic_copy(
             self.registry.model_path(self.registry.champion().id),
             self.output_dir / "best-model.pt",
@@ -442,9 +477,6 @@ class ImprovementController:
         atomic_copy(
             self.registry.model_path(self.baseline_id),
             self.output_dir / "baseline-model.pt",
-        )
-        atomic_torch_save(
-            self.state_dict(), self.output_dir / "latest-state.pt"
         )
         active_metrics = self.output_dir / ".active-metrics.jsonl"
         if active_metrics.exists():
@@ -673,6 +705,7 @@ class ImprovementController:
                 self.nominee_id,
                 expected_id=champion.id,
                 evidence=evidence,
+                player_counts=self.config.player_counts,
             )
             self._record_promotion()
         self._finish_cycle(promoted=promoted)
@@ -711,6 +744,7 @@ class ImprovementController:
         self.nominee_id = None
         self.confirmation_result = None
         self.champion_at_cycle_id = None
+        self._ingest_snapshots()
 
     def _reconcile_promotion(self) -> None:
         current = self.registry.champion()
@@ -733,6 +767,29 @@ class ImprovementController:
             and self.research_in_cycle
             >= self.config.research_episodes_per_cycle
         )
+
+    def _ingest_snapshots(self) -> bool:
+        if self.snapshots_dir is None or not self.snapshots_dir.is_dir():
+            return False
+        known_ids = set(self.registry._read()["models"])
+        new_ids = []
+        for path in sorted(self.snapshots_dir.glob("model-*.pt")):
+            match = re.fullmatch(r"model-([0-9a-f]{64})\.pt", path.name)
+            if match is None or match[1][:20] in known_ids:
+                continue
+            try:
+                record = self.registry.register(
+                    str(path), origin="frozen_opponent", expected_sha256=match[1],
+                )
+            except (OSError, RuntimeError, TypeError, ValueError, KeyError, EOFError, pickle.UnpicklingError):
+                continue
+            if record.id not in self.opponent_ids and record.origin == "frozen_opponent":
+                new_ids.append(record.id)
+        if not new_ids:
+            return False
+        self.opponent_ids = _bounded_pool((*self.opponent_ids, *new_ids), self.baseline_id)
+        self.league.refresh_opponent_pool(self._opponent_paths())
+        return True
 
     def _opponent_paths(self) -> Tuple[str, ...]:
         return tuple(
@@ -823,7 +880,9 @@ class ImprovementController:
 
 def _research_config(config: ImproveConfig) -> TrainingConfig:
     return TrainingConfig(
-        learning_rate=1e-4,
+        learning_rate=RESEARCH_FINETUNE_LR,
+        epsilon_start=RESEARCH_FINETUNE_EPSILON_START,
+        epsilon_end=RESEARCH_FINETUNE_EPSILON_END,
         curriculum_fraction=0.25,
         max_turns=config.max_turns,
         replay_capacity=10_000,
@@ -831,6 +890,7 @@ def _research_config(config: ImproveConfig) -> TrainingConfig:
         updates_per_episode=4,
         validation_games=config.solo_games,
         recycle_discard=config.recycle_discard,
+        shaping=DEFAULT_IMPROVE_SHAPING,
     )
 
 
@@ -940,6 +1000,9 @@ def _bounded_pool(record_ids: Sequence[str], baseline_id: str) -> Tuple[str, ...
     return (baseline_id, *others[-6:])
 
 
+_IMMUTABLE_MODEL_META: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+
+
 def _snapshot_manifest(output_dir: Path) -> Dict[str, Dict[str, Any]]:
     files = {}
     for path in sorted(output_dir.iterdir(), key=lambda item: item.name):
@@ -953,7 +1016,16 @@ def _snapshot_manifest(output_dir: Path) -> Dict[str, Dict[str, Any]]:
             )
         ):
             continue
-        files[path.name] = file_metadata(path)
+        if path.name.startswith("model-") and path.name.endswith(".pt"):
+            st = path.stat()
+            cache_key = (str(path), st.st_size, st.st_mtime_ns)
+            meta = _IMMUTABLE_MODEL_META.get(cache_key)
+            if meta is None:
+                meta = file_metadata(path)
+                _IMMUTABLE_MODEL_META[cache_key] = meta
+            files[path.name] = dict(meta)
+        else:
+            files[path.name] = file_metadata(path)
     required = {
         "latest-state.pt",
         "latest-model.pt",

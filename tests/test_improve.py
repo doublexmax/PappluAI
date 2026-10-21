@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -94,7 +96,7 @@ def gate_result(accepted):
                 "games": blocks * len(balanced_seat_orders(players)),
                 "seed_block_margins": [0.5 if accepted else 0.0] * blocks,
             }
-            for players in (2, 3, 4)
+            for players in kwargs["player_counts"]
         }
         solo = {
             "seed": kwargs["seed"] + 100_000,
@@ -112,7 +114,10 @@ def gate_result(accepted):
             "candidate_sha256": sha256(kwargs["candidate_path"]),
             "champion_sha256": sha256(kwargs["champion_path"]),
             "accepted": accepted,
-            **evidence_metrics(multiplayer, solo, blocks, kwargs["seed"], samples),
+            **evidence_metrics(
+                multiplayer, solo, blocks, kwargs["seed"], samples,
+                player_counts=kwargs["player_counts"],
+            ),
             "bootstrap_samples": samples,
             "seed": kwargs["seed"],
             "seed_blocks": kwargs["seed_blocks"],
@@ -136,6 +141,29 @@ def gate_result(accepted):
     return evaluate
 
 
+class TestImproveConfig(unittest.TestCase):
+    def test_specialist_scopes_roundtrip_without_expanding_to_master(self):
+        for counts in ((2,), (3,), (4,), (2, 4), (2, 3, 4)):
+            with self.subTest(counts=counts):
+                config = ImproveConfig(player_counts=counts)
+                restored = ImproveConfig.from_dict(config.to_dict())
+                self.assertEqual(restored.player_counts, counts)
+                self.assertEqual(restored, config)
+
+    def test_invalid_player_count_tuples_are_rejected(self):
+        for counts in ((), (1,), (5,), (True,), (2.0,), ("2",), (2, 2), (3, 2)):
+            with self.subTest(counts=counts), self.assertRaises(ValueError):
+                ImproveConfig(player_counts=counts)
+        for counts in (None, [2], "234", {2, 3, 4}):
+            with self.subTest(counts=counts):
+                with self.assertRaisesRegex(TypeError, "player_counts must be a tuple"):
+                    ImproveConfig(player_counts=counts)
+                raw = ImproveConfig().to_dict()
+                raw["player_counts"] = counts
+                with self.assertRaisesRegex(TypeError, "player_counts must be a tuple"):
+                    ImproveConfig.from_dict(raw)
+
+
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestImprovementController(unittest.TestCase):
     def make_model(self, path):
@@ -149,7 +177,7 @@ class TestImprovementController(unittest.TestCase):
             meta={"best_score": 164 / 256},
         )
 
-    def make_controller(self, root):
+    def make_controller(self, root, *, snapshots_dir=None, **config_overrides):
         model = root / "champion-source.pt"
         self.make_model(model)
         config = ImproveConfig(
@@ -162,7 +190,17 @@ class TestImprovementController(unittest.TestCase):
             checkpoint_every=1,
             gate_samples=20,
         )
-        return ImprovementController(model, root / "output", config=config)
+        return ImprovementController(
+            model, root / "output", config=replace(config, **config_overrides),
+            snapshots_dir=snapshots_dir,
+        )
+
+    def make_snapshot(self, directory):
+        source = directory / "incoming.pt"
+        self.make_model(source)
+        destination = directory / ("model-" + sha256(source) + ".pt")
+        source.rename(destination)
+        return destination
 
     def prepare_distinct_candidates(self, controller):
         with torch.no_grad():
@@ -186,17 +224,17 @@ class TestImprovementController(unittest.TestCase):
         else:
             self.assertEqual(left, right)
 
-    def test_research_is_independent_lower_lr_and_starts_at_distance_four(self):
+    def test_research_is_independent_and_both_learners_finetune_gently(self):
         with tempfile.TemporaryDirectory() as temporary:
             controller = self.make_controller(Path(temporary))
-            self.assertEqual(
-                controller.research.config.learning_rate,
-                1e-4,
-            )
-            self.assertLess(
-                controller.research.config.learning_rate,
-                1e-3,
-            )
+            for session, decay in (
+                (controller.league, controller.league.config.epsilon_decay_matches),
+                (controller.research, controller.research.config.epsilon_decay_episodes),
+            ):
+                self.assertEqual(session.optimizer.param_groups[0]["lr"], 2e-5)
+                self.assertEqual(session.current_epsilon, 0.04)
+                session.epsilon_progress = decay
+                self.assertAlmostEqual(session.current_epsilon, 0.01)
             self.assertEqual(controller.research.config.curriculum_fraction, 0.25)
             self.assertEqual(controller.research.stage_index, 2)
             self.assertEqual(controller.research.current_distance, 4)
@@ -209,6 +247,125 @@ class TestImprovementController(unittest.TestCase):
                 controller.league.replay,
             )
             self.assertIsNone(controller.best_score)
+
+    def test_snapshot_ingestion_skips_bad_files_and_keeps_a_bounded_pool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshots = root / "snapshots"
+            snapshots.mkdir()
+            sources = [self.make_snapshot(snapshots) for _ in range(8)]
+            corrupt = snapshots / "corrupt.pt"
+            corrupt.write_bytes(b"not a torch checkpoint")
+            corrupt_id = sha256(corrupt)[:20]
+            corrupt.rename(snapshots / ("model-" + sha256(corrupt) + ".pt"))
+            (snapshots / ("model-" + "0" * 64 + ".pt")).write_bytes(sources[0].read_bytes())
+            (snapshots / "model-invalid.pt").write_bytes(sources[0].read_bytes())
+            controller = self.make_controller(root, snapshots_dir=snapshots)
+            expected_ids = tuple(sha256(path)[:20] for path in sorted(sources)[-6:])
+            self.assertEqual(controller.opponent_ids, (controller.baseline_id, *expected_ids))
+            self.assertEqual(controller.league.opponent_pool_generation, 1)
+            for record_id in expected_ids:
+                record = controller.registry.get(record_id)
+                self.assertEqual(record.origin, "frozen_opponent")
+                self.assertIn(record.sha256, controller.league.opponent_hashes)
+            with self.assertRaisesRegex(ValueError, "Unknown model id"):
+                controller.registry.get(corrupt_id)
+            self.assertFalse(controller._ingest_snapshots())
+            self.assertEqual(controller.opponent_ids, (controller.baseline_id, *expected_ids))
+            self.assertEqual(controller.league.opponent_pool_generation, 1)
+
+    def test_cycle_boundary_ingestion_is_saved_and_resumes_before_new_arrivals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshots = root / "snapshots"
+            snapshots.mkdir()
+            controller = self.make_controller(
+                root, snapshots_dir=snapshots, max_cycles=2, player_counts=(2,),
+                max_turns=1, selection_blocks=1, confirmation_blocks=1,
+                solo_games=1, gate_samples=100,
+            )
+            deadline = time.monotonic() + 120
+            self.assertTrue(controller.step(deadline))
+            first = self.make_snapshot(snapshots)
+            first_id = sha256(first)[:20]
+            self.assertTrue(controller.step(deadline))
+            self.assertEqual(controller.phase, "selection")
+            self.assertEqual(controller.opponent_ids, (controller.baseline_id,))
+            while controller.cycle_index == 0:
+                self.assertTrue(controller.step(deadline))
+            self.assertEqual(controller.opponent_ids, (controller.baseline_id, first_id))
+            self.assertEqual(controller.league.opponent_pool_generation, 1)
+            saved_path = controller.output_dir / "latest-state.pt"
+            saved = torch.load(saved_path, map_location="cpu", weights_only=True)
+            self.assertEqual(saved["cycle"], 1)
+            self.assertEqual(saved["phase"], "training")
+            self.assertEqual(saved["opponent_ids"], (controller.baseline_id, first_id))
+            self.assertIn(sha256(first), saved["league_state"]["opponent_hashes"])
+            second = self.make_snapshot(snapshots)
+            second_id = sha256(second)[:20]
+            resumed = ImprovementController.load(
+                str(saved_path), controller.output_dir, snapshots_dir=snapshots,
+            )
+            self.assertEqual(resumed.opponent_ids, (controller.baseline_id, first_id))
+            self.assertEqual(resumed.league.completed_matches, 1)
+            self.assertFalse(resumed.step(deadline=0))
+            self.assertEqual(resumed.opponent_ids, (controller.baseline_id, first_id, second_id))
+            self.assertEqual(resumed.league.completed_matches, 1)
+            updated = torch.load(saved_path, map_location="cpu", weights_only=True)
+            self.assertEqual(updated["opponent_ids"], (controller.baseline_id, first_id, second_id))
+            self.assertEqual(updated["cursors"]["league"], 0)
+            self.assertIn(sha256(second), updated["league_state"]["opponent_hashes"])
+            reloaded = ImprovementController.load(
+                str(saved_path), controller.output_dir, snapshots_dir=snapshots,
+            )
+            self.assertEqual(reloaded.league.opponent_hashes, resumed.league.opponent_hashes)
+            self.assertEqual(reloaded.config.player_counts, (2,))
+
+    def test_midcycle_resume_defers_new_snapshots_until_the_next_cycle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshots = root / "snapshots"
+            snapshots.mkdir()
+            first = self.make_snapshot(snapshots)
+            first_id = sha256(first)[:20]
+            controller = self.make_controller(
+                root, snapshots_dir=snapshots, max_cycles=2, player_counts=(2,),
+                max_turns=1, selection_blocks=1, confirmation_blocks=1,
+                solo_games=1, gate_samples=100,
+            )
+            deadline = time.monotonic() + 120
+            self.assertTrue(controller.step(deadline))
+            second = self.make_snapshot(snapshots)
+            second_id = sha256(second)[:20]
+            resumed = ImprovementController.load(
+                str(controller.output_dir / "latest-state.pt"),
+                controller.output_dir, snapshots_dir=snapshots,
+            )
+            self.assertEqual(resumed.league_in_cycle, 1)
+            self.assertEqual(resumed.opponent_ids, (controller.baseline_id, first_id))
+            self.assertTrue(resumed.step(deadline))
+            self.assertEqual(resumed.phase, "selection")
+            self.assertEqual(resumed.opponent_ids, (controller.baseline_id, first_id))
+            while resumed.cycle_index == 0:
+                self.assertTrue(resumed.step(deadline))
+            self.assertEqual(resumed.opponent_ids, (controller.baseline_id, first_id, second_id))
+            self.assertEqual(resumed.league.opponent_pool_generation, 2)
+
+    def test_specialist_promotion_preserves_its_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = self.make_controller(Path(temporary), player_counts=(3,))
+            self.prepare_distinct_candidates(controller)
+            with mock.patch("src.training.improve.evaluate_gate", side_effect=gate_result(True)):
+                controller._selection_step()
+                controller._selection_step()
+                controller._selection_step()
+                nominee = controller.nominee_id
+                controller._confirmation_step()
+                controller._confirmation_step()
+            self.assertEqual(controller.registry.champion().id, nominee)
+            pointer = json.loads(controller.registry.champion_path.read_text(encoding="utf-8"))
+            self.assertEqual(pointer["history"][0]["evidence"]["player_counts"], [3])
+            self.assertEqual(controller.promotions, 1)
 
     def test_other_rule_reference_cannot_seed_current_training(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -395,6 +552,30 @@ class TestImprovementController(unittest.TestCase):
                     invalid,
                 )
 
+    def test_resume_preserves_specialist_scope_unless_explicitly_changed(self):
+        from src.cli.improve import _validate_resume_options
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = self.make_controller(Path(temporary), player_counts=(3,))
+            parser = build_arg_parser()
+            base = [
+                "--resume", "latest-state.pt", "--output-dir", "output",
+                "--max-seconds", "60",
+            ]
+            for extra in ([], ["--players", "3"]):
+                arguments = base + extra
+                _validate_resume_options(
+                    improve_runtime, controller, parser.parse_args(arguments), arguments,
+                )
+                self.assertEqual(controller.config.player_counts, (3,))
+            for counts in (["2"], ["2", "3", "4"], ["3", "3"]):
+                arguments = base + ["--players", *counts]
+                with self.assertRaisesRegex(ValueError, "Resume cannot change --players"):
+                    _validate_resume_options(
+                        improve_runtime, controller, parser.parse_args(arguments), arguments,
+                    )
+                self.assertEqual(controller.config.player_counts, (3,))
+
     def test_solo_resume_rejects_nonfinite_optimizer_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             controller = self.make_controller(Path(temporary))
@@ -547,6 +728,18 @@ class TestImprovementController(unittest.TestCase):
 
 
 class TestImproveCli(unittest.TestCase):
+    def test_cli_exposes_specialist_scopes_and_optional_snapshot_directory(self):
+        parser = build_arg_parser()
+        base = ["--initial-model", "champion.pt", "--output-dir", "out", "--max-seconds", "60"]
+        defaults = parser.parse_args(base)
+        self.assertIsNone(defaults.players)
+        self.assertIsNone(defaults.snapshots)
+        for counts in (["2"], ["3"], ["4"], ["2", "3", "4"]):
+            with self.subTest(counts=counts):
+                args = parser.parse_args(base + ["--players", *counts, "--snapshots", "snapshots"])
+                self.assertEqual(args.players, [int(count) for count in counts])
+                self.assertEqual(args.snapshots, Path("snapshots"))
+
     def test_cli_requires_budget_and_exposes_bounded_cycle_overrides(self):
         parser = build_arg_parser()
         max_seconds = next(
