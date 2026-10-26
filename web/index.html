@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Papplu · Social club</title>
-    <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
@@ -237,17 +237,22 @@
                 <span class="summary-value">Players, decks and rules</span>
               </summary>
               <div class="settings-body">
+                <label class="preset-select">
+                  Mode preset
+                  <select id="table-preset">
+                    <option value="vs-ai">vs AI</option>
+                    <option value="solo">Solo Practice</option>
+                    <option value="pass-and-play">Pass &amp; Play</option>
+                    <option value="ai-watch">AI Watch</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </label>
+                <div class="section-head">
+                  <h2>Seats</h2>
+                  <button type="button" id="table-add-seat" class="secondary">Add seat</button>
+                </div>
+                <div id="table-seats" class="seat-editor" aria-label="Player seats"></div>
                 <div class="field-grid">
-                  <label>
-                    Players (solo…6)
-                    <input
-                      id="table-players"
-                      type="number"
-                      min="1"
-                      max="6"
-                      value="1"
-                    />
-                  </label>
                   <label>
                     Decks
                     <input
@@ -278,14 +283,33 @@
                       value="5"
                     />
                   </label>
+                  <label>
+                    AI turn speed
+                    <select id="table-ai-speed">
+                      <option value="instant">Instant</option>
+                      <option value="normal" selected>Normal</option>
+                      <option value="slow">Slow</option>
+                    </select>
+                  </label>
                 </div>
+                <label class="toggle-field">
+                  <input id="table-recycle" type="checkbox" checked />
+                  Reshuffle discard pile when stock is empty
+                </label>
+                <p class="muted">Seat and rule changes apply at the next deal.</p>
+                <p class="model-note">
+                  The included neural weights are an untrained bootstrap model.
+                  Tactical uses exact deadwood scoring. Neural falls back to Tactical
+                  when its model is unavailable or the rules differ.
+                </p>
                 <details class="rules-details">
                   <summary>House rules</summary>
                   <p>
                     Settings apply to the next deal. Invalid declarations
                     eliminate that player and add 80 penalty points. Scores
-                    carry across deals with the same player count. Empty stock
-                    is not reshuffled.
+                    carry across deals with the same player count. Reshuffling
+                    keeps the top discard on the table. AI Watch pauses after
+                    200 turns and can be resumed.
                   </p>
                 </details>
               </div>
@@ -293,7 +317,9 @@
             <button type="button" id="table-deal" class="primary">
               Deal new game
             </button>
+            <button type="button" id="table-pause" class="secondary" hidden>Pause</button>
           </div>
+          <p id="table-notice" class="status" role="status" aria-live="polite"></p>
         </div>
 
         <section id="table-board" class="card-panel table-board">
@@ -335,9 +361,10 @@
           </div>
           <div id="table-eval" class="eval-body" aria-live="polite"></div>
         </section>
+        <section id="table-summary" class="card-panel round-summary" aria-live="polite" hidden></section>
       </section>
     </main>
 
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="./app.js"></script>
   </body>
 </html>

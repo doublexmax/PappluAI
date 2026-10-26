@@ -21,6 +21,13 @@ ASSETS = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/game.mjs": ("game.mjs", "text/javascript; charset=utf-8"),
     "/cards.mjs": ("cards.mjs", "text/javascript; charset=utf-8"),
+    "/evaluate.mjs": ("evaluate.mjs", "text/javascript; charset=utf-8"),
+    "/qnet.mjs": ("qnet.mjs", "text/javascript; charset=utf-8"),
+    "/ai.mjs": ("ai.mjs", "text/javascript; charset=utf-8"),
+    "/engine.mjs": ("engine.mjs", "text/javascript; charset=utf-8"),
+    "/engine-worker.mjs": ("engine-worker.mjs", "text/javascript; charset=utf-8"),
+    "/table.mjs": ("table.mjs", "text/javascript; charset=utf-8"),
+    "/papplu-model.json": ("papplu-model.json", "application/json; charset=utf-8"),
 }
 MAX_BODY_BYTES = 8192
 EVALUATION_SECONDS = 10
