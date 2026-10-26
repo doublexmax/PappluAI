@@ -171,6 +171,10 @@ def _iter_sequences(
     wilds = _wild_faces(joker)
     wild_count = sum(counts[face] for face in wilds)
     natural = tuple(count > 0 and face not in wilds for face, count in enumerate(counts))
+    for face, count in enumerate(counts):
+        if count >= MIN_MELD:
+            triplet = (face, face, face)
+            yield Meld(kind="sequence", cards=triplet, represented_cards=triplet, is_pure=True)
     for represented in _IRREDUCIBLE_SEQUENCES:
         if len(represented) > total:
             continue
@@ -393,7 +397,14 @@ def validate_hand_penalty(
         if raw["kind"] == "sequence":
             legal = (
                 len({face // NUM_RANKS for face in represented}) == 1
-                and tuple(face % NUM_RANKS for face in represented) in RANK_PATTERNS
+                and (
+                    tuple(face % NUM_RANKS for face in represented) in RANK_PATTERNS
+                    or (
+                        len(represented) == MIN_MELD
+                        and len(set(represented)) == 1
+                        and actuals == represented
+                    )
+                )
             )
         else:
             legal = (

@@ -39,7 +39,7 @@ from src.model.network import (
     select_greedy_action,
     select_random_legal,
 )
-from src.training.core import EpisodeReplay, discounted_returns
+from src.training.core import EpisodeReplay, TerminalShaping, discounted_returns, terminal_reward
 from src.training.optimization import train_batch
 from src.model.spec import ModelSpec
 
@@ -89,6 +89,7 @@ class TrainingConfig:
     validation_games: int = 64
     validate_every: int = 1_000
     torch_threads: int = 1
+    shaping: TerminalShaping = TerminalShaping()
 
     def __post_init__(self) -> None:
         if (
@@ -144,6 +145,8 @@ class TrainingConfig:
             raise ValueError("curriculum_distances must be (1, 2, 4, 8)")
         if type(self.recycle_discard) is not bool:
             raise TypeError("recycle_discard must be a bool")
+        if not isinstance(self.shaping, TerminalShaping):
+            raise TypeError("shaping must be a TerminalShaping")
 
     @property
     def game_config(self) -> GameConfig:
@@ -156,20 +159,27 @@ class TrainingConfig:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if self.shaping == TerminalShaping():
+            del payload["shaping"]
+        else:
+            payload["shaping"] = self.shaping.to_dict()
+        return payload
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TrainingConfig":
         if not isinstance(data, dict):
             raise TypeError("training_config must be a dict")
         fields = set(cls.__dataclass_fields__)
-        if set(data) == fields:
+        if set(data) in (fields, fields - {"shaping"}):
             values = dict(data)
         else:
             raise ValueError("training_config fields do not match this trainer")
         distances = values["curriculum_distances"]
         if not isinstance(distances, tuple):
             raise TypeError("curriculum_distances must be a tuple")
+        if "shaping" in values:
+            values["shaping"] = TerminalShaping.from_dict(values["shaping"])
         return cls(**values)
 
 
@@ -615,7 +625,12 @@ class TrainingSession:
                 )
                 state = obs
                 obs = env.step(action)
-                steps.append((state, action, float(obs.last_reward)))
+                reward = terminal_reward(
+                    self.config.shaping, won=obs.won,
+                    turns_remaining=obs.turns_remaining, max_turns=self.config.max_turns,
+                    hand=obs.hand, joker=obs.joker, required_sequences=self.config.required_sequences,
+                ) if obs.done else float(obs.last_reward)
+                steps.append((state, action, reward))
 
             if deadline is not None and time.monotonic() >= deadline:
                 self._restore_rng_snapshot(rng_snapshot)
@@ -870,19 +885,27 @@ def save_session_checkpoint(
         raise RuntimeError("cannot checkpoint a partial episode")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "metrics.jsonl").touch(exist_ok=True)
+    staged_state = output_dir / ".staged-latest-state.pt"
+    staged_latest = output_dir / ".staged-latest-model.pt"
+    staged_best = output_dir / ".staged-best-model.pt"
+    staged_base = output_dir / ".staged-baseline-model.pt"
+    atomic_torch_save(session.state_dict(), staged_state)
     atomic_torch_save(
         _model_payload(session, session.network.state_dict(), "latest"),
-        output_dir / "latest-model.pt",
+        staged_latest,
     )
     atomic_torch_save(
         _model_payload(session, session.best_model_state, "best"),
-        output_dir / "best-model.pt",
+        staged_best,
     )
     atomic_torch_save(
         _model_payload(session, session.baseline_model_state, "baseline"),
-        output_dir / "baseline-model.pt",
+        staged_base,
     )
-    atomic_torch_save(session.state_dict(), output_dir / "latest-state.pt")
+    os.replace(str(staged_state), str(output_dir / "latest-state.pt"))
+    os.replace(str(staged_latest), str(output_dir / "latest-model.pt"))
+    os.replace(str(staged_best), str(output_dir / "best-model.pt"))
+    os.replace(str(staged_base), str(output_dir / "baseline-model.pt"))
     active_metrics = output_dir / ".active-metrics.jsonl"
     if active_metrics.exists():
         atomic_copy(active_metrics, output_dir / "metrics.jsonl")

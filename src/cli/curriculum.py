@@ -23,6 +23,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     source.add_argument("--resume")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--heads", type=int, default=None)
     parser.add_argument("--max-episodes", type=int, default=1_000_000)
     parser.add_argument("--max-seconds", type=float, default=82_800)
     parser.add_argument("--checkpoint-every", type=int, default=100)
@@ -149,6 +151,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     1_000 if args.validate_every is None else args.validate_every
                 ),
             )
+            default_spec = runtime.ModelSpec()
             session = runtime.TrainingSession(
                 config=config,
                 seed=41 if args.seed is None else args.seed,
@@ -156,7 +159,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 initial_stage_index=(
                     0 if args.initial_stage is None else args.initial_stage
                 ),
+                model_spec=runtime.ModelSpec(
+                    width=default_spec.width if args.width is None else args.width,
+                    heads=default_spec.heads if args.heads is None else args.heads,
+                ),
             )
+            _validate_model_arguments(session, args)
             initialize = True
         reason = runtime.run(
             session,
@@ -213,6 +221,7 @@ def _validate_resume_arguments(
                 "resume cannot change %s from %r to %r"
                 % (name, getattr(session.config, name), value)
             )
+    _validate_model_arguments(session, args)
     if args.seed is not None and args.seed != session.initial_seed:
         raise ValueError(
             "resume seed %d does not match saved seed %d"
@@ -220,6 +229,16 @@ def _validate_resume_arguments(
         )
     if args.initial_stage is not None:
         raise ValueError("--initial-stage is only valid for a new session")
+
+
+def _validate_model_arguments(session, args: argparse.Namespace) -> None:
+    for name in ("width", "heads"):
+        requested = getattr(args, name)
+        saved = getattr(session.network.spec, name)
+        if requested is not None and requested != saved:
+            raise ValueError(
+                "%s %d does not match model %s %d" % (name, requested, name, saved),
+            )
 
 
 if __name__ == "__main__":
