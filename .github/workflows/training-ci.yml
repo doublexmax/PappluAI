@@ -6,6 +6,7 @@ on:
       - "src/**"
       - "tests/**"
       - "tools/**"
+      - "web/**"
       - "requirements-training.txt"
       - "README.md"
       - "TRAINING.md"
@@ -39,7 +40,15 @@ jobs:
           tests.test_information
           tests.test_registry
       - name: Check browser simulator
-        run: node --test tests/simulator.test.mjs tests/card_art.test.mjs
+        run: >-
+          node --test
+          tests/simulator.test.mjs
+          tests/card_art.test.mjs
+          tests/evaluate.test.mjs
+          tests/game_events.test.mjs
+          tests/qnet.test.mjs
+          tests/ai.test.mjs
+          tests/table.test.mjs
       - name: Check command help without training dependencies
         run: |
           python -m src.cli.solo --help

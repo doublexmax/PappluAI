@@ -136,6 +136,18 @@ class ServerTests(unittest.TestCase):
                 status, _, _ = self.request("GET", path)
                 self.assertEqual(status, 404)
 
+    def test_browser_engine_assets(self):
+        for filename in (
+            "evaluate.mjs", "qnet.mjs", "ai.mjs", "engine.mjs",
+            "engine-worker.mjs", "table.mjs", "papplu-model.json",
+        ):
+            with self.subTest(filename=filename):
+                status, headers, body = self.request("GET", "/" + filename)
+                self.assertEqual(status, 200)
+                content_type = "application/json" if filename.endswith(".json") else "text/javascript"
+                self.assertEqual(headers["Content-Type"], content_type + "; charset=utf-8")
+                self.assertGreater(len(body), 0)
+
     def test_static_assets_and_head(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

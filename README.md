@@ -2,7 +2,7 @@
 
 Papplu hand correctness and a binary reward function for model training.
 The evaluator uses this project's house rules, not a universal rummy ruleset.
-The local simulator provides a hand builder and a pass-and-play card table.
+The browser play area provides a hand builder and a card table with Human and AI seats.
 The optional training tools use PyTorch.
 
 The Social club layout uses a warm background, player seats, a green hand mat,
@@ -38,19 +38,25 @@ Load a sample to inspect a complete hand without entering all 21 cards.
 The result updates after each edit. A winning hand shows its complete grouping
 and what each substituted joker represents. A losing hand has reward zero, but
 the display does not claim that it contains zero useful sequences.
-Incomplete hands show the number of cards still needed.
+Partial and complete hands also show `minimumPenalty` deadwood points,
+exempt melds, and counted deadwood cards.
 
 ### Game table
 
-Choose one through six players for solo or local pass-and-play. The default
-uses three decks, 21 cards per player, and five required pure sequences.
+Choose a preset or edit one through six seats. Each seat has a custom name
+and is either Human or AI. The default is **vs AI**, with You and a Neural AI.
+**Solo Practice** has one human. **Pass & Play** has two humans.
+**AI Watch** seats Neural, Tactical, and Casual opponents.
+Custom tables can mix any of these seats.
+
+The default rules use three decks, 21 cards per player, and five required pure sequences.
 Deal a new game to shuffle and deal each player's hand.
 The game then removes one card as the joker indicator and places another on
 the discard pile. The indicator cannot be drawn during the round.
-Settings collapse after a successful deal to leave room for play. Expand them
-to configure the next round; the current round keeps its original rules.
-On wide screens, the hand and draw tray sit side by side. On narrow screens,
-draw controls appear above the hand and turn-completion controls remain below it.
+Seat and rule changes apply at the next deal. The current round keeps its
+original seats and rules. AI speed can be Instant, Normal, or Slow.
+**Pause** stops AI play. **Resume** continues it.
+AI Watch pauses after 200 completed turns and can be resumed.
 
 Draw from the stock or the top of the discard pile. Choose a card to discard
 from your enlarged hand, or discard the drawn card immediately.
@@ -58,22 +64,42 @@ Both choices finish the turn with the original hand size.
 Returning a card drawn from the discard pile is allowed in this simulator.
 The game does not decide whether that choice improved your hand.
 
-On multiplayer turns, pass the screen and reveal the next player's hand.
-Other players' cards are not shown. Solo play continues without the reveal step.
-**Check hand** is off by default for every player. Enable it to see live
-validity and grouping for your own hand. The next player does not
-inherit your setting, and a new round starts with checking off again.
+With multiple human seats, pass the screen and reveal the next human's hand.
+With one human seat, that human's hand stays visible during AI turns.
+AI-only tables show all hands to spectators, but each AI receives only its own
+hand and public history. Opponent stock draws and face-down declarations stay hidden.
+**Check hand** is off initially. Enable it to see validity and grouping for the
+visible human hand.
 Having a valid hand does not automatically end the round.
 The hand-check panel appears only when requested. Declaration results appear
 when a declaration is made, rather than occupying an empty panel during play.
-An empty stock is not reshuffled automatically. Draw from the discard pile or
-deal a new game.
+**Reshuffle discard pile when stock is empty** is on by default.
+After a continuing discard or invalid declaration, the game shuffles all but
+the top discard into the empty stock. Turn the rule off to leave the stock empty.
+If both piles are empty, deal again.
+
+### AI tiers
+
+- **Neural + Search** runs the `dynamic_table` QNetwork in JavaScript.
+  It uses public-card beliefs, feed risk, exact winning checks, draw lookahead,
+  and a four-candidate one-ply outs search.
+- **Tactical** minimizes exact deadwood penalty and uses feed risk and a
+  four-candidate one-ply outs search.
+- **Casual** keeps wild cards and builds groups with nearby ranks and matching cards.
+
+Every tier declares when it finds a discard that leaves a valid hand.
+Neural falls back to Tactical when the model is unavailable, the rules differ,
+or the table has only one seat. The scoreboard reports the effective tier.
+The shipped weights are deterministic, untrained bootstrap weights, not a
+promoted champion. They prove inference compatibility and do not establish playing strength.
+There is no promotion evidence for these weights at any seat count.
+Training examples evaluate two, three, and four seats.
 
 ### Declare a win
 
 After drawing, select the card you want to put down and choose **Declare win**.
 That card goes face down into a separate declaration area, not the playable
-discard pile. The Python evaluator checks the remaining hand against the
+discard pile. The browser evaluator checks the remaining hand against the
 round's rules, even when **Check hand** is off.
 
 | Result | Outcome |
@@ -89,8 +115,10 @@ Cards and turns cannot be changed while a declaration is awaiting a verdict.
 
 Penalty totals accumulate across deals with the same player count.
 Changing the player count resets those totals. These are false-declaration
-penalties only, not a full deadwood-scoring system. Lower totals are better.
-The evaluator's binary reward remains separate from these game penalties.
+penalties only. The end-of-round summary reveals every final hand, the
+declared card, minimum deadwood points, exempt melds, and counted cards.
+Deadwood scores do not change the false-declaration scoreboard.
+The evaluator's binary reward remains separate from both scores.
 
 The 80-point penalty and continued multiplayer play follow
 [RummyCircle's points-rummy declaration rules](https://www.rummycircle.com/rummy-variations/points-rummy.html).
@@ -107,8 +135,9 @@ Your order persists across draws, discards, checks, and turns.
 Drawing appends the new card instead of rearranging your hand.
 
 Builder and table hands are separate. Table settings apply when a new game is
-dealt, not halfway through a round. Reloading the page resets both modes.
-There are no automated opponents, network players, or saved games.
+dealt, not halfway through a round. Reloading resets the hands and scores.
+Seat and rule preferences persist under `papplu:settings:v1` in local storage.
+There are no network players or saved rounds.
 
 ### Simulator limits
 
@@ -117,12 +146,36 @@ required sequence counts from 0 through 10.
 The deal must leave enough cards for all players, the indicator, and the first
 discard. Individual copies retain their identities during draw and discard.
 
-The browser calls `src\evaluate.py` through the local server. There is no second
-JavaScript version of the hand-validation rules.
-Requests are coalesced so an older result cannot overwrite an edited hand.
-An evaluation that exceeds ten seconds stops and reports an error instead of
-returning a false losing-hand result. Preview errors leave the hand editable.
-A pending declaration remains committed until a verdict or a new round.
+The browser runs `web/evaluate.mjs`, an exact port of `src/evaluate.py`.
+Parity fixtures compare validity, meld witnesses, penalties, and validation errors.
+Module workers run evaluation and AI search without a production API.
+Any HTTP static server can serve `web/`. The Python server still provides
+`POST /api/evaluate` for existing scripts.
+Older results cannot overwrite an edited hand.
+A worker evaluation that exceeds ten seconds stops and reports an error,
+not a losing-hand verdict. Preview errors leave the hand editable.
+A pending declaration remains committed and retryable without a false penalty.
+Browsers without workers use the same engine in the main thread.
+That fallback can block the UI during a long search and cannot interrupt it.
+
+### Regenerate browser fixtures and weights
+
+The parity exporter and bootstrap exporter need only Python's standard library.
+
+```powershell
+python tools\export_parity_fixtures.py
+python tools\weights_export.py --bootstrap
+```
+
+The second command writes `web/papplu-model.json` and
+`tests/fixtures/qnet-golden.json`. A pure-Python forward pass produces the
+golden Q values. Node tests compare all 54 actions within `1e-4`.
+With PyTorch installed, replace the bootstrap with a current checkpoint or registry champion.
+
+```powershell
+python tools\weights_export.py --checkpoint path\to\model.pt
+python tools\weights_export.py --registry path\to\registry
+```
 
 ## House rules
 
@@ -418,7 +471,7 @@ From the repository root, the standard-library test command is:
 
 ```powershell
 python -m unittest discover -s tests -v
-node --test tests\simulator.test.mjs tests\card_art.test.mjs
+node --test tests\*.test.mjs
 .\.venv\Scripts\python tools\check_training_architecture.py
 .\.venv\Scripts\python tools\verify_dynamic_model.py --output-dir "$env:TEMP\papplu-dynamic-verification"
 ```
@@ -437,4 +490,7 @@ API tests cover request validation and bounded evaluation. Game-state tests
 cover card conservation, physical copies, card order, draw/discard transitions,
 declaration outcomes, and elimination penalties.
 Card-art tests cover all 52 faces, pip counts, and generic face-down backs.
+Browser-engine tests cover evaluator parity, inference parity, private observations,
+AI declarations, discard recycling, table scheduling, retryable declarations,
+and end-of-round deadwood summaries.
 Node.js is needed only for the JavaScript tests, not to run the simulator.

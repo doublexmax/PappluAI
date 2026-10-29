@@ -28,7 +28,8 @@
  *   turn: number,
  *   winnerIndex: number | null,
  *   outcomeReason: 'valid-declaration' | 'last-remaining' | 'solo-invalid' | null,
- *   rules: { cardsInHand: number, requiredSequences: number, decks: number }
+ *   rules: { cardsInHand: number, requiredSequences: number, decks: number, recycleDiscard: boolean },
+ *   events: object[]
  * }} GameState
  */
 
@@ -125,6 +126,7 @@ function cloneState(state) {
     winnerIndex: state.winnerIndex,
     outcomeReason: state.outcomeReason,
     rules: { ...state.rules },
+    events: state.events.slice(),
   };
 }
 
@@ -158,6 +160,8 @@ export function createGame(
     cardsInHand = 21,
     requiredSequences = 5,
     penaltyTotals,
+    recycleDiscard = false,
+    names,
   } = {},
   random = Math.random,
 ) {
@@ -185,6 +189,15 @@ export function createGame(
   ) {
     throw new Error("penaltyTotals must contain one non-negative integer per player");
   }
+  if (typeof recycleDiscard !== "boolean") {
+    throw new TypeError("recycleDiscard must be a boolean");
+  }
+  if (names !== undefined && (
+    !Array.isArray(names) || names.length !== players ||
+    names.some((name) => typeof name !== "string" || !name.trim())
+  )) {
+    throw new TypeError("names must contain one nonempty string per player");
+  }
   const initialPenalties = penaltyTotals || Array(players).fill(0);
 
   const needed = players * cardsInHand + 2;
@@ -210,7 +223,7 @@ export function createGame(
   const table = [];
   for (let player = 0; player < players; player += 1) {
     table.push({
-      name: players === 1 ? "You" : `Player ${player + 1}`,
+      name: names ? names[player].trim() : players === 1 ? "You" : `Player ${player + 1}`,
       hand: [],
       active: true,
       roundPenalty: 0,
@@ -244,7 +257,13 @@ export function createGame(
     turn: 1,
     winnerIndex: null,
     outcomeReason: null,
-    rules: { cardsInHand, requiredSequences, decks },
+    rules: { cardsInHand, requiredSequences, decks, recycleDiscard },
+    events: [Object.freeze({
+      kind: "deal",
+      hands: Object.freeze(table.map((player) => Object.freeze(player.hand.map((card) => card.face)))),
+      stock: deck.length,
+      top: firstDiscard.face,
+    })],
   };
 }
 
@@ -262,6 +281,7 @@ export function drawCard(state, source) {
   }
 
   const next = cloneState(state);
+  const offeredTop = state.discard.length ? state.discard[state.discard.length - 1].face : null;
   /** @type {Card | undefined} */
   let card;
   if (source === "stock") {
@@ -281,6 +301,10 @@ export function drawCard(state, source) {
   player.hand.push(card);
   next.phase = "discard";
   next.drawnCardId = card.id;
+  appendEvent(next, {
+    kind: "draw", seat: next.currentPlayer, source, face: card.face,
+    offeredTop, stock: next.stock.length,
+  });
   return next;
 }
 
@@ -289,7 +313,7 @@ export function drawCard(state, source) {
  * @param {number} physicalId
  * @returns {GameState}
  */
-export function discardCard(state, physicalId) {
+export function discardCard(state, physicalId, random = Math.random) {
   if (state.phase !== "discard") {
     throw new Error("cannot discard unless phase is discard");
   }
@@ -317,6 +341,8 @@ export function discardCard(state, physicalId) {
   next.drawnCardId = null;
   next.turn += 1;
   next.currentPlayer = nextActivePlayer(next.players, next.currentPlayer);
+  appendEvent(next, { kind: "discard", seat: state.currentPlayer, face: card.face, stock: next.stock.length });
+  refillIfNeeded(next, state.currentPlayer, random);
   return next;
 }
 
@@ -353,6 +379,7 @@ export function beginDeclaration(state, physicalId) {
   });
   next.phase = "declaring";
   next.drawnCardId = null;
+  appendEvent(next, { kind: "declare", seat: next.currentPlayer });
   return next;
 }
 
@@ -361,7 +388,7 @@ export function beginDeclaration(state, physicalId) {
  * @param {boolean} isValid
  * @returns {GameState}
  */
-export function resolveDeclaration(state, isValid) {
+export function resolveDeclaration(state, isValid, random = Math.random) {
   if (state.phase !== "declaring") {
     throw new Error("no declaration is pending");
   }
@@ -374,12 +401,14 @@ export function resolveDeclaration(state, isValid) {
   if (!declaration || declaration.verdict !== "pending") {
     throw new Error("no declaration is pending");
   }
+  appendEvent(next, { kind: "verdict", seat: declaration.ownerIndex, valid: isValid });
 
   if (isValid) {
     declaration.verdict = "valid";
     next.phase = "finished";
     next.winnerIndex = declaration.ownerIndex;
     next.outcomeReason = "valid-declaration";
+    appendEvent(next, { kind: "finish", winner: next.winnerIndex, reason: next.outcomeReason });
     return next;
   }
 
@@ -396,13 +425,76 @@ export function resolveDeclaration(state, isValid) {
     next.phase = "finished";
     next.winnerIndex = active.length === 1 ? active[0].index : null;
     next.outcomeReason = active.length === 1 ? "last-remaining" : "solo-invalid";
+    appendEvent(next, { kind: "finish", winner: next.winnerIndex, reason: next.outcomeReason });
     return next;
   }
 
   next.phase = "draw";
   next.turn += 1;
   next.currentPlayer = nextActivePlayer(next.players, declaration.ownerIndex);
+  refillIfNeeded(next, declaration.ownerIndex, random);
   return next;
+}
+
+function appendEvent(next, event) {
+  next.events.push(Object.freeze(event));
+}
+
+function refillIfNeeded(next, seat, random) {
+  if (!next.rules.recycleDiscard || next.stock.length || next.discard.length <= 1) return;
+  next.stock = shuffle(next.discard.slice(0, -1), random);
+  next.discard = next.discard.slice(-1);
+  appendEvent(next, { kind: "refill", seat, stock: next.stock.length });
+}
+
+export function observe(state, seat) {
+  if (!Number.isInteger(seat) || seat < 0 || seat >= state.players.length) {
+    throw new RangeError("seat must be a player index");
+  }
+  return {
+    seat,
+    hand: state.players[seat].hand.map((card) => ({ ...card })),
+    drawnCardId: seat === state.currentPlayer ? state.drawnCardId : null,
+    pile: state.discard.map((card) => card.face),
+    joker: state.joker.face,
+    stockCount: state.stock.length,
+    phase: state.phase,
+    currentPlayer: state.currentPlayer,
+    turn: state.turn,
+    rules: { ...state.rules },
+    players: state.players.map((player, index) => ({
+      name: player.name,
+      handSize: player.hand.length,
+      active: player.active,
+      discards: state.events.filter((event) => event.kind === "discard" && event.seat === index).length,
+      roundPenalty: player.roundPenalty,
+      penaltyPoints: player.penaltyPoints,
+    })),
+    declarations: state.declarations.map(({ ownerIndex, verdict }) => ({ ownerIndex, verdict })),
+    events: state.events.map((event) => {
+      if (event.kind === "deal") {
+        return { kind: "deal", hand: [...event.hands[seat]], stock: event.stock, top: event.top };
+      }
+      if (event.kind === "draw" && event.source === "stock" && event.seat !== seat) {
+        return { ...event, face: null };
+      }
+      return { ...event };
+    }),
+  };
+}
+
+export function revealHands(state) {
+  if (state.phase !== "finished") {
+    throw new Error("hands are revealed only after the round is finished");
+  }
+  return {
+    joker: state.joker.face,
+    requiredSequences: state.rules.requiredSequences,
+    hands: state.players.map((player, seat) => ({
+      seat, name: player.name, faces: player.hand.map((card) => card.face),
+      faceDown: state.declarations.find((declaration) => declaration.ownerIndex === seat)?.card.face ?? null,
+    })),
+  };
 }
 
 /**
