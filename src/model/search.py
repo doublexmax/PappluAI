@@ -266,9 +266,21 @@ def search(
             and obs.history[-1].face in faces
         ):
             faces = [f for f in faces if f != obs.history[-1].face]
+        rows = 1
+        if (
+            config.exact_wins and config.rollout_depth >= 2
+            and obs.config.cards_in_hand > 3 and len(faces) > 1
+        ):
+            after_states = [
+                replace(_after_discard(obs, face), discard_pile=obs.discard_pile)
+                for face in faces
+            ]
+            v_after = network(collate_observations(after_states, device))[:, 0].tolist()
+            for idx, face in enumerate(faces):
+                values[face] = 0.80 * values[face] + 0.20 * v_after[idx]
+            rows += len(after_states)
         for face in faces:
             values[face] -= config.feed_weight * belief.feed_risk(face, 1)
-        rows = 1
         if config.rollout_depth >= 2 and config.outs_weight > 0:
             candidates = sorted(faces, key=lambda face: (-values[face], face))[:config.rollout_beam]
             hand = list(obs.hand)

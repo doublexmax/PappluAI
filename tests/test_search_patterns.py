@@ -301,6 +301,43 @@ class TestBeliefSearch(unittest.TestCase):
         self.assertEqual(result.reason, "discard_search")
         self.assertEqual(result.rows, 1)
 
+    def test_discard_search_blends_q_values_with_post_discard_draw_values(self):
+        class AfterstateQ(QNetwork):
+            def __init__(self, q_margin):
+                super().__init__()
+                self.q_margin = q_margin
+
+            def forward(self, batch):
+                values = batch.cards.new_ones((len(batch.cards), 54))
+                values[:, discard_action(0)] += self.q_margin
+                values[:, 0] = (
+                    4.0 - 6.0 * batch.cards[:, 42, 0] - 12.0 * batch.cards[:, 42, 1]
+                )
+                values[:, 1] = -values[:, 0]
+                return values
+
+        draw = self.draw_observation()
+        hand = tuple(int(face in range(0, 42, 2)) for face in range(52))
+        draw = replace(
+            draw, hand=hand, config=GameConfig(), stock_remaining=112,
+            players=tuple(replace(player, hand_size=21) for player in draw.players),
+            history=(replace(
+                draw.history[0], hand_size=21, stock_remaining=112, initial_hand=hand,
+            ),),
+        )
+        discard = _after_draw(draw, 42, EventKind.DRAW_STOCK)
+        for q_margin, expected_face in ((0.0, 42), (0.49, 42), (0.51, 0)):
+            with self.subTest(q_margin=q_margin):
+                result = search(
+                    AfterstateQ(q_margin), discard,
+                    SearchConfig(
+                        exact_wins=True, rollout_depth=2, feed_weight=0.0, outs_weight=0.0,
+                    ),
+                )
+                self.assertEqual(result.action, discard_action(expected_face))
+                self.assertEqual(result.reason, "discard_search")
+                self.assertEqual(result.rows, 23)
+
     def test_depth3_rollout_updates_post_discard_hand_size_and_history(self):
         obs = self.draw_observation()
         discard = _after_draw(obs, 30, EventKind.DRAW_STOCK)
