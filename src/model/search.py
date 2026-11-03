@@ -346,6 +346,18 @@ def search(
                 chance * float(best[index + 1].item())
                 for index, (_, chance) in enumerate(probs)
             )
+            if config.exact_wins and config.rollout_depth >= 2 and config.outs_weight > 0:
+                take_scores = (values[0] - penalties).tolist()
+                take_faces = [f for f, ok in enumerate(take_mask) if ok]
+                candidates = sorted(take_faces, key=lambda f: (-take_scores[f], f))[:config.rollout_beam]
+                child_hand = list(children[0].hand)
+                for face in candidates:
+                    child_hand[face] -= 1
+                    take_scores[face] += config.outs_weight * outs_1ply(child_hand, belief, obs.config)
+                    child_hand[face] += 1
+                take_value = max(take_scores[f] for f in take_faces)
+                base_outs = outs_1ply(obs.hand, belief, obs.config)
+                stock_value += config.outs_weight * base_outs
             action = ACTION_TAKE_DISCARD if take_value > stock_value else ACTION_DRAW_STOCK
             return SearchResult(action, "draw_lookahead", len(children), take_value, stock_value)
     return SearchResult(select_greedy_action(network, obs, device=device), "greedy", 1)

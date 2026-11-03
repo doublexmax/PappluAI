@@ -236,6 +236,32 @@ class TestBeliefSearch(unittest.TestCase):
         self.assertEqual(result.take_value, 1.0)
         self.assertAlmostEqual(result.stock_value, 2 / 151)
 
+    def test_draw_lookahead_takes_discard_that_creates_outs(self):
+        class ZeroQ(QNetwork):
+            def forward(self, batch):
+                return batch.cards.new_zeros((len(batch.cards), 54))
+
+        obs = self.draw_observation()
+        hand = tuple(int(face in (0, 30, 40)) for face in range(52))
+        obs = replace(
+            obs, hand=hand, discard_pile=(1,),
+            history=(replace(obs.history[0], initial_hand=hand, offered_top=1),),
+        )
+        belief = BeliefState.from_observation(obs)
+        self.assertEqual(outs_1ply(obs.hand, belief, obs.config), 0.0)
+        child_hand = list(obs.hand)
+        child_hand[obs.discard_top] += 1
+        child_hand[40] -= 1
+        self.assertGreater(outs_1ply(child_hand, belief, obs.config), 0.0)
+
+        result = search(
+            ZeroQ(), obs, SearchConfig(exact_wins=True, feed_weight=0.0),
+        )
+        self.assertEqual(result.action, ACTION_TAKE_DISCARD)
+        self.assertEqual(result.reason, "draw_lookahead")
+        self.assertGreater(result.take_value, result.stock_value)
+        self.assertEqual(result.stock_value, 0.0)
+
     def test_draw_lookahead_matches_pile_and_stock_context(self):
         class PreferShortPile(QNetwork):
             def forward(self, batch):
