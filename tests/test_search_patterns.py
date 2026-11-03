@@ -236,6 +236,30 @@ class TestBeliefSearch(unittest.TestCase):
         self.assertEqual(result.take_value, 1.0)
         self.assertAlmostEqual(result.stock_value, 2 / 151)
 
+    def test_draw_lookahead_matches_pile_and_stock_context(self):
+        class PreferShortPile(QNetwork):
+            def forward(self, batch):
+                return -batch.cards[:, :, 1].sum(dim=1, keepdim=True).expand(-1, 54)
+
+        class PreferMoreStock(QNetwork):
+            def forward(self, batch):
+                return (batch.context[:, 4:5] - 1.0).expand(-1, 54)
+
+        for network, expected in (
+            (PreferShortPile(), -1 / 3),
+            (PreferMoreStock(), 147 / 156 - 1.0),
+        ):
+            with self.subTest(network=type(network).__name__):
+                result = search(
+                    network, self.draw_observation(),
+                    SearchConfig(exact_wins=False, feed_weight=0.0),
+                )
+                self.assertEqual(result.reason, "draw_lookahead")
+                self.assertEqual(result.rows, 53)
+                self.assertAlmostEqual(result.take_value, expected)
+                self.assertAlmostEqual(result.stock_value, expected)
+                self.assertAlmostEqual(result.take_value, result.stock_value)
+
     def test_forced_greedy_and_discard_paths_return_legal_actions(self):
         obs = self.draw_observation()
         forced = replace(obs, stock_remaining=0)

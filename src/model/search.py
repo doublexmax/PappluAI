@@ -325,7 +325,7 @@ def search(
         if probs:
             if device is None:
                 device = next(network.parameters()).device
-            children = [_after_draw(obs, obs.discard_top, EventKind.TAKE_DISCARD)] + [
+            children = [_after_draw(obs, obs.discard_top, EventKind.DRAW_STOCK)] + [
                 _after_draw(obs, face, EventKind.DRAW_STOCK) for face, _ in probs
             ]
             values = network(collate_observations(children, device))[:, 2:]
