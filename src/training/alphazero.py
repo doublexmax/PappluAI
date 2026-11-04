@@ -121,6 +121,7 @@ class AlphaZeroReplay:
 def _validate_losses(
     value_weight: float, policy_weight: float, q_weight: float,
     bootstrap_blend: float, grad_clip: float,
+    bootstrap_blend_end: Optional[float] = None,
 ) -> None:
     for name, value in (
         ("value_weight", value_weight), ("policy_weight", policy_weight),
@@ -133,6 +134,12 @@ def _validate_losses(
         raise ValueError("at least one loss weight must be positive")
     if bootstrap_blend > 1 or grad_clip == 0:
         raise ValueError("bootstrap_blend must be in [0, 1] and grad_clip must be positive")
+    if bootstrap_blend_end is not None and (
+        type(bootstrap_blend_end) not in (int, float)
+        or not math.isfinite(bootstrap_blend_end)
+        or not 0 <= bootstrap_blend_end <= 1
+    ):
+        raise ValueError("bootstrap_blend_end must be in [0, 1]")
 
 
 def train_alphazero_batch(
@@ -199,7 +206,9 @@ class AlphaZeroConfig:
     value_weight: float = 1.0
     policy_weight: float = 1.0
     q_weight: float = 0.5
-    bootstrap_blend: float = 0.5
+    bootstrap_blend: float = 0.65
+    bootstrap_blend_end: Optional[float] = 0.20
+    bootstrap_decay_matches: int = 100
     grad_clip: float = 1.0
     opponent_paths: Tuple[str, ...] = ()
     seed: int = 41
@@ -212,7 +221,7 @@ class AlphaZeroConfig:
         MatchConfig(self.game, players=2)
         for name, minimum in (
             ("batch_size", 1), ("replay_capacity", 1), ("updates_per_match", 0),
-            ("exploration_turns", 0), ("seed", 0),
+            ("exploration_turns", 0), ("bootstrap_decay_matches", 1), ("seed", 0),
         ):
             value = getattr(self, name)
             if type(value) is not int or value < minimum:
@@ -230,7 +239,17 @@ class AlphaZeroConfig:
             raise ValueError("opponent_paths must be a tuple of checkpoint paths")
         _validate_losses(
             self.value_weight, self.policy_weight, self.q_weight,
-            self.bootstrap_blend, self.grad_clip,
+            self.bootstrap_blend, self.grad_clip, self.bootstrap_blend_end,
+        )
+
+    def bootstrap_blend_at(self, match_index: int) -> float:
+        if type(match_index) is not int or match_index < 0:
+            raise ValueError("match_index must be a nonnegative integer")
+        if self.bootstrap_blend_end is None:
+            return float(self.bootstrap_blend)
+        progress = min(1.0, match_index / float(self.bootstrap_decay_matches))
+        return float(
+            self.bootstrap_blend + (self.bootstrap_blend_end - self.bootstrap_blend) * progress
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -303,10 +322,15 @@ class AlphaZeroSession:
         self.last_samples: Tuple[AlphaZeroSample, ...] = ()
         self.last_losses: Tuple[AlphaZeroLoss, ...] = ()
 
+    @property
+    def current_bootstrap_blend(self) -> float:
+        return self.config.bootstrap_blend_at(self.completed_matches)
+
     def train_match(self, seed: Optional[int] = None) -> Dict[str, Any]:
         if seed is not None and type(seed) is not int:
             raise ValueError("match seed must be an integer")
         match_seed = self.rng.getrandbits(63) if seed is None else seed
+        blend = self.current_bootstrap_blend
         policies = [
             _SelfPlayPolicy(self.model, self.config, self.device),
             _SelfPlayPolicy(self.model, self.config, self.device),
@@ -344,7 +368,7 @@ class AlphaZeroSession:
                 self.replay.sample(self.replay_rng, self.config.batch_size),
                 device=self.device, value_weight=self.config.value_weight,
                 policy_weight=self.config.policy_weight, q_weight=self.config.q_weight,
-                bootstrap_blend=self.config.bootstrap_blend, grad_clip=self.config.grad_clip,
+                bootstrap_blend=blend, grad_clip=self.config.grad_clip,
             ))
         self.last_losses = tuple(losses)
         self.total_updates += len(losses)
@@ -359,6 +383,7 @@ class AlphaZeroSession:
             "samples": len(samples),
             "replay": len(self.replay),
             "train_updates": self.total_updates,
+            "bootstrap_blend": blend,
             "loss": asdict(losses[-1]) if losses else None,
         }
 
@@ -448,6 +473,8 @@ def main(args: Any) -> int:
                 exploration_turns=args.exploration_turns,
                 gamma=model.gamma if args.gamma is None else args.gamma,
                 shaping=model.shaping, bootstrap_blend=args.bootstrap_blend,
+                bootstrap_blend_end=args.bootstrap_blend_end,
+                bootstrap_decay_matches=args.bootstrap_decay_matches,
                 grad_clip=args.grad_clip, opponent_paths=tuple(args.opponent), seed=args.seed,
             )
             session = AlphaZeroSession(model, config, device=device)

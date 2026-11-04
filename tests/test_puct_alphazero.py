@@ -473,6 +473,7 @@ class TestAlphaZeroTraining(TorchTest):
         self.assertEqual(summary["matches"], 1)
         self.assertEqual(summary["train_updates"], 2)
         self.assertEqual(summary["samples"], 8)
+        self.assertAlmostEqual(summary["bootstrap_blend"], 0.65)
         self.assertEqual(len(session.replay), 8)
         self.assertTrue(any(
             not torch.equal(before[name], tensor) for name, tensor in model.state_dict().items()
@@ -522,6 +523,26 @@ class TestAlphaZeroTraining(TorchTest):
             self.assertFalse(any(parameter.requires_grad for parameter in opponent.parameters()))
             for name, tensor in opponent.state_dict().items():
                 torch.testing.assert_close(tensor, before[name], rtol=0, atol=0)
+
+    def test_dynamic_bootstrap_blend_schedule(self):
+        game = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=1)
+        config = AlphaZeroConfig(
+            game=game, search=small_search(simulations=0),
+            updates_per_match=0, bootstrap_blend=0.65,
+            bootstrap_blend_end=0.15, bootstrap_decay_matches=2,
+        )
+        session = AlphaZeroSession(PolicyValueNet(QNetwork(ModelSpec(8, 2)), game), config)
+        self.assertAlmostEqual(session.current_bootstrap_blend, 0.65)
+        first = session.train_match(seed=41)
+        self.assertAlmostEqual(first["bootstrap_blend"], 0.65)
+        self.assertAlmostEqual(session.current_bootstrap_blend, 0.40)
+        second = session.train_match(seed=42)
+        self.assertAlmostEqual(second["bootstrap_blend"], 0.40)
+        self.assertAlmostEqual(session.current_bootstrap_blend, 0.15)
+        third = session.train_match(seed=43)
+        self.assertAlmostEqual(third["bootstrap_blend"], 0.15)
+        fixed = AlphaZeroConfig(game=game, bootstrap_blend=0.65, bootstrap_blend_end=None)
+        self.assertAlmostEqual(fixed.bootstrap_blend_at(50), 0.65)
 
 
 class TestAlphaZeroCLI(unittest.TestCase):
