@@ -7,7 +7,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from src.evaluate import is_valid_hand
+from src.evaluate import is_valid_hand, minimum_penalty
 from src.game.environment import (
     ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, NUM_FACES,
     GameConfig, Observation, Phase, discard_action, legal_action_mask,
@@ -163,6 +163,115 @@ def outs_1ply(hand: Sequence[int], belief: BeliefState, config: GameConfig) -> f
     return probability
 
 
+_PEN_CACHE = {}
+_DECOMP_CACHE = {}
+_PROTO_PAIRS = tuple([(r, r + 1) for r in range(12)] + [(12, 0)] + [(r, r + 2) for r in range(11)] + [(11, 0)])
+
+
+def _count_residual_protos(rem, joker):
+    wild_rank = joker % 13
+    r_list = list(rem)
+    for s in range(4):
+        r_list[s * 13 + wild_rank] = 0
+    seq_p = 0
+    for s in range(4):
+        base = s * 13
+        for a, b_idx in _PROTO_PAIRS:
+            while r_list[base + a] > 0 and r_list[base + b_idx] > 0:
+                r_list[base + a] -= 1
+                r_list[base + b_idx] -= 1
+                seq_p += 1
+    set_p = 0
+    for r in range(13):
+        if r == wild_rank:
+            continue
+        suits_present = (r_list[r] > 0) + (r_list[13 + r] > 0) + (r_list[26 + r] > 0) + (r_list[39 + r] > 0)
+        if suits_present >= 2:
+            set_p += 1
+    return seq_p, set_p
+
+
+def _score_from_parts(q_seq, impure_melds, rem_cards, joker, req, max_impure):
+    seq_p, set_p = _count_residual_protos(rem_cards, joker)
+    need_pure = max(0, req - q_seq)
+    need_imp = max(0, max_impure - impure_melds)
+    u_seq = min(need_pure, seq_p)
+    u_imp = min(need_imp, max(0, seq_p - u_seq) + set_p)
+    return float(q_seq) + 0.55 * float(impure_melds) + 0.22 * float(u_seq) + 0.12 * float(u_imp)
+
+
+def _decompose_hand(hand_t, joker, req, cards_in_hand):
+    wild_rank = joker % 13
+    if (hand_t[wild_rank] + hand_t[13 + wild_rank] + hand_t[26 + wild_rank] + hand_t[39 + wild_rank]) > 2:
+        return None
+    key = (hand_t, joker, req, cards_in_hand)
+    cached = _DECOMP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    pen = minimum_penalty(hand_t, joker, req)
+    q_seq = min(req, pen.qualifying_sequences)
+    max_impure = max(0, (cards_in_hand // 3) - req)
+    rem_cards = pen.counted_cards
+    if q_seq >= req:
+        impure_melds = min(max_impure, max(0, len(pen.exempt_melds) - req))
+    elif max_impure > 0 and sum(pen.counted_cards) >= 3:
+        pen0 = minimum_penalty(pen.counted_cards, joker, 0)
+        impure_melds = min(max_impure, len(pen0.exempt_melds))
+        if len(pen0.exempt_melds) <= max_impure:
+            rem_cards = pen0.counted_cards
+    else:
+        impure_melds = 0
+    res = (q_seq, impure_melds, max_impure, rem_cards)
+    if len(_DECOMP_CACHE) > 32768:
+        _DECOMP_CACHE.clear()
+    _DECOMP_CACHE[key] = res
+    return res
+
+
+def _cached_meld_val(hand_t, joker, req, cards_in_hand):
+    key = (hand_t, joker, req)
+    cached = _PEN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    d = _decompose_hand(hand_t, joker, req, cards_in_hand)
+    if d is None:
+        return 0.0
+    q_seq, impure_melds, max_impure, rem_cards = d
+    res = _score_from_parts(q_seq, impure_melds, rem_cards, joker, req, max_impure)
+    if len(_PEN_CACHE) > 32768:
+        _PEN_CACHE.clear()
+    _PEN_CACHE[key] = res
+    return res
+
+
+def _score_22_discards(hand22, faces, q_vals, joker, req, cards_in_hand, top_non_u=4):
+    d22 = _decompose_hand(tuple(hand22), joker, req, cards_in_hand)
+    if d22 is None:
+        return {f: 0.0 for f in faces}
+    q_seq, impure_melds, max_impure, u22 = d22
+    out = {}
+    non_u = []
+    rem_l = list(u22)
+    for f in faces:
+        if u22[f] > 0:
+            rem_l[f] -= 1
+            out[f] = _score_from_parts(q_seq, impure_melds, rem_l, joker, req, max_impure)
+            rem_l[f] += 1
+        else:
+            non_u.append(f)
+    non_u_top = sorted(non_u, key=lambda f: (-q_vals[f], f))[:top_non_u]
+    h_l = list(hand22)
+    min_u_val = min(out.values()) if out else 0.0
+    for f in non_u:
+        if f in non_u_top:
+            h_l[f] -= 1
+            out[f] = _cached_meld_val(tuple(h_l), joker, req, cards_in_hand)
+            h_l[f] += 1
+        else:
+            out[f] = max(0.0, min_u_val - 0.55)
+    return out
+
+
 @dataclass(frozen=True)
 class SearchConfig:
     exact_wins: bool = True
@@ -246,6 +355,8 @@ def search(
         raise ValueError("no legal actions")
     if len(legal) == 1:
         return SearchResult(legal[0], "forced", 0)
+    req = obs.config.required_sequences
+    cards = obs.config.cards_in_hand
     if obs.phase is Phase.DISCARD:
         if config.exact_wins:
             face = winning_discard(
@@ -266,10 +377,28 @@ def search(
             and obs.history[-1].face in faces
         ):
             faces = [f for f in faces if f != obs.history[-1].face]
+        rows = 1
+        if (
+            config.exact_wins and config.rollout_depth >= 2
+            and obs.config.cards_in_hand > 3 and len(faces) > 1
+        ):
+            after_states = [
+                replace(_after_discard(obs, face), discard_pile=obs.discard_pile)
+                for face in faces
+            ]
+            v_after = network(collate_observations(after_states, device))[:, 0].tolist()
+            for idx, face in enumerate(faces):
+                values[face] = 0.80 * values[face] + 0.20 * v_after[idx]
+            rows += len(after_states)
         for face in faces:
             values[face] -= config.feed_weight * belief.feed_risk(face, 1)
-        rows = 1
         if config.rollout_depth >= 2 and config.outs_weight > 0:
+            if config.exact_wins and cards > 3:
+                mv_map = _score_22_discards(
+                    obs.hand, faces, values, obs.joker, req, cards, top_non_u=4,
+                )
+                for face in faces:
+                    values[face] += 0.06 * mv_map[face]
             candidates = sorted(faces, key=lambda face: (-values[face], face))[:config.rollout_beam]
             hand = list(obs.hand)
             for face in candidates:
@@ -325,7 +454,7 @@ def search(
         if probs:
             if device is None:
                 device = next(network.parameters()).device
-            children = [_after_draw(obs, obs.discard_top, EventKind.TAKE_DISCARD)] + [
+            children = [_after_draw(obs, obs.discard_top, EventKind.DRAW_STOCK)] + [
                 _after_draw(obs, face, EventKind.DRAW_STOCK) for face, _ in probs
             ]
             values = network(collate_observations(children, device))[:, 2:]
@@ -340,14 +469,79 @@ def search(
                 [take_mask, *(legal_action_mask(child)[2:] for child in children[1:])],
                 dtype=torch.bool, device=device,
             )
-            best = (values - penalties).masked_fill(~allowed, -torch.inf).max(dim=1).values
-            take_value = float(best[0].item())
+            best_vals, best_faces = (values - penalties).masked_fill(~allowed, -torch.inf).max(dim=1)
+            rows = len(children)
+            take_value = float(best_vals[0].item())
             stock_value = sum(
-                chance * float(best[index + 1].item())
+                chance * float(best_vals[index + 1].item())
                 for index, (_, chance) in enumerate(probs)
             )
+            if (
+                config.exact_wins and config.rollout_depth >= 2
+                and (cards > 3 or config.outs_weight > 0)
+            ):
+                take_scores = (values[0] - penalties).tolist()
+                take_faces = [f for f, ok in enumerate(take_mask) if ok]
+                if cards > 3 and config.outs_weight > 0:
+                    base_mv = _cached_meld_val(obs.hand, obs.joker, req, cards)
+                    mv_take = _score_22_discards(
+                        children[0].hand, take_faces, take_scores,
+                        obs.joker, req, cards, top_non_u=4,
+                    )
+                    for face in take_faces:
+                        take_scores[face] += 0.06 * (mv_take[face] - base_mv)
+                candidates = sorted(take_faces, key=lambda f: (-take_scores[f], f))[:config.rollout_beam]
+                if cards > 3:
+                    unique_obs = []
+                    hand_to_idx = {}
+                    for face in candidates:
+                        after = replace(
+                            _after_discard(children[0], face), discard_pile=obs.discard_pile,
+                        )
+                        if after.hand not in hand_to_idx:
+                            hand_to_idx[after.hand] = len(unique_obs)
+                            unique_obs.append(after)
+                    stock_hands = []
+                    for idx_s, face in enumerate(best_faces[1:].tolist()):
+                        after = replace(
+                            _after_discard(children[idx_s + 1], face),
+                            discard_pile=obs.discard_pile,
+                        )
+                        stock_hands.append(after.hand)
+                        if after.hand not in hand_to_idx:
+                            hand_to_idx[after.hand] = len(unique_obs)
+                            unique_obs.append(after)
+                    v_after_all = network(collate_observations(unique_obs, device))[:, 0].tolist()
+                    rows += len(unique_obs)
+                    for face in candidates:
+                        post_hand = list(children[0].hand)
+                        post_hand[face] -= 1
+                        raw_q = float((values[0, face] - penalties[face]).item())
+                        mv_bonus = take_scores[face] - raw_q
+                        take_scores[face] = (
+                            0.85 * raw_q
+                            + 0.15 * v_after_all[hand_to_idx[tuple(post_hand)]]
+                            + mv_bonus
+                        )
+                    stock_value = sum(
+                        chance * (
+                            0.85 * float(best_vals[idx_s + 1].item())
+                            + 0.15 * v_after_all[hand_to_idx[stock_hands[idx_s]]]
+                        )
+                        for idx_s, (_, chance) in enumerate(probs)
+                    )
+                if config.outs_weight > 0:
+                    child_hand = list(children[0].hand)
+                    for face in candidates:
+                        child_hand[face] -= 1
+                        take_scores[face] += config.outs_weight * outs_1ply(child_hand, belief, obs.config)
+                        child_hand[face] += 1
+                    stock_value += config.outs_weight * outs_1ply(obs.hand, belief, obs.config)
+                take_value = max(
+                    take_scores[f] for f in (candidates if cards > 3 else take_faces)
+                )
             action = ACTION_TAKE_DISCARD if take_value > stock_value else ACTION_DRAW_STOCK
-            return SearchResult(action, "draw_lookahead", len(children), take_value, stock_value)
+            return SearchResult(action, "draw_lookahead", rows, take_value, stock_value)
     return SearchResult(select_greedy_action(network, obs, device=device), "greedy", 1)
 
 

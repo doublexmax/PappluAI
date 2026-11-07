@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
+from src.checkpoints.io import file_sha256
 from src.checkpoints.tensor import validate_model_state
 from src.game.environment import (
     ENCODING_VERSION, NUM_ACTIONS, NUM_FACES, GameConfig, Observation, legal_action_mask,
@@ -347,3 +348,41 @@ def load_checkpoint(
     network.to(device)
     network.eval()
     return network, config, meta
+
+
+def average_checkpoints(
+    sources: Sequence[Tuple[str, float]],
+    output_path: str,
+    *,
+    preserve_head_keys: Sequence[str] = (
+        "draw_head.2.weight", "draw_head.2.bias", "score.2.weight", "score.2.bias",
+    ),
+    meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[QNetwork, GameConfig, str]:
+    if not sources:
+        raise ValueError("sources must not be empty")
+    if any(
+        type(weight) not in (int, float) or not math.isfinite(weight) or weight <= 0
+        for _, weight in sources
+    ):
+        raise ValueError("source weights must be positive and finite")
+    if not math.isclose(sum(weight for _, weight in sources), 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError("source weights must sum to 1.0")
+    base_net, base_config, _ = load_checkpoint(sources[0][0])
+    states = [(base_net.state_dict(), sources[0][1])]
+    for path, weight in sources[1:]:
+        network, _, _ = load_checkpoint(path, expected_config=base_config)
+        if network.spec != base_net.spec:
+            raise ValueError("source checkpoint model_spec must match")
+        states.append((network.state_dict(), weight))
+    averaged = {
+        name: tensor.clone() if name in preserve_head_keys else sum(
+            state[name].to(torch.float32) * weight for state, weight in states
+        ).to(tensor.dtype)
+        for name, tensor in states[0][0].items()
+    }
+    target_net = QNetwork(base_net.spec)
+    target_net.load_state_dict(averaged)
+    target_net.eval()
+    save_checkpoint(output_path, target_net, base_config, meta)
+    return target_net, base_config, file_sha256(Path(output_path))

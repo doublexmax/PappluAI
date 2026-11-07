@@ -1,5 +1,6 @@
 import copy
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 import random
 import tempfile
@@ -19,8 +20,8 @@ if torch is not None:
     from src.evaluation.arena import CheckpointPolicy
     from src.model.encoding import collate_observations
     from src.model.network import (
-        QNetwork, build_checkpoint, expand_network_width, load_checkpoint, masked_q_values,
-        save_checkpoint, select_action, select_greedy_action,
+        QNetwork, average_checkpoints, build_checkpoint, expand_network_width,
+        load_checkpoint, masked_q_values, save_checkpoint, select_action, select_greedy_action,
     )
     from src.model.spec import ModelSpec
     from src.training.optimization import train_batch
@@ -357,6 +358,80 @@ class TestDynamicNetwork(unittest.TestCase):
             self.assertEqual(payload["encoding_version"], 2)
             self.assertEqual(payload["model_spec"], {"width": 32, "heads": 2})
             self.assertNotIn("state_dim", payload)
+
+    def test_checkpoint_averaging_preserves_requested_heads_and_roundtrips(self):
+        first = QNetwork(ModelSpec(16, 2))
+        second = QNetwork(ModelSpec(16, 2))
+        with torch.no_grad():
+            for parameter in first.parameters():
+                parameter.fill_(2.0)
+            for parameter in second.parameters():
+                parameter.fill_(6.0)
+        default_heads = (
+            "draw_head.2.weight", "draw_head.2.bias", "score.2.weight", "score.2.bias",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = [Path(temporary) / name for name in ("first.pt", "second.pt")]
+            for path, network in zip(paths, (first, second)):
+                save_checkpoint(str(path), network, GameConfig())
+            source_bytes = [path.read_bytes() for path in paths]
+            for index, preserved in enumerate((None, ("score.2.bias",), ())):
+                with self.subTest(preserved=preserved):
+                    output = Path(temporary) / ("average-%d.pt" % index)
+                    kwargs = {} if preserved is None else {"preserve_head_keys": preserved}
+                    averaged, config, digest = average_checkpoints(
+                        [(str(paths[0]), 0.75), (str(paths[1]), 0.25)],
+                        str(output), meta={"note": "soup"}, **kwargs,
+                    )
+                    loaded, loaded_config, meta = load_checkpoint(str(output))
+                    self.assertEqual(config, GameConfig())
+                    self.assertEqual(loaded_config, config)
+                    self.assertEqual(loaded.spec, ModelSpec(16, 2))
+                    self.assertEqual(meta, {"note": "soup"})
+                    self.assertEqual(digest, hashlib.sha256(output.read_bytes()).hexdigest())
+                    head_keys = default_heads if preserved is None else preserved
+                    for name, tensor in averaged.state_dict().items():
+                        expected = torch.full_like(tensor, 2.0 if name in head_keys else 3.0)
+                        self.assertEqual(tensor.dtype, first.state_dict()[name].dtype)
+                        torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            loaded.state_dict()[name], expected, rtol=0, atol=0,
+                        )
+            self.assertEqual([path.read_bytes() for path in paths], source_bytes)
+
+    def test_checkpoint_averaging_rejects_invalid_weights_before_loading(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = str(Path(temporary) / "missing.pt")
+            output = Path(temporary) / "average.pt"
+            cases = (
+                (), ((missing, 0.0),), ((missing, -1.0),),
+                ((missing, float("nan")),), ((missing, float("inf")),),
+                ((missing, True),), ((missing, "1.0"),),
+                ((missing, 0.999998),), ((missing, 1.000002),),
+                ((missing, 0.4), (missing, 0.5)),
+            )
+            for sources in cases:
+                with self.subTest(sources=sources), self.assertRaises(ValueError):
+                    average_checkpoints(sources, str(output))
+            self.assertFalse(output.exists())
+
+    def test_checkpoint_averaging_rejects_mismatched_specs_and_game_configs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(temporary) / "first.pt"
+            second = Path(temporary) / "second.pt"
+            output = Path(temporary) / "average.pt"
+            save_checkpoint(str(first), self.network, GameConfig())
+            cases = (
+                (QNetwork(ModelSpec(32, 2)), GameConfig(), "model_spec"),
+                (QNetwork(), GameConfig(max_turns=1), "game_config"),
+            )
+            for network, config, error in cases:
+                save_checkpoint(str(second), network, config)
+                with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                    average_checkpoints(
+                        [(str(first), 0.70), (str(second), 0.30)], str(output),
+                    )
+            self.assertFalse(output.exists())
 
     def test_bad_or_old_checkpoints_do_not_mutate_supplied_network(self):
         baseline = copy.deepcopy(self.network.state_dict())
