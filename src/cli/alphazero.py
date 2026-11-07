@@ -37,7 +37,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--gamma", type=float)
     parser.add_argument("--bootstrap-blend", type=float, default=0.65)
-    parser.add_argument("--bootstrap-blend-end", type=float, default=0.20)
+    parser.add_argument("--bootstrap-blend-end", type=float, default=0.15)
     parser.add_argument("--bootstrap-decay-matches", type=int, default=100)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     return parser.parse_args(list(argv) if argv is not None else None)

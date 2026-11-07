@@ -207,7 +207,7 @@ class AlphaZeroConfig:
     policy_weight: float = 1.0
     q_weight: float = 0.5
     bootstrap_blend: float = 0.65
-    bootstrap_blend_end: Optional[float] = 0.20
+    bootstrap_blend_end: Optional[float] = 0.15
     bootstrap_decay_matches: int = 100
     grad_clip: float = 1.0
     opponent_paths: Tuple[str, ...] = ()
