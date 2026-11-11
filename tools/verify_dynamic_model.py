@@ -213,6 +213,7 @@ def verify(output: Path) -> dict:
             "--updates-per-match", 1, "--max-seconds", 120, "--checkpoint-every", 1, "--seed", 62)
         state_path = league / "latest-state.pt"
         first = torch.load(state_path, weights_only=True)
+        assert first["last_exported_sha256"] == file_sha256(league / "latest-model.pt")
         league_summary = json.loads(evidence["commands"][-1]["stdout"].splitlines()[-1])
         assert league_summary["count_matches"] == {str(players): 2 for players in player_counts}
         control = LeagueSession(
@@ -224,14 +225,18 @@ def verify(output: Path) -> dict:
         )
         for _ in range(6):
             control.train_match()
+        control.export_model(output / "control-league" / "latest-model.pt")
         assert digest(control.state_dict()) == digest(first)
         resumed = LeagueSession.load(str(state_path), str(paths[0]))
         assert control.train_match() == resumed.train_match()
+        control.export_model(output / "control-league" / "latest-model.pt")
+        resumed.export_model(output / "resumed-league" / "latest-model.pt")
         assert digest(control.state_dict()) == digest(resumed.state_dict())
         exact_digest = digest(resumed.state_dict())
         cli("league", "--initial-model", paths[0], "--output-dir", league,
             "--resume", state_path, "--matches", 1, "--max-seconds", 120, "--checkpoint-every", 1)
         final = torch.load(state_path, weights_only=True)
+        assert final["last_exported_sha256"] == file_sha256(league / "latest-model.pt")
         assert digest(final) == exact_digest
         counts = Counter(
             episode["player_count"]
@@ -249,7 +254,7 @@ def verify(output: Path) -> dict:
         improve = output / "improve"
         cli("improve", "--initial-model", paths[0], "--output-dir", improve,
             "--max-seconds", 120, "--max-cycles", 1, "--max-turns", 1,
-            "--league-matches", 1, "--research-episodes", 1,
+            "--league-matches", 1,
             "--selection-blocks", 1, "--confirmation-blocks", 1, "--solo-games", 1,
             "--checkpoint-every", 1)
         cli("improve", "--resume", improve / "latest-state.pt", "--output-dir", improve,
@@ -258,6 +263,19 @@ def verify(output: Path) -> dict:
         improvement_status = json.loads((improve / "status.json").read_text())
         assert improvement_status["completed_cycles"] == 1
         assert improvement_status["last_gate"]["accepted"] is False
+        assert improvement_status["league_matches"] == 1
+        assert improvement_status["updates"] == 4
+        assert "research_episodes" not in improvement_status
+        improvement_state = torch.load(improve / "latest-state.pt", weights_only=True)
+        assert improvement_state["improvement_state_version"] == 3
+        assert improvement_state["cursors"] == {"league": 0}
+        assert "research_state" not in improvement_state
+        improvement_metrics = [
+            json.loads(line) for line in (improve / "metrics.jsonl").read_text().splitlines()
+        ]
+        assert [event["event"] for event in improvement_metrics] == ["league_match", "gate"]
+        assert improvement_metrics[-1]["phase"] == "selection"
+        assert improvement_metrics[-1]["candidate_origin"] == "league"
         evidence["improvement"] = {
             "cycles": improvement_status["completed_cycles"],
             "promotions": improvement_status["promotions"],

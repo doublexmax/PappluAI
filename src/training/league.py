@@ -158,6 +158,7 @@ class LeagueSession:
         self.config = LeagueConfig() if config is None else config
         self.initial_seed = seed
         self.parent_sha256 = file_sha256(Path(initial_model))
+        self.last_exported_sha256: Optional[str] = None
         network, saved_game, _ = load_checkpoint(
             initial_model, device=torch.device("cpu")
         )
@@ -330,6 +331,7 @@ class LeagueSession:
             "model_spec": self.network.spec.to_dict(),
             "initial_seed": self.initial_seed,
             "parent_sha256": self.parent_sha256,
+            "last_exported_sha256": self.last_exported_sha256,
             "opponent_hashes": self.opponent_hashes,
             "opponent_pool_generation": self.opponent_pool_generation,
             "replay_preserved_across_pool_refresh": True,
@@ -363,6 +365,7 @@ class LeagueSession:
             "model_spec",
             "initial_seed",
             "parent_sha256",
+            "last_exported_sha256",
             "opponent_hashes",
             "opponent_pool_generation",
             "replay_preserved_across_pool_refresh",
@@ -388,6 +391,13 @@ class LeagueSession:
             raise ValueError("league checkpoint seed changed")
         if payload["parent_sha256"] != self.parent_sha256:
             raise ValueError("league checkpoint parent changed")
+        last_exported_sha256 = payload["last_exported_sha256"]
+        if last_exported_sha256 is not None and (
+            not isinstance(last_exported_sha256, str)
+            or len(last_exported_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in last_exported_sha256)
+        ):
+            raise ValueError("league checkpoint export checksum is invalid")
         if payload["opponent_hashes"] != self.opponent_hashes:
             raise ValueError("league checkpoint opponent pool changed")
         pool_generation = require_checkpoint_int(
@@ -483,6 +493,7 @@ class LeagueSession:
         self.opponent_rng.setstate(candidate_rngs["opponent"].getstate())
         self.replay_rng.setstate(candidate_rngs["replay"].getstate())
         self.torch_rng_state = torch_state.clone()
+        self.last_exported_sha256 = last_exported_sha256
         self.opponent_pool_generation = pool_generation
         for name, value in validated_counters.items():
             setattr(self, name, value)
@@ -528,6 +539,33 @@ class LeagueSession:
             },
         )
         atomic_torch_save(payload, path)
+        self.last_exported_sha256 = file_sha256(Path(path))
+
+    def follow_champion(
+        self, champion_path: str, *, force_rebase: bool = False,
+    ) -> bool:
+        if not self.at_match_boundary:
+            raise RuntimeError("cannot follow a champion during a match")
+        champ_sha = file_sha256(Path(champion_path))
+        if not force_rebase and champ_sha in (
+            self.parent_sha256, self.last_exported_sha256,
+        ):
+            self.parent_sha256 = champ_sha
+            self._parent_path = str(champion_path)
+            return False
+        with torch.random.fork_rng(devices=[]):
+            network, saved_game, _ = load_checkpoint(
+                champion_path, device=torch.device("cpu"),
+            )
+        _require_compatible_game(saved_game, self.config.game, "champion")
+        self.network = network
+        self.network.train()
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(), lr=self.config.learning_rate,
+        )
+        self.parent_sha256 = champ_sha
+        self._parent_path = str(champion_path)
+        return True
 
     def refresh_opponent_pool(self, opponent_paths: Sequence[str]) -> None:
         if not self.at_match_boundary:
@@ -550,8 +588,8 @@ class LeagueSession:
 
 def save_session_checkpoint(session: LeagueSession, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    atomic_torch_save(session.state_dict(), output_dir / "latest-state.pt")
     session.export_model(output_dir / "latest-model.pt")
+    atomic_torch_save(session.state_dict(), output_dir / "latest-state.pt")
 
 
 def _require_compatible_game(

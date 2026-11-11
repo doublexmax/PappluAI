@@ -31,13 +31,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=128,
     )
-    parser.add_argument(
-        "--research-episodes",
-        "--research-episodes-per-cycle",
-        dest="research_episodes_per_cycle",
-        type=int,
-        default=128,
-    )
+    parser.add_argument("--rebase-after-rejections", type=int, default=8)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--selection-blocks", type=int, default=32)
     parser.add_argument("--confirmation-blocks", type=int, default=128)
@@ -93,7 +87,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 config=runtime.ImproveConfig(
                     max_cycles=args.max_cycles,
                     league_matches_per_cycle=args.league_matches_per_cycle,
-                    research_episodes_per_cycle=args.research_episodes_per_cycle,
+                    rebase_after_rejections=args.rebase_after_rejections,
                     seed=args.seed,
                     selection_blocks=args.selection_blocks,
                     confirmation_blocks=args.confirmation_blocks,
@@ -115,8 +109,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "cycle": controller.cycle_index,
                     "champion_id": controller.registry.champion().id,
                     "league_matches": controller.league.completed_matches,
-                    "research_episodes": controller.research.total_episodes,
                     "promotions": controller.promotions,
+                    "consecutive_rejections": controller.consecutive_rejections,
                 },
                 sort_keys=True,
             ),
@@ -144,8 +138,7 @@ def _validate_resume_options(
     learning_options = {
         "--league-matches": "league_matches_per_cycle",
         "--league-matches-per-cycle": "league_matches_per_cycle",
-        "--research-episodes": "research_episodes_per_cycle",
-        "--research-episodes-per-cycle": "research_episodes_per_cycle",
+        "--rebase-after-rejections": "rebase_after_rejections",
         "--selection-blocks": "selection_blocks",
         "--confirmation-blocks": "confirmation_blocks",
         "--solo-games": "solo_games",
