@@ -75,7 +75,7 @@ class Sample:
 
 
 class TrajectoryReplay:
-    STATE_VERSION = 3
+    STATE_VERSION = 4
 
     def __init__(self, capacity: int) -> None:
         if type(capacity) is not int or capacity < 1:
@@ -186,6 +186,8 @@ class TrajectoryReplay:
         }:
             raise ValueError("replay state fields do not match the journal schema")
         if type(state["version"]) is not int or state["version"] != self.STATE_VERSION:
+            if type(state["version"]) is int and state["version"] == 3:
+                raise ValueError("replay v3 stores pre-v4.1 utilities; warm-start with --initial-model")
             raise ValueError("unsupported replay state version %r" % state["version"])
         if type(state["capacity"]) is not int or state["capacity"] != self.capacity:
             raise ValueError("replay capacity does not match")

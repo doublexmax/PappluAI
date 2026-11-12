@@ -329,6 +329,13 @@ class TestReplayJournals(unittest.TestCase):
             replay.load_state_dict(bad)
         self.assertEqual(replay.state_dict(), before)
 
+    def test_pre_shaping_journals_require_a_model_warm_start(self):
+        replay = self.replay(players=2)
+        before = replay.state_dict()
+        with self.assertRaisesRegex(ValueError, r"v3.*--initial-model"):
+            replay.load_state_dict({**before, "version": 3})
+        self.assertEqual(replay.state_dict(), before)
+
     def test_corrupt_own_history_and_chronology_are_rejected(self):
         replay = self.replay(players=2)
         before = replay.state_dict()

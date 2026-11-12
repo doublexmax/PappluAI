@@ -15,8 +15,7 @@ from src.game.environment import (
     Observation,
     PappluEnv,
 )
-from src.game.multiplayer import TerminalSnapshot
-from src.game.outcome import DealOutcome
+from src.game.outcome import solo_outcome
 from src.model.encoding import encode
 from src.model.network import (
     CHECKPOINT_VERSION,
@@ -165,11 +164,7 @@ def train(
             warm_start=use_warm,
             device=torch_device,
         )
-        outcome = DealOutcome.score(
-            TerminalSnapshot((tuple(final_obs.hand),), final_obs.joker),
-            0 if final_obs.won else None, "win" if final_obs.won else "turns_exhausted",
-            cfg.required_sequences,
-        ).seat(0)
+        outcome = solo_outcome(final_obs.hand, final_obs.joker, bool(final_obs.won), cfg.required_sequences)
         episode_reward = outcome.utility
         reward_sum += episode_reward
         return_sum += gamma ** (len(steps) - 1) * outcome.utility

@@ -8,6 +8,9 @@ from src.game.multiplayer import TerminalSnapshot
 
 
 CAP_POLICIES = ("undecided", "points", "weighted-points", "tie", "exclude")
+DECLARATION_UTILITY = 1.0
+DEADWOOD_WEIGHT = 0.5
+SOLO_HALF_CREDIT_POINTS = 40
 
 
 def placements(points: Sequence[int], winner: Optional[int], ending: str, cap_policy: str) -> Optional[tuple[int, ...]]:
@@ -71,8 +74,24 @@ class DealOutcome:
 
     def seat(self, seat: int) -> SeatOutcome:
         count = len(self.penalties)
+        points = self.penalties[seat].points
         utility = (
-            sum(self.margin(seat, other) for other in range(count) if other != seat) / (count - 1)
-            if count > 1 else 1.0 if self.winner == 0 else -1.0
+            sum(
+                (DECLARATION_UTILITY if self.winner in (seat, other) else DEADWOOD_WEIGHT)
+                * self.margin(seat, other)
+                for other in range(count) if other != seat
+            ) / (count - 1)
+            if count > 1 else DECLARATION_UTILITY if self.winner == 0
+            else -1.0 + DEADWOOD_WEIGHT * SOLO_HALF_CREDIT_POINTS / (SOLO_HALF_CREDIT_POINTS + points)
         )
-        return SeatOutcome(utility, self.winner == seat, self.penalties[seat].points)
+        return SeatOutcome(utility, self.winner == seat, points)
+
+
+def solo_outcome(
+    hand: Sequence[int], joker: int, declared: bool, required_sequences: int,
+) -> SeatOutcome:
+    return DealOutcome.score(
+        TerminalSnapshot((tuple(hand),), joker),
+        0 if declared else None, "win" if declared else "turns_exhausted",
+        required_sequences,
+    ).seat(0)

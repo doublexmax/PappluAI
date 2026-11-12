@@ -15,6 +15,7 @@ from src.game.environment import GameConfig, PappluEnv, Phase, discard_action
 from src.model.network import QNetwork, collate_observations, load_checkpoint
 from src.model.search import TeacherConfig
 from src.model.spec import ModelSpec
+from src.training.core import TrajectoryReplay
 from src.training.optimization import Learner
 from src.training.solo import evaluate_policy, run_episode, train
 
@@ -73,7 +74,7 @@ class TestTrainLearning(unittest.TestCase):
         torch.set_num_threads(1)
         self.game = GameConfig(num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3)
 
-    def test_solo_losses_are_minus_one_without_replacing_the_exact_penalty(self):
+    def test_solo_losses_use_deadwood_credit_without_replacing_the_exact_penalty(self):
         learners = []
 
         def capture_learner(*args, **kwargs):
@@ -87,9 +88,17 @@ class TestTrainLearning(unittest.TestCase):
                 config=GameConfig(cards_in_hand=3, required_sequences=1, max_turns=1),
                 model_spec=ModelSpec(8, 1, 1), teacher=TeacherConfig(fraction=0),
             )
-        self.assertEqual(summary["reward_avg"], -1.0)
-        self.assertEqual(summary["return_avg"], -1.0)
-        self.assertEqual(learners[0].replay.state_dict()["trajectories"][0]["outcome"], (-1.0, False, 24))
+        self.assertEqual(summary["reward_avg"], -0.6875)
+        self.assertEqual(summary["return_avg"], -0.6875)
+        self.assertEqual(summary["win_rate"], 0.0)
+        self.assertEqual(learners[0].replay.state_dict()["trajectories"][0]["outcome"], (-0.6875, False, 24))
+
+    def test_old_replay_requires_a_model_warm_start_without_mutating_live_state(self):
+        replay = TrajectoryReplay(8)
+        state = replay.state_dict()
+        with self.assertRaisesRegex(ValueError, r"v3.*--initial-model"):
+            replay.load_state_dict({**state, "version": 3})
+        self.assertEqual(replay.state_dict(), state)
 
     def test_collection_rngs_are_independent_of_replay_and_update_budget(self):
         captured, sources = [], []

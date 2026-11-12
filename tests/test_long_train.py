@@ -176,7 +176,7 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
 
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestTrainingSession(unittest.TestCase):
-    def test_curriculum_losses_are_minus_one_with_the_exact_penalty_in_replay(self):
+    def test_curriculum_losses_record_deadwood_utility_and_exact_penalty(self):
         session = TrainingSession(
             self.small_config(curriculum_fraction=1, teacher=TeacherConfig(fraction=0)),
             19, model_spec=ModelSpec(8, 1, 1),
@@ -184,7 +184,8 @@ class TestTrainingSession(unittest.TestCase):
         result = session.run_episode()
         self.assertEqual(result["source"], "curriculum_distance_1")
         self.assertFalse(result["won"])
-        self.assertEqual(session.replay.state_dict()["trajectories"][0]["outcome"], (-1.0, False, 24))
+        self.assertEqual((result["utility"], result["penalty"]), (-0.6875, 24))
+        self.assertEqual(session.replay.state_dict()["trajectories"][0]["outcome"], (-0.6875, False, 24))
 
     @staticmethod
     def small_config(**overrides):
@@ -565,6 +566,7 @@ class TestTrainingSession(unittest.TestCase):
         session.best_score = 0.5
         session.stage_episodes = session.config.minimum_stage_episodes
         full = validation(0.4, 0.0)
+        full["greedy"]["utility_avg"] = 1.0
         curriculum = validation(1.0, 0.0)
         before = {
             name: value.clone()

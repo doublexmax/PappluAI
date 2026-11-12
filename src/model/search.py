@@ -10,7 +10,8 @@ from torch import Tensor
 
 from src.game.belief import BeliefState
 from src.game.environment import NUM_ACTIONS, Observation, Phase
-from src.game.lookahead import Continues, Declares, expand, winning_discard
+from src.game.lookahead import Continues, expand, winning_discard
+from src.game.outcome import DECLARATION_UTILITY
 from src.model.network import QNetwork, collate_observations
 
 
@@ -51,7 +52,7 @@ def state_values(target: QNetwork, observations: Sequence[Observation], device: 
         elif winning_discard(
             obs.hand, obs.joker, obs.config.required_sequences, obs.config.cards_in_hand,
         ) is not None:
-            values[row] = 1.0
+            values[row] = DECLARATION_UTILITY
         else:
             decisions.append(row)
     if decisions:
@@ -96,8 +97,7 @@ def teacher_targets(
                     terms.append((branch.probability, len(children), 0.0))
                     children.append(branch.observation)
                 else:
-                    value = 1.0 if isinstance(branch, Declares) else branch.value
-                    terms.append((branch.probability, None, value))
+                    terms.append((branch.probability, None, branch.value))
             actions[action] = terms
         if actions:
             rows.append(row)

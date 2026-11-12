@@ -18,6 +18,7 @@ from src.game.lookahead import (
     winning_discard,
 )
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.outcome import solo_outcome
 from src.model.encoding import CONTEXT_CHANNELS, LAYOUT, encode, feature_values
 
 try:
@@ -27,6 +28,7 @@ except ImportError:
 
 if torch is not None:
     from src.model.search import TeacherConfig, state_values, teacher_targets
+    from src.training.core import Decision, Trajectory, TrajectoryReplay
 
 
 def draw_observation():
@@ -207,7 +209,7 @@ class TestBeliefLookahead(unittest.TestCase):
         self.assertEqual(expand(other), {})
         self.assertEqual(expand(discard)[discard_action(30)], (Declares(1.0),))
 
-    def test_terminal_solo_discards_have_literal_losses_and_multiplayer_exhaustion_is_skipped(self):
+    def test_terminal_solo_discards_score_deadwood_and_multiplayer_exhaustion_is_skipped(self):
         discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)
         solo = replace(discard, players=(replace(discard.players[0], next_player=0, previous_player=0),))
         for obs in (
@@ -216,9 +218,9 @@ class TestBeliefLookahead(unittest.TestCase):
         ):
             branches = expand(obs)
             self.assertEqual(branches, {
-                discard_action(0): (Terminates(1.0, -1.0),),
-                discard_action(1): (Terminates(1.0, -1.0),),
-                discard_action(2): (Terminates(1.0, -1.0),),
+                discard_action(0): (Terminates(1.0, -0.6),),
+                discard_action(1): (Terminates(1.0, -0.6551724137931034),),
+                discard_action(2): (Terminates(1.0, -0.6491228070175439),),
                 discard_action(30): (Declares(1.0),),
             })
         exhausted = replace(
@@ -296,7 +298,21 @@ class TestBudgetedTeacher(unittest.TestCase):
                 random.Random(1), 0.5, self.device,
             )
         self.assertEqual(result.mask[0].nonzero().flatten().tolist(), [2, 3, 4, 32])
-        self.assertEqual(result.values[0, [2, 3, 4, 32]].tolist(), [-1.0, -1.0, -1.0, 1.0])
+        for action, expected, penalty in (
+            (2, -0.6, 10), (3, -0.6551724137931034, 18),
+            (4, -0.6491228070175439, 17), (32, 1.0, 0),
+        ):
+            remaining = list(solo.hand)
+            remaining[action - 2] -= 1
+            outcome = solo_outcome(remaining, solo.joker, action == 32, solo.config.required_sequences)
+            replay = TrajectoryReplay(8)
+            replay.append(Trajectory(1, (Decision(
+                solo, encode(solo), action, (solo.hand,) + ((0,) * 52,) * 5,
+            ),), outcome))
+            sample = replay.sample(random.Random(1), 1)[0]
+            self.assertEqual((sample.outcome.utility, sample.outcome.penalty), (expected, penalty))
+            self.assertAlmostEqual(result.values[0, action].item(), expected, places=6)
+            self.assertAlmostEqual(result.values[0, action].item(), sample.outcome.utility, places=6)
 
     def test_discard_declarations_are_exact_and_afterstates_are_not_discounted(self):
         discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)

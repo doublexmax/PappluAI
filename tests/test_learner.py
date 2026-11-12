@@ -12,7 +12,7 @@ from src.evaluation.arena import (
 )
 from src.game.environment import GameConfig, PappluEnv, discard_action
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.game.outcome import SeatOutcome
+from src.game.outcome import SeatOutcome, solo_outcome
 from src.model.encoding import encode, legal_actions
 from src.model.network import NetworkOutputs, QNetwork
 from src.model.search import TeacherConfig
@@ -89,13 +89,17 @@ class TestTrajectoryReplay(unittest.TestCase):
     def test_n_step_bootstrap_and_terminal_discount_have_literal_scales(self):
         records = tuple(decision(seed) for seed in range(7))
         replay = TrajectoryReplay(10)
-        replay.append(Trajectory(1, records, SeatOutcome(-1.0, False, 100)))
+        replay.append(Trajectory(1, records, SeatOutcome(-0.75, False, 40)))
         rng = mock.Mock()
         rng.randrange.side_effect = range(7)
         samples = replay.sample(rng, 7, n_step=5, gamma=0.5)
         self.assertEqual([s.scale for s in samples], [1 / 32, 1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2, 1])
         self.assertEqual([s.bootstrap for s in samples], [records[5], records[6], None, None, None, None, None])
-        self.assertEqual([s.outcome.utility for s in samples], [-1.0] * 7)
+        self.assertEqual([s.outcome.utility for s in samples], [-0.75] * 7)
+        self.assertEqual(
+            [s.scale * s.outcome.utility for s in samples[2:]],
+            [-0.046875, -0.09375, -0.1875, -0.375, -0.75],
+        )
 
     def test_decisions_are_uniform_within_each_round_robin_player_count(self):
         replay = TrajectoryReplay(100)
@@ -191,6 +195,17 @@ class TestLearner(unittest.TestCase):
         self.assertEqual((stats.samples, stats.updates), (6, 2))
         self.assertEqual(stats.belief_loss, 0.0)
         self.assertTrue(torch.isfinite(torch.tensor(stats.loss)))
+
+    def test_shaped_terminal_target_does_not_change_binary_win_or_exact_penalty_heads(self):
+        learner = Learner(TableNetwork(), self.config(weight_decay=0))
+        hand = tuple(int(face in (0, 12, 26, 38)) for face in range(52))
+        outcome = solo_outcome(hand, 7, False, 1)
+        learner.append([Trajectory(1, (decision(),), outcome)])
+        stats = learner.update()
+        self.assertAlmostEqual(stats.q_loss, 0.28125, places=6)
+        self.assertAlmostEqual(stats.win_loss, 0.69314718, places=6)
+        self.assertAlmostEqual(stats.penalty_loss, 0.08, places=6)
+        self.assertEqual(learner.replay.state_dict()["trajectories"][0]["outcome"], (-0.75, False, 40))
 
     def test_auxiliary_losses_mask_absent_seats_and_scale_penalties_and_decks(self):
         class BeliefNetwork(TableNetwork):

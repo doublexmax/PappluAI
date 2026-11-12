@@ -23,8 +23,7 @@ from src.checkpoints.tensor import (
 from src.evaluation.arena import EpsilonPolicy
 from src.evaluation.benchmark import evaluate_games
 from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv
-from src.game.multiplayer import TerminalSnapshot
-from src.game.outcome import DealOutcome
+from src.game.outcome import solo_outcome
 from src.model.encoding import encode
 from src.model.network import (
     CHECKPOINT_VERSION,
@@ -598,11 +597,10 @@ class TrainingSession:
                 self.at_episode_boundary = True
                 return None
 
-            outcome = DealOutcome.score(
-                TerminalSnapshot((tuple(obs.hand),), obs.joker),
-                0 if obs.won else None, "win" if obs.won else "turns_exhausted",
+            outcome = solo_outcome(
+                obs.hand, obs.joker, bool(obs.won),
                 self.config.required_sequences,
-            ).seat(0)
+            )
             self.learner.append([Trajectory(1, tuple(steps), outcome)])
             replay_committed = True
             self.learner.update(self.config.updates_per_episode)
@@ -627,6 +625,8 @@ class TrainingSession:
                     else "ordinary_full21"
                 ),
                 "won": bool(obs.won),
+                "utility": outcome.utility,
+                "penalty": outcome.penalty,
                 "epsilon": epsilon,
                 "steps": len(steps),
             }

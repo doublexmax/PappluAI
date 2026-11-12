@@ -137,7 +137,9 @@ class TestLeagueSession(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             champion = Path(temporary) / "champion.pt"
             self.make_model(champion)
-            for points, expected in (((10, 50), 1.0), ((50, 10), -1.0), ((30, 30), 0.0)):
+            for points, expected, score in (
+                ((10, 50), 0.5, 1.0), ((50, 10), -0.5, 0.0), ((30, 30), 0.0, 0.5),
+            ):
                 with self.subTest(points=points):
                     session = LeagueSession(str(champion), config=self.config(player_counts=(2,), gamma=0.5))
                     outcome = DealOutcome(None, "turns_exhausted", tuple(
@@ -155,6 +157,10 @@ class TestLeagueSession(unittest.TestCase):
                     self.assertEqual({s.outcome.utility for s in samples}, {expected})
                     self.assertEqual({s.scale for s in samples}, {0.5, 1.0})
                     self.assertTrue(all(s.bootstrap is None for s in samples))
+                    self.assertEqual(
+                        tuple(row[2:] for row in session.scheduler.state_dict()["scores"]),
+                        ((score, 1),),
+                    )
 
     def test_changed_opponent_pool_is_rejected_on_resume(self):
         with tempfile.TemporaryDirectory() as temporary:

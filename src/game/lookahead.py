@@ -10,6 +10,7 @@ from src.game.environment import (
     discard_action, legal_action_mask,
 )
 from src.game.information import EventKind, InformationEvent, _player_views
+from src.game.outcome import DECLARATION_UTILITY, solo_outcome
 
 
 LEGAL_RUNS = tuple((start, start + 1, start + 2) for start in range(11)) + ((11, 12, 0),)
@@ -94,6 +95,10 @@ def after_discard(obs: Observation, face: int) -> Observation:
 class Declares:
     probability: float
 
+    @property
+    def value(self) -> float:
+        return DECLARATION_UTILITY
+
 
 @dataclass(frozen=True)
 class Continues:
@@ -141,7 +146,9 @@ def expand(obs: Observation) -> dict[int, tuple[Branch, ...]]:
             result[action] = (
                 Declares(1.0)
                 if is_valid_hand(remaining, obs.joker, obs.config.required_sequences, obs.config.cards_in_hand)
-                else Terminates(1.0, -1.0) if terminal_discard
+                else Terminates(1.0, solo_outcome(
+                    remaining, obs.joker, False, obs.config.required_sequences,
+                ).utility) if terminal_discard
                 else Continues(1.0, after_discard(obs, face)),
             )
     return result
