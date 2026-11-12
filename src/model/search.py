@@ -63,7 +63,7 @@ def state_values(target: QNetwork, observations: Sequence[Observation], device: 
     return values
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def teacher_targets(
     target: QNetwork, observations: Sequence[Observation], config: TeacherConfig, rng: random.Random,
     gamma: float, device: torch.device,

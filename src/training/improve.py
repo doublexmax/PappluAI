@@ -30,18 +30,16 @@ from src.evaluation.promotion import GateInterrupted, evaluate_gate
 from src.game.environment import ENCODING_VERSION, GameConfig
 from src.model.network import CHECKPOINT_VERSION
 from src.model.spec import ARCHITECTURE
-from src.training.core import TerminalShaping
 from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
 from src.training.curriculum import STATUS_SCHEMA_VERSION
 
 
 IMPROVEMENT_STATE_VERSION = 3
-ALGORITHM = "champion_league_mc"
+ALGORITHM = "champion_league_nstep_ddqn"
 PHASES = ("training", "selection", "confirmation")
 LEAGUE_FINETUNE_LR = 2e-5
 LEAGUE_FINETUNE_EPSILON_START = 0.04
 LEAGUE_FINETUNE_EPSILON_END = 0.01
-DEFAULT_IMPROVE_SHAPING = TerminalShaping(speed=0.35, margin=0.25)
 
 
 @dataclass(frozen=True)
@@ -54,6 +52,7 @@ class ImproveConfig:
     confirmation_blocks: int = evidence.MIN_CONFIRMATION_SEED_BLOCKS
     solo_games: int = evidence.MIN_SOLO_GAMES
     checkpoint_every: int = 16
+    matches_per_round: int = 16
     max_turns: int = 60
     player_counts: Tuple[int, ...] = (2, 3, 4)
     gate_samples: int = 2_000
@@ -70,6 +69,7 @@ class ImproveConfig:
             "confirmation_blocks",
             "solo_games",
             "checkpoint_every",
+            "matches_per_round",
             "max_turns",
             "gate_samples",
         ):
@@ -145,7 +145,7 @@ class ImprovementController:
                 learning_rate=LEAGUE_FINETUNE_LR,
                 epsilon_start=LEAGUE_FINETUNE_EPSILON_START,
                 epsilon_end=LEAGUE_FINETUNE_EPSILON_END,
-                shaping=DEFAULT_IMPROVE_SHAPING,
+                matches_per_round=self.config.matches_per_round,
             ),
             seed=self.config.seed,
         )
@@ -479,22 +479,22 @@ class ImprovementController:
     def _training_step(self, deadline: float) -> bool:
         if self._training_complete():
             return True
+        remaining = self.config.league_matches_per_cycle - self.league_in_cycle
+        until_checkpoint = self.config.checkpoint_every - self.league_in_cycle % self.config.checkpoint_every
         try:
-            result = self.league.train_match(deadline=deadline)
+            results = self.league.train_round(
+                min(self.config.matches_per_round, until_checkpoint, remaining), deadline=deadline,
+            )
         except MatchInterrupted:
             return False
-        self.league_in_cycle += 1
-        _append_metric_once(
-            self.output_dir,
-            "cycle-%d-league-%d"
-            % (self.cycle_index, self.league_in_cycle),
-            {
-                "event": "league_match",
-                "cycle": self.cycle_index,
-                **result,
-            },
-            self.metric_ids,
-        )
+        for result in results:
+            self.league_in_cycle += 1
+            _append_metric_once(
+                self.output_dir,
+                "cycle-%d-league-%d" % (self.cycle_index, self.league_in_cycle),
+                {"event": "league_match", "cycle": self.cycle_index, **result},
+                self.metric_ids,
+            )
         return True
 
     def _prepare_candidate(self) -> None:

@@ -12,9 +12,10 @@ from unittest import mock
 from src.game.environment import GameConfig, PappluEnv, discard_action, legal_action_mask
 from src.game.information import EventKind
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.outcome import SeatOutcome
 from src.model.encoding import encode
 from src.model.spec import ModelSpec
-from src.training.core import EpisodeReplay
+from src.training.core import Decision, Trajectory, TrajectoryReplay
 
 try:
     import torch
@@ -27,7 +28,8 @@ if torch is not None:
         QNetwork, build_checkpoint, collate, collate_observations, load_checkpoint,
         masked_q_values, save_checkpoint, select_action, select_greedy_action,
     )
-    from src.training.optimization import train_batch
+    from src.model.search import TeacherConfig
+    from src.training.optimization import Learner, LearnerConfig, LossWeights
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +55,7 @@ class TestAxialNetwork(unittest.TestCase):
         torch.manual_seed(41)
         self.network = QNetwork()
         self.device = torch.device("cpu")
+        self.private = {}
 
     def observation(self, players=4, turns=5, takes=False):
         env = MultiplayerEnv(MatchConfig(
@@ -63,7 +66,9 @@ class TestAxialNetwork(unittest.TestCase):
             for _ in range(turns):
                 env.step(int(takes))
                 env.step(discard_action(next(i for i, n in enumerate(env.observe().hand) if n)))
-        return env.observe()
+        obs = env.observe()
+        self.private[obs] = env.private_hands(env.view().current_seat)
+        return obs
 
     def values(self, *observations):
         return self.network(collate_observations(observations, self.device))
@@ -99,20 +104,26 @@ class TestAxialNetwork(unittest.TestCase):
     def test_training_reduces_selected_action_error_on_a_controlled_batch(self):
         observations = [self.observation(players, turns=10) for players in (2, 3, 4)]
         targets = torch.tensor([1.0, 0.5, 0.0])
-        batch = [(obs, 0, float(target)) for obs, target in zip(observations, targets)]
+        trajectories = [Trajectory(
+            len(obs.players),
+            (Decision(obs, encode(obs), 0, self.hidden_hands(obs)),),
+            SeatOutcome(float(target), bool(target == 1), 0),
+        ) for obs, target in zip(observations, targets)]
         before = torch.nn.functional.mse_loss(self.values(*observations)[:, 0], targets).item()
-        loss = train_batch(
-            self.network, torch.optim.Adam(self.network.parameters(), lr=1e-4),
-            torch.nn.MSELoss(), batch, self.device, 1.0,
-        )
-        self.assertAlmostEqual(loss, before)
+        learner = Learner(self.network, LearnerConfig(
+            learning_rate=1e-4, teacher=TeacherConfig(fraction=0), losses=LossWeights(0, 0, 0),
+        ))
+        learner.learn(trajectories, updates=8)
         after = torch.nn.functional.mse_loss(self.values(*observations)[:, 0], targets).item()
         self.assertLess(after, before)
+
+    def hidden_hands(self, obs):
+        return self.private[obs]
 
     def test_warm_start_training_generalizes_to_unseen_deals(self):
         config = GameConfig(num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3)
         env = PappluEnv(config)
-        transitions, training_deals = [], set()
+        trajectories, training_deals = [], set()
         for seed in range(64):
             obs = env.reset_warm_start(seed)
             training_deals.add((obs.hand, obs.joker))
@@ -120,11 +131,15 @@ class TestAxialNetwork(unittest.TestCase):
                 if count:
                     env.reset_warm_start(seed)
                     action = discard_action(face)
-                    transitions.append((obs, action, env.step(action).last_reward))
-        optimizer = torch.optim.Adam(self.network.parameters(), lr=1e-3)
-        rng = random.Random(47)
-        for _ in range(64):
-            train_batch(self.network, optimizer, torch.nn.MSELoss(), rng.sample(transitions, 64), self.device, 1.0)
+                    won = env.step(action).won
+                    trajectories.append(Trajectory(
+                        1, (Decision(obs, encode(obs), action, (obs.hand,) + ((0,) * 52,) * 5),),
+                        SeatOutcome(1.0 if won else -1.0, won, 0 if won else 100),
+                    ))
+        learner = Learner(self.network, LearnerConfig(
+            batch_size=64, learning_rate=1e-3, teacher=TeacherConfig(fraction=0),
+        ), seed=47)
+        learner.learn(trajectories, updates=64)
         greedy_wins, random_wins = 0, 0
         evaluation_rng = random.Random(600000)
         for seed in range(600000, 600100):
@@ -164,11 +179,11 @@ class TestAxialNetwork(unittest.TestCase):
 
     def test_replay_and_inference_use_identical_information(self):
         obs = self.observation(4, 12)
-        replay = EpisodeReplay(3)
-        replay.append(((obs, 0, 0.5),))
-        restored = EpisodeReplay(3)
+        replay = TrajectoryReplay(3)
+        replay.append(Trajectory(4, (Decision(obs, encode(obs), 0, self.hidden_hands(obs)),), SeatOutcome(0.5, False, 50)))
+        restored = TrajectoryReplay(3)
         restored.load_state_dict(replay.state_dict())
-        replay_obs = restored.sample(random.Random(4), 1)[0][0]
+        replay_obs = restored.sample(random.Random(4), 1)[0].decision.observation
         self.assertEqual(replay_obs, obs)
         torch.testing.assert_close(self.values(obs), self.values(replay_obs), rtol=0, atol=0)
 

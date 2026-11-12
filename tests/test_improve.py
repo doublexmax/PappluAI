@@ -5,6 +5,7 @@ from dataclasses import replace
 import io
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import time
 import unittest
@@ -189,8 +190,9 @@ class TestImprovementController(unittest.TestCase):
     def make_model(self, path, parameter_value=None):
         from src.game.environment import GameConfig
         from src.model.network import QNetwork, save_checkpoint
+        from src.model.spec import ModelSpec
 
-        network = QNetwork()
+        network = QNetwork(ModelSpec(8, 1, 1))
         if parameter_value is not None:
             with torch.no_grad():
                 for parameter in network.parameters():
@@ -377,6 +379,8 @@ class TestImprovementController(unittest.TestCase):
             self.assertEqual(league.parent_sha256, sha256(champion))
             self.assertEqual(league._parent_path, str(champion))
             for parameter in league.network.parameters():
+                self.assertTrue(torch.equal(parameter, torch.full_like(parameter, 0.125)))
+            for parameter in league.learner.target.parameters():
                 self.assertTrue(torch.equal(parameter, torch.full_like(parameter, 0.125)))
             self.assertIsNot(league.optimizer, warm_optimizer)
             self.assertEqual(league.optimizer.state_dict()["state"], {})
@@ -818,6 +822,33 @@ class TestImprovementController(unittest.TestCase):
                 sha256(controller.output_dir / "latest-model.pt"),
             )
             self.assertNotIn("research_state", after)
+            resumed_dir = root / "resumed"
+            shutil.copytree(controller.output_dir, resumed_dir)
+            continued = ImprovementController.load(
+                str(resumed_dir / "latest-state.pt"), resumed_dir,
+            )
+            deadline = time.monotonic() + 120
+            self.assertTrue(controller.step(deadline))
+            self.assertTrue(continued.step(deadline))
+            self.assertEqual(controller.phase, "selection")
+            self.assert_nested_equal(controller.state_dict(), continued.state_dict())
+
+    def test_rounds_stop_at_checkpoint_and_cycle_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = self.make_controller(
+                Path(temporary), league_matches_per_cycle=7, matches_per_round=5,
+                checkpoint_every=3, max_turns=1, player_counts=(2,),
+            )
+            deadline = time.monotonic() + 120
+            with mock.patch.object(controller.league, "train_round", wraps=controller.league.train_round) as rounds:
+                for expected in (3, 6, 7):
+                    self.assertTrue(controller.step(deadline))
+                    self.assertEqual(controller.league_in_cycle, expected)
+                    saved = torch.load(controller.output_dir / "latest-state.pt", weights_only=True)
+                    self.assertEqual(saved["cursors"]["league"], expected)
+            self.assertEqual([call.args[0] for call in rounds.call_args_list], [3, 3, 1])
+            self.assertEqual(controller.phase, "selection")
+            self.assertEqual(controller.league.total_updates, 28)
 
     def test_resume_can_extend_runtime_cap_but_not_learning_settings(self):
         from src.cli.improve import _validate_resume_options
@@ -837,7 +868,7 @@ class TestImprovementController(unittest.TestCase):
             )
             self.assertEqual(controller.config.max_cycles, 3)
             self.assertEqual(controller.config.league_matches_per_cycle, 1)
-            for changed in (["--league-matches", "999"], ["--rebase-after-rejections", "2"]):
+            for changed in (["--league-matches", "999"], ["--rebase-after-rejections", "2"], ["--matches-per-round", "4"]):
                 invalid = arguments + changed
                 with self.assertRaisesRegex(ValueError, "cannot change"):
                     _validate_resume_options(
@@ -875,7 +906,7 @@ class TestImprovementController(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = self.make_controller(Path(temporary))
             payload = controller.state_dict()
-            payload["league_state"]["optimizer_state_dict"]["state"] = {
+            payload["league_state"]["learner"]["optimizer"]["state"] = {
                 0: {"exp_avg": torch.tensor([float("nan")])}
             }
             path = controller.output_dir / "invalid-state.pt"
@@ -1076,6 +1107,8 @@ class TestImproveCli(unittest.TestCase):
                 "1",
                 "--league-matches-per-cycle",
                 "2",
+                "--matches-per-round",
+                "4",
                 "--rebase-after-rejections",
                 "3",
                 "--selection-blocks",
@@ -1088,6 +1121,7 @@ class TestImproveCli(unittest.TestCase):
         )
         self.assertEqual(args.max_cycles, 1)
         self.assertEqual(args.league_matches_per_cycle, 2)
+        self.assertEqual(args.matches_per_round, 4)
         self.assertEqual(args.rebase_after_rejections, 3)
         self.assertEqual(args.selection_blocks, 2)
         self.assertEqual(args.confirmation_blocks, 2)

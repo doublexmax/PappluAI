@@ -57,7 +57,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--learning-rate",
         type=float,
         default=None,
-        help="Optimizer learning rate. New sessions default to 0.001.",
+        help="Optimizer learning rate. New sessions default to 0.0003.",
     )
     parser.add_argument(
         "--curriculum-fraction",
@@ -138,7 +138,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     else args.recycle_discard
                 ),
                 learning_rate=(
-                    1e-3 if args.learning_rate is None else args.learning_rate
+                    3e-4 if args.learning_rate is None else args.learning_rate
                 ),
                 curriculum_fraction=(
                     0.75

@@ -28,6 +28,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-turns", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--updates-per-match", type=int, default=None)
+    parser.add_argument("--matches-per-round", type=int, default=None)
     return parser
 
 
@@ -69,7 +70,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_dir = Path(args.output_dir)
         settings = {
             name: getattr(args, name)
-            for name in ("batch_size", "updates_per_match")
+            for name in ("batch_size", "updates_per_match", "matches_per_round")
             if getattr(args, name) is not None
         }
         if args.players is not None:
@@ -115,11 +116,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 reason = "budget"
                 break
             try:
-                result = session.train_match(deadline=deadline)
+                until_checkpoint = args.checkpoint_every - session.completed_matches % args.checkpoint_every
+                results = session.train_round(
+                    min(session.config.matches_per_round, until_checkpoint, target - session.completed_matches),
+                    deadline=deadline,
+                )
             except runtime.MatchInterrupted:
                 reason = "budget"
                 break
-            print(json.dumps(result, sort_keys=True), flush=True)
+            for result in results:
+                print(json.dumps(result, sort_keys=True), flush=True)
             if session.completed_matches % args.checkpoint_every == 0:
                 runtime.save_session_checkpoint(session, output_dir)
         runtime.save_session_checkpoint(session, output_dir)

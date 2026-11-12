@@ -11,22 +11,19 @@ from src.cli._runtime import MissingTrainingDependency, load_runtime
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a Papplu Q-network with episodic Monte Carlo return regression "
-            "(not DQN). Rewards come from src.evaluate.hand_reward."
+            "Train a Papplu Q-network with n-step Double DQN and auxiliary outcome heads."
         )
     )
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--replay-capacity", type=int, default=5000)
-    parser.add_argument(
-        "--replay-sampling",
-        choices=("transition", "episode"),
-        default="transition",
-        help="Replay sampling unit (default transition).",
-    )
+    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--n-step", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--replay-capacity", type=int, default=50_000)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--heads", type=int, default=None)
+    parser.add_argument("--blocks", type=int, default=None)
     parser.add_argument("--epsilon-start", type=float, default=1.0)
     parser.add_argument("--epsilon-end", type=float, default=0.05)
     parser.add_argument("--epsilon-decay-episodes", type=int, default=200)
@@ -127,6 +124,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if not args.load
                 else None
             )
+        model_spec = None
+        if any(getattr(args, name) is not None for name in ("width", "heads", "blocks")):
+            default_spec = runtime.ModelSpec()
+            if args.load:
+                saved_network, _, _ = runtime.load_checkpoint(args.load)
+                default_spec = saved_network.spec
+            model_spec = runtime.ModelSpec(**{
+                name: getattr(default_spec, name) if getattr(args, name) is None else getattr(args, name)
+                for name in ("width", "heads", "blocks")
+            })
         summary = runtime.train(
             episodes=args.episodes,
             seed=args.seed,
@@ -134,7 +141,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lr=args.lr,
             batch_size=args.batch_size,
             replay_capacity=args.replay_capacity,
-            replay_sampling=args.replay_sampling,
+            n_step=args.n_step,
+            model_spec=model_spec,
             epsilon_start=args.epsilon_start,
             epsilon_end=args.epsilon_end,
             epsilon_decay_episodes=args.epsilon_decay_episodes,

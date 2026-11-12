@@ -11,7 +11,9 @@ from src.game.environment import (
 )
 from src.game.information import EventKind
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.training.core import EpisodeReplay
+from src.game.outcome import SeatOutcome
+from src.model.encoding import encode
+from src.training.core import Decision, Trajectory, TrajectoryReplay
 
 try:
     import torch
@@ -170,23 +172,23 @@ class TestInformationHistory(unittest.TestCase):
 
     def test_replay_eviction_does_not_cut_history_or_expose_future_events(self):
         env = self.make_match(players=2)
-        replay = EpisodeReplay(2)
+        replay = TrajectoryReplay(2)
         decisions = []
         with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             for _ in range(12):
                 obs = env.observe()
                 if env.view().current_seat == 0:
-                    decisions.append((obs, 0, 0.0))
+                    decisions.append(Decision(obs, encode(obs), 0, env.private_hands(0)))
                 env.step(0)
                 env.step(discard_action(next(i for i, n in enumerate(env.observe().hand) if n)))
-        replay.append(tuple(decisions))
-        restored = EpisodeReplay(2)
+        replay.append(Trajectory(2, tuple(decisions), SeatOutcome(0, False, 0)))
+        restored = TrajectoryReplay(2)
         restored.load_state_dict(replay.state_dict())
-        retained = replay.state_dict()["episodes"][0]
-        self.assertEqual(len(retained["transitions"]), 2)
+        retained = replay.state_dict()["trajectories"][0]
+        self.assertEqual(len(retained["decisions"]), 2)
         self.assertEqual(len(retained["history"]), 21)
-        self.assertEqual(tuple(t[1] for t in retained["transitions"]), (17, 21))
-        first, second = tuple(t[0] for t in restored._episodes[0])
+        self.assertEqual(tuple(t[1] for t in retained["decisions"]), (17, 21))
+        first, second = tuple(t.observation for t in restored._trajectories[0].decisions)
         self.assertEqual(len(first.history), 17)
         self.assertEqual(len(second.history), 21)
         self.assertEqual(len(env.observe().history), 25)
@@ -246,18 +248,19 @@ class TestReplayJournals(unittest.TestCase):
         with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
             for _ in range(rounds * players):
                 seat = env.view().current_seat
-                episodes[seat].append((env.observe(), 0, 0.125))
+                obs = env.observe()
+                episodes[seat].append(Decision(obs, encode(obs), 0, env.private_hands(seat)))
                 env.step(0)
                 obs = env.observe()
                 action = discard_action(next(i for i, count in enumerate(obs.hand) if count))
-                episodes[seat].append((obs, action, -0.25))
+                episodes[seat].append(Decision(obs, encode(obs), action, env.private_hands(seat)))
                 env.step(action)
         return tuple(tuple(episode) for episode in episodes)
 
     def replay(self, **kwargs):
-        replay = EpisodeReplay(500)
+        replay = TrajectoryReplay(500)
         for episode in self.episodes(**kwargs):
-            replay.append(episode)
+            replay.append(Trajectory(len(episode[0].observation.players), episode, SeatOutcome(0.125, False, 25)))
         return replay
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
@@ -267,36 +270,37 @@ class TestReplayJournals(unittest.TestCase):
         replay = self.replay()
         state = replay.state_dict()
         self.assertEqual(
-            tuple(tuple(t[1] for t in e["transitions"]) for e in state["episodes"]),
+            tuple(tuple(t[1] for t in e["decisions"]) for e in state["trajectories"]),
             ((1, 2, 7, 8), (3, 4, 9, 10), (5, 6, 11, 12)),
         )
-        self.assertEqual(tuple(len(e["history"]) for e in state["episodes"]), (8, 10, 12))
-        for journal in state["episodes"]:
-            for snapshot, _prefix, _action, _target in journal["transitions"]:
+        self.assertEqual(tuple(len(e["history"]) for e in state["trajectories"]), (8, 10, 12))
+        for journal in state["trajectories"]:
+            for snapshot, _prefix, _action, _hidden in journal["decisions"]:
                 self.assertNotIn("history", snapshot)
                 self.assertNotIn("config", snapshot)
                 self.assertNotIn("joker", snapshot)
         buffer = io.BytesIO()
         torch.save(state, buffer)
         buffer.seek(0)
-        restored = EpisodeReplay(500)
+        restored = TrajectoryReplay(500)
         restored.load_state_dict(torch.load(buffer, weights_only=True))
         self.assertEqual(restored.state_dict(), state)
-        self.assertEqual(tuple(restored._episodes), tuple(replay._episodes))
-        for episode in restored._episodes:
-            final_history = episode[-1][0].history
-            for obs, _action, _target in episode:
+        self.assertEqual(tuple(restored._trajectories), tuple(replay._trajectories))
+        for trajectory in restored._trajectories:
+            final_history = trajectory.decisions[-1].observation.history
+            for decision in trajectory.decisions:
+                obs = decision.observation
                 for index, event in enumerate(obs.history):
                     self.assertIs(event, final_history[index])
-        original = [obs for e in replay._episodes for obs, _, _ in e]
-        reloaded = [obs for e in restored._episodes for obs, _, _ in e]
+        original = [d.observation for t in replay._trajectories for d in t.decisions]
+        reloaded = [d.observation for t in restored._trajectories for d in t.decisions]
         left = collate_observations(original, torch.device("cpu"))
         right = collate_observations(reloaded, torch.device("cpu"))
         for name in left.__dataclass_fields__:
             self.assertTrue(torch.equal(getattr(left, name), getattr(right, name)), name)
         self.assertEqual(
-            [target for e in restored._episodes for _, _, target in e],
-            [0.125, -0.25] * 6,
+            [t.outcome for t in restored._trajectories],
+            [SeatOutcome(0.125, False, 25)] * 3,
         )
 
     def test_malformed_prefixes_and_future_snapshots_are_rejected_atomically(self):
@@ -304,24 +308,24 @@ class TestReplayJournals(unittest.TestCase):
         before = replay.state_dict()
         for prefix in (0, -1, True, 1.0, 7):
             bad = copy.deepcopy(before)
-            journal = bad["episodes"][0]
-            transitions = list(journal["transitions"])
+            journal = bad["trajectories"][0]
+            transitions = list(journal["decisions"])
             snapshot, _prefix, action, target = transitions[0]
             transitions[0] = (snapshot, prefix, action, target)
-            journal["transitions"] = tuple(transitions)
+            journal["decisions"] = tuple(transitions)
             with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, "prefix"):
                 replay.load_state_dict(bad)
             self.assertEqual(replay.state_dict(), before)
         bad = copy.deepcopy(before)
-        journal = bad["episodes"][0]
-        snapshot, _prefix, action, target = journal["transitions"][0]
-        journal["transitions"] = ((snapshot, 2, action, target),)
+        journal = bad["trajectories"][0]
+        snapshot, _prefix, action, target = journal["decisions"][0]
+        journal["decisions"] = ((snapshot, 2, action, target),)
         with self.assertRaisesRegex(ValueError, "own card history"):
             replay.load_state_dict(bad)
         bad = copy.deepcopy(before)
-        journal = bad["episodes"][0]
-        journal["transitions"] = tuple(reversed(journal["transitions"]))
-        with self.assertRaisesRegex(ValueError, "nondecreasing"):
+        journal = bad["trajectories"][0]
+        journal["decisions"] = tuple(reversed(journal["decisions"]))
+        with self.assertRaisesRegex(ValueError, "prefixes"):
             replay.load_state_dict(bad)
         self.assertEqual(replay.state_dict(), before)
 
@@ -329,23 +333,23 @@ class TestReplayJournals(unittest.TestCase):
         replay = self.replay(players=2)
         before = replay.state_dict()
         bad = copy.deepcopy(before)
-        bad["episodes"][0]["history"][1]["face"] = (
-            bad["episodes"][0]["history"][1]["face"] + 1
+        bad["trajectories"][0]["history"][1]["face"] = (
+            bad["trajectories"][0]["history"][1]["face"] + 1
         ) % 52
         with self.assertRaisesRegex(ValueError, "own card history"):
             replay.load_state_dict(bad)
         bad = copy.deepcopy(before)
-        history = list(bad["episodes"][0]["history"])
+        history = list(bad["trajectories"][0]["history"])
         history[1], history[2] = history[2], history[1]
-        bad["episodes"][0]["history"] = tuple(history)
+        bad["trajectories"][0]["history"] = tuple(history)
         with self.assertRaisesRegex(ValueError, "chronology"):
             replay.load_state_dict(bad)
         bad = copy.deepcopy(before)
-        bad["episodes"][0]["history"][1]["stock_remaining"] += 1
+        bad["trajectories"][0]["history"][1]["stock_remaining"] += 1
         with self.assertRaisesRegex(ValueError, "chronology"):
             replay.load_state_dict(bad)
         bad = copy.deepcopy(before)
-        snapshot = bad["episodes"][0]["transitions"][0][0]
+        snapshot = bad["trajectories"][0]["decisions"][0][0]
         snapshot["turns_remaining"] -= 1
         snapshot["players"][0]["turns_remaining"] -= 1
         with self.assertRaisesRegex(ValueError, "own player turns"):
@@ -356,11 +360,11 @@ class TestReplayJournals(unittest.TestCase):
         replay = self.replay(players=2)
         original = replay.state_dict()
         corrupted = copy.deepcopy(original)
-        journal = corrupted["episodes"][0]
-        transitions = list(journal["transitions"])
+        journal = corrupted["trajectories"][0]
+        transitions = list(journal["decisions"])
         snapshot, prefix, _action, target = transitions[0]
         transitions[0] = (snapshot, prefix, 1, target)
-        journal["transitions"] = tuple(transitions)
+        journal["decisions"] = tuple(transitions)
         with self.assertRaisesRegex(ValueError, "action does not match"):
             replay.load_state_dict(corrupted)
         self.assertEqual(replay.state_dict(), original)
@@ -383,36 +387,37 @@ class TestReplayJournals(unittest.TestCase):
 
     def test_mixed_seats_configurations_and_episode_histories_are_rejected(self):
         episodes = self.episodes(players=2)
-        mixed = EpisodeReplay(500)
-        mixed.append((episodes[0][0], episodes[1][0]))
-        with self.assertRaisesRegex(ValueError, "mixes seat or episode"):
+        mixed = TrajectoryReplay(500)
+        mixed.append(Trajectory(2, (episodes[0][0], episodes[1][0]), SeatOutcome(0, False, 0)))
+        with self.assertRaisesRegex(ValueError, "mixes seat or deal"):
             mixed.state_dict()
-        obs, action, target = episodes[0][-1]
+        decision = episodes[0][-1]
+        obs = decision.observation
         changed = replace(obs, config=replace(obs.config, max_turns=3))
-        mixed = EpisodeReplay(500)
-        mixed.append(episodes[0][:-1] + ((changed, action, target),))
+        mixed = TrajectoryReplay(500)
+        mixed.append(Trajectory(2, episodes[0][:-1] + (replace(decision, observation=changed),), SeatOutcome(0, False, 0)))
         with self.assertRaisesRegex(ValueError, "configuration"):
             mixed.state_dict()
         replay = self.replay(players=2)
         before = replay.state_dict()
         bad = copy.deepcopy(before)
-        journal = bad["episodes"][0]
-        peer = bad["episodes"][1]["transitions"][0][0]
-        _snapshot, prefix, action, target = journal["transitions"][0]
-        journal["transitions"] = ((peer, prefix, action, target),)
+        journal = bad["trajectories"][0]
+        peer = bad["trajectories"][1]["decisions"][0][0]
+        _snapshot, prefix, action, target = journal["decisions"][0]
+        journal["decisions"] = ((peer, prefix, action, target),)
         with self.assertRaisesRegex(ValueError, "own card history"):
             replay.load_state_dict(bad)
         bad = copy.deepcopy(before)
-        bad["episodes"][0]["history"] += bad["episodes"][1]["history"]
+        bad["trajectories"][0]["history"] += bad["trajectories"][1]["history"]
         with self.assertRaisesRegex(ValueError, "later initial event"):
             replay.load_state_dict(bad)
         bad = copy.deepcopy(before)
-        bad["episodes"][0]["transitions"][0][0]["config"] = bad["episodes"][0]["config"]
+        bad["trajectories"][0]["decisions"][0][0]["config"] = bad["trajectories"][0]["config"]
         with self.assertRaisesRegex(ValueError, "current information schema"):
             replay.load_state_dict(bad)
         bad = copy.deepcopy(before)
-        bad["episodes"][0]["transitions"][0][0]["players"] += (
-            bad["episodes"][0]["transitions"][0][0]["players"][0],
+        bad["trajectories"][0]["decisions"][0][0]["players"] += (
+            bad["trajectories"][0]["decisions"][0][0]["players"][0],
         )
         with self.assertRaisesRegex(ValueError, "player count"):
             replay.load_state_dict(bad)
@@ -423,27 +428,29 @@ class TestReplayJournals(unittest.TestCase):
         state = replay.state_dict()
         self.assertIn(
             int(EventKind.REFILL),
-            [event["kind"] for event in state["episodes"][0]["history"]],
+            [event["kind"] for event in state["trajectories"][0]["history"]],
         )
-        restored = EpisodeReplay(500)
+        restored = TrajectoryReplay(500)
         restored.load_state_dict(state)
-        self.assertEqual(tuple(restored._episodes), tuple(replay._episodes))
+        self.assertEqual(tuple(restored._trajectories), tuple(replay._trajectories))
         self.assertEqual(len(restored), 100)
 
 
 class TestCountBalancedReplay(unittest.TestCase):
     def test_counts_are_balanced_before_episodes_and_decisions(self):
-        replay = EpisodeReplay(100)
+        replay = TrajectoryReplay(100)
         for players, decisions in ((2, 30), (3, 12), (4, 1)):
             env = MultiplayerEnv(MatchConfig(
                 GameConfig(cards_in_hand=3, required_sequences=1), players,
             ))
             env.reset(players)
-            replay.append(tuple((env.observe(), 0, 0.0) for _ in range(decisions)))
+            obs = env.observe()
+            record = Decision(obs, encode(obs), 0, env.private_hands(0))
+            replay.append(Trajectory(players, (record,) * decisions, SeatOutcome(0, False, 0)))
         batch = replay.sample(random.Random(81), 30)
-        self.assertEqual(Counter(len(item[0].players) for item in batch), {2: 10, 3: 10, 4: 10})
+        self.assertEqual(Counter(len(item.decision.observation.players) for item in batch), {2: 10, 3: 10, 4: 10})
         replay.sample(random.Random(17), 1)
-        restored = EpisodeReplay(100)
+        restored = TrajectoryReplay(100)
         restored.load_state_dict(replay.state_dict())
         self.assertEqual(
             replay.sample(random.Random(18), 11),

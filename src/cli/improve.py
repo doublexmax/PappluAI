@@ -37,6 +37,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirmation-blocks", type=int, default=128)
     parser.add_argument("--solo-games", type=int, default=256)
     parser.add_argument("--checkpoint-every", type=int, default=16)
+    parser.add_argument("--matches-per-round", type=int, default=16)
     parser.add_argument(
         "--max-turns", type=int, default=60,
         help="Explicit per-player cap. Reduced-cap smoke runs cannot promote.",
@@ -93,6 +94,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     confirmation_blocks=args.confirmation_blocks,
                     solo_games=args.solo_games,
                     checkpoint_every=args.checkpoint_every,
+                    matches_per_round=args.matches_per_round,
                     max_turns=args.max_turns,
                     player_counts=(2, 3, 4) if args.players is None else tuple(args.players),
                 ),
@@ -144,6 +146,7 @@ def _validate_resume_options(
         "--solo-games": "solo_games",
         "--seed": "seed",
         "--max-turns": "max_turns",
+        "--matches-per-round": "matches_per_round",
     }
     for option, field in learning_options.items():
         if option in explicit and getattr(args, field) != getattr(controller.config, field):

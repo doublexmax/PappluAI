@@ -26,10 +26,13 @@ from src.game.environment import (
     ACTION_TAKE_DISCARD, GameConfig, Observation, discard_action, legal_action_mask,
 )
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.outcome import DealOutcome
 from src.model.encoding import encode
 from src.model.network import collate_observations
+from src.model.search import TeacherConfig
+from src.training.core import Decision, Trajectory
 from src.training.league import LeagueConfig, LeagueSession
-from src.training.optimization import train_batch
+from src.training.optimization import Learner, LearnerConfig
 
 
 def normalized(value):
@@ -127,12 +130,15 @@ def verify(output: Path) -> dict:
                 seed=4000 + players, record_trajectories=True, record_terminal=True,
                 deadline=time.monotonic() + 120,
             )
-            observations = [step[0] for trajectory in result.trajectories for step in trajectory]
+            observations = [step.observation for trajectory in result.trajectories for step in trajectory]
             for trajectory in result.trajectories:
-                for obs, action, _ in trajectory:
+                for decision in trajectory:
+                    obs, action = decision.observation, decision.action
                     assert len(obs.players) == players
                     assert legal_action_mask(obs)[action]
-                    assert obs.history[0].initial_hand == trajectory[0][0].hand
+                    assert obs.history[0].initial_hand == trajectory[0].observation.hand
+                    assert decision.hidden_hands[0] == obs.hand
+                    assert decision.features == encode(obs)
             assert result.action_count == sum(map(len, result.trajectories))
             assert result.action_count == 2 * sum(result.seat_turns)
             assert result.terminal_reason in ("win", "turns_exhausted")
@@ -163,6 +169,8 @@ def verify(output: Path) -> dict:
             face = history_match.observe().discard_top
             history_match.step(ACTION_TAKE_DISCARD)
             representative = history_match.observe()
+            representative_seat = history_match.view().current_seat
+            representative_hands = history_match.private_hands(representative_seat)
             history_match.step(discard_action(face))
         assert history_match.view().terminal_reason == "turns_exhausted"
         assert len(representative.history) == 2 * completed_turns
@@ -183,21 +191,27 @@ def verify(output: Path) -> dict:
             values = policy.network(batch)
         forward_seconds = time.perf_counter() - started
         assert torch.isfinite(values).all()
-        learner = copy.deepcopy(policy.network)
-        learner_before = digest(learner.state_dict())
-        optimizer = torch.optim.Adam(learner.parameters(), lr=1e-4)
+        learner = Learner(copy.deepcopy(policy.network), LearnerConfig(
+            batch_size=1, learning_rate=1e-4, teacher=TeacherConfig(fraction=0),
+        ))
+        learner_before = digest(learner.online.state_dict())
         action = next(i for i, allowed in enumerate(legal_action_mask(representative)) if allowed)
-        started = time.perf_counter()
-        loss = train_batch(
-            learner, optimizer, torch.nn.MSELoss(), [(representative, action, 1.0)],
-            torch.device("cpu"), 1.0,
+        outcome = DealOutcome.score(
+            history_match.terminal_snapshot(), None, "turns_exhausted",
+            history_match.config.game.required_sequences,
         )
+        started = time.perf_counter()
+        stats = learner.learn([Trajectory(
+            len(representative.players),
+            (Decision(representative, encode(representative), action, representative_hands),),
+            outcome.seat(representative_seat),
+        )])
         update_seconds = time.perf_counter() - started
-        assert digest(learner.state_dict()) != learner_before
+        assert digest(learner.online.state_dict()) != learner_before
         evidence["bounded_cpu_cost"] = {
             "history_events": len(representative.history), "players": len(representative.players), "batch_size": 1,
-            "model_spec": learner.spec.to_dict(), "forward_seconds": [forward_seconds],
-            "update_seconds": update_seconds, "loss": loss,
+            "model_spec": learner.online.spec.to_dict(), "forward_seconds": [forward_seconds],
+            "update_seconds": update_seconds, "loss": stats.loss,
             "errors": 0, "completed_forwards": 1, "completed_updates": 1,
             "scope": "Single diagnostic samples with full collation and history reconstruction. No speedup or production throughput claim.",
         }
@@ -215,7 +229,8 @@ def verify(output: Path) -> dict:
         league = output / "league"
         cli("league", "--initial-model", paths[0], "--output-dir", league, "--matches", 6,
             "--players", 2, 3, 4, "--max-turns", 1, "--batch-size", 2,
-            "--updates-per-match", 1, "--max-seconds", 120, "--checkpoint-every", 1, "--seed", 62)
+            "--updates-per-match", 1, "--matches-per-round", 4,
+            "--max-seconds", 120, "--checkpoint-every", 3, "--seed", 62)
         state_path = league / "latest-state.pt"
         first = torch.load(state_path, weights_only=True)
         assert first["last_exported_sha256"] == file_sha256(league / "latest-model.pt")
@@ -224,12 +239,12 @@ def verify(output: Path) -> dict:
         control = LeagueSession(
             str(paths[0]),
             config=LeagueConfig(
-                game=GameConfig(max_turns=1), batch_size=2, updates_per_match=1,
+                game=GameConfig(max_turns=1), batch_size=2, updates_per_match=1, matches_per_round=4,
             ),
             seed=62,
         )
-        for _ in range(6):
-            control.train_match()
+        for _ in range(2):
+            control.train_round(3)
         control.export_model(output / "control-league" / "latest-model.pt")
         assert digest(control.state_dict()) == digest(first)
         resumed = LeagueSession.load(str(state_path), str(paths[0]))
@@ -245,13 +260,13 @@ def verify(output: Path) -> dict:
         assert digest(final) == exact_digest
         counts = Counter(
             episode["player_count"]
-            for episode in final["replay_state_dict"]["episodes"]
+            for episode in final["learner"]["replay"]["trajectories"]
         )
         assert set(counts) == {2, 3, 4}
         evidence["resume"] = {
             "exact_state_sha256": exact_digest,
             "matches": final["counters"]["completed_matches"],
-            "count_matches": resumed.count_matches, "replay_episodes_by_count": dict(counts),
+            "count_matches": resumed.count_matches, "replay_trajectories_by_count": dict(counts),
             "curriculum_episodes": solo_state["counters"]["total_episodes"],
             "uninterrupted_control_matches": control.completed_matches,
             "comparison": "Uninterrupted actual play and updates against restored CLI state.",

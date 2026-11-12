@@ -15,7 +15,6 @@ import time
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
-import torch.nn as nn
 
 from src.checkpoints.io import (
     atomic_copy,
@@ -26,27 +25,30 @@ from src.checkpoints.io import (
 from src.checkpoints.tensor import (
     atomic_torch_save,
     clone_model_state,
-    validate_checkpoint_tree,
     validate_model_state,
 )
+from src.evaluate import minimum_penalty
+from src.evaluation.arena import EpsilonPolicy
 from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv
+from src.game.outcome import SeatOutcome
+from src.model.encoding import encode
 from src.model.network import (
     CHECKPOINT_VERSION,
     QNetwork,
     build_checkpoint,
     load_checkpoint,
-    select_action,
     select_greedy_action,
     select_random_legal,
 )
-from src.training.core import EpisodeReplay, TerminalShaping, discounted_returns, terminal_reward
-from src.training.optimization import train_batch
+from src.training.core import Decision, Trajectory
+from src.training.optimization import Learner, LearnerConfig, LossWeights
+from src.model.search import TeacherConfig
 from src.model.spec import ModelSpec
 
 
-TRAINING_STATE_VERSION = 2
+TRAINING_STATE_VERSION = 3
 STATUS_SCHEMA_VERSION = 1
-ALGORITHM = "full21_curriculum_monte_carlo_q_regression"
+ALGORITHM = "full21_curriculum_nstep_ddqn"
 ORDINARY_VALIDATION_SEED = 30_000_000
 CURRICULUM_VALIDATION_SEED = 20_000_000
 PUBLISHED_SNAPSHOT_FILES = (
@@ -71,11 +73,14 @@ class TrainingConfig:
     required_sequences: int = 5
     max_turns: int = 60
     recycle_discard: bool = True
-    replay_capacity: int = 10_000
-    batch_size: int = 64
+    replay_capacity: int = 50_000
+    batch_size: int = 128
     updates_per_episode: int = 4
-    learning_rate: float = 1e-3
-    gamma: float = 0.99
+    learning_rate: float = 3e-4
+    weight_decay: float = 1e-4
+    gamma: float = 1.0
+    n_step: int = 5
+    target_tau: float = 0.005
     grad_clip: float = 1.0
     epsilon_start: float = 0.3
     epsilon_end: float = 0.1
@@ -89,7 +94,8 @@ class TrainingConfig:
     validation_games: int = 64
     validate_every: int = 1_000
     torch_threads: int = 1
-    shaping: TerminalShaping = TerminalShaping()
+    losses: LossWeights = LossWeights()
+    teacher: TeacherConfig = TeacherConfig()
 
     def __post_init__(self) -> None:
         if (
@@ -145,8 +151,13 @@ class TrainingConfig:
             raise ValueError("curriculum_distances must be (1, 2, 4, 8)")
         if type(self.recycle_discard) is not bool:
             raise TypeError("recycle_discard must be a bool")
-        if not isinstance(self.shaping, TerminalShaping):
-            raise TypeError("shaping must be a TerminalShaping")
+        self.learner_config
+
+    @property
+    def learner_config(self) -> LearnerConfig:
+        return LearnerConfig(**{
+            name: getattr(self, name) for name in LearnerConfig.__dataclass_fields__
+        })
 
     @property
     def game_config(self) -> GameConfig:
@@ -159,27 +170,24 @@ class TrainingConfig:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        payload = asdict(self)
-        if self.shaping == TerminalShaping():
-            del payload["shaping"]
-        else:
-            payload["shaping"] = self.shaping.to_dict()
-        return payload
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TrainingConfig":
         if not isinstance(data, dict):
             raise TypeError("training_config must be a dict")
         fields = set(cls.__dataclass_fields__)
-        if set(data) in (fields, fields - {"shaping"}):
+        if set(data) == fields:
             values = dict(data)
         else:
             raise ValueError("training_config fields do not match this trainer")
         distances = values["curriculum_distances"]
         if not isinstance(distances, tuple):
             raise TypeError("curriculum_distances must be a tuple")
-        if "shaping" in values:
-            values["shaping"] = TerminalShaping.from_dict(values["shaping"])
+        for name, kind in (("losses", LossWeights), ("teacher", TeacherConfig)):
+            if not isinstance(values[name], dict) or set(values[name]) != set(kind.__dataclass_fields__):
+                raise ValueError("training %s fields do not match" % name)
+            values[name] = kind(**values[name])
         return cls(**values)
 
 
@@ -206,39 +214,29 @@ class TrainingSession:
         self.config = config
         self.initial_seed = seed
         torch.set_num_threads(config.torch_threads)
-        torch.manual_seed(seed)
-
-        if initial_model is None:
-            self.network = QNetwork(model_spec)
-        else:
-            network, saved_game, _ = load_checkpoint(
-                initial_model,
-                device=torch.device("cpu"),
-            )
-            expected = config.game_config
-            if (
-                saved_game.num_decks != expected.num_decks
-                or saved_game.cards_in_hand != expected.cards_in_hand
-                or saved_game.required_sequences != expected.required_sequences
-            ):
-                raise ValueError(
-                    "initial model must use 3 decks, 21 cards, and 5 pure sequences"
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            if initial_model is None:
+                network = QNetwork(model_spec)
+            else:
+                network, saved_game, _ = load_checkpoint(
+                    initial_model, device=torch.device("cpu"),
                 )
-            self.network = network
-        self.network.train()
-        self.optimizer = torch.optim.Adam(
-            self.network.parameters(), lr=config.learning_rate
-        )
-        self.loss_fn = nn.SmoothL1Loss()
-        self.replay = EpisodeReplay(config.replay_capacity)
-
+                expected = config.game_config
+                if (
+                    saved_game.num_decks != expected.num_decks
+                    or saved_game.cards_in_hand != expected.cards_in_hand
+                    or saved_game.required_sequences != expected.required_sequences
+                ):
+                    raise ValueError(
+                        "initial model must use 3 decks, 21 cards, and 5 pure sequences"
+                    )
         seed_source = random.Random(seed)
         self.deal_rng = random.Random(seed_source.getrandbits(64))
         self.action_rng = random.Random(seed_source.getrandbits(64))
-        self.replay_rng = random.Random(seed_source.getrandbits(64))
+        self.learner = Learner(network, config.learner_config, seed_source.getrandbits(63))
 
         self.total_episodes = 0
-        self.total_updates = 0
         self.stage_index = initial_stage_index
         self.stage_episodes = 0
         self.epsilon_progress = 0
@@ -257,6 +255,22 @@ class TrainingSession:
         self.baseline_model_state = clone_model_state(self.network.state_dict())
         self.best_model_state = clone_model_state(self.network.state_dict())
         self.at_episode_boundary = True
+
+    @property
+    def network(self):
+        return self.learner.online
+
+    @property
+    def optimizer(self):
+        return self.learner.optimizer
+
+    @property
+    def replay(self):
+        return self.learner.replay
+
+    @property
+    def total_updates(self) -> int:
+        return self.learner.update_count
 
     @property
     def current_distance(self) -> Optional[int]:
@@ -295,9 +309,8 @@ class TrainingSession:
                 payload,
                 expected_config=expected_config,
             )
-        except BaseException:
+        finally:
             torch.set_rng_state(previous_rng_state)
-            raise
 
     @classmethod
     def _from_state_dict(
@@ -315,9 +328,7 @@ class TrainingSession:
             "training_config",
             "model_spec",
             "initial_seed",
-            "network_state_dict",
-            "optimizer_state_dict",
-            "replay_state_dict",
+            "learner",
             "counters",
             "curriculum",
             "validation",
@@ -370,19 +381,8 @@ class TrainingSession:
         if canonical_trace != expected_trace:
             raise ValueError("training checkpoint source_trace is incompatible")
         seed = require_checkpoint_int(payload["initial_seed"], "initial_seed")
-        validate_checkpoint_tree(
-            payload["optimizer_state_dict"], "optimizer_state_dict"
-        )
-
         session = cls(config=config, seed=seed, model_spec=ModelSpec.from_dict(payload["model_spec"]))
-        network_state = validate_model_state(
-            payload["network_state_dict"],
-            session.network.state_dict(),
-            "network_state_dict",
-        )
-        session.network.load_state_dict(network_state, strict=True)
-        session.optimizer.load_state_dict(payload["optimizer_state_dict"])
-        session.replay.load_state_dict(payload["replay_state_dict"])
+        session.learner.load_state_dict(payload["learner"])
 
         counters = require_checkpoint_fields(
             payload["counters"],
@@ -397,11 +397,12 @@ class TrainingSession:
             "counters",
         )
         for name, value in counters.items():
-            setattr(
-                session,
-                name,
-                require_checkpoint_int(value, name, minimum=0),
-            )
+            checked = require_checkpoint_int(value, name, minimum=0)
+            if name == "total_updates":
+                if checked != session.total_updates:
+                    raise ValueError("curriculum and learner update counts differ")
+            else:
+                setattr(session, name, checked)
         if session.curriculum_wins > session.curriculum_episodes:
             raise ValueError("curriculum wins exceed curriculum episodes")
         if session.random_wins > session.random_episodes:
@@ -507,34 +508,25 @@ class TrainingSession:
         )
 
         rng_states = require_checkpoint_fields(
-            payload["rng_states"], {"deal", "action", "replay", "torch"}, "rng_states"
+            payload["rng_states"], {"deal", "action"}, "rng_states"
         )
         for name, rng in (
             ("deal", session.deal_rng),
             ("action", session.action_rng),
-            ("replay", session.replay_rng),
         ):
             candidate = random.Random()
             try:
                 candidate.setstate(rng_states[name])
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, IndexError) as exc:
                 raise ValueError("%s RNG state is invalid" % name) from exc
             rng.setstate(rng_states[name])
-        torch_state = rng_states["torch"]
-        if (
-            not isinstance(torch_state, torch.Tensor)
-            or torch_state.dtype != torch.uint8
-            or torch_state.ndim != 1
-        ):
-            raise ValueError("torch RNG state is invalid")
-        torch.set_rng_state(torch_state)
         session.network.train()
         session.at_episode_boundary = True
         return session
 
     def state_dict(self) -> Dict[str, Any]:
-        optimizer_state = self.optimizer.state_dict()
-        validate_checkpoint_tree(optimizer_state, "optimizer_state_dict")
+        if not self.at_episode_boundary:
+            raise RuntimeError("cannot checkpoint a partial episode")
         return {
             "training_state_version": TRAINING_STATE_VERSION,
             "encoding_version": ENCODING_VERSION,
@@ -543,9 +535,7 @@ class TrainingSession:
             "training_config": self.config.to_dict(),
             "model_spec": self.network.spec.to_dict(),
             "initial_seed": self.initial_seed,
-            "network_state_dict": self.network.state_dict(),
-            "optimizer_state_dict": optimizer_state,
-            "replay_state_dict": self.replay.state_dict(),
+            "learner": self.learner.state_dict(),
             "counters": {
                 "total_episodes": self.total_episodes,
                 "total_updates": self.total_updates,
@@ -573,8 +563,6 @@ class TrainingSession:
             "rng_states": {
                 "deal": self.deal_rng.getstate(),
                 "action": self.action_rng.getstate(),
-                "replay": self.replay_rng.getstate(),
-                "torch": torch.get_rng_state(),
             },
             "baseline_model_state_dict": self.baseline_model_state,
             "best_model_state_dict": self.best_model_state,
@@ -593,8 +581,6 @@ class TrainingSession:
         rng_snapshot = {
             "deal": self.deal_rng.getstate(),
             "action": self.action_rng.getstate(),
-            "replay": self.replay_rng.getstate(),
-            "torch": torch.get_rng_state(),
         }
         self.at_episode_boundary = False
         replay_committed = False
@@ -611,56 +597,29 @@ class TrainingSession:
                 else env.reset(seed=deal_seed)
             )
             steps = []
+            policy = EpsilonPolicy(self.network, epsilon)
             while not obs.done:
                 if deadline is not None and time.monotonic() >= deadline:
                     self._restore_rng_snapshot(rng_snapshot)
                     self.at_episode_boundary = True
                     return None
-                action = select_action(
-                    self.network,
-                    obs,
-                    epsilon=epsilon,
-                    rng=self.action_rng,
-                    device=torch.device("cpu"),
-                )
-                state = obs
+                features = encode(obs)
+                action = policy.act_features([features], [self.action_rng])[0]
+                steps.append(Decision(
+                    obs, features, action, (tuple(obs.hand),) + ((0,) * 52,) * 5,
+                ))
                 obs = env.step(action)
-                reward = terminal_reward(
-                    self.config.shaping, won=obs.won,
-                    turns_remaining=obs.turns_remaining, max_turns=self.config.max_turns,
-                    hand=obs.hand, joker=obs.joker, required_sequences=self.config.required_sequences,
-                ) if obs.done else float(obs.last_reward)
-                steps.append((state, action, reward))
 
             if deadline is not None and time.monotonic() >= deadline:
                 self._restore_rng_snapshot(rng_snapshot)
                 self.at_episode_boundary = True
                 return None
 
-            returns = discounted_returns(
-                [reward for _state, _action, reward in steps],
-                self.config.gamma,
-            )
-            episode = tuple(
-                (state, action, target)
-                for (state, action, _reward), target in zip(steps, returns)
-            )
-            self.replay.append(episode)
+            points = minimum_penalty(obs.hand, obs.joker, self.config.required_sequences).points
+            outcome = SeatOutcome(1.0 if obs.won else -min(points, 100) / 100.0, obs.won, points)
+            self.learner.append([Trajectory(1, tuple(steps), outcome)])
             replay_committed = True
-            for _ in range(self.config.updates_per_episode):
-                batch = self.replay.sample(
-                    self.replay_rng,
-                    min(self.config.batch_size, len(self.replay)),
-                )
-                train_batch(
-                    self.network,
-                    self.optimizer,
-                    self.loss_fn,
-                    batch,
-                    torch.device("cpu"),
-                    self.config.grad_clip,
-                )
-                self.total_updates += 1
+            self.learner.update(self.config.updates_per_episode)
 
             self.total_episodes += 1
             self.stage_episodes += 1
@@ -809,8 +768,6 @@ class TrainingSession:
     def _restore_rng_snapshot(self, snapshot: Mapping[str, Any]) -> None:
         self.deal_rng.setstate(snapshot["deal"])
         self.action_rng.setstate(snapshot["action"])
-        self.replay_rng.setstate(snapshot["replay"])
-        torch.set_rng_state(snapshot["torch"])
 
 
 def curriculum_passed(
