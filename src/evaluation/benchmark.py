@@ -6,15 +6,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import random
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 
 from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv, Phase, discard_action
 from src.evaluate import hand_reward
+from src.model.encoding import encode
 from src.model.network import (
+    collate,
+    greedy_actions,
     load_checkpoint,
-    select_greedy_action,
     select_random_legal,
 )
 from src.model.spec import CHECKPOINT_VERSION
@@ -51,45 +53,54 @@ def evaluate_games(
         raise ValueError("policy must be greedy, random, or oracle")
     if policy == "oracle" and not warm_start:
         raise ValueError("oracle is only a discard-puzzle sensitivity check")
-    env = PappluEnv(config)
-    outcomes: List[int] = []
+    outcomes = []
     draws = [0, 0]
     was_training = network.training
     network.eval()
     try:
-        for index in range(games):
+        for start in range(0, games, 32):
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("Game evaluation reached its time limit")
-            obs = (
+            indices = range(start, min(start + 32, games))
+            envs = [PappluEnv(config) for _ in indices]
+            observations = [
                 env.reset_warm_start(seed=seed + index)
                 if warm_start else env.reset(seed=seed + index)
-            )
-            rng = random.Random(seed + index + 10_000_000)
-            while not obs.done:
+                for env, index in zip(envs, indices)
+            ]
+            rngs = [random.Random(seed + index + 10_000_000) for index in indices]
+            while any(not obs.done for obs in observations):
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("Game evaluation reached its time limit")
+                active = [index for index, obs in enumerate(observations) if not obs.done]
                 if policy == "greedy":
-                    action = select_greedy_action(network, obs)
+                    device = next(network.parameters()).device
+                    actions = greedy_actions(
+                        network, collate([encode(observations[index]) for index in active], device),
+                    ).tolist()
                 elif policy == "random":
-                    action = select_random_legal(obs, rng)
+                    actions = [select_random_legal(observations[index], rngs[index]) for index in active]
                 else:
-                    action = None
-                    for face, count in enumerate(obs.hand):
-                        if count:
-                            hand = list(obs.hand)
-                            hand[face] -= 1
-                            if hand_reward(
-                                hand, obs.joker, config.required_sequences,
-                                config.cards_in_hand,
-                            ):
-                                action = discard_action(face)
-                                break
-                    if action is None:
-                        raise RuntimeError("warm-start puzzle has no winning discard")
-                if obs.phase is Phase.DRAW:
-                    draws[action] += 1
-                obs = env.step(action)
-            outcomes.append(int(obs.won))
+                    actions = []
+                    for index in active:
+                        obs = observations[index]
+                        for face, count in enumerate(obs.hand):
+                            if count:
+                                hand = list(obs.hand)
+                                hand[face] -= 1
+                                if hand_reward(
+                                    hand, obs.joker, config.required_sequences,
+                                    config.cards_in_hand,
+                                ):
+                                    actions.append(discard_action(face))
+                                    break
+                        else:
+                            raise RuntimeError("warm-start puzzle has no winning discard")
+                for index, action in zip(active, actions):
+                    if observations[index].phase is Phase.DRAW:
+                        draws[action] += 1
+                    observations[index] = envs[index].step(action)
+            outcomes.extend(int(obs.won) for obs in observations)
     finally:
         network.train(was_training)
     return PolicyResults(tuple(outcomes), draws[0], draws[1])

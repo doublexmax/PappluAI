@@ -38,6 +38,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--solo-games", type=int, default=256)
     parser.add_argument("--checkpoint-every", type=int, default=16)
     parser.add_argument("--matches-per-round", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument(
         "--max-turns", type=int, default=60,
         help="Explicit per-player cap. Reduced-cap smoke runs cannot promote.",
@@ -95,6 +96,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     solo_games=args.solo_games,
                     checkpoint_every=args.checkpoint_every,
                     matches_per_round=args.matches_per_round,
+                    gate_workers=args.workers,
                     max_turns=args.max_turns,
                     player_counts=(2, 3, 4) if args.players is None else tuple(args.players),
                 ),
@@ -182,6 +184,9 @@ def _validate_resume_options(
             minimum=1,
         )
         changes["checkpoint_every"] = args.checkpoint_every
+    if "--workers" in explicit:
+        runtime.require_checkpoint_int(args.workers, "gate_workers", minimum=1)
+        changes["gate_workers"] = args.workers
     if changes:
         controller.config = replace(controller.config, **changes)
 

@@ -90,14 +90,17 @@ def sha256(path):
 
 def gate_result(accepted):
     def evaluate(**kwargs):
-        from src.checkpoints.evidence import balanced_seat_orders, evidence_metrics
+        from src.checkpoints.evidence import balanced_seat_orders, blocks_for_count, evidence_metrics
 
         blocks = kwargs["seed_blocks"]
         multiplayer = {
             str(players): {
+                "blocks": blocks_for_count(blocks, players),
                 "candidate_minus_champion": 0.5 if accepted else 0.0,
-                "games": blocks * len(balanced_seat_orders(players)),
-                "seed_block_margins": [0.5 if accepted else 0.0] * blocks,
+                "games": blocks_for_count(blocks, players) * len(balanced_seat_orders(players)),
+                "placement_margins": [0.5 if accepted else 0.0] * blocks_for_count(blocks, players),
+                "declaration_margins": [0.0] * blocks_for_count(blocks, players),
+                "declaration_delta": 0.0,
             }
             for players in kwargs["player_counts"]
         }
@@ -111,7 +114,7 @@ def gate_result(accepted):
         }
         samples = max(100, kwargs["samples"])
         return {
-            "gate_schema_version": 2,
+            "gate_schema_version": 3,
             "encoding_version": 2,
             "architecture": "axial_table",
             "candidate_sha256": sha256(kwargs["candidate_path"]),
@@ -145,6 +148,13 @@ def gate_result(accepted):
 
 
 class TestImproveConfig(unittest.TestCase):
+    def test_gate_worker_count_requires_a_positive_integer(self):
+        for value in (0, -1, True, 1.5, "2", None):
+            with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
+                ImproveConfig(gate_workers=value)
+        config = ImproveConfig(gate_workers=2)
+        self.assertEqual(ImproveConfig.from_dict(config.to_dict()).gate_workers, 2)
+
     def test_rebase_threshold_requires_a_positive_integer(self):
         for value in (0, -1, True, 1.5, "8", None):
             with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
@@ -768,7 +778,7 @@ class TestImprovementController(unittest.TestCase):
 
     def test_one_selection_bank_and_one_confirmation_bank_gate_the_same_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
-            controller = self.make_controller(Path(temporary))
+            controller = self.make_controller(Path(temporary), gate_workers=2)
             self.prepare_distinct_candidate(controller)
             calls = []
             decisions = iter((True, False))
@@ -795,6 +805,10 @@ class TestImprovementController(unittest.TestCase):
             self.assertEqual(calls[1]["seed_blocks"], 128)
             self.assertEqual(calls[0]["candidate_path"], candidate_path)
             self.assertEqual(calls[1]["candidate_path"], candidate_path)
+            self.assertEqual([call["workers"] for call in calls], [2, 2])
+            self.assertEqual(
+                [call["journal_dir"] for call in calls], [controller.output_dir / "gates"] * 2,
+            )
             self.assertEqual(controller.promotions, 0)
             self.assertEqual(controller.consecutive_rejections, 1)
 
@@ -859,6 +873,7 @@ class TestImprovementController(unittest.TestCase):
             arguments = [
                 "--resume", "latest-state.pt", "--output-dir", "output",
                 "--max-seconds", "60", "--max-cycles", "3",
+                "--workers", "2", "--checkpoint-every", "3",
             ]
             _validate_resume_options(
                 improve_runtime,
@@ -868,6 +883,20 @@ class TestImprovementController(unittest.TestCase):
             )
             self.assertEqual(controller.config.max_cycles, 3)
             self.assertEqual(controller.config.league_matches_per_cycle, 1)
+            self.assertEqual(controller.config.gate_workers, 2)
+            self.assertEqual(controller.config.checkpoint_every, 3)
+            unchanged = [
+                "--resume", "latest-state.pt", "--output-dir", "output", "--max-seconds", "60",
+            ]
+            _validate_resume_options(
+                improve_runtime, controller, parser.parse_args(unchanged), unchanged,
+            )
+            self.assertEqual(controller.config.gate_workers, 2)
+            controller.save_checkpoint()
+            restored = ImprovementController.load(
+                str(controller.output_dir / "latest-state.pt"), controller.output_dir,
+            )
+            self.assertEqual(restored.config.gate_workers, 2)
             for changed in (["--league-matches", "999"], ["--rebase-after-rejections", "2"], ["--matches-per-round", "4"]):
                 invalid = arguments + changed
                 with self.assertRaisesRegex(ValueError, "cannot change"):
@@ -963,6 +992,21 @@ class TestImprovementController(unittest.TestCase):
             controller.save_checkpoint()
             self.assertIn("new-event", (controller.output_dir / "metrics.jsonl").read_text())
 
+    def test_snapshot_manifest_skips_gate_directories_and_hidden_temporary_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = self.make_controller(Path(temporary))
+            gates = controller.output_dir / "gates"
+            gates.mkdir()
+            (gates / "completed.jsonl").write_text('{"complete":true}\n')
+            (controller.output_dir / "not-a-file.json").mkdir()
+            (controller.output_dir / ".temporary-model.pt").write_bytes(b"unfinished")
+            files = controller.save_checkpoint()
+            self.assertEqual(files["latest-state.pt"]["sha256"], sha256(controller.output_dir / "latest-state.pt"))
+            self.assertEqual(
+                set(files) & {"gates", "not-a-file.json", ".temporary-model.pt"}, set(),
+            )
+            self.assertEqual((gates / "completed.jsonl").read_text(), '{"complete":true}\n')
+
     def test_gate_budget_exceptions_checkpoint_without_partial_promotion(self):
         from src.evaluation.arena import MatchInterrupted
         from src.evaluation.promotion import GateInterrupted
@@ -1047,7 +1091,14 @@ class TestImprovementController(unittest.TestCase):
             self.assertEqual(controller.promotions, 0)
             self.assertEqual(controller.league.config.game.max_turns, 1)
             self.assertEqual(controller.last_gate["max_turns"], 1)
+            self.assertEqual(controller.last_gate["gate_schema_version"], 3)
             self.assertEqual(controller.last_gate["candidate_origin"], "league")
+            journal, = (controller.output_dir / "gates").glob("*.jsonl")
+            completed = [json.loads(line) for line in journal.read_text().splitlines()]
+            self.assertEqual(
+                [record["job"] for record in completed if record["job"][0] == "solo"],
+                [["solo", 0, 2]],
+            )
             metrics = [
                 json.loads(line)
                 for line in (controller.output_dir / "metrics.jsonl").read_text().splitlines()
@@ -1081,6 +1132,7 @@ class TestImproveCli(unittest.TestCase):
         defaults = parser.parse_args(base)
         self.assertIsNone(defaults.players)
         self.assertIsNone(defaults.snapshots)
+        self.assertEqual(defaults.workers, 1)
         for counts in (["2"], ["3"], ["4"], ["2", "3", "4"]):
             with self.subTest(counts=counts):
                 args = parser.parse_args(base + ["--players", *counts, "--snapshots", "snapshots"])
@@ -1109,6 +1161,8 @@ class TestImproveCli(unittest.TestCase):
                 "2",
                 "--matches-per-round",
                 "4",
+                "--workers",
+                "2",
                 "--rebase-after-rejections",
                 "3",
                 "--selection-blocks",
@@ -1122,6 +1176,7 @@ class TestImproveCli(unittest.TestCase):
         self.assertEqual(args.max_cycles, 1)
         self.assertEqual(args.league_matches_per_cycle, 2)
         self.assertEqual(args.matches_per_round, 4)
+        self.assertEqual(args.workers, 2)
         self.assertEqual(args.rebase_after_rejections, 3)
         self.assertEqual(args.selection_blocks, 2)
         self.assertEqual(args.confirmation_blocks, 2)

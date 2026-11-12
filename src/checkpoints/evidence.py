@@ -5,7 +5,7 @@ import math
 from itertools import permutations
 from numbers import Real
 import random
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from src.game.environment import ENCODING_VERSION, GameConfig
 from src.model.spec import ARCHITECTURE
@@ -14,7 +14,7 @@ from src.model.spec import ARCHITECTURE
 MIN_SELECTION_SEED_BLOCKS = 32
 MIN_CONFIRMATION_SEED_BLOCKS = 128
 MIN_SOLO_GAMES = 256
-GATE_SCHEMA_VERSION = 2
+GATE_SCHEMA_VERSION = 3
 PLAYER_COUNTS = (2, 3, 4)
 
 
@@ -54,24 +54,63 @@ def balanced_seat_orders(players: int) -> tuple:
     )
 
 
-def clustered_interval(
-    values: Sequence[float],
-    samples: int = 2000,
-    seed: int = 81,
-) -> list:
-    if not values or isinstance(samples, bool) or not isinstance(samples, int) or samples < 100:
-        raise ValueError("Nonempty seed-block scores and at least 100 bootstrap samples are required")
-    if any(
+def blocks_for_count(seed_blocks: int, players: int) -> int:
+    if type(seed_blocks) is not int or seed_blocks <= 0:
+        raise ValueError("seed_blocks must be a positive integer")
+    if type(players) is not int or players not in PLAYER_COUNTS:
+        raise ValueError("players must be 2, 3, or 4")
+    return {2: 4, 3: 2, 4: 1}[players] * seed_blocks
+
+
+def _require_margins(values: Sequence[float]) -> None:
+    if not values or any(
         isinstance(value, bool)
         or not isinstance(value, Real)
         or not math.isfinite(float(value))
         or not -1 <= float(value) <= 1
         for value in values
     ):
-        raise ValueError("Seed-block scores must be finite and in [-1, 1]")
+        raise ValueError("Seed-block scores must be nonempty, finite, and in [-1, 1]")
+
+
+def _require_samples(samples: int) -> None:
+    if type(samples) is not int or samples < 100:
+        raise ValueError("At least 100 bootstrap samples are required")
+
+
+def clustered_interval(
+    values: Sequence[float],
+    samples: int = 2000,
+    seed: int = 81,
+) -> list[float]:
+    _require_margins(values)
+    _require_samples(samples)
     rng = random.Random(seed)
     bootstrap = sorted(
         sum(rng.choices(values, k=len(values))) / len(values)
+        for _ in range(samples)
+    )
+    return [bootstrap[int(samples * 0.025)], bootstrap[int(samples * 0.975)]]
+
+
+def stratified_interval(
+    margins_by_count: Mapping[int, Sequence[float]],
+    samples: int = 2000,
+    seed: int = 81,
+) -> list[float]:
+    if not isinstance(margins_by_count, Mapping) or not margins_by_count:
+        raise ValueError("Nonempty player-count margins are required")
+    _require_samples(samples)
+    counts = sorted(margins_by_count)
+    for values in margins_by_count.values():
+        _require_margins(values)
+    rng = random.Random(seed)
+    bootstrap = sorted(
+        sum(
+            sum(rng.choices(margins_by_count[count], k=len(margins_by_count[count])))
+            / len(margins_by_count[count])
+            for count in counts
+        ) / len(counts)
         for _ in range(samples)
     )
     return [bootstrap[int(samples * 0.025)], bootstrap[int(samples * 0.975)]]
@@ -91,27 +130,30 @@ def evidence_metrics(
     if not isinstance(multiplayer, dict) or set(multiplayer) != {str(count) for count in counts}:
         raise ValueError("Multiplayer results must match player_counts")
     margins = {}
+    declarations = {}
     for count in counts:
         raw = multiplayer[str(count)]
-        values = raw.get("seed_block_margins")
-        if not isinstance(values, (list, tuple)) or len(values) != blocks:
-            raise ValueError("Each multiplayer result requires one margin per independent seed block")
-        if raw.get("games") != blocks * len(balanced_seat_orders(count)):
+        count_blocks = blocks_for_count(blocks, count)
+        if not isinstance(raw, dict) or type(raw.get("blocks")) is not int or raw["blocks"] != count_blocks:
+            raise ValueError("Block count does not match the player-count schedule")
+        if raw.get("games") != count_blocks * len(balanced_seat_orders(count)):
             raise ValueError("Game count does not match the balanced seating schedule")
-        if any(
-            isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value) or not -1 <= value <= 1
-            for value in values
+        for field, summary, target in (
+            ("placement_margins", "candidate_minus_champion", margins),
+            ("declaration_margins", "declaration_delta", declarations),
         ):
-            raise ValueError("Invalid seed-block margin")
-        mean = sum(values) / blocks
-        declared = raw.get("candidate_minus_champion")
-        if (
-            isinstance(declared, bool) or not isinstance(declared, (int, float))
-            or not math.isclose(mean, declared, abs_tol=1e-12)
-        ):
-            raise ValueError("Player-count summary disagrees with its raw margins")
-        margins[count] = values
+            values = raw.get(field)
+            if not isinstance(values, (list, tuple)) or len(values) != count_blocks:
+                raise ValueError("Each multiplayer result requires one %s value per seed block" % field)
+            _require_margins(values)
+            declared = raw.get(summary)
+            if (
+                isinstance(declared, bool) or not isinstance(declared, Real)
+                or not math.isfinite(float(declared))
+                or not math.isclose(sum(values) / count_blocks, declared, rel_tol=0, abs_tol=1e-12)
+            ):
+                raise ValueError("Player-count summary disagrees with its raw %s" % field)
+            target[count] = values
     if not isinstance(solo, dict):
         raise ValueError("Paired solo results are required")
     games = solo.get("games")
@@ -127,14 +169,13 @@ def evidence_metrics(
             raise ValueError("Solo outcomes must contain one binary verdict per game")
     if solo.get("candidate_wins") != sum(candidate) or solo.get("champion_wins") != sum(champion):
         raise ValueError("Solo win counts disagree with their raw outcomes")
-    combined = [
-        sum(values) / len(counts)
-        for values in zip(*(margins[count] for count in counts))
-    ]
     differences = [left - right for left, right in zip(candidate, champion)]
     return {
-        "multiplayer_gain": sum(combined) / blocks,
-        "multiplayer_ci95": clustered_interval(combined, samples, seed + 91827),
+        "multiplayer_gain": sum(sum(margins[count]) / len(margins[count]) for count in counts) / len(counts),
+        "declaration_gain": sum(
+            sum(declarations[count]) / len(declarations[count]) for count in counts
+        ) / len(counts),
+        "multiplayer_ci95": stratified_interval(margins, samples, seed + 91827),
         "multiplayer_ci95_by_count": {
             str(count): clustered_interval(margins[count], samples, seed + 91827 + count)
             for count in counts
@@ -163,6 +204,7 @@ def gate_accepted(
         )
         and set(metrics["multiplayer_ci95_by_count"]) == {str(count) for count in counts}
         and all(interval[0] > 0 for interval in metrics["multiplayer_ci95_by_count"].values())
+        and metrics["declaration_gain"] >= 0
         and metrics["solo_gain"] >= 0
         and metrics["solo_ci95"][0] >= -0.03
     )
@@ -186,12 +228,15 @@ def validate_gate_evidence(
         raise ValueError(
             "%s evidence must accept these exact models" % phase
         )
+    if evidence.get("gate_schema_version") == 2:
+        raise ValueError("%s evidence uses unsupported gate schema v2; expected v3" % phase)
     if (
-        evidence.get("gate_schema_version") != GATE_SCHEMA_VERSION
+        type(evidence.get("gate_schema_version")) is not int
+        or evidence.get("gate_schema_version") != GATE_SCHEMA_VERSION
         or evidence.get("encoding_version") != ENCODING_VERSION
         or evidence.get("architecture") != ARCHITECTURE
     ):
-        raise ValueError("%s evidence requires the current dynamic gate schema" % phase)
+        raise ValueError("%s evidence requires axial_table gate schema v3" % phase)
     raw_counts = evidence.get("player_counts")
     if not isinstance(raw_counts, (list, tuple)):
         raise ValueError("%s evidence requires player_counts as a list or tuple" % phase)
@@ -242,7 +287,7 @@ def validate_gate_evidence(
                 MIN_SOLO_GAMES,
             )
         )
-    for name in ("multiplayer_gain", "solo_gain"):
+    for name in ("multiplayer_gain", "declaration_gain", "solo_gain"):
         value = evidence.get(name)
         if (
             isinstance(value, bool)
@@ -302,7 +347,7 @@ def validate_gate_evidence(
         )
         if any(
             type(left) not in (int, float) or not math.isfinite(left)
-            or not math.isclose(left, right, abs_tol=1e-12)
+            or not math.isclose(left, right, rel_tol=0, abs_tol=1e-12)
             for left, right in pairs
         ):
             raise ValueError(

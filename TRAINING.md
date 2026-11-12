@@ -33,7 +33,7 @@ performance.
 The first command writes `checkpoints\smoke.pt`. The second writes paired
 evaluation details to `runs\smoke-evaluation.json`.
 
-To fine-tune those weights with fresh optimizer and replay state:
+To fine-tune those weights, start with fresh optimizer and replay state.
 
 ```powershell
 .\.venv\Scripts\python -m src.cli.solo --load checkpoints\smoke.pt --episodes 5 --checkpoint checkpoints\smoke-finetuned.pt
@@ -42,11 +42,19 @@ To fine-tune those weights with fresh optimizer and replay state:
 ## Train and resume full 21-card play
 
 The curriculum trainer defaults to three decks, 21 cards, five required pure
-sequences, discard recycling, a 60-turn limit, and the `dynamic_table` network.
+sequences, discard recycling, a 60-turn limit, and the `axial_table` network.
 This is a one-player curriculum for the same model that plays multiplayer.
 
 ```powershell
 .\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21
+```
+
+For a larger model, set `--width`, `--heads`, and `--blocks` on the first run.
+Both `src.cli.solo` and `src.cli.curriculum` accept these flags.
+The default spec is `ModelSpec(width=64, heads=4, blocks=2)`.
+
+```powershell
+.\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21-wide --width 128 --heads 8 --blocks 3
 ```
 
 The output directory contains `latest-state.pt`, `latest-model.pt`,
@@ -54,7 +62,7 @@ The output directory contains `latest-state.pt`, `latest-model.pt`,
 checkpoint includes model and optimizer tensors, replay, curriculum and
 learning counters, plus Python and PyTorch random-number-generator states.
 
-Resume the exact run and then benchmark its latest model:
+Resume the saved run, then benchmark its latest model.
 
 ```powershell
 .\.venv\Scripts\python -m src.cli.curriculum --resume runs\full21\latest-state.pt --output-dir runs\full21
@@ -62,21 +70,27 @@ Resume the exact run and then benchmark its latest model:
 ```
 
 Start this architecture with fresh weights in a new output directory.
-Checkpoint version 3, information encoding version 2, and replay version 2
+Checkpoint version 4, information encoding version 2, and `TrajectoryReplay` version 3
 are the only supported formats. Historical checkpoints, old replay, and old
 registry records fail explicitly. No conversion path remains.
 
-Decision observations retain their complete visible histories.
-The current and initial own hand, public draws and discards, and own stock
-draw faces form direct card-history channels on a four-suit, 13-rank grid.
-Shared suit convolutions, card self-attention, and cross-suit rank pooling
-encode the grid without learned suit identities. A chronology-weighted event
-summary and player turn relations provide table context. Peers' stock faces
-and hidden stock order never enter the encoder. Inference reconstructs these
-features without private recurrent state. Replay uses the same collation.
-Checkpoints store one journal per episode and a history-prefix length for each
-decision. Resume validates that each snapshot matches its history prefix and
-restores shared event objects.
+`Learner` uses 5-step Double DQN with `gamma = 1.0`.
+The online network selects a legal bootstrap action, and the target network values that action.
+Terminal multiplayer targets use pairwise placement utility. Solo targets use +1 for a win and -1 for a loss.
+AdamW, a Polyak target network, and gradient clipping update the challenger.
+Win, penalty, opponent-card, afterstate, and budgeted lookahead losses provide additional training targets.
+
+`encode` converts each visible observation into a pure `Features` record of 3,208 float32 values.
+The encoder includes meld membership, public-card beliefs, per-kind history recencies, and six relative seat slots.
+`PolicyNet` combines rank convolutions, suit pooling, table attention, and FiLM on a four-suit, 13-rank grid.
+`collate` batches cached records without rescanning history.
+Hidden hands provide auxiliary training targets only.
+Browser exports omit `aux.*` weights and retain only `policy.*`.
+See the [current model contract](README.md#current-model-contract) for the model layout.
+
+`TrajectoryReplay` v3 samples decisions uniformly within each player count.
+Checkpoints store one visible-history journal per trajectory and a prefix for each decision.
+Resume validates each snapshot against its prefix and restores the replay sampling cursor.
 
 ## Run shared-deck arena matches
 
@@ -90,6 +104,8 @@ Repeat `--model` once per seat, using either a checkpoint or `random`.
 turn counts, and remaining stock. Its `telemetry` field records stock draws
 and discard draws per seat, plus the completed-turn number of each stock
 refill. A refill does not reset the turn budget.
+`run_matches` encodes each active state once and batches inference by policy.
+`evaluate_games` advances up to 32 solo deals in lockstep while preserving `seed + index` order.
 
 ## Calibrate multiplayer draw limits
 
@@ -119,7 +135,7 @@ permutations as additional trials.
 `protocol.json` fixes the models, source, caps, seeds, and sample budget.
 Completed cases are persisted individually. Repeating the same command resumes
 unfinished work. Use a new output directory and fresh seeds for a new study.
-`status.json` reports progress; `summary.json` contains outcomes, refill counts,
+`status.json` reports progress. `summary.json` contains outcomes, refill counts,
 and the cap comparison.
 
 The default selection bound allows at most a 5% probability that the larger
@@ -149,22 +165,27 @@ Training defaults to two, three, and four players.
 ```powershell
 New-Item -ItemType Directory -Force checkpoints
 Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
-.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --players 2 3 4 --matches 128 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --players 2 3 4 --matches 128 --matches-per-round 16 --max-seconds 3600 --checkpoint-every 16
 .\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
 ```
 
 League options have these defaults.
 
 - `--max-turns 60` limits each seat's completed draw-discard turns.
-- `--batch-size 64` caps the replay samples in each optimizer update.
+- `--batch-size 128` caps the replay samples in each optimizer update.
 - `--updates-per-match 4` sets the updates after a match with challenger actions.
+- `--matches-per-round 16` batches deals before updates.
 
 League checkpoints are published only at match boundaries and preserve the
 opponent-pool identity, replay, optimizer, counters, and random streams.
 Count and challenger-seat schedules are independent and deterministic.
-Replay samples counts equally before episodes and decisions.
+Replay gives each count equal sampling shares and samples its decisions uniformly.
 Resume restores the saved count selection and schedule cursors.
-On resume, omit `--max-turns`, `--batch-size`, and `--updates-per-match` to keep
+`OpponentScheduler` uses PFSP weights `(1 - p)^2` from smoothed pairwise placement scores.
+The default schedule reserves 35% for the champion and 15% for available baseline and random opponents.
+Other frozen opponents share the remaining probability according to those weights.
+
+On resume, omit `--max-turns`, `--batch-size`, `--updates-per-match`, and `--matches-per-round` to keep
 their saved values, or supply the same values.
 Changes to those options, `--players`, or `--seed` fail before checkpoint publication.
 Player counts must be sorted and distinct.
@@ -173,23 +194,49 @@ model or state checkpoint. Use a new output directory for a fresh run.
 
 ## Run finite improvement cycles
 
-Improvement alternates league and independent research training, evaluates
-both candidates, and promotes only through the guarded evidence gate.
+`ImprovementController` v3 trains one league challenger, selects it, and confirms it on fresh seeds.
+It registers one candidate per cycle and promotes only through `evaluate_gate` evidence.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.improve --initial-model runs\full21\latest-model.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1
-.\.venv\Scripts\python -m src.cli.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600
+.\.venv\Scripts\python -m src.cli.improve --initial-model runs\full21\latest-model.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1 --matches-per-round 16 --workers 4
+.\.venv\Scripts\python -m src.cli.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600 --workers 2
 ```
 
 `champion.json` is the sole champion pointer. Registered model snapshots are
 immutable. `status.json` describes the latest stable published state.
 
-Selection needs at least 32 independent seed blocks for each player count.
-Confirmation needs at least 128 blocks for each count on disjoint seeds.
-Four-player blocks contain all 24 seat permutations.
-Each count needs a positive lower 95% confidence bound.
-The aggregate gain threshold remains 0.05.
-The paired solo retention check still needs 256 games.
+The challenger follows the champion at each cycle boundary.
+Self-promotion keeps its weights, AdamW state, and replay.
+An external champion change reloads weights and resets the optimizer.
+`--rebase-after-rejections 8` applies the same rebase after eight rejected cycles.
+Replay and random streams survive both forms of rebase.
+
+Keep the default `--selection-blocks 32`, `--confirmation-blocks 128`, and `--solo-games 256` for promotion.
+The gate uses 4x, 2x, and 1x the base block count for two, three, and four players.
+Selection therefore plays 256, 384, and 768 games.
+Confirmation plays 1,024, 1,536, and 3,072 games.
+Each block batches all 2, 6, or 24 seat orders.
+The registry requires disjoint selection and confirmation seeds.
+
+`gate_schema_version == 3` records both placement margins and declaration margins.
+Better loser placements count even when neither contender declares.
+The stratified bootstrap weights player counts equally.
+Promotion requires placement gain of at least 0.05, positive gain for every count, and positive overall and per-count lower 95% bounds.
+Aggregate declaration gain and paired solo gain cannot be negative.
+The solo lower 95% bound must be at least -0.03.
+See [promotion evidence](RATINGS.md#promotion-evidence-stays-separate) for the complete gate contract.
+
+Use `--workers` to set the gate process count. The default is 1.
+Each worker verifies the source fingerprint and loads frozen policies once.
+Workers use one PyTorch thread each.
+Only the coordinator appends and flushes completed jobs to `gates/<gate_id>.jsonl`.
+Interrupted gates retain completed blocks and paired solo slices.
+Resume with the same model hashes, rules, seeds, and budgets to skip that work.
+Result assembly follows block index and solo-slice start, not worker completion order.
+
+On `--resume`, change `--workers`, `--checkpoint-every`, or `--max-cycles` as needed.
+Omit those options to retain their saved values.
+Learning settings, player counts, and the initial opponent pool cannot change on resume.
 
 Keep full 21-card, 60-turn recycling rules for promotion.
 Smaller `--selection-blocks`, `--confirmation-blocks`, and `--solo-games`
@@ -205,11 +252,13 @@ Use a temporary output directory for a bounded local check.
 .\.venv\Scripts\python tools\verify_dynamic_model.py --output-dir "$env:TEMP\papplu-dynamic-verification"
 ```
 
-The script runs full 60-turn legal games at each supported player count.
+The script verifies `axial_table` v4 checkpoints and runs full 60-turn games at each supported player count.
 Separate one-turn smoke games exercise mixed-count updates, exact full-state
 resume, a rejected improvement cycle, and persisted tournaments and reports.
 The resume check compares an uninterrupted learner's actual matches and updates
 with the checkpoint restored by the CLI.
+Gate v3 checks compare in-process and two-worker results byte for byte and reuse a completed JSONL journal.
+Unit tests also interrupt a gate between jobs and verify that resume skips completed blocks and solo slices.
 Each invocation creates a new timestamped directory, so repeated checks
 preserve earlier artifacts.
 Read `evidence.json` for the commands, exit codes, checkpoint identities, and

@@ -47,6 +47,35 @@ class TestPairedComparison(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "Training dependencies not installed")
 class TestEvaluation(unittest.TestCase):
+    def test_lockstep_batches_preserve_scalar_deal_order_outcomes_and_draws(self):
+        from src.model.network import QNetwork
+        from src.model.spec import ModelSpec
+
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(17)
+                network = QNetwork(ModelSpec(8, 1, 1))
+            config = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=3)
+            greedy = evaluate_games(network, config, 35, 600000, warm_start=True)
+            self.assertEqual(greedy, PolicyResults((
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1,
+            ), 0, 0))
+            random_policy = evaluate_games(network, config, 35, 600000, "random", True)
+            self.assertEqual(random_policy, PolicyResults((
+                0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0,
+            ), 0, 0))
+            ordinary = evaluate_games(network, config, 35, 600000)
+            self.assertEqual(ordinary, PolicyResults((
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+            ), 103, 0))
+        finally:
+            torch.set_num_threads(previous_threads)
+
     def test_checkpoint_evaluation_restores_torch_threads(self):
         from src.model.network import QNetwork, save_checkpoint
 

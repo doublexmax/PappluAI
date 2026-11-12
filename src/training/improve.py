@@ -56,6 +56,7 @@ class ImproveConfig:
     max_turns: int = 60
     player_counts: Tuple[int, ...] = (2, 3, 4)
     gate_samples: int = 2_000
+    gate_workers: int = 1
     recycle_discard: bool = True
 
     def __post_init__(self) -> None:
@@ -72,6 +73,7 @@ class ImproveConfig:
             "matches_per_round",
             "max_turns",
             "gate_samples",
+            "gate_workers",
         ):
             require_checkpoint_int(getattr(self, name), name, minimum=1)
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
@@ -535,6 +537,8 @@ class ImprovementController:
             samples=self.config.gate_samples,
             deadline=deadline,
             recycle_discard=self.config.recycle_discard,
+            workers=self.config.gate_workers,
+            journal_dir=self.output_dir / "gates",
         )
         checked = _gate_result(result, "selection")
         self.selection_result = checked
@@ -569,6 +573,8 @@ class ImprovementController:
                 samples=self.config.gate_samples,
                 deadline=deadline,
                 recycle_discard=self.config.recycle_discard,
+                workers=self.config.gate_workers,
+                journal_dir=self.output_dir / "gates",
             )
             checked = _gate_result(result, "confirmation")
             checked["selection_passed"] = True

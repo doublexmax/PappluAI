@@ -81,7 +81,6 @@ class ModelRegistry:
         *,
         expected_sha256: Optional[str] = None,
     ) -> ModelRecord:
-        # Registry reads stay Torch-free; registration validates model files.
         from src.model.network import load_checkpoint
 
         source = Path(path)
@@ -192,9 +191,9 @@ class ModelRegistry:
             or abs(confirmation.seed - selection.seed)
             < 100_000
             + max(
-                confirmation.seed_blocks,
+                4 * confirmation.seed_blocks,
                 confirmation.solo_games,
-                selection.seed_blocks,
+                4 * selection.seed_blocks,
                 selection.solo_games,
             )
         ):

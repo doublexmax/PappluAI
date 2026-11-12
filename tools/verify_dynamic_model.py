@@ -21,6 +21,7 @@ import torch
 
 from src.checkpoints.io import atomic_write_json, file_sha256
 from src.evaluation.arena import CheckpointPolicy, play_match
+from src.evaluation.promotion import evaluate_gate
 from src.evaluation.ratings import RatingStore
 from src.game.environment import (
     ACTION_TAKE_DISCARD, GameConfig, Observation, discard_action, legal_action_mask,
@@ -116,11 +117,20 @@ def verify(output: Path) -> dict:
         for seed in (11, 22, 33):
             path = output / ("fresh-%d.pt" % seed)
             cli("solo", "--episodes", 0, "--seed", seed, "--max-turns", 60,
+                "--width", 16, "--heads", 2, "--blocks", 1,
                 "--log-every", 0, "--checkpoint", path)
             frozen = snapshots / ("model-" + file_sha256(path) + ".pt")
             frozen.write_bytes(path.read_bytes())
             paths.append(frozen)
         evidence["snapshot_sha256"] = [file_sha256(path) for path in paths]
+        checkpoint = torch.load(paths[0], weights_only=True)
+        assert checkpoint["checkpoint_version"] == 4
+        assert checkpoint["architecture"] == "axial_table"
+        assert checkpoint["model_spec"] == {"width": 16, "heads": 2, "blocks": 1}
+        evidence["model"] = {
+            "checkpoint_version": checkpoint["checkpoint_version"],
+            "architecture": checkpoint["architecture"], "model_spec": checkpoint["model_spec"],
+        }
         policy = CheckpointPolicy(str(paths[0]))
         before = digest(policy.network.state_dict())
         full_play = []
@@ -218,11 +228,13 @@ def verify(output: Path) -> dict:
         curriculum = output / "curriculum"
         cli("curriculum", "--output-dir", curriculum, "--max-episodes", 1,
             "--max-seconds", 120, "--checkpoint-every", 1, "--validation-games", 1,
-            "--validate-every", 100, "--max-turns", 1, "--seed", 61)
+            "--validate-every", 100, "--max-turns", 1, "--seed", 61,
+            "--width", 16, "--heads", 2, "--blocks", 1)
         cli("curriculum", "--resume", curriculum / "latest-state.pt", "--output-dir", curriculum,
             "--max-episodes", 2, "--max-seconds", 120, "--checkpoint-every", 1)
         solo_state = torch.load(curriculum / "latest-state.pt", weights_only=True)
         assert solo_state["counters"]["total_episodes"] == 2
+        assert solo_state["learner"]["replay"]["version"] == 3
         cli("benchmark", "--checkpoint", curriculum / "latest-model.pt",
             "--output", output / "benchmark.json", "--games", 1, "--warm-games", 0)
 
@@ -263,6 +275,7 @@ def verify(output: Path) -> dict:
             for episode in final["learner"]["replay"]["trajectories"]
         )
         assert set(counts) == {2, 3, 4}
+        assert final["learner"]["replay"]["version"] == 3
         evidence["resume"] = {
             "exact_state_sha256": exact_digest,
             "matches": final["counters"]["completed_matches"],
@@ -276,18 +289,25 @@ def verify(output: Path) -> dict:
             "--max-seconds", 120, "--max-cycles", 1, "--max-turns", 1,
             "--league-matches", 1,
             "--selection-blocks", 1, "--confirmation-blocks", 1, "--solo-games", 1,
-            "--checkpoint-every", 1)
+            "--checkpoint-every", 1, "--matches-per-round", 2, "--workers", 2)
         cli("improve", "--resume", improve / "latest-state.pt", "--output-dir", improve,
-            "--max-seconds", 0)
+            "--max-seconds", 0, "--workers", 1)
         assert json.loads((improve / "status.json").read_text())["promotions"] == 0
         improvement_status = json.loads((improve / "status.json").read_text())
         assert improvement_status["completed_cycles"] == 1
         assert improvement_status["last_gate"]["accepted"] is False
+        assert improvement_status["last_gate"]["gate_schema_version"] == 3
+        assert improvement_status["last_gate"]["architecture"] == "axial_table"
+        assert [
+            (raw["blocks"], raw["games"])
+            for raw in improvement_status["last_gate"]["multiplayer"].values()
+        ] == [(4, 8), (2, 12), (1, 24)]
         assert improvement_status["league_matches"] == 1
         assert improvement_status["updates"] == 4
         assert "research_episodes" not in improvement_status
         improvement_state = torch.load(improve / "latest-state.pt", weights_only=True)
         assert improvement_state["improvement_state_version"] == 3
+        assert improvement_state["config"]["gate_workers"] == 1
         assert improvement_state["cursors"] == {"league": 0}
         assert "research_state" not in improvement_state
         improvement_metrics = [
@@ -300,6 +320,30 @@ def verify(output: Path) -> dict:
             "cycles": improvement_status["completed_cycles"],
             "promotions": improvement_status["promotions"],
             "cap": improvement_status["rules"]["max_turns"],
+            "gate_schema_version": improvement_status["last_gate"]["gate_schema_version"],
+        }
+
+        gate_arguments = {
+            "candidate_path": str(paths[1]), "champion_path": str(paths[0]),
+            "opponent_paths": (str(paths[2]),), "seed": 70_000_000,
+            "seed_blocks": 1, "solo_games": 35, "max_turns": 1, "samples": 100,
+        }
+        journal_dir = output / "gates"
+        serial_gate = evaluate_gate(**gate_arguments, workers=1, journal_dir=journal_dir)
+        parallel_gate = evaluate_gate(**gate_arguments, workers=2)
+        resumed_gate = evaluate_gate(**gate_arguments, workers=2, journal_dir=journal_dir)
+        assert json.dumps(serial_gate) == json.dumps(parallel_gate) == json.dumps(resumed_gate)
+        journal, = journal_dir.glob("*.jsonl")
+        completed_jobs = [json.loads(line) for line in journal.read_text().splitlines()]
+        assert len(completed_jobs) == 9
+        assert [record["job"] for record in completed_jobs[-2:]] == [["solo", 0, 32], ["solo", 32, 3]]
+        assert serial_gate["gate_schema_version"] == 3
+        assert serial_gate["accepted"] is False
+        evidence["gate"] = {
+            "gate_schema_version": serial_gate["gate_schema_version"],
+            "result_sha256": digest(serial_gate), "completed_jobs": len(completed_jobs),
+            "workers_compared": [1, 2], "journal": str(journal),
+            "scope": "One-turn worker-count and journal-resume equality. Not promotion evidence.",
         }
 
         tournament = output / "tournament"
@@ -337,7 +381,7 @@ def verify(output: Path) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Verify the current dynamic model with bounded CPU play, training, resume, and ratings.")
+    parser = argparse.ArgumentParser(description="Verify axial_table v4 play, training, gate v3 journals, resume, and ratings.")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     verify(args.output_dir)

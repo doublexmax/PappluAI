@@ -62,7 +62,7 @@ Its report always says `cap_weight_validated: false`.
 The discount interpolates the approximate Gaussian update in information
 parameters, affecting both the skill estimate and its internal uncertainty.
 It does not misuse OpenSkill's player-contribution `weights` parameter.
-A weight of zero leaves the prior unchanged; a weight of one reproduces the
+A weight of zero leaves the prior unchanged. A weight of one reproduces the
 full update. Declared games retain full weight.
 
 Keep the completed-game-only view beside the discounted view. Validate any
@@ -83,8 +83,8 @@ cap-conditioned play rather than a shared trajectory with different cutoffs.
 The calibration command and its evidence rules are described in
 [TRAINING.md](TRAINING.md#calibrate-multiplayer-draw-limits).
 
-Earlier frozen-pool cap studies do not establish limits for the new dynamic
-architecture. Its checkpoints use information encoding version 2.
+Earlier frozen-pool cap studies do not establish limits for `axial_table`.
+Current checkpoints use `checkpoint_version == 4` and `encoding_version == 2`.
 Current tournament registration rejects old model schemas and old registry
 records. Keep historical evidence separate and use a new root for current models.
 
@@ -134,7 +134,7 @@ idempotent; conflicting results fail explicitly.
 Rating calculations follow the persisted block and seating order, not worker
 completion order. Only complete, scored blocks in the settled prefix are used.
 Failed blocks remain visible. The live writer retains a disposable projection
-and applies only newly settled blocks; a read-only report can replay from the
+and applies only newly settled blocks. A read-only report can replay from the
 canonical database. Standings publication is rate-limited.
 
 ## Read the results
@@ -152,7 +152,7 @@ control. The coordinator does not refresh the secondary file in that mode.
 After changing cap policy, do not use an older `standings-completed-only.json`
 as the current control.
 
-Generate a separate uncertainty report while the coordinator runs:
+Generate a separate uncertainty report while the coordinator runs.
 
 ```powershell
 $reference = (Get-Content runs\ratings\status.json -Raw | ConvertFrom-Json).reference
@@ -172,8 +172,56 @@ recenter each replicate on its reference. They preserve the evidence revision
 and sampling settings. Small samples, disconnected comparison groups,
 one-sided results, and experimental cap discounts remain provisional.
 
-This service does not modify model weights or promote a champion. Training
-and protected promotion remain separate from the rating ladder.
-The protected gate evaluates two-, three-, and four-player results
-independently, with all 24 four-player seat permutations.
-Fresh or smoke-trained current models have no established competitive strength.
+## Promotion evidence stays separate
+
+The rating service does not modify model weights or promote a champion.
+`ImprovementController` v3 trains and gates one league challenger per cycle.
+Its `Learner` uses 5-step Double DQN with `gamma = 1.0` and `TrajectoryReplay` v3.
+League training uses PFSP opponent weights from pairwise placement scores.
+Tournament lineups use coverage, not PFSP or current rating estimates.
+The [training guide](TRAINING.md#run-finite-improvement-cycles) describes champion lineage and rebasing.
+
+`DealOutcome.margin(candidate_seat, champion_seat)` is +1 for a better placement, -1 for a worse placement, and 0 for a tie.
+If another seat declares, a candidate with 40 points beats a champion with 80 points.
+That game contributes placement margin +1 and declaration margin 0.
+Gate v3 averages these margins over every seating in a seed block.
+Declaration margin is +1 if the candidate declares, -1 if the champion declares, and 0 otherwise.
+
+`blocks_for_count` scales the base budget by 4, 2, and 1 for two, three, and four players.
+The default evidence budgets are:
+
+| Phase | Base blocks | Two-player blocks and games | Three-player blocks and games | Four-player blocks and games |
+|---|---|---|---|---|
+| Selection | 32 | 128 blocks, 256 games | 64 blocks, 384 games | 32 blocks, 768 games |
+| Confirmation | 128 | 512 blocks, 1,024 games | 256 blocks, 1,536 games | 128 blocks, 3,072 games |
+
+Two-player blocks contain both seat orders. Three-player blocks contain all six orders.
+Four-player blocks contain all 24 orders.
+Specialist runs retain only their configured player counts.
+`multiplayer_gain` averages the count means equally.
+`stratified_interval` resamples blocks independently within each count and averages the resampled means equally.
+Each count also has its own clustered bootstrap interval.
+
+Promotion requires all of these conditions:
+
+- The evidence has `gate_schema_version == 3`, `architecture == "axial_table"`, and the exact candidate and champion hashes.
+- Selection has at least 32 base blocks. Confirmation has at least 128 base blocks.
+- Both phases use full21, 60-turn discard-recycling rules and matching player counts.
+- Aggregate placement gain is at least 0.05, and every count has positive placement gain.
+- The overall and every per-count lower 95% placement bound are greater than zero.
+- Aggregate declaration gain is nonnegative.
+- At least 256 paired solo games have nonnegative gain and a lower 95% bound of at least -0.03.
+
+The absolute seed distance is at least `100_000 + max(4 * confirmation.seed_blocks, confirmation.solo_games, 4 * selection.seed_blocks, selection.solo_games)`.
+`ModelRegistry.promote` recomputes summaries and intervals from raw `placement_margins`, `declaration_margins`, and paired solo outcomes.
+It rejects gate schema v2 rather than converting declaration-only evidence.
+
+`evaluate_gate` batches every block in one `run_matches` call.
+Solo retention uses deterministic slices of up to 32 games per policy.
+`src.cli.improve --workers` defaults to 1 and supports process-parallel evaluation.
+Only the coordinator appends and flushes completed jobs to `gates/<gate_id>.jsonl`.
+The gate identity includes model hashes, rules, versions, seeds, budgets, and player counts.
+Resume skips valid completed jobs and reconstructs results in deterministic order.
+The worker count can change without changing the evidence.
+
+Fresh or smoke-trained checkpoints have no established competitive strength.
