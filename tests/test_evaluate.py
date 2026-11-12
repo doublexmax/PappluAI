@@ -205,6 +205,25 @@ class TestEvaluateValid(unittest.TestCase):
         self.assertFalse(is_valid_hand(hand, JOKER_8S, required_sequences=8))
         self.assertEqual(hand_reward(hand, JOKER_8S, required_sequences=8), 0.0)
 
+    def test_search_fast_skips_preserve_duplicate_and_exact_joker_wins(self):
+        cases = (
+            ("pure_quota_unreachable", [1, 14, 27, 4, 17, 30], 2, False),
+            ("sets_without_quota", [1, 14, 27, 4, 17, 30], 0, True),
+            ("unmeldable_face", [0, 1, 2, 3, 4, 51], 1, False),
+            ("six_identical_copies", [30, 30, 30, 30, 30, 30], 2, True),
+            ("exact_joker_pure", [16, 17, 7], 1, True),
+            ("two_exact_jokers", [16, 7, 7, 19, 20, 21], 2, True),
+        )
+        for name, cards, required, expected in cases:
+            with self.subTest(name=name):
+                self.assertIs(
+                    is_valid_hand(
+                        from_cards(cards), JOKER_8S,
+                        required_sequences=required, cards_in_hand=len(cards),
+                    ),
+                    expected,
+                )
+
     def test_defaults_match_21_and_5(self):
         hand = classic_valid_21()
         self.assertEqual(

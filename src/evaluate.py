@@ -209,7 +209,33 @@ def _search(
 ) -> Optional[Tuple[Meld, ...]]:
     if sum(counts) < pure_needed * MIN_MELD:
         return None
+    if pure_needed > 0:
+        upper = counts[joker]
+        if upper < pure_needed:
+            for suit in range(NUM_SUITS):
+                rem = list(counts[suit * NUM_RANKS:(suit + 1) * NUM_RANKS])
+                if joker // NUM_RANKS == suit:
+                    rem[joker % NUM_RANKS] = 0
+                triples = (
+                    sum(copies // MIN_MELD for copies in rem)
+                    + sum(
+                        min(rem[start:start + MIN_MELD])
+                        for start in range(NUM_RANKS - MIN_MELD + 1)
+                    )
+                    + min(rem[-2], rem[-1], rem[0])
+                )
+                upper += min(sum(rem) // MIN_MELD, triples)
+                if upper >= pure_needed:
+                    break
+            if upper < pure_needed:
+                return None
     faces, options = _compile_meld_options(counts, joker)
+    covered = [False] * len(faces)
+    for option in chain.from_iterable(options):
+        for position, _ in option.take:
+            covered[position] = True
+    if not all(covered):
+        return None
     initial = tuple(counts[face] for face in faces)
     memo: Dict[Tuple[Tuple[int, ...], int], Optional[Tuple[Meld, ...]]] = {}
 
