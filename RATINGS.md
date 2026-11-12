@@ -175,8 +175,8 @@ one-sided results, and experimental cap discounts remain provisional.
 ## Promotion evidence stays separate
 
 The rating service does not modify model weights or promote a champion.
-`ImprovementController` v3 trains and gates one league challenger per cycle.
-Its `Learner` uses 5-step Double DQN with `gamma = 1.0` and `TrajectoryReplay` v3.
+`ImprovementController` v4 trains and gates one league challenger per cycle.
+Its `Learner` uses 5-step Double DQN with `gamma = 1.0` and `TrajectoryReplay` v4.
 League training uses PFSP opponent weights from pairwise placement scores.
 Tournament lineups use coverage, not PFSP or current rating estimates.
 The [training guide](TRAINING.md#run-finite-improvement-cycles) describes champion lineage and rebasing.
@@ -184,8 +184,9 @@ The [training guide](TRAINING.md#run-finite-improvement-cycles) describes champi
 `DealOutcome.margin(candidate_seat, champion_seat)` is +1 for a better placement, -1 for a worse placement, and 0 for a tie.
 If another seat declares, a candidate with 40 points beats a champion with 80 points.
 That game contributes placement margin +1 and declaration margin 0.
-Gate v3 averages these margins over every seating in a seed block.
+Gate v4 averages these unshaped margins over every seating in a replica.
 Declaration margin is +1 if the candidate declares, -1 if the champion declares, and 0 otherwise.
+Training's declaration-weighted utility does not change these evaluation scores or OpenSkill updates.
 
 `blocks_for_count` scales the base budget by 4, 2, and 1 for two, three, and four players.
 The default evidence budgets are:
@@ -199,22 +200,42 @@ Two-player blocks contain both seat orders. Three-player blocks contain all six 
 Four-player blocks contain all 24 orders.
 Specialist runs retain only their configured player counts.
 `multiplayer_gain` averages the count means equally.
-`stratified_interval` resamples blocks independently within each count and averages the resampled means equally.
-Each count also has its own clustered bootstrap interval.
+For each base block `b`, replica `r` uses deal seed `seed + 4 * b + r`.
+Two, three, and four players have 4, 2, and 1 replicas per base block.
+The canonical flattened index is `base_block * replicas + replica`.
+Distinct base blocks never share seeds, while active counts share seeds within a base block.
 
-Promotion requires all of these conditions:
+`evidence_metrics` averages replicas within each count and base block.
+It then averages active counts equally and bootstraps whole base blocks.
+This preserves cross-count covariance for placement and declaration intervals.
+Per-count placement intervals resample those same base-block means.
+Solo intervals use paired binary outcomes.
+The interval fields are `multiplayer_ci95`, `multiplayer_ci95_by_count`, `declaration_ci95`, and `solo_ci95`.
 
-- The evidence has `gate_schema_version == 3`, `architecture == "axial_table"`, and the exact candidate and champion hashes.
+Both phases require:
+
+- `gate_schema_version == 4`, `architecture == "axial_table"`, and the exact candidate and champion hashes.
 - Selection has at least 32 base blocks. Confirmation has at least 128 base blocks.
 - Both phases use full21, 60-turn discard-recycling rules and matching player counts.
-- Aggregate placement gain is at least 0.05, and every count has positive placement gain.
-- The overall and every per-count lower 95% placement bound are greater than zero.
-- Aggregate declaration gain is nonnegative.
-- At least 256 paired solo games have nonnegative gain and a lower 95% bound of at least -0.03.
+- At least 256 paired solo games per phase. `--solo-games` remains configurable.
+
+Phase acceptance uses these limits:
+
+| Check | Selection | Confirmation |
+|---|---|---|
+| Aggregate placement | Mean gain > 0 | Mean gain > 0 and lower 95% bound > 0 |
+| Each player count | Mean gain >= -0.05 | Mean gain >= -0.02 and lower 95% bound >= -0.06 |
+| Declarations | Mean gain >= -0.02 | Mean gain >= -0.01 and lower 95% bound >= -0.05 |
+| Paired solo | Mean gain >= -0.02 | Mean gain >= -0.01 and lower 95% bound >= -0.05 |
+
+`assess_gate` owns both verdicts.
+Evidence records `phase` and `gate_failures`, with an empty failure list when accepted.
+Failure names are `rules`, `seed_blocks`, `solo_games`, `placement`, `placement_2p`, `placement_3p`, `placement_4p`, `declaration`, and `solo`.
 
 The absolute seed distance is at least `100_000 + max(4 * confirmation.seed_blocks, confirmation.solo_games, 4 * selection.seed_blocks, selection.solo_games)`.
-`ModelRegistry.promote` recomputes summaries and intervals from raw `placement_margins`, `declaration_margins`, and paired solo outcomes.
-It rejects gate schema v2 rather than converting declaration-only evidence.
+`ModelRegistry.promote` recomputes summaries, intervals, and the phase verdict from raw margins and paired solo outcomes.
+It checks the stored failure list exactly.
+Gate schemas v2 and v3 require new v4 gates rather than conversion.
 
 `evaluate_gate` batches every block in one `run_matches` call.
 Solo retention uses deterministic slices of up to 32 games per policy.

@@ -69,14 +69,34 @@ Resume the saved run, then benchmark its latest model.
 .\.venv\Scripts\python -m src.cli.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
 ```
 
-Start this architecture with fresh weights in a new output directory.
-Checkpoint version 4, information encoding version 2, and `TrajectoryReplay` version 3
-are the only supported formats. Historical checkpoints, old replay, and old
-registry records fail explicitly. No conversion path remains.
+Model checkpoint version 4 and information encoding version 2 remain unchanged.
+Existing `axial_table` v4 weights can warm-start a new run.
+`TrajectoryReplay` v4 stores shaped terminal utilities.
+Resume rejects replay v3 with an instruction to warm-start through `--initial-model`.
+Old model architectures and old registry records remain unsupported.
+
+To finetune existing weights at curriculum stage 2, start fresh optimizer and replay state.
+
+```powershell
+.\.venv\Scripts\python -m src.cli.curriculum --initial-model runs\full21\best-model.pt --initial-stage 2 --output-dir runs\full21-finetune --learning-rate 0.0001 --epsilon-start 0.08 --epsilon-end 0.02 --epsilon-decay-episodes 10000
+```
+
+Curriculum defaults remain learning rate 0.0003 and epsilon 0.3 to 0.1 over 10000 stage episodes.
+All four settings persist in `TrainingConfig`.
+Resume rejects changed values in both spaced and `=` argument forms.
 
 `Learner` uses 5-step Double DQN with `gamma = 1.0`.
 The online network selects a legal bootstrap action, and the target network values that action.
-Terminal multiplayer targets use pairwise placement utility. Solo targets use +1 for a win and -1 for a loss.
+Solo declaration earns +1.
+A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`, inside `(-1, -0.5]`.
+Multiplayer utility averages pairwise margins weighted by 1 when either seat declared, and by 0.5 otherwise.
+The declarer earns +1. The best exhausted hand earns at most +0.5.
+An opponent's declaration never improves another seat's utility.
+Multiplayer utilities remain zero-sum.
+`DealOutcome.margin` stays unshaped for PFSP, ratings, and promotion.
+Solo, curriculum, and terminal lookahead targets all use `solo_outcome`.
+Curriculum episode metrics expose `utility` and `penalty`.
+Greedy validation and best-model selection still use binary declaration win rates.
 AdamW, a Polyak target network, and gradient clipping update the challenger.
 Win, penalty, opponent-card, afterstate, and budgeted lookahead losses provide additional training targets.
 
@@ -88,7 +108,7 @@ Hidden hands provide auxiliary training targets only.
 Browser exports omit `aux.*` weights and retain only `policy.*`.
 See the [current model contract](README.md#current-model-contract) for the model layout.
 
-`TrajectoryReplay` v3 samples decisions uniformly within each player count.
+`TrajectoryReplay` v4 samples decisions uniformly within each player count.
 Checkpoints store one visible-history journal per trajectory and a prefix for each decision.
 Resume validates each snapshot against its prefix and restores the replay sampling cursor.
 
@@ -175,6 +195,9 @@ League options have these defaults.
 - `--batch-size 128` caps the replay samples in each optimizer update.
 - `--updates-per-match 4` sets the updates after a match with challenger actions.
 - `--matches-per-round 16` batches deals before updates.
+- `--learning-rate 0.0003` sets the optimizer rate.
+- `--epsilon-start 0.2` and `--epsilon-end 0.05` set exploration.
+- `--epsilon-decay-matches 10000` sets the exploration decay budget.
 
 League checkpoints are published only at match boundaries and preserve the
 opponent-pool identity, replay, optimizer, counters, and random streams.
@@ -185,16 +208,17 @@ Resume restores the saved count selection and schedule cursors.
 The default schedule reserves 35% for the champion and 15% for available baseline and random opponents.
 Other frozen opponents share the remaining probability according to those weights.
 
-On resume, omit `--max-turns`, `--batch-size`, `--updates-per-match`, and `--matches-per-round` to keep
-their saved values, or supply the same values.
+On resume, omit learning and exploration options to retain their saved values, or supply matching values.
+The same rule applies to `--max-turns`, `--batch-size`, `--updates-per-match`, and `--matches-per-round`.
 Changes to those options, `--players`, or `--seed` fail before checkpoint publication.
+Both spaced and `=` argument forms enforce this rule.
 Player counts must be sorted and distinct.
 Starting without `--resume` rejects a directory that already contains a league
 model or state checkpoint. Use a new output directory for a fresh run.
 
 ## Run finite improvement cycles
 
-`ImprovementController` v3 trains one league challenger, selects it, and confirms it on fresh seeds.
+`ImprovementController` v4 trains one league challenger, selects it, and confirms it on fresh seeds.
 It registers one candidate per cycle and promotes only through `evaluate_gate` evidence.
 
 ```powershell
@@ -211,6 +235,15 @@ An external champion change reloads weights and resets the optimizer.
 `--rebase-after-rejections 8` applies the same rebase after eight rejected cycles.
 Replay and random streams survive both forms of rebase.
 
+`FinetuneSchedule` defaults to learning rate 0.0001 and epsilon 0.08 to 0.02.
+Verified ordinary full21 win rate of at least 0.95 selects learning rate 0.00002 and epsilon 0.04 to 0.01.
+The controller reads `final-best.json` beside the initial model.
+That file must bind ordinary outcomes to the model's SHA-256 and matching recycling rules.
+`--learning-rate`, `--epsilon-start`, and `--epsilon-end` override individual defaults.
+`--epsilon-decay-matches` defaults to 10000.
+`LeagueConfig` stores the resolved values and remains the source of truth on resume.
+An explicit changed finetune option fails even when written as `--epsilon-start=value`.
+
 Keep the default `--selection-blocks 32`, `--confirmation-blocks 128`, and `--solo-games 256` for promotion.
 The gate uses 4x, 2x, and 1x the base block count for two, three, and four players.
 Selection therefore plays 256, 384, and 768 games.
@@ -218,12 +251,15 @@ Confirmation plays 1,024, 1,536, and 3,072 games.
 Each block batches all 2, 6, or 24 seat orders.
 The registry requires disjoint selection and confirmation seeds.
 
-`gate_schema_version == 3` records both placement margins and declaration margins.
+`gate_schema_version == 4` records placement margins, declaration margins, `phase`, and `gate_failures`.
 Better loser placements count even when neither contender declares.
-The stratified bootstrap weights player counts equally.
-Promotion requires placement gain of at least 0.05, positive gain for every count, and positive overall and per-count lower 95% bounds.
-Aggregate declaration gain and paired solo gain cannot be negative.
-The solo lower 95% bound must be at least -0.03.
+Within base block `b`, each count's replica `r` uses deal seed `seed + 4 * b + r`.
+The gate averages replicas within each count, then averages counts equally.
+The 95% bootstrap resamples whole base blocks and preserves cross-count seed covariance.
+Evidence includes `multiplayer_ci95`, `multiplayer_ci95_by_count`, `declaration_ci95`, and paired binary `solo_ci95`.
+Selection requires positive aggregate mean placement gain and screens count, declaration, and solo means.
+Confirmation requires aggregate placement superiority and bounded per-count, declaration, and solo noninferiority.
+Both phases retain the 256-game paired solo minimum.
 See [promotion evidence](RATINGS.md#promotion-evidence-stays-separate) for the complete gate contract.
 
 Use `--workers` to set the gate process count. The default is 1.
@@ -257,7 +293,8 @@ Separate one-turn smoke games exercise mixed-count updates, exact full-state
 resume, a rejected improvement cycle, and persisted tournaments and reports.
 The resume check compares an uninterrupted learner's actual matches and updates
 with the checkpoint restored by the CLI.
-Gate v3 checks compare in-process and two-worker results byte for byte and reuse a completed JSONL journal.
+Gate v4 checks compare in-process and two-worker results byte for byte and reuse a completed JSONL journal.
+The script checks persisted finetune flags in curriculum, league, and improvement states.
 Unit tests also interrupt a gate between jobs and verify that resume skips completed blocks and solo slices.
 Each invocation creates a new timestamped directory, so repeated checks
 preserve earlier artifacts.

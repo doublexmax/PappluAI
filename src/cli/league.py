@@ -29,6 +29,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--updates-per-match", type=int, default=None)
     parser.add_argument("--matches-per-round", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--epsilon-start", type=float, default=None)
+    parser.add_argument("--epsilon-end", type=float, default=None)
+    parser.add_argument("--epsilon-decay-matches", type=int, default=None)
     return parser
 
 
@@ -70,7 +74,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_dir = Path(args.output_dir)
         settings = {
             name: getattr(args, name)
-            for name in ("batch_size", "updates_per_match", "matches_per_round")
+            for name in (
+                "batch_size", "updates_per_match", "matches_per_round",
+                "learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_matches",
+            )
             if getattr(args, name) is not None
         }
         if args.players is not None:

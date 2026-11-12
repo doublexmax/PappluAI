@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 from src.training.improve import (
+    FinetuneSchedule,
     ImproveConfig,
     ImprovementController,
 )
@@ -17,14 +18,57 @@ from tests.improve_support import ControllerTestCase, gate_result, sha256, torch
 
 
 class TestImprovementController(ControllerTestCase):
-    def test_single_challenger_finetunes_gently(self):
+    def test_verified_solo_mastery_selects_defaults_and_resume_keeps_the_saved_schedule(self):
+        for wins, score, expected in ((80, 0.8, (1e-4, 0.08, 0.02)), (95, 0.95, (2e-5, 0.04, 0.01))):
+            with self.subTest(wins=wins), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                model = root / "initial.pt"
+                self.make_model(model)
+                self.write_solo_reference(model, wins)
+                controller = ImprovementController(model, root / "output")
+                league = controller.league
+                self.assertEqual(
+                    (league.optimizer.param_groups[0]["lr"], league.current_epsilon, league.config.epsilon_end),
+                    expected,
+                )
+                self.assertEqual(controller.best_score, score)
+                controller.save_checkpoint()
+                self.write_solo_reference(model, 100 - wins)
+                resumed = ImprovementController.load(
+                    str(controller.output_dir / "latest-state.pt"), controller.output_dir,
+                )
+                self.assertEqual(
+                    (resumed.league.optimizer.param_groups[0]["lr"], resumed.league.current_epsilon,
+                     resumed.league.config.epsilon_end),
+                    expected,
+                )
+
+    def test_explicit_finetune_schedule_overrides_verified_mastery_and_persists_decay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "initial.pt"
+            self.make_model(model)
+            self.write_solo_reference(model, 95)
+            controller = ImprovementController(
+                model, root / "output", finetune=FinetuneSchedule(0.00015, 0.12, 0.03),
+                epsilon_decay_matches=77,
+            )
+            self.assertEqual(controller.league.optimizer.param_groups[0]["lr"], 0.00015)
+            self.assertEqual(controller.league.current_epsilon, 0.12)
+            controller.save_checkpoint()
+            resumed = ImprovementController.load(str(controller.output_dir / "latest-state.pt"), controller.output_dir)
+            resumed.league.epsilon_progress = 77
+            self.assertAlmostEqual(resumed.league.current_epsilon, 0.03)
+            self.assertEqual(resumed.league.config.epsilon_decay_matches, 77)
+
+    def test_unmeasured_challenger_uses_the_partial_mastery_finetune_schedule(self):
         with tempfile.TemporaryDirectory() as temporary:
             controller = self.make_controller(Path(temporary))
             session = controller.league
-            self.assertEqual(session.optimizer.param_groups[0]["lr"], 2e-5)
-            self.assertEqual(session.current_epsilon, 0.04)
+            self.assertEqual(session.optimizer.param_groups[0]["lr"], 1e-4)
+            self.assertEqual(session.current_epsilon, 0.08)
             session.epsilon_progress = session.config.epsilon_decay_matches
-            self.assertAlmostEqual(session.current_epsilon, 0.01)
+            self.assertAlmostEqual(session.current_epsilon, 0.02)
             self.assertFalse(hasattr(controller, "research"))
             self.assertIsNone(controller.best_score)
 
@@ -122,7 +166,7 @@ class TestImprovementController(ControllerTestCase):
                 self.assertTrue(torch.equal(parameter, torch.full_like(parameter, 0.125)))
             self.assertIsNot(league.optimizer, warm_optimizer)
             self.assertEqual(league.optimizer.state_dict()["state"], {})
-            self.assertEqual(league.optimizer.param_groups[0]["lr"], 2e-5)
+            self.assertEqual(league.optimizer.param_groups[0]["lr"], 1e-4)
             self.assertIs(league.replay, replay)
             self.assert_nested_equal(league.replay.state_dict(), replay_state)
             self.assert_nested_equal(league.state_dict()["rng_states"], rng_states)
@@ -301,10 +345,10 @@ class TestImprovementController(ControllerTestCase):
             controller.save_checkpoint()
             payload = controller.state_dict()
             path = controller.output_dir / "incompatible.pt"
-            for version in (0, 1, 2, 4, 3.0, "3", None):
+            for version in (0, 1, 2, 3, 4.0, "4", None):
                 with self.subTest(version=version):
                     torch.save({**payload, "improvement_state_version": version}, path)
-                    with self.assertRaisesRegex(ValueError, "expected version 3"):
+                    with self.assertRaisesRegex(ValueError, "expected version 4"):
                         ImprovementController.load(str(path), controller.output_dir)
             resumed = ImprovementController.load(
                 str(controller.output_dir / "latest-state.pt"), controller.output_dir,
@@ -534,6 +578,8 @@ class TestImprovementController(ControllerTestCase):
             self.assertEqual(calls[1]["seed"], 60_500_000)
             self.assertEqual(calls[0]["seed_blocks"], 32)
             self.assertEqual(calls[1]["seed_blocks"], 128)
+            self.assertEqual([call["phase"] for call in calls], ["selection", "confirmation"])
+            self.assertEqual([call["solo_games"] for call in calls], [256, 256])
             self.assertEqual(calls[0]["candidate_path"], candidate_path)
             self.assertEqual(calls[1]["candidate_path"], candidate_path)
             self.assertEqual([call["workers"] for call in calls], [2, 2])
@@ -543,7 +589,7 @@ class TestImprovementController(ControllerTestCase):
             self.assertEqual(controller.promotions, 0)
             self.assertEqual(controller.consecutive_rejections, 1)
 
-    def test_v3_state_roundtrip_preserves_the_single_learner_and_rejection_count(self):
+    def test_v4_state_roundtrip_preserves_the_single_learner_and_rejection_count(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             controller = self.make_controller(
@@ -561,7 +607,7 @@ class TestImprovementController(ControllerTestCase):
             self.assert_nested_equal(before, after)
             self.assertEqual(resumed.league.completed_matches, 1)
             self.assertEqual(resumed.consecutive_rejections, 3)
-            self.assertEqual(after["improvement_state_version"], 3)
+            self.assertEqual(after["improvement_state_version"], 4)
             self.assertEqual(
                 after["league_state"]["last_exported_sha256"],
                 sha256(controller.output_dir / "latest-model.pt"),
@@ -691,8 +737,9 @@ class TestImprovementController(ControllerTestCase):
             self.assertEqual(controller.promotions, 0)
             self.assertEqual(controller.league.config.game.max_turns, 1)
             self.assertEqual(controller.last_gate["max_turns"], 1)
-            self.assertEqual(controller.last_gate["gate_schema_version"], 3)
+            self.assertEqual(controller.last_gate["gate_schema_version"], 4)
             self.assertEqual(controller.last_gate["candidate_origin"], "league")
+            self.assertIn("rules", controller.last_gate["gate_failures"])
             journal, = (controller.output_dir / "gates").glob("*.jsonl")
             completed = [json.loads(line) for line in journal.read_text().splitlines()]
             self.assertEqual(

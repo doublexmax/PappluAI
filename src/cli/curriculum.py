@@ -59,6 +59,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optimizer learning rate. New sessions default to 0.0003.",
     )
+    parser.add_argument("--epsilon-start", type=float, default=None)
+    parser.add_argument("--epsilon-end", type=float, default=None)
+    parser.add_argument("--epsilon-decay-episodes", type=int, default=None)
     parser.add_argument(
         "--curriculum-fraction",
         type=float,
@@ -140,6 +143,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 learning_rate=(
                     3e-4 if args.learning_rate is None else args.learning_rate
                 ),
+                epsilon_start=0.3 if args.epsilon_start is None else args.epsilon_start,
+                epsilon_end=0.1 if args.epsilon_end is None else args.epsilon_end,
+                epsilon_decay_episodes=10_000 if args.epsilon_decay_episodes is None else args.epsilon_decay_episodes,
                 curriculum_fraction=(
                     0.75
                     if args.curriculum_fraction is None
@@ -213,6 +219,9 @@ def _validate_resume_arguments(
         "max_turns": args.max_turns,
         "recycle_discard": args.recycle_discard,
         "learning_rate": args.learning_rate,
+        "epsilon_start": args.epsilon_start,
+        "epsilon_end": args.epsilon_end,
+        "epsilon_decay_episodes": args.epsilon_decay_episodes,
         "curriculum_fraction": args.curriculum_fraction,
         "validation_games": args.validation_games,
         "validate_every": args.validate_every,

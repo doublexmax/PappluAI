@@ -79,8 +79,10 @@ class _GateRunner:
               for seat in range(job.players - 2)),
         ]
         orders = evidence.balanced_seat_orders(job.players)
+        replicas = evidence.replicas_for_count(job.players)
+        base_block, replica = divmod(job.block_index, replicas)
         matches = run_matches(
-            [Deal(self.seed + job.block_index, order, job.players) for order in orders],
+            [Deal(self.seed + 4 * base_block + replica, order, job.players) for order in orders],
             lineup, self.rules, deadline=deadline,
         )
         placement, declaration = 0, 0
@@ -251,7 +253,11 @@ def evaluate_gate(
     workers: int = 1,
     task_seconds: float = 180.0,
     journal_dir: Optional[Path] = None,
+    *,
+    phase: str = "confirmation",
 ) -> dict:
+    if phase not in evidence.GATE_PHASES:
+        raise ValueError("gate phase must be selection or confirmation")
     for name, value in (
         ("seed_blocks", seed_blocks), ("solo_games", solo_games),
         ("max_turns", max_turns), ("workers", workers),
@@ -284,9 +290,10 @@ def evaluate_gate(
         {"source_sha256": source_sha256},
     ), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
     jobs: list[_GateJob] = [
-        _MultiplayerJob(players, index)
+        _MultiplayerJob(players, base_block * evidence.replicas_for_count(players) + replica)
+        for base_block in range(seed_blocks)
         for players in counts
-        for index in range(evidence.blocks_for_count(seed_blocks, players))
+        for replica in range(evidence.replicas_for_count(players))
     ] + [_SoloJob(start, min(32, solo_games - start)) for start in range(0, solo_games, 32)]
     with ExitStack() as stack:
         journal = None
@@ -343,8 +350,8 @@ def evaluate_gate(
     for path, digest in zip(paths, hashes):
         if file_sha256(Path(path)) != digest:
             raise ValueError("Checkpoint changed during gate evaluation")
-    accepted = max_turns == 60 and recycle_discard and evidence.gate_accepted(
-        by_player_count, metrics, seed_blocks, solo_games, player_counts=counts,
+    accepted, failures = evidence.assess_gate(
+        phase, rules, by_player_count, metrics, seed_blocks, solo_games, player_counts=counts,
     )
     return {
         "gate_schema_version": evidence.GATE_SCHEMA_VERSION,
@@ -355,6 +362,8 @@ def evaluate_gate(
         "champion_sha256": hashes[1],
         "opponent_sha256": hashes[2:],
         "accepted": accepted,
+        "phase": phase,
+        "gate_failures": failures,
         "seed": seed,
         "seed_blocks": seed_blocks,
         "bootstrap_samples": samples,

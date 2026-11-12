@@ -39,6 +39,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-every", type=int, default=16)
     parser.add_argument("--matches-per-round", type=int, default=16)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--epsilon-start", type=float, default=None)
+    parser.add_argument("--epsilon-end", type=float, default=None)
+    parser.add_argument("--epsilon-decay-matches", type=int, default=None)
     parser.add_argument(
         "--max-turns", type=int, default=60,
         help="Explicit per-player cap. Reduced-cap smoke runs cannot promote.",
@@ -101,6 +105,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     player_counts=(2, 3, 4) if args.players is None else tuple(args.players),
                 ),
                 snapshots_dir=args.snapshots,
+                learning_rate=args.learning_rate,
+                epsilon_start=args.epsilon_start,
+                epsilon_end=args.epsilon_end,
+                epsilon_decay_matches=args.epsilon_decay_matches,
             )
         reason = controller.run(
             args.max_seconds,
@@ -153,6 +161,10 @@ def _validate_resume_options(
     for option, field in learning_options.items():
         if option in explicit and getattr(args, field) != getattr(controller.config, field):
             raise ValueError("Resume cannot change %s" % option)
+    for field in ("learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_matches"):
+        value = getattr(args, field)
+        if value is not None and value != getattr(controller.league.config, field):
+            raise ValueError("Resume cannot change --%s" % field.replace("_", "-"))
     if "--players" in explicit and tuple(args.players) != controller.config.player_counts:
         raise ValueError("Resume cannot change --players")
     for path in args.opponent:

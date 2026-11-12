@@ -9,18 +9,19 @@ import unittest
 from unittest import mock
 
 from src.checkpoints.evidence import (
+    assess_gate,
     balanced_seat_orders,
     blocks_for_count,
     clustered_interval,
     evidence_metrics,
-    gate_accepted,
     require_player_counts,
-    stratified_interval,
+    validate_gate_evidence,
 )
 from src.evaluation.promotion import (
     GateInterrupted,
     evaluate_gate,
 )
+from src.game.environment import GameConfig
 
 try:
     import torch
@@ -28,7 +29,50 @@ except ImportError:
     torch = None
 
 
+def block_result(players, placement, declaration):
+    return {
+        "blocks": len(placement), "games": len(placement) * {2: 2, 3: 6, 4: 24}[players],
+        "placement_margins": placement, "declaration_margins": declaration,
+        "candidate_minus_champion": sum(placement) / len(placement),
+        "declaration_delta": sum(declaration) / len(declaration),
+    }
+
+
+def solo_result(candidate, champion):
+    return {
+        "games": len(candidate), "candidate_outcomes": candidate, "champion_outcomes": champion,
+        "candidate_wins": sum(candidate), "champion_wins": sum(champion),
+    }
+
+
 class TestPlayerCountEvidence(unittest.TestCase):
+    def test_joint_bootstrap_preserves_cross_count_covariance_for_placement_and_declarations(self):
+        multiplayer = {
+            "2": block_result(2, [1.0] * 4 + [-1.0] * 4, [1.0] * 4 + [-1.0] * 4),
+            "3": block_result(3, [-1.0] * 2 + [1.0] * 2, [-1.0] * 2 + [1.0] * 2),
+            "4": block_result(4, [0.0, 0.0], [0.0, 0.0]),
+        }
+        result = evidence_metrics(multiplayer, solo_result([1, 0], [0, 1]), 2, 41, 100)
+        self.assertEqual(result, {
+            "multiplayer_gain": 0.0, "declaration_gain": 0.0,
+            "multiplayer_ci95": [0.0, 0.0], "declaration_ci95": [0.0, 0.0],
+            "multiplayer_ci95_by_count": {"2": [-1.0, 1.0], "3": [-1.0, 1.0], "4": [0.0, 0.0]},
+            "solo_gain": 0.0, "solo_ci95": [-1.0, 1.0],
+        })
+
+    def test_replica_variation_is_averaged_inside_each_base_block(self):
+        multiplayer = {
+            "2": block_result(2, [1.0, -1.0] * 4, [-1.0, 1.0] * 4),
+            "3": block_result(3, [0.0] * 4, [0.0] * 4),
+            "4": block_result(4, [0.0] * 2, [0.0] * 2),
+        }
+        result = evidence_metrics(multiplayer, solo_result([0, 0], [0, 0]), 2, 41, 100)
+        self.assertEqual(result["multiplayer_ci95"], [0.0, 0.0])
+        self.assertEqual(result["declaration_ci95"], [0.0, 0.0])
+        self.assertEqual(result["multiplayer_ci95_by_count"], {
+            "2": [0.0, 0.0], "3": [0.0, 0.0], "4": [0.0, 0.0],
+        })
+
     def test_scaled_blocks_produce_the_selection_and_confirmation_game_budgets(self):
         for blocks, expected in (
             (32, [(128, 256), (64, 384), (32, 768)]),
@@ -82,19 +126,25 @@ class TestPlayerCountEvidence(unittest.TestCase):
         self.assertEqual(metrics, {
             "multiplayer_gain": 0.375,
             "declaration_gain": 0.125,
+            "declaration_ci95": [0.125, 0.125],
             "multiplayer_ci95": [0.375, 0.375],
             "multiplayer_ci95_by_count": {"2": [0.25, 0.25], "4": [0.5, 0.5]},
             "solo_gain": 0.0,
             "solo_ci95": [0.0, 0.0],
         })
-        self.assertTrue(gate_accepted(multiplayer, metrics, 32, 256, player_counts=(2, 4)))
-        self.assertFalse(gate_accepted(multiplayer, metrics, 32, 256))
+        self.assertEqual(
+            assess_gate("selection", GameConfig(max_turns=60), multiplayer, metrics, 32, 256, player_counts=(2, 4)),
+            (True, []),
+        )
         specialist = evidence_metrics(
             {"2": multiplayer["2"]}, solo, 32, 41, 100, player_counts=(2,),
         )
         self.assertEqual(specialist["multiplayer_gain"], 0.25)
         self.assertEqual(specialist["multiplayer_ci95_by_count"], {"2": [0.25, 0.25]})
-        self.assertTrue(gate_accepted({"2": multiplayer["2"]}, specialist, 32, 256, (2,)))
+        self.assertEqual(
+            assess_gate("selection", GameConfig(max_turns=60), {"2": multiplayer["2"]}, specialist, 32, 256, (2,)),
+            (True, []),
+        )
         for counts in ((2,), (2, 3, 4)):
             with self.subTest(counts=counts), self.assertRaisesRegex(ValueError, "player_counts"):
                 evidence_metrics(multiplayer, solo, 32, 41, 100, player_counts=counts)
@@ -123,6 +173,8 @@ class TestPlayerCountEvidence(unittest.TestCase):
                     self.assertEqual(result["multiplayer_gain"], 0.0)
                     self.assertEqual(result["multiplayer_ci95_by_count"], {str(count): [0.0, 0.0]})
                     self.assertFalse(result["accepted"])
+                    self.assertEqual(result["phase"], "confirmation")
+                    self.assertEqual(result["gate_failures"], ["rules", "seed_blocks", "solo_games", "placement"])
 
     def test_gate_rejects_invalid_scopes_before_loading_models(self):
         for counts in ((), (True,), (2.0,), (2, 2), (4, 2), (5,)):
@@ -134,25 +186,6 @@ class TestPlayerCountEvidence(unittest.TestCase):
 
 
 class TestSeatClusterBootstrap(unittest.TestCase):
-    def test_stratified_bootstrap_weights_counts_equally_despite_different_block_counts(self):
-        self.assertEqual(stratified_interval({2: [1.0] * 128, 4: [0.0] * 32}, 100), [0.5, 0.5])
-        values = {4: [-1.0, 0.0, 1.0], 2: [-1.0, 1.0], 3: [0.5]}
-        before = random.getstate()
-        self.assertEqual(
-            stratified_interval(values, 100, 81),
-            [-0.38888888888888884, 0.7222222222222222],
-        )
-        self.assertEqual(
-            stratified_interval({count: values[count] for count in (2, 3, 4)}, 100, 81),
-            [-0.38888888888888884, 0.7222222222222222],
-        )
-        self.assertEqual(random.getstate(), before)
-
-    def test_stratified_bootstrap_rejects_empty_or_invalid_strata(self):
-        for values in ({}, {2: []}, {2: [True]}, {3: [float("nan")]}, {4: [-1.01]}):
-            with self.subTest(values=values), self.assertRaises(ValueError):
-                stratified_interval(values, 100)
-
     def test_four_players_cover_adjacent_and_opposite_contenders_equally(self):
         orders = balanced_seat_orders(4)
         self.assertEqual(len(set(orders)), 24)
@@ -187,8 +220,7 @@ class TestSeatClusterBootstrap(unittest.TestCase):
 
     def test_bootstrap_preserves_global_random_state(self):
         before = random.getstate()
-        values = [0, 0.5, -0.5, 1] * 32
-        self.assertEqual(clustered_interval(values, samples=100), clustered_interval(values, samples=100))
+        self.assertEqual(clustered_interval([-1.0, 1.0], samples=100), [-1.0, 1.0])
         self.assertEqual(before, random.getstate())
 
     def test_invalid_or_nonfinite_scores_are_rejected(self):
@@ -225,6 +257,110 @@ class TestSeatClusterBootstrap(unittest.TestCase):
             torch.set_num_threads(previous)
 
 
+class TestPhaseGateAssessment(unittest.TestCase):
+    def setUp(self):
+        self.multiplayer = {str(count): {"candidate_minus_champion": 0.1} for count in (2, 3, 4)}
+        self.metrics = {
+            "multiplayer_gain": 0.1, "multiplayer_ci95": [0.05, 0.15],
+            "multiplayer_ci95_by_count": {str(count): [0.05, 0.15] for count in (2, 3, 4)},
+            "declaration_gain": 0.0, "declaration_ci95": [-0.02, 0.02],
+            "solo_gain": 0.0, "solo_ci95": [-0.02, 0.02],
+        }
+
+    def assess(self, phase, *, rules=None, blocks=None, games=256):
+        return assess_gate(
+            phase, GameConfig(max_turns=60) if rules is None else rules, self.multiplayer, self.metrics,
+            (32 if phase == "selection" else 128) if blocks is None else blocks, games,
+        )
+
+    def test_selection_accepts_noisy_positive_placement_without_count_superiority(self):
+        for count, mean in (("2", 0.029), ("3", 0.1339), ("4", 0.0375)):
+            self.multiplayer[count]["candidate_minus_champion"] = mean
+        self.metrics.update({
+            "multiplayer_gain": 0.0668, "multiplayer_ci95": [0.0152, 0.1185],
+            "multiplayer_ci95_by_count": {
+                "2": [-0.078, 0.137], "3": [0.04, 0.22], "4": [-0.025, 0.104],
+            },
+            "declaration_gain": 0.0477, "declaration_ci95": [0.0, 0.1],
+            "solo_gain": 0.0625, "solo_ci95": [0.01, 0.12],
+        })
+        self.assertEqual(self.assess("selection"), (True, []))
+        self.assertEqual(self.assess("confirmation"), (False, ["placement_2p"]))
+
+    def test_only_confirmation_requires_a_positive_aggregate_lower_bound(self):
+        self.metrics["multiplayer_ci95"] = [0.0, 0.2]
+        self.assertEqual(self.assess("selection"), (True, []))
+        self.assertEqual(self.assess("confirmation"), (False, ["placement"]))
+        self.metrics["multiplayer_gain"] = 0.0
+        self.assertEqual(self.assess("selection"), (False, ["placement"]))
+
+    def test_selection_mean_boundaries_are_inclusive_except_aggregate_superiority(self):
+        self.multiplayer["2"]["candidate_minus_champion"] = -0.05
+        self.metrics.update({"multiplayer_gain": 0.05, "declaration_gain": -0.02, "solo_gain": -0.02})
+        self.assertEqual(self.assess("selection"), (True, []))
+        for field, value, failure in (
+            ("multiplayer_gain", 0.0, "placement"),
+            ("declaration_gain", -0.020001, "declaration"),
+            ("solo_gain", -0.020001, "solo"),
+        ):
+            with self.subTest(field=field), mock.patch.dict(self.metrics, {field: value}):
+                self.assertEqual(self.assess("selection"), (False, [failure]))
+        with mock.patch.dict(self.multiplayer["2"], {"candidate_minus_champion": -0.050001}):
+            self.assertEqual(self.assess("selection"), (False, ["placement_2p"]))
+
+    def test_confirmation_noninferiority_boundaries_apply_to_every_player_count(self):
+        self.metrics.update({
+            "multiplayer_gain": 0.06, "declaration_gain": -0.01, "declaration_ci95": [-0.05, 0.03],
+            "solo_gain": -0.01, "solo_ci95": [-0.05, 0.03],
+        })
+        for count in ("2", "3", "4"):
+            with self.subTest(count=count), mock.patch.dict(
+                self.multiplayer[count], {"candidate_minus_champion": -0.02},
+            ), mock.patch.dict(self.metrics["multiplayer_ci95_by_count"], {count: [-0.06, 0.1]}):
+                self.assertEqual(self.assess("confirmation"), (True, []))
+                with mock.patch.dict(self.multiplayer[count], {"candidate_minus_champion": -0.020001}):
+                    self.assertEqual(self.assess("confirmation"), (False, ["placement_%sp" % count]))
+                with mock.patch.dict(self.metrics["multiplayer_ci95_by_count"], {count: [-0.060001, 0.1]}):
+                    self.assertEqual(self.assess("confirmation"), (False, ["placement_%sp" % count]))
+        for field, value, failure in (
+            ("declaration_gain", -0.010001, "declaration"),
+            ("declaration_ci95", [-0.050001, 0.03], "declaration"),
+            ("solo_gain", -0.010001, "solo"),
+            ("solo_ci95", [-0.050001, 0.03], "solo"),
+        ):
+            with self.subTest(field=field), mock.patch.dict(self.metrics, {field: value}):
+                self.assertEqual(self.assess("confirmation"), (False, [failure]))
+
+    def test_four_player_improvement_cannot_hide_a_two_player_regression(self):
+        for count, mean in (("2", -0.15), ("3", 0.3), ("4", 0.3)):
+            self.multiplayer[count]["candidate_minus_champion"] = mean
+        self.metrics["multiplayer_gain"] = 0.15
+        self.metrics["multiplayer_ci95_by_count"]["2"] = [-0.15, -0.15]
+        for phase in ("selection", "confirmation"):
+            self.assertEqual(self.assess(phase), (False, ["placement_2p"]))
+
+    def test_common_checks_report_all_failures_and_phase_specific_sample_floors(self):
+        for phase, blocks in (("selection", 31), ("confirmation", 127)):
+            self.assertEqual(
+                self.assess(phase, rules=GameConfig(max_turns=60, recycle_discard=False), blocks=blocks, games=255),
+                (False, ["rules", "seed_blocks", "solo_games"]),
+            )
+        for changes in (
+            {"num_decks": 2}, {"cards_in_hand": 18}, {"required_sequences": 4},
+            {"max_turns": 59}, {"recycle_discard": False},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(
+                    self.assess("confirmation", rules=GameConfig(**{"max_turns": 60, **changes})),
+                    (False, ["rules"]),
+                )
+        self.assertEqual(self.assess("confirmation"), (True, []))
+
+    def test_unknown_phases_fail_before_loading_checkpoints(self):
+        with self.assertRaisesRegex(ValueError, "phase"):
+            evaluate_gate("missing.pt", "missing.pt", (), 41, 32, 256, phase="screen")
+
+
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class TestGateExecution(unittest.TestCase):
     @classmethod
@@ -257,6 +393,63 @@ class TestGateExecution(unittest.TestCase):
             "solo_games": 35, "max_turns": 1, "samples": 100,
         }
         return evaluate_gate(**{**arguments, **overrides})
+
+    def test_joint_base_blocks_use_disjoint_seed_groups_and_canonical_replica_order(self):
+        from src.evaluation.arena import run_matches
+
+        played = []
+
+        def record(deals, *args, **kwargs):
+            played.append((deals[0].players, deals[0].seed))
+            return run_matches(deals, *args, **kwargs)
+
+        with mock.patch("src.evaluation.promotion.run_matches", side_effect=record):
+            result = self.gate(seed_blocks=2, solo_games=1)
+        self.assertEqual(played, [
+            (2, 41), (2, 42), (2, 43), (2, 44), (3, 41), (3, 42), (4, 41),
+            (2, 45), (2, 46), (2, 47), (2, 48), (3, 45), (3, 46), (4, 45),
+        ])
+        self.assertEqual(
+            [(raw["blocks"], raw["games"]) for raw in result["multiplayer"].values()],
+            [(8, 16), (4, 24), (2, 48)],
+        )
+
+    def test_evaluator_and_validator_share_phase_verdicts_and_failure_recomputation(self):
+        from src.evaluation.promotion import _SoloJob
+
+        for phase, blocks in (("selection", 32), ("confirmation", 128)):
+            for placement, expected in ((0.125, (True, [])), (0.0, (False, ["placement"]))):
+                with self.subTest(phase=phase, placement=placement):
+                    def finish(_runner, job, **_kwargs):
+                        if isinstance(job, _SoloJob):
+                            return {"candidate_outcomes": [0] * job.games, "champion_outcomes": [0] * job.games}
+                        return {"placement_margin": placement, "declaration_margin": 0.0}
+
+                    with mock.patch("src.evaluation.promotion._GateRunner.run", autospec=True, side_effect=finish):
+                        result = self.gate(seed_blocks=blocks, solo_games=256, max_turns=60, phase=phase)
+                    self.assertEqual((result["accepted"], result["gate_failures"]), expected)
+                    self.assertEqual(result["phase"], phase)
+                    self.assertEqual(result["declaration_ci95"], [0.0, 0.0])
+                    arguments = (phase, result["candidate_sha256"], result["champion_sha256"])
+                    if expected[0]:
+                        validated = validate_gate_evidence(result, *arguments)
+                        self.assertEqual((validated.phase, validated.seed_blocks, validated.solo_games), (phase, blocks, 256))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "gate did not pass: placement"):
+                            validate_gate_evidence(result, *arguments)
+                    with self.assertRaisesRegex(ValueError, "verdict disagrees"):
+                        validate_gate_evidence({**result, "gate_failures": ["solo"]}, *arguments)
+
+    def test_phase_changes_reuse_the_same_raw_journal(self):
+        directory = self.root / "phase-shared"
+        selection = self.gate(phase="selection", journal_dir=directory)
+        with mock.patch("src.evaluation.promotion._GateRunner", side_effect=AssertionError("replayed raw evidence")):
+            confirmation = self.gate(phase="confirmation", journal_dir=directory)
+        self.assertEqual(selection["phase"], "selection")
+        self.assertEqual(confirmation["phase"], "confirmation")
+        self.assertEqual(selection["multiplayer"], confirmation["multiplayer"])
+        self.assertEqual(selection["solo"], confirmation["solo"])
+        self.assertEqual(len(list(directory.glob("*.jsonl"))), 1)
 
     def test_loser_placement_improves_without_either_contender_declaring(self):
         from src.evaluate import HandPenalty

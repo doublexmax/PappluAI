@@ -172,7 +172,6 @@ class ModelRegistry:
             phase="confirmation",
             candidate_sha256=candidate.sha256,
             champion_sha256=current.sha256,
-            minimum_seed_blocks=gate_evidence.MIN_CONFIRMATION_SEED_BLOCKS,
             player_counts=player_counts,
         )
         selection = gate_evidence.validate_gate_evidence(
@@ -180,7 +179,6 @@ class ModelRegistry:
             phase="selection",
             candidate_sha256=candidate.sha256,
             champion_sha256=current.sha256,
-            minimum_seed_blocks=gate_evidence.MIN_SELECTION_SEED_BLOCKS,
             player_counts=player_counts,
         )
         if selection.player_counts != confirmation.player_counts:

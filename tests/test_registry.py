@@ -57,6 +57,7 @@ def gate_evidence(candidate, champion, blocks, seed, player_counts=(2, 3, 4)):
     }
     return {
         "accepted": True,
+        "gate_failures": [],
         "candidate_sha256": candidate.sha256,
         "champion_sha256": champion.sha256,
         "gate_schema_version": GATE_SCHEMA_VERSION,
@@ -161,19 +162,20 @@ class TestModelRegistration(unittest.TestCase):
 
 
 class TestChampionProtection(unittest.TestCase):
-    def test_gate_v2_is_explicitly_rejected_even_with_current_model_hashes(self):
+    def test_pre_joint_gate_schemas_are_explicitly_rejected_with_current_model_hashes(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = ModelRegistry(Path(directory))
             champion = install_record(registry, b"frozen", "initial")
             candidate = install_record(registry, b"new", "league")
             registry.initialize_champion(champion.id)
-            for phase in ("selection", "confirmation"):
-                bad = evidence(candidate, champion)
-                target = bad if phase == "confirmation" else bad["selection"]
-                target["gate_schema_version"] = 2
-                with self.subTest(phase=phase), self.assertRaisesRegex(ValueError, "gate schema v2"):
-                    registry.promote(candidate.id, champion.id, bad)
-                self.assertEqual(registry.champion().id, champion.id)
+            for version in (2, 3):
+                for phase in ("selection", "confirmation"):
+                    bad = evidence(candidate, champion)
+                    target = bad if phase == "confirmation" else bad["selection"]
+                    target["gate_schema_version"] = version
+                    with self.subTest(phase=phase, version=version), self.assertRaisesRegex(ValueError, "re-run gates under schema v4"):
+                        registry.promote(candidate.id, champion.id, bad)
+                    self.assertEqual(registry.champion().id, champion.id)
 
     def test_declared_architecture_must_match_axial_table(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -183,7 +185,7 @@ class TestChampionProtection(unittest.TestCase):
             registry.initialize_champion(champion.id)
             bad = evidence(candidate, champion)
             bad["architecture"] = "dynamic_table"
-            with self.assertRaisesRegex(ValueError, "axial_table gate schema v3"):
+            with self.assertRaisesRegex(ValueError, "axial_table gate schema v4"):
                 registry.promote(candidate.id, champion.id, bad)
             self.assertEqual(registry.champion().id, champion.id)
 
@@ -220,7 +222,7 @@ class TestChampionProtection(unittest.TestCase):
             bad.update(evidence_metrics(bad["multiplayer"], bad["solo"], 128, bad["seed"], 100))
             self.assertEqual(bad["multiplayer_gain"], 0.125)
             self.assertEqual(bad["declaration_gain"], -0.5)
-            with self.assertRaisesRegex(ValueError, "gate did not pass"):
+            with self.assertRaisesRegex(ValueError, "gate_failures=.*declaration"):
                 registry.promote(candidate.id, champion.id, bad)
             self.assertEqual(registry.champion().id, champion.id)
 
@@ -324,7 +326,7 @@ class TestChampionProtection(unittest.TestCase):
             bad.update(evidence_metrics(bad["multiplayer"], bad["solo"], 128, bad["seed"], 100))
             self.assertGreater(bad["multiplayer_gain"], 0.05)
             self.assertGreater(bad["multiplayer_ci95"][0], 0)
-            with self.assertRaisesRegex(ValueError, "gate did not pass"):
+            with self.assertRaisesRegex(ValueError, "gate_failures=.*placement_4p"):
                 registry.promote(candidate.id, champion.id, bad)
             self.assertEqual(registry.champion().id, champion.id)
 
@@ -401,7 +403,7 @@ class TestChampionProtection(unittest.TestCase):
                 short_confirmation["seed"],
             )
             short_confirmation.update(replacement)
-            with self.assertRaisesRegex(ValueError, "confirmation requires"):
+            with self.assertRaisesRegex(ValueError, "confirmation.*seed_blocks"):
                 registry.promote(
                     candidate.id,
                     champion.id,
@@ -418,7 +420,7 @@ class TestChampionProtection(unittest.TestCase):
                 ),
                 "phase": "selection",
             }
-            with self.assertRaisesRegex(ValueError, "selection requires"):
+            with self.assertRaisesRegex(ValueError, "selection.*seed_blocks"):
                 registry.promote(
                     candidate.id,
                     champion.id,

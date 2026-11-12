@@ -34,12 +34,30 @@ from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
 from src.training.curriculum_io import STATUS_SCHEMA_VERSION
 
 
-IMPROVEMENT_STATE_VERSION = 3
+IMPROVEMENT_STATE_VERSION = 4
 ALGORITHM = "champion_league_nstep_ddqn"
 PHASES = ("training", "selection", "confirmation")
-LEAGUE_FINETUNE_LR = 2e-5
-LEAGUE_FINETUNE_EPSILON_START = 0.04
-LEAGUE_FINETUNE_EPSILON_END = 0.01
+
+
+@dataclass(frozen=True)
+class FinetuneSchedule:
+    learning_rate: float = 1e-4
+    epsilon_start: float = 0.08
+    epsilon_end: float = 0.02
+
+    def __post_init__(self) -> None:
+        if type(self.learning_rate) not in (int, float) or not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("learning_rate must be finite and positive")
+        for name in ("epsilon_start", "epsilon_end"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError("%s must be in [0, 1]" % name)
+        if self.epsilon_end > self.epsilon_start:
+            raise ValueError("epsilon_end cannot exceed epsilon_start")
+
+    @classmethod
+    def for_solo_win_rate(cls, win_rate: Optional[float]) -> "FinetuneSchedule":
+        return cls(2e-5, 0.04, 0.01) if win_rate is not None and win_rate >= 0.95 else cls()
 
 
 @dataclass(frozen=True)
@@ -103,6 +121,12 @@ class ImprovementController:
         opponent_paths: Sequence[str] = (),
         config: Optional[ImproveConfig] = None,
         snapshots_dir: Optional[Path] = None,
+        finetune: Optional[FinetuneSchedule] = None,
+        *,
+        learning_rate: Optional[float] = None,
+        epsilon_start: Optional[float] = None,
+        epsilon_end: Optional[float] = None,
+        epsilon_decay_matches: Optional[int] = None,
     ) -> None:
         self.config = ImproveConfig() if config is None else config
         self.snapshots_dir = None if snapshots_dir is None else Path(snapshots_dir)
@@ -138,16 +162,24 @@ class ImprovementController:
 
         baseline_path = str(self.registry.model_path(self.baseline_id))
         league_paths = self._opponent_paths()
+        schedule = finetune if finetune is not None else FinetuneSchedule.for_solo_win_rate(
+            initial_evidence.get("current_solo_reference", {}).get("win_rate"),
+        )
+        league_settings = asdict(schedule)
+        for name, value in (
+            ("learning_rate", learning_rate), ("epsilon_start", epsilon_start),
+            ("epsilon_end", epsilon_end), ("epsilon_decay_matches", epsilon_decay_matches),
+        ):
+            if value is not None:
+                league_settings[name] = value
         self.league = LeagueSession(
             baseline_path,
             league_paths,
             config=LeagueConfig(
                 game=GameConfig(max_turns=self.config.max_turns, recycle_discard=self.config.recycle_discard),
                 player_counts=self.config.player_counts,
-                learning_rate=LEAGUE_FINETUNE_LR,
-                epsilon_start=LEAGUE_FINETUNE_EPSILON_START,
-                epsilon_end=LEAGUE_FINETUNE_EPSILON_END,
                 matches_per_round=self.config.matches_per_round,
+                **league_settings,
             ),
             seed=self.config.seed,
         )
@@ -181,7 +213,7 @@ class ImprovementController:
             or type(payload.get("improvement_state_version")) is not int
             or payload["improvement_state_version"] != IMPROVEMENT_STATE_VERSION
         ):
-            raise ValueError("improvement checkpoint version is incompatible; expected version 3")
+            raise ValueError("improvement checkpoint version is incompatible; expected version 4; warm-start with --initial-model")
         required = {
             "improvement_state_version",
             "encoding_version",
@@ -521,14 +553,14 @@ class ImprovementController:
         self.confirmation_result = None
         self.phase = "selection"
 
-    def _selection_step(self, deadline: Optional[float] = None) -> None:
+    def _run_gate(self, phase: str, deadline: Optional[float]) -> Dict[str, Any]:
         champion = self.registry.get(self.champion_at_cycle_id)
         result = evaluate_gate(
             candidate_path=str(self.registry.model_path(self.candidate_id)),
             champion_path=str(self.registry.model_path(champion.id)),
             opponent_paths=self._gate_opponent_paths(champion.id),
             seed=self.pending_gate_seed,
-            seed_blocks=self.config.selection_blocks,
+            seed_blocks=self.config.selection_blocks if phase == "selection" else self.config.confirmation_blocks,
             solo_games=self.config.solo_games,
             max_turns=self.config.max_turns,
             player_counts=self.config.player_counts,
@@ -537,8 +569,12 @@ class ImprovementController:
             recycle_discard=self.config.recycle_discard,
             workers=self.config.gate_workers,
             journal_dir=self.output_dir / "gates",
+            phase=phase,
         )
-        checked = _gate_result(result, "selection")
+        return _gate_result(result, phase)
+
+    def _selection_step(self, deadline: Optional[float] = None) -> None:
+        checked = self._run_gate("selection", deadline)
         self.selection_result = checked
         self.last_gate = checked
         _append_metric_once(
@@ -561,22 +597,7 @@ class ImprovementController:
     ) -> None:
         champion = self.registry.get(self.champion_at_cycle_id)
         if self.confirmation_result is None:
-            result = evaluate_gate(
-                candidate_path=str(self.registry.model_path(self.candidate_id)),
-                champion_path=str(self.registry.model_path(champion.id)),
-                opponent_paths=self._gate_opponent_paths(champion.id),
-                seed=self.pending_gate_seed,
-                seed_blocks=self.config.confirmation_blocks,
-                solo_games=self.config.solo_games,
-                max_turns=self.config.max_turns,
-                player_counts=self.config.player_counts,
-                samples=self.config.gate_samples,
-                deadline=deadline,
-                recycle_discard=self.config.recycle_discard,
-                workers=self.config.gate_workers,
-                journal_dir=self.output_dir / "gates",
-            )
-            checked = _gate_result(result, "confirmation")
+            checked = self._run_gate("confirmation", deadline)
             checked["selection_passed"] = True
             self.confirmation_result = checked
             self.last_gate = checked
@@ -788,8 +809,9 @@ def _gate_result(raw: Any, phase: str) -> Dict[str, Any]:
         raise ValueError("promotion gate must return a dict")
     if not isinstance(raw.get("accepted"), bool):
         raise ValueError("promotion gate accepted result must be bool")
+    if raw.get("phase") != phase:
+        raise ValueError("promotion gate phase must match %s" % phase)
     result = dict(raw)
-    result["phase"] = phase
     result["candidate_origin"] = "league"
     return result
 

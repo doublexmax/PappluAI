@@ -19,6 +19,45 @@ if torch is not None:
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class TestFreshLeagueOutputs(unittest.TestCase):
+    def test_finetune_flags_persist_and_resume_rejects_separate_and_equals_forms(self):
+        from src.model.spec import ModelSpec
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model, output = root / "initial.pt", root / "league"
+            save_checkpoint(str(model), QNetwork(ModelSpec(8, 1, 1)), GameConfig())
+            base = [
+                "--initial-model", str(model), "--output-dir", str(output),
+                "--matches", "0", "--max-seconds", "0",
+            ]
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(main(base + [
+                    "--learning-rate", "0.00015", "--epsilon-start=0.12",
+                    "--epsilon-end", "0.03", "--epsilon-decay-matches=77",
+                ]), 0)
+            state_path = output / "latest-state.pt"
+            fields = ("learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_matches")
+            config = torch.load(state_path, weights_only=True)["league_config"]
+            self.assertEqual(tuple(config[field] for field in fields), (0.00015, 0.12, 0.03, 77))
+            resume = base + ["--resume", str(state_path)]
+            matching = resume + [
+                "--learning-rate=0.00015", "--epsilon-start", "0.12",
+                "--epsilon-end=0.03", "--epsilon-decay-matches", "77",
+            ]
+            for arguments in (resume, matching):
+                with mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(main(arguments), 0)
+            before = state_path.read_bytes()
+            for option, value, field in (
+                ("--learning-rate", "0.0002", "learning_rate"), ("--epsilon-start", "0.13", "epsilon_start"),
+                ("--epsilon-end", "0.04", "epsilon_end"), ("--epsilon-decay-matches", "78", "epsilon_decay_matches"),
+            ):
+                for extra in ([option, value], [option + "=" + value]):
+                    with self.subTest(extra=extra), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                        self.assertEqual(main(resume + extra), 2)
+                        self.assertIn("resume cannot change " + field, error.getvalue())
+                    self.assertEqual(state_path.read_bytes(), before)
+
     def test_round_flag_batches_matches_without_skipping_checkpoint_boundaries(self):
         from src.model.spec import ModelSpec
         from src.training.league import LeagueSession

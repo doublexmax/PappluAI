@@ -9,7 +9,7 @@ from unittest import mock
 
 import src.training.improve as improve_runtime
 from src.cli.improve import build_arg_parser
-from src.training.improve import ALGORITHM, ImproveConfig, ImprovementController
+from src.training.improve import ALGORITHM, FinetuneSchedule, ImproveConfig, ImprovementController
 from tests.improve_support import ControllerTestCase, sha256
 
 
@@ -69,6 +69,21 @@ class TestMetricHistory(unittest.TestCase):
 
 
 class TestImproveConfig(unittest.TestCase):
+    def test_finetune_schedule_selects_by_verified_mastery_and_rejects_invalid_values(self):
+        for rate, expected in (
+            (None, (1e-4, 0.08, 0.02)), (0.9499, (1e-4, 0.08, 0.02)),
+            (0.95, (2e-5, 0.04, 0.01)), (1.0, (2e-5, 0.04, 0.01)),
+        ):
+            schedule = FinetuneSchedule.for_solo_win_rate(rate)
+            self.assertEqual((schedule.learning_rate, schedule.epsilon_start, schedule.epsilon_end), expected)
+        for settings in (
+            {"learning_rate": 0}, {"learning_rate": float("nan")}, {"learning_rate": True},
+            {"epsilon_start": 1.01}, {"epsilon_end": -0.01}, {"epsilon_end": float("nan")},
+            {"epsilon_start": 0.01, "epsilon_end": 0.02},
+        ):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                FinetuneSchedule(**settings)
+
     def test_gate_worker_count_requires_a_positive_integer(self):
         for value in (0, -1, True, 1.5, "2", None):
             with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
@@ -106,6 +121,42 @@ class TestImproveConfig(unittest.TestCase):
 
 
 class TestImproveResume(ControllerTestCase):
+    def test_real_cli_partial_override_preserves_mastery_defaults_and_rejects_resume_changes(self):
+        from src.cli.improve import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model, output = root / "initial.pt", root / "output"
+            self.make_model(model)
+            self.write_solo_reference(model, 95)
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(main([
+                    "--initial-model", str(model), "--output-dir", str(output), "--max-seconds", "0",
+                    "--learning-rate=0.00015", "--epsilon-decay-matches", "77",
+                ]), 0)
+            state_path = output / "latest-state.pt"
+            config = improve_runtime.torch.load(state_path, weights_only=True)["league_state"]["league_config"]
+            fields = ("learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_matches")
+            self.assertEqual(tuple(config[field] for field in fields), (0.00015, 0.04, 0.01, 77))
+            base = ["--resume", str(state_path), "--output-dir", str(output), "--max-seconds", "0"]
+            matching = base + [
+                "--learning-rate", "0.00015", "--epsilon-start=0.04",
+                "--epsilon-end", "0.01", "--epsilon-decay-matches=77",
+            ]
+            for arguments in (base, matching):
+                with mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(main(arguments), 0)
+            before = state_path.read_bytes()
+            for option, value in (
+                ("--learning-rate", "0.0002"), ("--epsilon-start", "0.05"),
+                ("--epsilon-end", "0.02"), ("--epsilon-decay-matches", "78"),
+            ):
+                for extra in ([option, value], [option + "=" + value]):
+                    with self.subTest(extra=extra), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                        self.assertEqual(main(base + extra), 2)
+                        self.assertIn("Resume cannot change " + option, error.getvalue())
+                    self.assertEqual(state_path.read_bytes(), before)
+
     def test_resume_can_extend_runtime_cap_but_not_learning_settings(self):
         from src.cli.improve import _validate_resume_options
 

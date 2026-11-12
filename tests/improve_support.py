@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 import unittest
 
@@ -44,10 +45,12 @@ def gate_result(accepted):
         }
         samples = max(100, kwargs["samples"])
         return {
-            "gate_schema_version": 3, "encoding_version": 2, "architecture": "axial_table",
+            "gate_schema_version": 4, "encoding_version": 2, "architecture": "axial_table",
             "candidate_sha256": sha256(kwargs["candidate_path"]),
             "champion_sha256": sha256(kwargs["champion_path"]),
             "accepted": accepted,
+            "phase": kwargs["phase"],
+            "gate_failures": [] if accepted else ["placement"],
             **evidence_metrics(
                 multiplayer, solo, blocks, kwargs["seed"], samples,
                 player_counts=kwargs["player_counts"],
@@ -105,6 +108,17 @@ class ControllerTestCase(unittest.TestCase):
             snapshots_dir=snapshots_dir,
         )
 
+    def write_solo_reference(self, model, wins):
+        (model.parent / "final-best.json").write_text(json.dumps({
+            "encoding_version": 2, "checkpoint_version": 4, "architecture": "axial_table",
+            "checkpoint_sha256": sha256(model),
+            "game_config": {
+                "num_decks": 3, "cards_in_hand": 21, "required_sequences": 5,
+                "max_turns": 60, "recycle_discard": True,
+            },
+            "greedy": {"games": 100, "wins": wins, "outcomes": [1] * wins + [0] * (100 - wins)},
+        }), encoding="utf-8")
+
     def make_snapshot(self, directory):
         source = directory / "incoming.pt"
         self.make_model(source)
@@ -133,11 +147,11 @@ class ControllerTestCase(unittest.TestCase):
             "recycle_discard": controller.config.recycle_discard,
         }
         selection = {
-            **gate_result(True)(**arguments, seed=60_000_000, seed_blocks=32), "phase": "selection",
+            **gate_result(True)(**arguments, seed=60_000_000, seed_blocks=32, phase="selection"),
         }
         confirmation = {
-            **gate_result(True)(**arguments, seed=60_500_000, seed_blocks=128),
-            "phase": "confirmation", "selection_passed": True,
+            **gate_result(True)(**arguments, seed=60_500_000, seed_blocks=128, phase="confirmation"),
+            "selection_passed": True,
             "selection": selection, "selection_seed": 60_000_000,
         }
         return controller.registry.promote(

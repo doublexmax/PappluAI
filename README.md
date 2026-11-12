@@ -279,7 +279,12 @@ Booleans are not accepted as integers. The evaluator does not mutate its inputs.
 The old `matched_rate` prototype and its matching helpers have been removed.
 Use `hand_reward` for a declaration verdict and `evaluate_hand` for a grouping.
 The binary reward is not the old prototype's unmatched-card count.
-The current multiplayer `Learner` trains on placement utility, not this binary reward.
+`Learner` trains on shaped terminal utility, not this binary reward.
+Solo declaration earns +1. A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`.
+Zero deadwood without a declaration still earns only -0.5.
+Multiplayer utility weights each pairwise margin by 1 when either seat declared, and by 0.5 otherwise.
+The declarer earns +1, while the best exhausted hand earns at most +0.5.
+Ratings and promotion still use unshaped `DealOutcome.margin` values.
 
 `minimum_penalty(hand, joker, required_sequences=5)` returns an exact
 `HandPenalty` for a hand of any size. Its `points`, `exempt_melds`, and
@@ -317,7 +322,7 @@ responsibility.
 | `src.checkpoints` | Atomic files, tensor validation, evidence, and registries |
 
 `src.cli.solo` uses `Learner` for 5-step Double DQN with `gamma = 1.0`.
-Multiplayer training uses the same learner with placement utility.
+Multiplayer training uses the same learner with declaration-weighted pairwise utility.
 See [TRAINING.md](TRAINING.md) for a
 fresh-clone walkthrough of every training workflow.
 See [RATINGS.md](RATINGS.md) for persistent multiplayer tournaments,
@@ -350,14 +355,16 @@ Browser exports use `formatVersion == 2` and contain only `policy.*` tensors.
 League and improvement runs inherit the initial checkpoint's spec.
 The browser accepts any valid spec, including width 128, eight heads, and three blocks.
 
-`TrajectoryReplay` v3 caches decision features and samples decisions uniformly
+`TrajectoryReplay` v4 caches decision features and samples decisions uniformly
 within each player count. Counts receive equal sampling shares.
 Checkpoints store each trajectory's visible history once, with a prefix for each decision.
 Hidden hands provide training targets only and never enter `Features`.
 Model checkpoints use `checkpoint_version == 4` and `encoding_version == 2`.
-Loaders reject old models and replay explicitly.
+Existing `axial_table` v4 weights remain valid warm starts.
+Resume rejects replay v3 because its stored utilities predate deadwood shaping.
+Use `--initial-model` with a fresh output directory instead of resuming that state.
 There is no checkpoint conversion or old architecture selector.
-Historical artifacts can remain on disk, but they cannot seed a current run.
+Old model architectures remain unsupported.
 Fresh weights and tiny updates establish working software, not competitive play.
 
 ### Run a short discard-puzzle smoke test
@@ -393,6 +400,15 @@ For a larger model, set its spec when the run starts.
 ```powershell
 .\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21-wide --width 128 --heads 8 --blocks 3
 ```
+
+To warm-start existing v4 weights with fresh optimizer and replay state, set the curriculum stage and exploration schedule.
+
+```powershell
+.\.venv\Scripts\python -m src.cli.curriculum --initial-model runs\full21\best-model.pt --initial-stage 2 --output-dir runs\full21-finetune --learning-rate 0.0001 --epsilon-start 0.08 --epsilon-end 0.02 --epsilon-decay-episodes 10000
+```
+
+`--epsilon-start`, `--epsilon-end`, and `--epsilon-decay-episodes` persist in the training state.
+Validation and best-model selection still use binary greedy declaration rates.
 
 The trainer writes standard model checkpoints and `latest-state.pt`.
 The state checkpoint includes the model, optimizer, replay buffer, counters,
@@ -455,6 +471,8 @@ explicit setting.
 `--batch-size` caps replay samples per optimizer update and defaults to 128.
 `--updates-per-match` sets updates after a match with challenger actions and defaults to 4.
 `--matches-per-round` batches up to 16 deals by default.
+`--learning-rate` defaults to 0.0003.
+`--epsilon-start`, `--epsilon-end`, and `--epsilon-decay-matches` default to 0.2, 0.05, and 10000.
 On resume, omit these options to restore their saved values, or supply the same values.
 Changed values for these options, `--players`, or `--seed` fail before checkpoint publication.
 Player counts must be sorted and distinct.
@@ -466,7 +484,7 @@ The remaining share favors opponents the challenger places below.
 
 ### Run finite improvement cycles
 
-`ImprovementController` v3 trains one league challenger per cycle.
+`ImprovementController` v4 trains one league challenger per cycle.
 It evaluates that challenger against a frozen champion, then confirms a passing result on fresh seeds.
 
 ```powershell
@@ -481,17 +499,28 @@ An external champion change reloads its weights and resets the optimizer.
 Eight consecutive rejections trigger the same rebase by default.
 Replay and random streams survive a rebase.
 
-`evaluate_gate` writes `gate_schema_version == 3` evidence.
+Without verified solo mastery, finetuning defaults to learning rate 0.0001 and epsilon 0.08 to 0.02.
+Verified ordinary full21 win rate of at least 0.95 selects learning rate 0.00002 and epsilon 0.04 to 0.01.
+The controller reads matching `final-best.json` evidence beside the initial model.
+`--learning-rate`, `--epsilon-start`, and `--epsilon-end` override those defaults.
+`--epsilon-decay-matches` defaults to 10000.
+Resume uses the saved `LeagueConfig` and rejects changed finetune settings in both spaced and `=` argument forms.
+
+`evaluate_gate` writes `gate_schema_version == 4` evidence.
 `--selection-blocks 32` produces 128 two-player, 64 three-player, and 32 four-player blocks.
 `--confirmation-blocks 128` produces 512, 256, and 128 blocks respectively.
 Each block batches all 2, 6, or 24 seat orders in one `run_matches` call.
 Placement margins count better loser placements even when another seat declares.
 Declaration margins remain a separate retention check.
-Counts receive equal weight in the stratified bootstrap despite their different block budgets.
+Each base block shares seeds `seed + 4 * base_block + replica` across active counts.
+The gate averages replicas within each count, gives counts equal weight, and bootstraps whole joint base blocks.
 
-Promotion requires a placement gain of at least 0.05 and positive overall and per-count lower 95% bounds.
-Every count must improve. Aggregate declaration gain and paired solo gain cannot be negative.
-At least 256 solo games are required, and the solo lower 95% bound must be at least -0.03.
+Selection screens mean gains at 32 base blocks.
+Confirmation requires a positive aggregate placement gain and lower 95% bound at 128 base blocks.
+Per-count placement, declaration, and paired solo checks allow bounded noninferiority.
+Both phases still require at least 256 paired solo games through `--solo-games`.
+Evidence includes `phase`, `gate_failures`, and `declaration_ci95`.
+See the [complete promotion limits](RATINGS.md#promotion-evidence-stays-separate).
 Reduced-cap or undersized smoke evidence cannot promote.
 The registry recomputes these metrics from raw margins and requires disjoint selection and confirmation seeds.
 
@@ -504,9 +533,9 @@ Training updates are stochastic and are
 not an atomic group, so published metrics need not improve monotonically.
 `status.json` is written last and describes the stable published snapshot.
 
-New current runs require fresh weights. Old champion conversion and rule
-migration commands are removed. Use a new output directory rather than resume
-an incompatible historical run.
+Existing v4 model weights can start a fresh run.
+Old champion conversion and rule migration commands remain removed.
+Use a new output directory rather than resume an incompatible replay or controller state.
 
 ## Verification
 

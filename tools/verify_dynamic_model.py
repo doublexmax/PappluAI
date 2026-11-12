@@ -12,6 +12,7 @@ from pathlib import Path
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -229,12 +230,17 @@ def verify(output: Path) -> dict:
         cli("curriculum", "--output-dir", curriculum, "--max-episodes", 1,
             "--max-seconds", 120, "--checkpoint-every", 1, "--validation-games", 1,
             "--validate-every", 100, "--max-turns", 1, "--seed", 61,
+            "--learning-rate", 0.0001, "--epsilon-start", 0.08, "--epsilon-end", 0.02,
+            "--epsilon-decay-episodes", 77,
             "--width", 16, "--heads", 2, "--blocks", 1)
         cli("curriculum", "--resume", curriculum / "latest-state.pt", "--output-dir", curriculum,
             "--max-episodes", 2, "--max-seconds", 120, "--checkpoint-every", 1)
         solo_state = torch.load(curriculum / "latest-state.pt", weights_only=True)
         assert solo_state["counters"]["total_episodes"] == 2
-        assert solo_state["learner"]["replay"]["version"] == 3
+        assert solo_state["learner"]["replay"]["version"] == 4
+        assert tuple(solo_state["training_config"][name] for name in (
+            "learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_episodes",
+        )) == (0.0001, 0.08, 0.02, 77)
         cli("benchmark", "--checkpoint", curriculum / "latest-model.pt",
             "--output", output / "benchmark.json", "--games", 1, "--warm-games", 0)
 
@@ -242,6 +248,8 @@ def verify(output: Path) -> dict:
         cli("league", "--initial-model", paths[0], "--output-dir", league, "--matches", 6,
             "--players", 2, 3, 4, "--max-turns", 1, "--batch-size", 2,
             "--updates-per-match", 1, "--matches-per-round", 4,
+            "--learning-rate", 0.00015, "--epsilon-start", 0.12, "--epsilon-end", 0.03,
+            "--epsilon-decay-matches", 77,
             "--max-seconds", 120, "--checkpoint-every", 3, "--seed", 62)
         state_path = league / "latest-state.pt"
         first = torch.load(state_path, weights_only=True)
@@ -252,6 +260,7 @@ def verify(output: Path) -> dict:
             str(paths[0]),
             config=LeagueConfig(
                 game=GameConfig(max_turns=1), batch_size=2, updates_per_match=1, matches_per_round=4,
+                learning_rate=0.00015, epsilon_start=0.12, epsilon_end=0.03, epsilon_decay_matches=77,
             ),
             seed=62,
         )
@@ -275,7 +284,10 @@ def verify(output: Path) -> dict:
             for episode in final["learner"]["replay"]["trajectories"]
         )
         assert set(counts) == {2, 3, 4}
-        assert final["learner"]["replay"]["version"] == 3
+        assert final["learner"]["replay"]["version"] == 4
+        assert tuple(final["league_config"][name] for name in (
+            "learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_matches",
+        )) == (0.00015, 0.12, 0.03, 77)
         evidence["resume"] = {
             "exact_state_sha256": exact_digest,
             "matches": final["counters"]["completed_matches"],
@@ -289,6 +301,8 @@ def verify(output: Path) -> dict:
             "--max-seconds", 120, "--max-cycles", 1, "--max-turns", 1,
             "--league-matches", 1,
             "--selection-blocks", 1, "--confirmation-blocks", 1, "--solo-games", 1,
+            "--learning-rate", 0.00015, "--epsilon-start", 0.12, "--epsilon-end", 0.03,
+            "--epsilon-decay-matches", 77,
             "--checkpoint-every", 1, "--matches-per-round", 2, "--workers", 2)
         cli("improve", "--resume", improve / "latest-state.pt", "--output-dir", improve,
             "--max-seconds", 0, "--workers", 1)
@@ -296,7 +310,9 @@ def verify(output: Path) -> dict:
         improvement_status = json.loads((improve / "status.json").read_text())
         assert improvement_status["completed_cycles"] == 1
         assert improvement_status["last_gate"]["accepted"] is False
-        assert improvement_status["last_gate"]["gate_schema_version"] == 3
+        assert improvement_status["last_gate"]["gate_schema_version"] == 4
+        assert improvement_status["last_gate"]["phase"] == "selection"
+        assert "rules" in improvement_status["last_gate"]["gate_failures"]
         assert improvement_status["last_gate"]["architecture"] == "axial_table"
         assert [
             (raw["blocks"], raw["games"])
@@ -306,7 +322,10 @@ def verify(output: Path) -> dict:
         assert improvement_status["updates"] == 4
         assert "research_episodes" not in improvement_status
         improvement_state = torch.load(improve / "latest-state.pt", weights_only=True)
-        assert improvement_state["improvement_state_version"] == 3
+        assert improvement_state["improvement_state_version"] == 4
+        assert tuple(improvement_state["league_state"]["league_config"][name] for name in (
+            "learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_matches",
+        )) == (0.00015, 0.12, 0.03, 77)
         assert improvement_state["config"]["gate_workers"] == 1
         assert improvement_state["cursors"] == {"league": 0}
         assert "research_state" not in improvement_state
@@ -327,6 +346,7 @@ def verify(output: Path) -> dict:
             "candidate_path": str(paths[1]), "champion_path": str(paths[0]),
             "opponent_paths": (str(paths[2]),), "seed": 70_000_000,
             "seed_blocks": 1, "solo_games": 35, "max_turns": 1, "samples": 100,
+            "phase": "selection",
         }
         journal_dir = output / "gates"
         serial_gate = evaluate_gate(**gate_arguments, workers=1, journal_dir=journal_dir)
@@ -337,7 +357,9 @@ def verify(output: Path) -> dict:
         completed_jobs = [json.loads(line) for line in journal.read_text().splitlines()]
         assert len(completed_jobs) == 9
         assert [record["job"] for record in completed_jobs[-2:]] == [["solo", 0, 32], ["solo", 32, 3]]
-        assert serial_gate["gate_schema_version"] == 3
+        assert serial_gate["gate_schema_version"] == 4
+        assert serial_gate["phase"] == "selection"
+        assert "rules" in serial_gate["gate_failures"]
         assert serial_gate["accepted"] is False
         evidence["gate"] = {
             "gate_schema_version": serial_gate["gate_schema_version"],
@@ -381,8 +403,8 @@ def verify(output: Path) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Verify axial_table v4 play, training, gate v3 journals, resume, and ratings.")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser = argparse.ArgumentParser(description="Verify axial_table v4 play, finetune flags, gate v4 journals, resume, and ratings.")
+    parser.add_argument("--output-dir", type=Path, default=Path(tempfile.gettempdir()) / "papplu-dynamic-verification")
     args = parser.parse_args()
     verify(args.output_dir)
     return 0

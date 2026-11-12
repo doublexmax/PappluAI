@@ -95,6 +95,9 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
             "--recycle-discard",
             "--no-recycle-discard",
             "--seed",
+            "--epsilon-start",
+            "--epsilon-end",
+            "--epsilon-decay-episodes",
         ):
             self.assertIn(flag, text)
 
@@ -172,6 +175,42 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
                     )
                     self.assertEqual(mismatch.returncode, 2)
                     self.assertIn("does not match model", mismatch.stderr)
+
+    @unittest.skipIf(torch is None, TORCH_REASON)
+    def test_real_cli_finetune_flags_persist_and_resume_rejects_both_option_forms(self):
+        from src.cli.curriculum import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "run"
+            base = ["--output-dir", str(output), "--max-episodes", "0", "--max-seconds", "0"]
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(main(base + [
+                    "--width", "8", "--heads", "1", "--blocks", "1",
+                    "--learning-rate=0.0001", "--epsilon-start", "0.1",
+                    "--epsilon-end=0.02", "--epsilon-decay-episodes", "42",
+                ]), 0)
+            state_path = output / "latest-state.pt"
+            fields = ("learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_episodes")
+            config = torch.load(state_path, weights_only=True)["training_config"]
+            self.assertEqual(tuple(config[field] for field in fields), (0.0001, 0.1, 0.02, 42))
+            resume = base + ["--resume", str(state_path)]
+            matching = resume + [
+                "--learning-rate", "0.0001", "--epsilon-start=0.1",
+                "--epsilon-end", "0.02", "--epsilon-decay-episodes=42",
+            ]
+            for arguments in (resume, matching):
+                with mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(main(arguments), 0)
+            for option, value, field in (
+                ("--learning-rate", "0.0002", "learning_rate"), ("--epsilon-start", "0.2", "epsilon_start"),
+                ("--epsilon-end", "0.03", "epsilon_end"), ("--epsilon-decay-episodes", "43", "epsilon_decay_episodes"),
+            ):
+                for extra in ([option, value], [option + "=" + value]):
+                    with self.subTest(extra=extra), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                        self.assertEqual(main(resume + extra), 2)
+                        self.assertIn("resume cannot change " + field, error.getvalue())
+                    saved = torch.load(state_path, weights_only=True)["training_config"]
+                    self.assertEqual(tuple(saved[name] for name in fields), (0.0001, 0.1, 0.02, 42))
 
 
 @unittest.skipIf(torch is None, TORCH_REASON)
