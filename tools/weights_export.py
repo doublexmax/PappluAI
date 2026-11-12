@@ -42,7 +42,10 @@ PRODUCTION = GameConfig(max_turns=60)
 TOLERANCE = 1e-4
 INPUT_TOLERANCE = 1e-6
 STEP_LIMIT = 1000
-SOURCES = ("src/game/belief.py", "src/model/encoding.py", "src/model/network.py", "tools/weights_export.py")
+SOURCES = (
+    "src/evaluate.py", "src/game/belief.py", "src/game/environment.py", "src/game/lookahead.py",
+    "src/model/encoding.py", "src/model/network.py", "tools/weights_export.py",
+)
 
 
 def tensor_shapes(spec=ModelSpec()):

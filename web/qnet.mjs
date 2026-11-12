@@ -1,3 +1,30 @@
+import { pureSequenceUpperBound } from "./evaluate.mjs";
+
+/**
+ * @typedef {Readonly<{width: number, heads: number, blocks: number}>} ModelSpec
+ * @typedef {Readonly<{
+ *   numDecks: number, cardsInHand: number, requiredSequences: number,
+ *   maxTurns: number, recycleDiscard: boolean
+ * }>} ModelGameConfig
+ * @typedef {Readonly<{
+ *   kind: "bootstrap"|"checkpoint"|"registry", trained: boolean, champion: boolean,
+ *   seed: number|null, registryId: string|null, sha256: string, tensorsSha256: string
+ * }>} ModelSource
+ * @typedef {Readonly<{
+ *   kind: "papplu-qnet", spec: ModelSpec, gameConfig: ModelGameConfig, source: ModelSource
+ * }>} QModel
+ * @typedef {object} Observation
+ * @property {number[]} hand
+ * @property {number[]} discardPile
+ * @property {number} joker
+ * @property {0|1|2} phase
+ * @property {number} turnsRemaining
+ * @property {number} stockRemaining
+ * @property {ModelGameConfig} config
+ * @property {{handSize: number, turnsRemaining: number, nextPlayer: number, previousPlayer: number, active: boolean}[]} players
+ * @property {{kind: number, actor: number, handSize: number, turnsRemaining: number, stockRemaining: number, nextPlayer: number, face: number|null, offeredTop: number|null, initialHand: number[]}[]} history
+ */
+
 const NUM_FACES = 52;
 const NUM_ACTIONS = 54;
 const SEATS = 6;
@@ -83,6 +110,10 @@ export function tensorShapes(spec) {
   return shapes;
 }
 
+/**
+ * @param {unknown} json A v4 checkpoint export in the papplu-qnet format.
+ * @returns {QModel} A frozen handle with private policy weights.
+ */
 export function parseQModel(json) {
   requireKeys(json, MODEL_KEYS, "model");
   for (const [key, expected] of Object.entries(HEADER)) {
@@ -195,6 +226,10 @@ function requireFaceCounts(value, path) {
   if (value.some(n => !Number.isSafeInteger(n) || n < 0)) fail(path, "expected nonnegative integer face counts");
 }
 
+function nonnegativeInteger(value, path) {
+  if (!Number.isSafeInteger(value) || value < 0) fail(path, "expected a nonnegative safe integer");
+}
+
 function validateObservation(obs, path) {
   if (!isRecord(obs)) fail(path, "expected an observation");
   if (!isRecord(obs.config)) fail(`${path}.config`, "expected a game config");
@@ -202,6 +237,8 @@ function validateObservation(obs, path) {
   requireFaceCounts(obs.hand, `${path}.hand`);
   index(obs.joker, NUM_FACES, `${path}.joker`);
   index(obs.phase, 3, `${path}.phase`);
+  nonnegativeInteger(obs.turnsRemaining, `${path}.turnsRemaining`);
+  nonnegativeInteger(obs.stockRemaining, `${path}.stockRemaining`);
   if (!Array.isArray(obs.discardPile)) fail(`${path}.discardPile`, "expected an array of faces");
   obs.discardPile.forEach((face, i) => index(face, NUM_FACES, `${path}.discardPile[${i}]`));
   if (!Array.isArray(obs.players) || obs.players.length < 1 || obs.players.length > SEATS) {
@@ -210,6 +247,8 @@ function validateObservation(obs, path) {
   obs.players.forEach((player, seat) => {
     const at = `${path}.players[${seat}]`;
     if (!isRecord(player)) fail(at, "expected a player view");
+    nonnegativeInteger(player.handSize, `${at}.handSize`);
+    nonnegativeInteger(player.turnsRemaining, `${at}.turnsRemaining`);
     index(player.nextPlayer, obs.players.length, `${at}.nextPlayer`);
     index(player.previousPlayer, obs.players.length, `${at}.previousPlayer`);
     if (typeof player.active !== "boolean") fail(`${at}.active`, "expected a boolean");
@@ -221,7 +260,9 @@ function validateObservation(obs, path) {
     index(event.kind, 6, `${at}.kind`);
     index(event.actor, obs.players.length, `${at}.actor`);
     index(event.nextPlayer, obs.players.length, `${at}.nextPlayer`);
-    if (event.face !== null) index(event.face, NUM_FACES, `${at}.face`);
+    if (event.face !== null || event.kind === TAKE_DISCARD || event.kind === DISCARD) {
+      index(event.face, NUM_FACES, `${at}.face`);
+    }
     if (event.offeredTop !== null) index(event.offeredTop, NUM_FACES, `${at}.offeredTop`);
   });
   requireFaceCounts(obs.history[0].initialHand, `${path}.history[0].initialHand`);
@@ -302,6 +343,10 @@ function meldMembership(hand, joker) {
   return { natural, pure, anyMeld };
 }
 
+/**
+ * @param {Observation} obs An observer-relative table and its public event history.
+ * @returns {Float32Array} The 3,208 v2 input features.
+ */
 export function encodeObservation(obs) {
   return encode(obs, "observation");
 }
@@ -352,11 +397,7 @@ function encode(obs, path) {
     (phase === 1 && [DRAW_STOCK, TAKE_DISCARD].includes(last.kind) && last.actor === 0) ||
     (phase === 0 && [DISCARD, REFILL].includes(last.kind) && last.nextPlayer === 0)
   );
-  const pureUpper = Math.min(
-    Math.floor(hand.reduce((a, b) => a + b, 0) / 3),
-    hand.reduce((sum, n) => sum + Math.floor(n / 3), 0) + hand[joker] +
-    RUN_FACES.reduce((sum, run) => sum + Math.min(...run.map(face => hand[face])), 0),
-  );
+  const pureUpper = pureSequenceUpperBound(hand, joker);
   values.set([
     Number(phase === 0), Number(phase === 1), Number(phase === 2), Number(toAct), obs.turnsRemaining / turns,
     obs.stockRemaining / supply, discardPile.length / supply, Math.min(belief.refills, 3) / 3, decks / 6, cards / 30,
@@ -380,6 +421,11 @@ function encode(obs, path) {
   return values;
 }
 
+/**
+ * @param {QModel} model The handle returned by parseQModel.
+ * @param {Observation[]} observations The observation batch.
+ * @returns {Float32Array[]} One row of 54 unmasked Q values per observation.
+ */
 export function qValues(model, observations) {
   const weights = WEIGHTS.get(model);
   if (weights === undefined) throw new TypeError("qValues: model must come from parseQModel");

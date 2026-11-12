@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.evaluate import (
     NUM_FACES, SCORING_VERSION, evaluate_hand, hand_reward, is_valid_hand, minimum_penalty,
+    pure_sequence_upper_bound,
 )
 from src.game.lookahead import can_declare_ub, winning_discard
 
@@ -66,6 +67,7 @@ def parity_case(name, group, hand, joker, required=5, size=21):
         entry["is_valid_hand"] = is_valid_hand(hand, joker, required, size)
         entry["hand_reward"] = hand_reward(hand, joker, required, size)
     if "errors" not in entry:
+        entry["pure_sequence_upper_bound"] = pure_sequence_upper_bound(hand, joker)
         entry["can_declare_ub"] = can_declare_ub(hand, joker, required)
         entry["winning_discard"] = winning_discard(hand, joker, required, size)
     return entry

@@ -7,23 +7,22 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from src.evaluate import minimum_penalty
 from src.evaluation.arena import EpsilonPolicy
+from src.evaluation.benchmark import evaluate_games
 from src.game.environment import (
     ENCODING_VERSION,
     GameConfig,
     Observation,
     PappluEnv,
 )
-from src.game.outcome import SeatOutcome
+from src.game.multiplayer import TerminalSnapshot
+from src.game.outcome import DealOutcome
 from src.model.encoding import encode
 from src.model.network import (
     CHECKPOINT_VERSION,
     QNetwork,
     load_checkpoint,
     save_checkpoint,
-    select_greedy_action,
-    select_random_legal,
 )
 from src.model.search import TeacherConfig
 from src.model.spec import ModelSpec
@@ -166,10 +165,11 @@ def train(
             warm_start=use_warm,
             device=torch_device,
         )
-        points = minimum_penalty(final_obs.hand, final_obs.joker, cfg.required_sequences).points
-        outcome = SeatOutcome(
-            1.0 if final_obs.won else -min(points, 100) / 100.0, final_obs.won, points,
-        )
+        outcome = DealOutcome.score(
+            TerminalSnapshot((tuple(final_obs.hand),), final_obs.joker),
+            0 if final_obs.won else None, "win" if final_obs.won else "turns_exhausted",
+            cfg.required_sequences,
+        ).seat(0)
         episode_reward = outcome.utility
         reward_sum += episode_reward
         return_sum += gamma ** (len(steps) - 1) * outcome.utility
@@ -288,49 +288,10 @@ def evaluate_policy(
     if isinstance(games, bool) or not isinstance(games, int) or games <= 0:
         raise ValueError("games must be a positive integer")
     cfg = config if config is not None else GameConfig()
-    if device is None:
-        device = next(network.parameters()).device
-
-    was_training = network.training
-    network.eval()
-    env = PappluEnv(cfg)
-
-    greedy_rewards = 0.0
-    greedy_wins = 0
-    for i in range(games):
-        obs = env.reset(seed=seed + i)
-        total_r = 0.0
-        while not obs.done:
-            action = select_greedy_action(network, obs, device=device)
-            obs = env.step(action)
-            total_r += obs.last_reward
-        greedy_rewards += total_r
-        if obs.won:
-            greedy_wins += 1
-
-    result: Dict[str, float] = {
-        "games": float(games),
-        "greedy_reward_avg": greedy_rewards / games if games else 0.0,
-        "greedy_win_rate": greedy_wins / games if games else 0.0,
-    }
-
-    if compare_random:
-        rand_rewards = 0.0
-        rand_wins = 0
-        for i in range(games):
-            obs = env.reset(seed=seed + i)
-            total_r = 0.0
-            step_rng = random.Random(seed + 10_000 + i)
-            while not obs.done:
-                action = select_random_legal(obs, step_rng)
-                obs = env.step(action)
-                total_r += obs.last_reward
-            rand_rewards += total_r
-            if obs.won:
-                rand_wins += 1
-        result["random_reward_avg"] = rand_rewards / games if games else 0.0
-        result["random_win_rate"] = rand_wins / games if games else 0.0
-
-    if was_training:
-        network.train()
+    result: Dict[str, float] = {"games": float(games)}
+    for policy in ("greedy", "random") if compare_random else ("greedy",):
+        evaluated = evaluate_games(network, cfg, games, seed, policy=policy)
+        rate = sum(evaluated.outcomes) / games
+        result[policy + "_reward_avg"] = rate
+        result[policy + "_win_rate"] = rate
     return result

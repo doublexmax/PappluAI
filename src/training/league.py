@@ -76,7 +76,6 @@ class OpponentScheduler:
         champion_rows = [row for row, identity in enumerate(opponents) if identity == champion]
         anchor_rows = [row for row, identity in enumerate(opponents) if identity in anchors and identity != champion]
         pfsp_rows = [row for row in range(len(opponents)) if row not in champion_rows + anchor_rows]
-        pfsp_rows = pfsp_rows or list(range(len(opponents)))
         weights = [0.0] * len(opponents)
         remaining = 1.0
         for rows, share in (
@@ -86,6 +85,9 @@ class OpponentScheduler:
                 for row in rows:
                     weights[row] += share / len(rows)
                 remaining -= share
+        if not pfsp_rows:
+            total = sum(weights)
+            return tuple(weight / total if total else 1.0 / len(opponents) for weight in weights)
         hardness = []
         for row in pfsp_rows:
             total, games = self._scores.get((players, opponents[row]), (0.0, 0))
@@ -286,7 +288,7 @@ class LeagueSession:
                     TRAINING_SEED_BASE + self.deal_rng.getrandbits(39), seats, players, frozenset((challenger,)),
                 ))
                 challenger_seats.append(challenger)
-            results = run_matches(deals, policies, self.config.game, deadline, record_terminal=True)
+            results = run_matches(deals, policies, self.config.game, deadline, record_terminal=False)
             if len(results) != matches:
                 raise ValueError("arena returned the wrong number of matches")
             collected = True
@@ -327,7 +329,9 @@ class LeagueSession:
                 "terminal_reason": result.terminal_reason, "actions": len(decisions),
                 "updated": bool(decisions), "epsilon": epsilon,
             })
-        self.learner.learn(trajectories, updates=self.config.updates_per_match * len(trajectories))
+        stats = self.learner.learn(trajectories, updates=self.config.updates_per_match * len(trajectories))
+        if stats.updates:
+            self.last_exported_sha256 = None
         self.at_match_boundary = True
         return summaries
 
@@ -452,6 +456,7 @@ class LeagueSession:
             network, game, _ = load_checkpoint(champion_path, device=torch.device("cpu"))
         _require_compatible_game(game, self.config.game, "champion")
         self.learner.adopt(network.state_dict())
+        self.last_exported_sha256 = None
         self.parent_sha256, self._parent_path = digest, str(champion_path)
         return True
 

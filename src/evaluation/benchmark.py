@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import random
 import time
-from typing import Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 
@@ -46,6 +46,8 @@ def evaluate_games(
     policy: str = "greedy",
     warm_start: bool = False,
     deadline: Optional[float] = None,
+    curriculum_distance: Optional[int] = None,
+    stop_requested: Callable[[], bool] = lambda: False,
 ) -> PolicyResults:
     if isinstance(games, bool) or not isinstance(games, int) or games <= 0:
         raise ValueError("games must be a positive integer")
@@ -53,23 +55,33 @@ def evaluate_games(
         raise ValueError("policy must be greedy, random, or oracle")
     if policy == "oracle" and not warm_start:
         raise ValueError("oracle is only a discard-puzzle sensitivity check")
+    if curriculum_distance is not None:
+        if type(curriculum_distance) is not int or curriculum_distance <= 0:
+            raise ValueError("curriculum_distance must be a positive integer")
+        if warm_start:
+            raise ValueError("curriculum and warm starts are separate evaluation sources")
     outcomes = []
     draws = [0, 0]
     was_training = network.training
     network.eval()
     try:
         for start in range(0, games, 32):
+            if stop_requested():
+                raise InterruptedError("Game evaluation stopped")
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("Game evaluation reached its time limit")
             indices = range(start, min(start + 32, games))
             envs = [PappluEnv(config) for _ in indices]
             observations = [
                 env.reset_warm_start(seed=seed + index)
-                if warm_start else env.reset(seed=seed + index)
+                if warm_start else env.reset_curriculum(curriculum_distance, seed=seed + index)
+                if curriculum_distance is not None else env.reset(seed=seed + index)
                 for env, index in zip(envs, indices)
             ]
             rngs = [random.Random(seed + index + 10_000_000) for index in indices]
             while any(not obs.done for obs in observations):
+                if stop_requested():
+                    raise InterruptedError("Game evaluation stopped")
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("Game evaluation reached its time limit")
                 active = [index for index, obs in enumerate(observations) if not obs.done]

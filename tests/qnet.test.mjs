@@ -88,7 +88,8 @@ describe("qnet golden parity", () => {
     assert.equal(GOLDEN.modelSha256, MODEL.source.sha256);
     assert.equal(GOLDEN.tensorsSha256, MODEL.source.tensorsSha256);
     assert.deepEqual(Object.keys(GOLDEN.sources).sort(), [
-      "src/game/belief.py", "src/model/encoding.py", "src/model/network.py", "tools/weights_export.py",
+      "src/evaluate.py", "src/game/belief.py", "src/game/environment.py", "src/game/lookahead.py",
+      "src/model/encoding.py", "src/model/network.py", "tools/weights_export.py",
     ]);
     for (const [path, digest] of Object.entries(GOLDEN.sources)) {
       const text = readFileSync(new URL(path, ROOT), "utf8").replace(/\r\n?/g, "\n");
@@ -233,6 +234,13 @@ describe("encodeObservation", () => {
     assert.equal(cardChannel(triplet, 5, "natural_run_member"), 0);
   });
 
+  it("counts the exact joker once in the pure-sequence upper bound", () => {
+    const obs = observation([0, 1, 2, 17, 30, 43], 2);
+    obs.config.cardsInHand = 6;
+    obs.config.requiredSequences = 2;
+    assert.equal(context(encodeObservation(obs), "pure_quota_deficit"), 0.5);
+  });
+
   it("records per-kind recency for each relative seat without collapsing opposite seats", () => {
     const obs = observation();
     obs.players.push({ ...obs.players[0], nextPlayer: 0, previousPlayer: 0 });
@@ -295,7 +303,9 @@ describe("encodeObservation", () => {
     ["an actor off the table", o => { o.history[0].actor = 1; }, /observation\.history\[0\]\.actor:/],
     ["an unknown event kind", o => { o.history[0].kind = 6; }, /observation\.history\[0\]\.kind:/],
     ["a missing face", o => { delete o.history[0].face; }, /observation\.history\[0\]\.face:/],
-    ["missing turns", o => { delete o.turnsRemaining; }, /features are not finite/],
+    ["missing turns", o => { delete o.turnsRemaining; }, /observation\.turnsRemaining:/],
+    ["a hidden discard take", o => { o.history[0].kind = 2; }, /observation\.history\[0\]\.face:/],
+    ["a hidden discard", o => { o.history[0].kind = 3; }, /observation\.history\[0\]\.face:/],
     ["zero decks", o => { o.config.numDecks = 0; }, /observation\.config\.numDecks:/],
   ];
   for (const [label, mutate, message] of MALFORMED) {
@@ -305,6 +315,32 @@ describe("encodeObservation", () => {
       assert.throws(() => encodeObservation(obs), { name: "TypeError", message });
     });
   }
+
+  for (const [label, select, field] of [
+    ["observer turns", o => o, "turnsRemaining"],
+    ["stock", o => o, "stockRemaining"],
+    ["hand size", o => o.players[0], "handSize"],
+    ["player turns", o => o.players[0], "turnsRemaining"],
+  ]) {
+    it(`rejects invalid ${label} counts at the observation boundary`, () => {
+      for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, true, "3", null, undefined]) {
+        const obs = observation();
+        select(obs)[field] = value;
+        assert.throws(() => encodeObservation(obs), /expected a nonnegative safe integer/);
+      }
+    });
+  }
+
+  it("accepts zero remaining counts in a terminal observation", () => {
+    const obs = observation();
+    Object.assign(obs, { phase: 2, turnsRemaining: 0, stockRemaining: 0 });
+    Object.assign(obs.players[0], { handSize: 0, turnsRemaining: 0, active: false });
+    const features = encodeObservation(obs);
+    assert.equal(context(features, "terminal"), 1);
+    assert.equal(context(features, "turns"), 0);
+    assert.equal(context(features, "stock"), 0);
+    assert.deepEqual(Array.from(features.slice(OFFSETS.seat, OFFSETS.seat + 5)), [1, 1, 0, 0, 0]);
+  });
 
   it("names the bad observation in a qValues batch", () => {
     const model = parseQModel(MODEL);

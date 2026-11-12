@@ -69,6 +69,26 @@ class TestLeagueSession(unittest.TestCase):
             after = [entry.policy.network.state_dict() for entry in session._opponents if hasattr(entry.policy, "network")]
             self.assert_nested_equal(frozen, after)
             self.assertEqual(sum(row[3] for row in session.scheduler.state_dict()["scores"]), 7)
+            self.assertFalse(runner.call_args.kwargs["record_terminal"])
+
+    def test_exports_stop_identifying_weights_after_learning_or_external_adoption(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            champion, exported, external = [root / name for name in ("champion.pt", "export.pt", "external.pt")]
+            self.make_model(champion)
+            self.make_model(external)
+            session = LeagueSession(str(champion), config=self.config())
+            session.export_model(exported)
+            self.assertIsNotNone(session.last_exported_sha256)
+            session.train_match()
+            self.assertIsNone(session.last_exported_sha256)
+            session.export_model(exported)
+            self.assertTrue(session.follow_champion(str(external)))
+            self.assertIsNone(session.last_exported_sha256)
+            self.assertTrue(session.follow_champion(str(exported)))
+            self.assert_nested_equal(
+                session.network.state_dict(), torch.load(exported, weights_only=True)["model_state_dict"],
+            )
 
     def test_resume_reproduces_next_round_target_optimizer_scheduler_and_rng(self):
         with tempfile.TemporaryDirectory() as temporary:

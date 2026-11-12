@@ -3,6 +3,7 @@ from collections import Counter
 import json
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -322,10 +323,6 @@ class TestGateExecution(unittest.TestCase):
         ])
         self.assertEqual(played, [(2, 41), (2, 42)])
         with journal.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({
-                "gate_id": records[0]["gate_id"], "job": ["multiplayer", 2, 2],
-                "result": {"placement_margin": 2.0, "declaration_margin": 0.0},
-            }) + "\n")
             stream.write('{"interrupted":')
         played.clear()
 
@@ -337,6 +334,9 @@ class TestGateExecution(unittest.TestCase):
             resumed = self.gate(journal_dir=journal_dir)
         self.assertEqual(played, [(2, 43), (2, 44), (3, 41), (3, 42), (4, 41)])
         self.assertTrue(journal.read_bytes().startswith(prefix))
+        resumed_records = [json.loads(line) for line in journal.read_bytes().splitlines()]
+        self.assertEqual(len(resumed_records), 9)
+        self.assertTrue(journal.read_bytes().endswith(b"\n"))
         uninterrupted = self.gate()
         self.assertEqual(json.dumps(resumed), json.dumps(uninterrupted))
         with mock.patch("src.evaluation.promotion._GateRunner", side_effect=AssertionError("replayed cached work")):
@@ -370,10 +370,83 @@ class TestGateExecution(unittest.TestCase):
         self.assertEqual([call.args[3] for call in solo.call_args_list], [100_073, 100_073])
         self.assertEqual(json.dumps(resumed), json.dumps(self.gate()))
 
-    def test_parallel_task_timeout_is_an_interruption_and_restores_parent_threads(self):
-        with self.assertRaises(GateInterrupted):
+    def test_parallel_task_timeout_is_a_failure_and_restores_parent_threads(self):
+        with self.assertRaisesRegex(RuntimeError, "Gate job timed out") as failure:
             self.gate(workers=2, task_seconds=0.000001)
+        self.assertNotIsInstance(failure.exception, GateInterrupted)
         self.assertEqual(torch.get_num_threads(), 1)
+
+    def test_serial_task_timeouts_are_distinct_from_the_global_deadline(self):
+        from src.evaluation.arena import MatchInterrupted
+
+        for error in (TimeoutError("task deadline"), MatchInterrupted("match deadline")):
+            with mock.patch("src.evaluation.promotion._GateRunner.run", side_effect=error):
+                with self.assertRaisesRegex(RuntimeError, "Gate job timed out") as failure:
+                    self.gate(deadline=time.monotonic() + 120)
+            self.assertNotIsInstance(failure.exception, GateInterrupted)
+        for workers in (1, 2):
+            with self.subTest(workers=workers), self.assertRaises(GateInterrupted):
+                self.gate(workers=workers, deadline=0)
+
+    def test_a_completed_serial_result_is_journaled_before_the_next_deadline_check(self):
+        clock = [0.0]
+        deadlines = []
+
+        def finish(_runner, _job, *, deadline):
+            deadlines.append(deadline)
+            clock[0] = 11.0
+            return {"placement_margin": 0.0, "declaration_margin": 0.0}
+
+        directory = self.root / "finished-job"
+        with mock.patch("src.evaluation.promotion.time.monotonic", side_effect=lambda: clock[0]), mock.patch(
+            "src.evaluation.promotion._GateRunner.run", autospec=True, side_effect=finish,
+        ), self.assertRaises(GateInterrupted):
+            self.gate(journal_dir=directory, deadline=10.0, task_seconds=5.0)
+        journal, = directory.glob("*.jsonl")
+        records = [json.loads(line) for line in journal.read_bytes().splitlines()]
+        self.assertEqual(deadlines, [5.0])
+        self.assertEqual([record["job"] for record in records], [["multiplayer", 2, 0]])
+        self.assertEqual(records[0]["result"], {"placement_margin": 0.0, "declaration_margin": 0.0})
+
+    def test_settled_journal_corruption_is_never_silently_replayed(self):
+        directory = self.root / "corrupt"
+        self.gate(journal_dir=directory, player_counts=(2,), solo_games=1)
+        journal, = directory.glob("*.jsonl")
+        original = journal.read_bytes()
+        record = json.loads(original.splitlines()[0])
+        corruptions = [
+            b"{broken}\n",
+            (json.dumps({**record, "job": ["multiplayer", 2, 99]}) + "\n").encode(),
+            (json.dumps({**record, "result": {"placement_margin": 2, "declaration_margin": 0}}) + "\n").encode(),
+            (json.dumps({**record, "gate_id": "wrong"}) + "\n").encode(),
+        ]
+        for corruption in corruptions:
+            with self.subTest(corruption=corruption):
+                journal.write_bytes(corruption + original)
+                with self.assertRaisesRegex(ValueError, "Malformed gate journal"):
+                    self.gate(journal_dir=directory, player_counts=(2,), solo_games=1)
+
+    def test_source_changes_use_a_different_journal_and_evidence_identity(self):
+        directory = self.root / "source-bound"
+        with mock.patch("src.evaluation.promotion.source_fingerprint", return_value="a" * 64):
+            first = self.gate(journal_dir=directory, player_counts=(2,), solo_games=1)
+        with mock.patch("src.evaluation.promotion.source_fingerprint", return_value="b" * 64):
+            second = self.gate(journal_dir=directory, player_counts=(2,), solo_games=1)
+        self.assertEqual(first["source_sha256"], "a" * 64)
+        self.assertEqual(second["source_sha256"], "b" * 64)
+        self.assertEqual(first["multiplayer"], second["multiplayer"])
+        self.assertEqual(len(list(directory.glob("*.jsonl"))), 2)
+
+    def test_gate_runner_rejects_checkpoint_swaps_before_loading_the_network(self):
+        from src.checkpoints.io import file_sha256
+        from src.evaluation.promotion import _GateRunner
+        from src.game.environment import GameConfig
+
+        hashes = [file_sha256(path) for path in (self.candidate, self.champion)]
+        self.candidate.write_bytes(b"replaced checkpoint")
+        with mock.patch("src.evaluation.arena.load_checkpoint", side_effect=AssertionError("loaded swapped model")):
+            with self.assertRaisesRegex(ValueError, "Checkpoint changed"):
+                _GateRunner(str(self.candidate), str(self.champion), (), GameConfig(), 41, hashes)
 
     def test_worker_source_mismatch_fails_before_loading_checkpoints(self):
         from src.evaluation.promotion import _init_gate_worker
@@ -382,7 +455,7 @@ class TestGateExecution(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "source differs"):
             _init_gate_worker(
                 expected_source="wrong", candidate_path="missing.pt", champion_path="missing.pt",
-                opponent_paths=(), rules=GameConfig(), seed=41,
+                opponent_paths=(), rules=GameConfig(), seed=41, expected_hashes=(),
             )
 
     def test_invalid_execution_settings_fail_before_loading_checkpoints(self):

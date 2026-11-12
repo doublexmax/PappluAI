@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Optional, Sequence, Union
 
-from src.evaluate import is_valid_hand
+from src.evaluate import is_valid_hand, pure_sequence_upper_bound
 from src.game.belief import BeliefState
 from src.game.environment import (
     ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, GameConfig, Observation, Phase,
@@ -16,17 +16,7 @@ LEGAL_RUNS = tuple((start, start + 1, start + 2) for start in range(11)) + ((11,
 
 
 def can_declare_ub(hand: Sequence[int], joker: int, required_sequences: int) -> bool:
-    upper = hand[joker]
-    if upper >= required_sequences:
-        return True
-    for suit in range(4):
-        rem = list(hand[suit * 13:(suit + 1) * 13])
-        if joker // 13 == suit:
-            rem[joker % 13] = 0
-        triples = sum(copies // 3 for copies in rem)
-        triples += sum(min(rem[rank] for rank in run) for run in LEGAL_RUNS)
-        upper += min(sum(rem) // 3, triples)
-    return upper >= required_sequences
+    return pure_sequence_upper_bound(hand, joker) >= required_sequences
 
 
 def winning_discard(
@@ -39,7 +29,7 @@ def winning_discard(
         if copies <= 0:
             continue
         remaining[face] -= 1
-        wins = can_declare_ub(remaining, joker, required_sequences) and is_valid_hand(
+        wins = is_valid_hand(
             remaining, joker, required_sequences, cards_in_hand,
         )
         remaining[face] += 1
@@ -111,14 +101,27 @@ class Continues:
     observation: Observation
 
 
-Branch = Union[Declares, Continues]
+@dataclass(frozen=True)
+class Terminates:
+    probability: float
+    value: float
+
+
+Branch = Union[Declares, Continues, Terminates]
 
 
 def expand(obs: Observation) -> dict[int, tuple[Branch, ...]]:
     if obs.done or not obs.players[0].active:
         return {}
     last = obs.history[-1]
+    if obs.phase is Phase.DISCARD and last.actor != 0:
+        return {}
     if obs.phase is Phase.DRAW and last.kind in (EventKind.DISCARD, EventKind.REFILL) and last.next_player != 0:
+        return {}
+    terminal_discard = obs.warm_start or (
+        obs.turns_remaining <= 1 and all(player.turns_remaining <= 0 for player in obs.players[1:])
+    )
+    if obs.phase is Phase.DISCARD and terminal_discard and len(obs.players) > 1:
         return {}
     result = {}
     for action, allowed in enumerate(legal_action_mask(obs)):
@@ -136,8 +139,9 @@ def expand(obs: Observation) -> dict[int, tuple[Branch, ...]]:
             remaining = list(obs.hand)
             remaining[face] -= 1
             result[action] = (
-                Declares(1.0) if can_declare_ub(remaining, obs.joker, obs.config.required_sequences)
-                and is_valid_hand(remaining, obs.joker, obs.config.required_sequences, obs.config.cards_in_hand)
+                Declares(1.0)
+                if is_valid_hand(remaining, obs.joker, obs.config.required_sequences, obs.config.cards_in_hand)
+                else Terminates(1.0, -1.0) if terminal_discard
                 else Continues(1.0, after_discard(obs, face)),
             )
     return result

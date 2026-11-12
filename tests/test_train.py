@@ -14,6 +14,8 @@ from src.cli.solo import build_arg_parser, main as train_main
 from src.game.environment import GameConfig, PappluEnv, Phase, discard_action
 from src.model.network import QNetwork, collate_observations, load_checkpoint
 from src.model.search import TeacherConfig
+from src.model.spec import ModelSpec
+from src.training.optimization import Learner
 from src.training.solo import evaluate_policy, run_episode, train
 
 
@@ -70,6 +72,24 @@ class TestTrainLearning(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
         self.game = GameConfig(num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3)
+
+    def test_solo_losses_are_minus_one_without_replacing_the_exact_penalty(self):
+        learners = []
+
+        def capture_learner(*args, **kwargs):
+            learner = Learner(*args, **kwargs)
+            learners.append(learner)
+            return learner
+
+        with mock.patch("src.training.solo.Learner", side_effect=capture_learner):
+            summary = train(
+                episodes=1, seed=19, updates_per_episode=1, log_every=0,
+                config=GameConfig(cards_in_hand=3, required_sequences=1, max_turns=1),
+                model_spec=ModelSpec(8, 1, 1), teacher=TeacherConfig(fraction=0),
+            )
+        self.assertEqual(summary["reward_avg"], -1.0)
+        self.assertEqual(summary["return_avg"], -1.0)
+        self.assertEqual(learners[0].replay.state_dict()["trajectories"][0]["outcome"], (-1.0, False, 24))
 
     def test_collection_rngs_are_independent_of_replay_and_update_budget(self):
         captured, sources = [], []

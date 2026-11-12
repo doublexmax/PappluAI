@@ -31,7 +31,7 @@ from src.game.environment import ENCODING_VERSION, GameConfig
 from src.model.network import CHECKPOINT_VERSION
 from src.model.spec import ARCHITECTURE
 from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
-from src.training.curriculum import STATUS_SCHEMA_VERSION
+from src.training.curriculum_io import STATUS_SCHEMA_VERSION
 
 
 IMPROVEMENT_STATE_VERSION = 3
@@ -420,7 +420,6 @@ class ImprovementController:
                 self.save_checkpoint("running", None, started)
             return True
         if self.phase == "selection":
-            self.save_checkpoint("running", None, started)
             try:
                 self._selection_step(deadline)
             except (GateInterrupted, MatchInterrupted, TimeoutError):
@@ -428,9 +427,8 @@ class ImprovementController:
             self.save_checkpoint("running", None, started)
             return True
 
-        self.save_checkpoint("running", None, started)
         try:
-            self._confirmation_step(deadline)
+            self._confirmation_step(deadline, started)
         except (GateInterrupted, MatchInterrupted, TimeoutError):
             return False
         self.save_checkpoint("running", None, started)
@@ -558,7 +556,9 @@ class ImprovementController:
         else:
             self._reject_cycle()
 
-    def _confirmation_step(self, deadline: Optional[float] = None) -> None:
+    def _confirmation_step(
+        self, deadline: Optional[float] = None, started: Optional[float] = None,
+    ) -> None:
         champion = self.registry.get(self.champion_at_cycle_id)
         if self.confirmation_result is None:
             result = evaluate_gate(
@@ -590,7 +590,8 @@ class ImprovementController:
                 },
                 self.metric_ids,
             )
-            return
+            if checked["accepted"]:
+                self.save_checkpoint("running", None, started)
 
         promoted = bool(self.confirmation_result["accepted"])
         if promoted:

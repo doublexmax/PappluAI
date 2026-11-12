@@ -190,16 +190,21 @@ class Learner:
                 after_loss = out.q.new_zeros(())
                 teacher_loss = out.q.new_zeros(())
                 teacher = self.config.teacher
+                discard_rows, after_obs = [], []
+                if teacher.fraction > 0 and teacher.after_weight > 0:
+                    for row, sample in enumerate(samples):
+                        obs = sample.decision.observation
+                        if sample.decision.action < 2 or obs.warm_start or sample.outcome.won:
+                            continue
+                        after = after_discard(obs, sample.decision.action - 2)
+                        if any(player.active for player in after.players):
+                            discard_rows.append(row)
+                            after_obs.append(after)
+                if discard_rows:
+                    after_loss = F.smooth_l1_loss(
+                        self.online.outputs(collate_observations(after_obs, device)).after, y[discard_rows],
+                    )
                 if teacher.fraction > 0 and (self.update_count + 1) % teacher.every_updates == 0:
-                    discard_rows = [row for row, sample in enumerate(samples) if sample.decision.action >= 2]
-                    if discard_rows:
-                        after_obs = [
-                            after_discard(samples[row].decision.observation, samples[row].decision.action - 2)
-                            for row in discard_rows
-                        ]
-                        after_loss = F.smooth_l1_loss(
-                            self.online.outputs(collate_observations(after_obs, device)).after, y[discard_rows],
-                        )
                     targets = teacher_targets(
                         self.target, [sample.decision.observation for sample in samples],
                         teacher, self.rng, self.config.gamma, device,

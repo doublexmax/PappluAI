@@ -193,11 +193,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 0
     except (TypeError, ValueError, OSError, RuntimeError, KeyError) as exc:
-        runtime._publish_error(output_dir, session, str(exc), started)
+        runtime.curriculum_io.publish_error(output_dir, session, str(exc), started)
         print("error: %s" % exc, file=sys.stderr, flush=True)
         return 2
     except BaseException as exc:
-        runtime._publish_error(output_dir, session, str(exc), started)
+        runtime.curriculum_io.publish_error(output_dir, session, str(exc), started)
         print("error: %s" % exc, file=sys.stderr, flush=True)
         return 1
     finally:

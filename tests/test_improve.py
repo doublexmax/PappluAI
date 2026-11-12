@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import replace
-import io
 import json
 from pathlib import Path
 import shutil
@@ -11,287 +9,14 @@ import time
 import unittest
 from unittest import mock
 
-import src.training.improve as improve_runtime
 from src.training.improve import (
-    ALGORITHM,
     ImproveConfig,
     ImprovementController,
 )
-from src.cli.improve import build_arg_parser
-from src.checkpoints.io import file_sha256
-
-try:
-    import torch
-except ImportError:
-    torch = None
+from tests.improve_support import ControllerTestCase, gate_result, sha256, torch
 
 
-TORCH_REASON = "PyTorch not installed (see requirements-training.txt)"
-
-
-class TestMetricHistory(unittest.TestCase):
-    def test_initial_evidence_requires_current_schema_and_matching_rules(self):
-        from src.training.improve import _initial_evidence
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            model = root / "model.pt"
-            model.write_bytes(b"same frozen weights")
-            rules = {
-                "num_decks": 3, "cards_in_hand": 21, "required_sequences": 5,
-                "max_turns": 60, "recycle_discard": True,
-            }
-            result = {
-                "encoding_version": 2, "checkpoint_version": 4, "architecture": "axial_table",
-                "checkpoint_sha256": sha256(model),
-                "game_config": rules,
-                "greedy": {"games": 2, "wins": 1, "outcomes": [1, 0]},
-            }
-            path = root / "final-best.json"
-            path.write_text(json.dumps(result))
-            evidence = _initial_evidence(model, current_recycle_discard=True)
-            verified = evidence["current_solo_reference"]
-            self.assertEqual(verified["win_rate"], 0.5)
-            self.assertTrue(verified["recycle_discard"])
-            for bad in (
-                {**result, "encoding_version": 1},
-                {**result, "game_config": {**rules, "recycle_discard": False}},
-            ):
-                path.write_text(json.dumps(bad))
-                with self.assertRaises(ValueError):
-                    _initial_evidence(model, current_recycle_discard=True)
-
-    def test_cached_event_index_avoids_rescanning_the_entire_log(self):
-        from src.training.improve import _append_metric_once, _read_metric_ids
-
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            identifiers = set()
-            with mock.patch("src.training.improve.json.loads", side_effect=AssertionError("unexpected rescan")):
-                _append_metric_once(output, "first", {"value": 1}, identifiers)
-                _append_metric_once(output, "second", {"value": 2}, identifiers)
-                _append_metric_once(output, "first", {"value": 99}, identifiers)
-            self.assertEqual(_read_metric_ids(output / ".active-metrics.jsonl"), {"first", "second"})
-            self.assertEqual(len((output / ".active-metrics.jsonl").read_text().splitlines()), 2)
-
-    def test_malformed_history_is_reported_instead_of_silently_skipped(self):
-        from src.training.improve import _read_metric_ids
-
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "metrics.jsonl"
-            path.write_text("{incomplete", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "Malformed"):
-                _read_metric_ids(path)
-
-
-def sha256(path):
-    return file_sha256(Path(path))
-
-
-def gate_result(accepted):
-    def evaluate(**kwargs):
-        from src.checkpoints.evidence import balanced_seat_orders, blocks_for_count, evidence_metrics
-
-        blocks = kwargs["seed_blocks"]
-        multiplayer = {
-            str(players): {
-                "blocks": blocks_for_count(blocks, players),
-                "candidate_minus_champion": 0.5 if accepted else 0.0,
-                "games": blocks_for_count(blocks, players) * len(balanced_seat_orders(players)),
-                "placement_margins": [0.5 if accepted else 0.0] * blocks_for_count(blocks, players),
-                "declaration_margins": [0.0] * blocks_for_count(blocks, players),
-                "declaration_delta": 0.0,
-            }
-            for players in kwargs["player_counts"]
-        }
-        solo = {
-            "seed": kwargs["seed"] + 100_000,
-            "games": kwargs["solo_games"],
-            "candidate_outcomes": [0] * kwargs["solo_games"],
-            "champion_outcomes": [0] * kwargs["solo_games"],
-            "candidate_wins": 0,
-            "champion_wins": 0,
-        }
-        samples = max(100, kwargs["samples"])
-        return {
-            "gate_schema_version": 3,
-            "encoding_version": 2,
-            "architecture": "axial_table",
-            "candidate_sha256": sha256(kwargs["candidate_path"]),
-            "champion_sha256": sha256(kwargs["champion_path"]),
-            "accepted": accepted,
-            **evidence_metrics(
-                multiplayer, solo, blocks, kwargs["seed"], samples,
-                player_counts=kwargs["player_counts"],
-            ),
-            "bootstrap_samples": samples,
-            "seed": kwargs["seed"],
-            "seed_blocks": kwargs["seed_blocks"],
-            "player_counts": list(kwargs["player_counts"]),
-            "rules": {
-                "num_decks": 3,
-                "cards_in_hand": 21,
-                "required_sequences": 5,
-                "max_turns": kwargs["max_turns"],
-                "recycle_discard": kwargs["recycle_discard"],
-            },
-            "pool_hashes": [
-                sha256(path) for path in kwargs["opponent_paths"]
-            ],
-            "raw_outcomes": (),
-            "multiplayer": multiplayer,
-            "solo": solo,
-            "scope": {"player_counts": kwargs["player_counts"]},
-        }
-
-    return evaluate
-
-
-class TestImproveConfig(unittest.TestCase):
-    def test_gate_worker_count_requires_a_positive_integer(self):
-        for value in (0, -1, True, 1.5, "2", None):
-            with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
-                ImproveConfig(gate_workers=value)
-        config = ImproveConfig(gate_workers=2)
-        self.assertEqual(ImproveConfig.from_dict(config.to_dict()).gate_workers, 2)
-
-    def test_rebase_threshold_requires_a_positive_integer(self):
-        for value in (0, -1, True, 1.5, "8", None):
-            with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
-                ImproveConfig(rebase_after_rejections=value)
-        config = ImproveConfig(rebase_after_rejections=2)
-        self.assertEqual(
-            ImproveConfig.from_dict(config.to_dict()).rebase_after_rejections, 2,
-        )
-
-    def test_specialist_scopes_roundtrip_without_expanding_to_master(self):
-        for counts in ((2,), (3,), (4,), (2, 4), (2, 3, 4)):
-            with self.subTest(counts=counts):
-                config = ImproveConfig(player_counts=counts)
-                restored = ImproveConfig.from_dict(config.to_dict())
-                self.assertEqual(restored.player_counts, counts)
-                self.assertEqual(restored, config)
-
-    def test_invalid_player_count_tuples_are_rejected(self):
-        for counts in ((), (1,), (5,), (True,), (2.0,), ("2",), (2, 2), (3, 2)):
-            with self.subTest(counts=counts), self.assertRaises(ValueError):
-                ImproveConfig(player_counts=counts)
-        for counts in (None, [2], "234", {2, 3, 4}):
-            with self.subTest(counts=counts):
-                with self.assertRaisesRegex(TypeError, "player_counts must be a tuple"):
-                    ImproveConfig(player_counts=counts)
-                raw = ImproveConfig().to_dict()
-                raw["player_counts"] = counts
-                with self.assertRaisesRegex(TypeError, "player_counts must be a tuple"):
-                    ImproveConfig.from_dict(raw)
-
-
-@unittest.skipIf(torch is None, TORCH_REASON)
-class TestImprovementController(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.previous_torch_threads = torch.get_num_threads()
-        torch.set_num_threads(1)
-
-    @classmethod
-    def tearDownClass(cls):
-        torch.set_num_threads(cls.previous_torch_threads)
-
-    def make_model(self, path, parameter_value=None):
-        from src.game.environment import GameConfig
-        from src.model.network import QNetwork, save_checkpoint
-        from src.model.spec import ModelSpec
-
-        network = QNetwork(ModelSpec(8, 1, 1))
-        if parameter_value is not None:
-            with torch.no_grad():
-                for parameter in network.parameters():
-                    parameter.fill_(parameter_value)
-        save_checkpoint(
-            str(path),
-            network,
-            GameConfig(max_turns=60),
-            meta={"best_score": 164 / 256},
-        )
-
-    def make_controller(
-        self, root, *, snapshots_dir=None, parameter_value=None, **config_overrides,
-    ):
-        model = root / "champion-source.pt"
-        self.make_model(model, parameter_value=parameter_value)
-        config = ImproveConfig(
-            max_cycles=1,
-            league_matches_per_cycle=1,
-            selection_blocks=32,
-            confirmation_blocks=128,
-            solo_games=256,
-            checkpoint_every=1,
-            gate_samples=20,
-        )
-        return ImprovementController(
-            model, root / "output", config=replace(config, **config_overrides),
-            snapshots_dir=snapshots_dir,
-        )
-
-    def make_snapshot(self, directory):
-        source = directory / "incoming.pt"
-        self.make_model(source)
-        destination = directory / ("model-" + sha256(source) + ".pt")
-        source.rename(destination)
-        return destination
-
-    def prepare_distinct_candidate(self, controller):
-        with torch.no_grad():
-            next(iter(controller.league.network.parameters())).add_(0.01)
-        controller.league_in_cycle = controller.config.league_matches_per_cycle
-        controller._prepare_candidate()
-
-    def replace_champion(self, controller, path):
-        self.make_model(path, parameter_value=0.125)
-        previous = controller.registry.champion()
-        replacement = controller.registry.register(
-            str(path), origin="frozen_opponent", parents=(previous.id,),
-        )
-        arguments = {
-            "candidate_path": str(controller.registry.model_path(replacement.id)),
-            "champion_path": str(controller.registry.model_path(previous.id)),
-            "opponent_paths": controller._gate_opponent_paths(previous.id),
-            "solo_games": controller.config.solo_games,
-            "max_turns": controller.config.max_turns,
-            "player_counts": controller.config.player_counts,
-            "samples": controller.config.gate_samples,
-            "recycle_discard": controller.config.recycle_discard,
-        }
-        selection = {
-            **gate_result(True)(**arguments, seed=60_000_000, seed_blocks=32),
-            "phase": "selection",
-        }
-        confirmation = {
-            **gate_result(True)(**arguments, seed=60_500_000, seed_blocks=128),
-            "phase": "confirmation",
-            "selection_passed": True,
-            "selection": selection,
-            "selection_seed": 60_000_000,
-        }
-        return controller.registry.promote(
-            replacement.id, expected_id=previous.id, evidence=confirmation,
-            player_counts=controller.config.player_counts,
-        )
-
-    def assert_nested_equal(self, left, right):
-        if isinstance(left, torch.Tensor):
-            self.assertTrue(torch.equal(left, right))
-        elif isinstance(left, dict):
-            self.assertEqual(set(left), set(right))
-            for key in left:
-                self.assert_nested_equal(left[key], right[key])
-        elif isinstance(left, (tuple, list)):
-            self.assertEqual(len(left), len(right))
-            for a, b in zip(left, right):
-                self.assert_nested_equal(a, b)
-        else:
-            self.assertEqual(left, right)
-
+class TestImprovementController(ControllerTestCase):
     def test_single_challenger_finetunes_gently(self):
         with tempfile.TemporaryDirectory() as temporary:
             controller = self.make_controller(Path(temporary))
@@ -331,13 +56,16 @@ class TestImprovementController(unittest.TestCase):
                 torch.count_nonzero(state["exp_avg"]).item()
                 for state in moments["state"].values()
             ))
-            with mock.patch("src.training.improve.evaluate_gate", side_effect=gate_result(True)):
+            with mock.patch("src.training.improve.evaluate_gate", side_effect=gate_result(True)) as gate:
                 self.assertTrue(controller.step(deadline))
                 self.assertEqual(controller.phase, "confirmation")
                 self.assertEqual(controller.registry.champion().id, original_id)
-                self.assertTrue(controller.step(deadline))
-                self.assertEqual(controller.registry.champion().id, original_id)
-                self.assertTrue(controller.step(deadline))
+                with mock.patch.object(controller, "save_checkpoint", wraps=controller.save_checkpoint) as checkpoints:
+                    self.assertTrue(controller.step(deadline))
+                self.assertEqual(checkpoints.call_count, 2)
+                self.assertEqual(gate.call_count, 2)
+                self.assertEqual(controller.phase, "training")
+                self.assertEqual(controller.cycle_index, 1)
             self.assertEqual(controller.registry.champion().id, candidate_id)
             self.assertEqual(controller.promotions, 1)
             self.assertEqual(controller.consecutive_rejections, 0)
@@ -460,8 +188,9 @@ class TestImprovementController(unittest.TestCase):
                     with mock.patch("src.training.improve.evaluate_gate", side_effect=evaluate):
                         self.assertTrue(controller.step(deadline))
                         if rejected_phase == "confirmation":
-                            self.assertTrue(controller.step(deadline))
-                            self.assertTrue(controller.step(deadline))
+                            with mock.patch.object(controller, "save_checkpoint", wraps=controller.save_checkpoint) as checkpoints:
+                                self.assertTrue(controller.step(deadline))
+                            self.assertEqual(checkpoints.call_count, 1)
                     self.assertEqual(controller.cycle_index, cycle + 1)
                     self.assertEqual(controller.registry.champion().id, champion_id)
                     self.assertEqual(controller.promotions, 0)
@@ -494,7 +223,6 @@ class TestImprovementController(unittest.TestCase):
             candidate_sha256 = controller.registry.get(candidate_id).sha256
             with mock.patch("src.training.improve.evaluate_gate", side_effect=gate_result(True)):
                 self.assertTrue(controller.step(deadline))
-                self.assertTrue(controller.step(deadline))
             moments = copy.deepcopy(controller.league.optimizer.state_dict())
             replay = copy.deepcopy(controller.league.replay.state_dict())
             promote = controller.registry.promote
@@ -503,7 +231,9 @@ class TestImprovementController(unittest.TestCase):
                 promote(*args, **kwargs)
                 raise RuntimeError("injected crash after champion pointer write")
 
-            with mock.patch.object(controller.registry, "promote", side_effect=promote_then_crash):
+            with mock.patch.object(controller.registry, "promote", side_effect=promote_then_crash), mock.patch(
+                "src.training.improve.evaluate_gate", side_effect=gate_result(True),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "injected crash"):
                     controller.step(deadline)
             self.assertEqual(controller.registry.champion().id, candidate_id)
@@ -513,6 +243,7 @@ class TestImprovementController(unittest.TestCase):
             saved = torch.load(state_path, weights_only=True)
             self.assertEqual(saved["phase"], "confirmation")
             self.assertEqual(saved["evaluation"]["candidate_id"], candidate_id)
+            self.assertTrue(saved["evaluation"]["confirmation_result"]["accepted"])
             for _ in range(2):
                 resumed = ImprovementController.load(str(state_path), controller.output_dir)
                 self.assertEqual(resumed.cycle_index, 1)
@@ -691,7 +422,6 @@ class TestImprovementController(unittest.TestCase):
                 controller._selection_step()
                 candidate_id = controller.candidate_id
                 controller._confirmation_step()
-                controller._confirmation_step()
             self.assertEqual(controller.registry.champion().id, candidate_id)
             pointer = json.loads(controller.registry.champion_path.read_text(encoding="utf-8"))
             self.assertEqual(pointer["history"][0]["evidence"]["player_counts"], [3])
@@ -765,8 +495,8 @@ class TestImprovementController(unittest.TestCase):
                 candidate_id = controller.candidate_id
                 self.assertEqual(controller.registry.champion().id, original.id)
                 controller._confirmation_step()
-                self.assertEqual(controller.registry.champion().id, original.id)
-                controller._confirmation_step()
+                self.assertEqual(controller.phase, "training")
+                self.assertEqual(controller.cycle_index, 1)
             self.assertEqual(controller.registry.champion().id, candidate_id)
             self.assertEqual(
                 controller.registry.model_path(original.id).read_bytes(),
@@ -797,7 +527,8 @@ class TestImprovementController(unittest.TestCase):
                 )
                 controller._confirmation_step()
                 self.assertEqual(controller.registry.champion().id, controller.baseline_id)
-                controller._confirmation_step()
+                self.assertEqual(controller.phase, "training")
+                self.assertEqual(controller.cycle_index, 1)
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0]["seed"], 60_000_000)
             self.assertEqual(calls[1]["seed"], 60_500_000)
@@ -864,73 +595,6 @@ class TestImprovementController(unittest.TestCase):
             self.assertEqual(controller.phase, "selection")
             self.assertEqual(controller.league.total_updates, 28)
 
-    def test_resume_can_extend_runtime_cap_but_not_learning_settings(self):
-        from src.cli.improve import _validate_resume_options
-
-        with tempfile.TemporaryDirectory() as temporary:
-            controller = self.make_controller(Path(temporary))
-            parser = build_arg_parser()
-            arguments = [
-                "--resume", "latest-state.pt", "--output-dir", "output",
-                "--max-seconds", "60", "--max-cycles", "3",
-                "--workers", "2", "--checkpoint-every", "3",
-            ]
-            _validate_resume_options(
-                improve_runtime,
-                controller,
-                parser.parse_args(arguments),
-                arguments,
-            )
-            self.assertEqual(controller.config.max_cycles, 3)
-            self.assertEqual(controller.config.league_matches_per_cycle, 1)
-            self.assertEqual(controller.config.gate_workers, 2)
-            self.assertEqual(controller.config.checkpoint_every, 3)
-            unchanged = [
-                "--resume", "latest-state.pt", "--output-dir", "output", "--max-seconds", "60",
-            ]
-            _validate_resume_options(
-                improve_runtime, controller, parser.parse_args(unchanged), unchanged,
-            )
-            self.assertEqual(controller.config.gate_workers, 2)
-            controller.save_checkpoint()
-            restored = ImprovementController.load(
-                str(controller.output_dir / "latest-state.pt"), controller.output_dir,
-            )
-            self.assertEqual(restored.config.gate_workers, 2)
-            for changed in (["--league-matches", "999"], ["--rebase-after-rejections", "2"], ["--matches-per-round", "4"]):
-                invalid = arguments + changed
-                with self.assertRaisesRegex(ValueError, "cannot change"):
-                    _validate_resume_options(
-                        improve_runtime,
-                        controller,
-                        parser.parse_args(invalid),
-                        invalid,
-                    )
-
-    def test_resume_preserves_specialist_scope_unless_explicitly_changed(self):
-        from src.cli.improve import _validate_resume_options
-
-        with tempfile.TemporaryDirectory() as temporary:
-            controller = self.make_controller(Path(temporary), player_counts=(3,))
-            parser = build_arg_parser()
-            base = [
-                "--resume", "latest-state.pt", "--output-dir", "output",
-                "--max-seconds", "60",
-            ]
-            for extra in ([], ["--players", "3"]):
-                arguments = base + extra
-                _validate_resume_options(
-                    improve_runtime, controller, parser.parse_args(arguments), arguments,
-                )
-                self.assertEqual(controller.config.player_counts, (3,))
-            for counts in (["2"], ["2", "3", "4"], ["3", "3"]):
-                arguments = base + ["--players", *counts]
-                with self.assertRaisesRegex(ValueError, "Resume cannot change --players"):
-                    _validate_resume_options(
-                        improve_runtime, controller, parser.parse_args(arguments), arguments,
-                    )
-                self.assertEqual(controller.config.player_counts, (3,))
-
     def test_controller_resume_rejects_nonfinite_league_optimizer_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             controller = self.make_controller(Path(temporary))
@@ -942,70 +606,6 @@ class TestImprovementController(unittest.TestCase):
             torch.save(payload, path)
             with self.assertRaisesRegex(ValueError, "non-finite"):
                 ImprovementController.load(str(path), controller.output_dir)
-
-    def test_zero_budget_exports_truthful_flat_snapshot(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            controller = self.make_controller(Path(temporary))
-            reason = controller.run(0)
-            self.assertEqual(reason, "budget")
-            status = json.loads(
-                (controller.output_dir / "status.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(status["algorithm"], ALGORITHM)
-            self.assertEqual(status["completed_cycles"], 0)
-            self.assertEqual(status["completed_episodes"], 0)
-            self.assertEqual(status["league_matches"], 0)
-            self.assertEqual(status["updates"], 0)
-            self.assertEqual(status["consecutive_rejections"], 0)
-            self.assertNotIn("research_episodes", status)
-            self.assertEqual(status["promotions"], 0)
-            self.assertEqual(status["distance"], None)
-            self.assertNotIn("genes", json.dumps(status).lower())
-            required = {
-                "latest-state.pt",
-                "latest-model.pt",
-                "best-model.pt",
-                "baseline-model.pt",
-                "metrics.jsonl",
-                "registry.json",
-                "champion.json",
-            }
-            self.assertTrue(required.issubset(status["files"]))
-            for name, metadata in status["files"].items():
-                path = controller.output_dir / name
-                self.assertEqual(metadata["bytes"], path.stat().st_size)
-                self.assertEqual(metadata["sha256"], sha256(path))
-
-    def test_active_metrics_cannot_invalidate_published_snapshot(self):
-        from src.training.improve import _append_metric_once
-
-        with tempfile.TemporaryDirectory() as temporary:
-            controller = self.make_controller(Path(temporary))
-            controller.save_checkpoint()
-            status = json.loads((controller.output_dir / "status.json").read_text())
-            metadata = status["files"]["metrics.jsonl"]
-            _append_metric_once(controller.output_dir, "new-event", {"event": "test"}, controller.metric_ids)
-            self.assertEqual(sha256(controller.output_dir / "metrics.jsonl"), metadata["sha256"])
-            self.assertTrue((controller.output_dir / ".active-metrics.jsonl").read_text())
-            controller.save_checkpoint()
-            self.assertIn("new-event", (controller.output_dir / "metrics.jsonl").read_text())
-
-    def test_snapshot_manifest_skips_gate_directories_and_hidden_temporary_files(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            controller = self.make_controller(Path(temporary))
-            gates = controller.output_dir / "gates"
-            gates.mkdir()
-            (gates / "completed.jsonl").write_text('{"complete":true}\n')
-            (controller.output_dir / "not-a-file.json").mkdir()
-            (controller.output_dir / ".temporary-model.pt").write_bytes(b"unfinished")
-            files = controller.save_checkpoint()
-            self.assertEqual(files["latest-state.pt"]["sha256"], sha256(controller.output_dir / "latest-state.pt"))
-            self.assertEqual(
-                set(files) & {"gates", "not-a-file.json", ".temporary-model.pt"}, set(),
-            )
-            self.assertEqual((gates / "completed.jsonl").read_text(), '{"complete":true}\n')
 
     def test_gate_budget_exceptions_checkpoint_without_partial_promotion(self):
         from src.evaluation.arena import MatchInterrupted
@@ -1108,79 +708,6 @@ class TestImprovementController(unittest.TestCase):
                 ["league_match", "league_match", "gate"],
             )
             self.assertEqual(metrics[-1]["phase"], "selection")
-
-
-class TestImproveCli(unittest.TestCase):
-    def test_removed_research_options_fail_before_loading_the_training_runtime(self):
-        from src.cli.improve import main
-
-        base = [
-            "--initial-model", "champion.pt", "--output-dir", "out",
-            "--max-seconds", "60",
-        ]
-        for option in ("--research-episodes", "--research-episodes-per-cycle"):
-            with self.subTest(option=option), mock.patch(
-                "src.cli.improve.load_runtime", side_effect=AssertionError("runtime loaded"),
-            ), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
-                self.assertEqual(main(base + [option, "2"]), 2)
-                self.assertIn("unrecognized arguments", error.getvalue())
-                self.assertIn(option, error.getvalue())
-
-    def test_cli_exposes_specialist_scopes_and_optional_snapshot_directory(self):
-        parser = build_arg_parser()
-        base = ["--initial-model", "champion.pt", "--output-dir", "out", "--max-seconds", "60"]
-        defaults = parser.parse_args(base)
-        self.assertIsNone(defaults.players)
-        self.assertIsNone(defaults.snapshots)
-        self.assertEqual(defaults.workers, 1)
-        for counts in (["2"], ["3"], ["4"], ["2", "3", "4"]):
-            with self.subTest(counts=counts):
-                args = parser.parse_args(base + ["--players", *counts, "--snapshots", "snapshots"])
-                self.assertEqual(args.players, [int(count) for count in counts])
-                self.assertEqual(args.snapshots, Path("snapshots"))
-
-    def test_cli_requires_budget_and_exposes_bounded_cycle_overrides(self):
-        parser = build_arg_parser()
-        max_seconds = next(
-            action
-            for action in parser._actions
-            if action.dest == "max_seconds"
-        )
-        self.assertTrue(max_seconds.required)
-        args = parser.parse_args(
-            [
-                "--initial-model",
-                "champion.pt",
-                "--output-dir",
-                "out",
-                "--max-seconds",
-                "60",
-                "--max-cycles",
-                "1",
-                "--league-matches-per-cycle",
-                "2",
-                "--matches-per-round",
-                "4",
-                "--workers",
-                "2",
-                "--rebase-after-rejections",
-                "3",
-                "--selection-blocks",
-                "2",
-                "--confirmation-blocks",
-                "2",
-                "--solo-games",
-                "2",
-            ]
-        )
-        self.assertEqual(args.max_cycles, 1)
-        self.assertEqual(args.league_matches_per_cycle, 2)
-        self.assertEqual(args.matches_per_round, 4)
-        self.assertEqual(args.workers, 2)
-        self.assertEqual(args.rebase_after_rejections, 3)
-        self.assertEqual(args.selection_blocks, 2)
-        self.assertEqual(args.confirmation_blocks, 2)
-        self.assertEqual(args.solo_games, 2)
 
 
 if __name__ == "__main__":

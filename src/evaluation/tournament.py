@@ -66,7 +66,7 @@ def _execute_job(job: dict, models_dir: str, match_seconds: float, source_sha256
     result = play_match(
         policies,
         MatchConfig(game=GameConfig.from_dict(job["config"]["game"]), players=len(policies)),
-        job["seed"], deadline=time.monotonic() + match_seconds, record_terminal=True,
+        job["seed"], deadline=time.monotonic() + match_seconds, record_terminal=True, score_outcome=False,
     )
     raw = asdict(result)
     del raw["trajectories"]

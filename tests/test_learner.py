@@ -183,7 +183,7 @@ class TestLearner(unittest.TestCase):
     def test_cached_update_never_encodes_current_or_bootstrap_observations(self):
         learner = Learner(QNetwork(ModelSpec(8, 1, 1)), self.config(n_step=1))
         records = (decision(1), decision(2), decision(3))
-        learner.append([Trajectory(1, records, SeatOutcome(1, True, 0))])
+        learner.append([Trajectory(1, records, SeatOutcome(-1, False, 50))])
         with mock.patch("src.model.encoding.encode", side_effect=AssertionError("cached state was encoded")), mock.patch(
             "src.model.network.encode", side_effect=AssertionError("network encoded cached state"),
         ), mock.patch("src.training.core.encode", side_effect=AssertionError("replay encoded cached state")):
@@ -209,22 +209,41 @@ class TestLearner(unittest.TestCase):
         self.assertAlmostEqual(stats.belief_loss, 1.28441553, places=6)
         self.assertAlmostEqual(stats.q_loss, 0.5, places=6)
 
-    def test_teacher_budget_runs_afterstate_and_action_distillation_on_schedule(self):
+    def test_afterstate_training_runs_every_update_while_teacher_distillation_is_scheduled(self):
         learner = Learner(QNetwork(ModelSpec(8, 1, 1)), self.config(
             teacher=TeacherConfig(fraction=1, every_updates=2, max_children=8),
         ))
-        env = PappluEnv(GameConfig(num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=1))
-        obs = env.reset_warm_start(99)
+        env = PappluEnv(GameConfig(num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3))
+        env.reset(99)
+        obs = env.step(0)
         action = discard_action(next(face for face, count in enumerate(obs.hand) if count))
         record = Decision(obs, encode(obs), action, (obs.hand,) + ((0,) * 52,) * 5)
         learner.append([Trajectory(1, (record,), SeatOutcome(-0.2, False, 20))])
         first = learner.update()
         after_before = learner.online.aux.after_out.weight.detach().clone()
         second = learner.update()
-        self.assertEqual((first.after_loss, first.teacher_loss), (0, 0))
+        self.assertGreater(first.after_loss, 0)
+        self.assertEqual(first.teacher_loss, 0)
         self.assertGreater(second.after_loss, 0)
         self.assertGreater(second.teacher_loss, 0)
         self.assertFalse(torch.equal(after_before, learner.online.aux.after_out.weight))
+
+    def test_terminal_discards_do_not_train_the_afterstate_head(self):
+        for warm_start, won, turns in ((True, False, 3), (False, True, 3), (False, False, 1)):
+            with self.subTest(warm_start=warm_start, won=won, turns=turns):
+                learner = Learner(QNetwork(ModelSpec(8, 1, 1)), self.config())
+                env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1, max_turns=turns))
+                if warm_start:
+                    obs = env.reset_warm_start(99)
+                else:
+                    env.reset(99)
+                    obs = env.step(0)
+                action = discard_action(next(face for face, count in enumerate(obs.hand) if count))
+                record = Decision(obs, encode(obs), action, (obs.hand,) + ((0,) * 52,) * 5)
+                learner.append([Trajectory(1, (record,), SeatOutcome(1.0 if won else -1.0, won, 20))])
+                stats = learner.update()
+                self.assertEqual(stats.after_loss, 0)
+                self.assertGreater(stats.q_loss, 0)
 
     def test_polyak_and_adopt_update_both_models_without_resetting_replay_or_counters(self):
         learner = Learner(QNetwork(ModelSpec(8, 1, 1)), self.config(target_tau=0.25))
@@ -333,8 +352,38 @@ class TestBatchedMatches(unittest.TestCase):
         self.assertEqual(forward.call_args.args[0].card.shape[0], 4)
         self.assertTrue(all(action in legal_actions(row) for action, row in zip(actions, features)))
 
+    def test_unscored_matches_preserve_play_and_only_retain_requested_terminal_snapshots(self):
+        policies = [RandomPolicy(), RandomPolicy()]
+        game = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=2)
+        deals = [Deal(17, (0, 1), 2), Deal(31, (1, 0), 2)]
+        scored = run_matches(deals, policies, game)
+        for record_terminal in (False, True):
+            with mock.patch("src.evaluation.arena.DealOutcome.score", side_effect=AssertionError("scored unrequested match")):
+                results = run_matches(
+                    deals, policies, game, score_outcome=False, record_terminal=record_terminal,
+                )
+            self.assertEqual([r.outcome for r in results], [None, None])
+            self.assertEqual([r.action_count for r in results], [8, 8])
+            self.assertEqual([r.telemetry for r in results], [r.telemetry for r in scored])
+            self.assertEqual([r.terminal_snapshot is not None for r in results], [record_terminal] * 2)
+        self.assertEqual(
+            play_match(policies, MatchConfig(game, 2), 17, score_outcome=False),
+            run_matches(deals[:1], policies, game, score_outcome=False)[0],
+        )
+
 
 class TestOpponentScheduler(unittest.TestCase):
+    def test_fixed_only_pools_normalize_without_applying_pfsp_again(self):
+        scheduler = OpponentScheduler()
+        for _ in range(20):
+            scheduler.record(2, "champion", 0.0)
+            scheduler.record(2, "random", 1.0)
+        self.assertEqual(scheduler.probabilities(2, ("champion", "random"), "champion"), (0.7, 0.3))
+        self.assertEqual(scheduler.probabilities(2, ("champion",), "champion"), (1.0,))
+        self.assertEqual(scheduler.probabilities(2, ("random",), "champion"), (1.0,))
+        zero_shares = OpponentScheduler(PfspConfig(champion_share=0, anchor_share=0))
+        self.assertEqual(zero_shares.probabilities(2, ("champion", "random"), "champion"), (0.5, 0.5))
+
     def test_pfsp_prefers_tough_opponents_and_keeps_champion_and_anchor_shares(self):
         scheduler = OpponentScheduler()
         identities = ("champion", "random", "tough", "beaten")

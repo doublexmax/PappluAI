@@ -44,13 +44,18 @@ _GateJob = Union[_MultiplayerJob, _SoloJob]
 class _GateRunner:
     def __init__(
         self, candidate_path: str, champion_path: str, opponent_paths: Sequence[str],
-        rules: GameConfig, seed: int,
+        rules: GameConfig, seed: int, expected_hashes: Sequence[str],
     ) -> None:
         self.candidate = CheckpointPolicy(candidate_path)
         self.champion = CheckpointPolicy(champion_path)
         frozen = [CheckpointPolicy(path) for path in opponent_paths]
-        for policy in (self.candidate, self.champion, *frozen):
+        paths = (candidate_path, champion_path, *opponent_paths)
+        for path, digest, policy in zip(paths, expected_hashes, (self.candidate, self.champion, *frozen)):
+            if file_sha256(Path(path)) != digest:
+                raise ValueError("Checkpoint changed during gate evaluation")
             policy.network.eval()
+            if file_sha256(Path(path)) != digest:
+                raise ValueError("Checkpoint changed during gate evaluation")
         self.opponents = [*frozen, RandomPolicy()]
         self.rules = rules
         self.seed = seed
@@ -96,13 +101,13 @@ _GATE_WORKER: Optional[_GateRunner] = None
 
 def _init_gate_worker(
     *, expected_source: str, candidate_path: str, champion_path: str,
-    opponent_paths: Sequence[str], rules: GameConfig, seed: int,
+    opponent_paths: Sequence[str], rules: GameConfig, seed: int, expected_hashes: Sequence[str],
 ) -> None:
     if source_fingerprint() != expected_source:
         raise RuntimeError("Gate worker source differs from the coordinator")
     torch.set_num_threads(1)
     global _GATE_WORKER
-    _GATE_WORKER = _GateRunner(candidate_path, champion_path, opponent_paths, rules, seed)
+    _GATE_WORKER = _GateRunner(candidate_path, champion_path, opponent_paths, rules, seed, expected_hashes)
 
 
 def _run_gate_worker(job: _GateJob) -> dict:
@@ -120,6 +125,7 @@ def _execute_jobs(
     jobs: Sequence[_GateJob], candidate_path: str, champion_path: str,
     opponent_paths: Sequence[str], rules: GameConfig, seed: int,
     workers: int, task_seconds: float, deadline: Optional[float],
+    expected_source: str, expected_hashes: Sequence[str],
 ) -> Generator[tuple[_GateJob, dict], None, None]:
     if not jobs:
         return
@@ -128,23 +134,23 @@ def _execute_jobs(
         previous_threads = torch.get_num_threads()
         torch.set_num_threads(1)
         try:
-            runner = _GateRunner(candidate_path, champion_path, opponent_paths, rules, seed)
+            runner = _GateRunner(candidate_path, champion_path, opponent_paths, rules, seed, expected_hashes)
             for job in jobs:
                 _check_deadline(deadline)
                 job_deadline = time.monotonic() + task_seconds
                 if deadline is not None:
                     job_deadline = min(job_deadline, deadline)
                 try:
-                    result = runner.run(job, job_deadline)
+                    result = runner.run(job, deadline=job_deadline)
                 except (MatchInterrupted, TimeoutError) as error:
-                    raise GateInterrupted("Promotion evaluation reached its time limit") from error
-                _check_deadline(job_deadline)
+                    _check_deadline(deadline)
+                    raise RuntimeError("Gate job timed out") from error
                 yield job, result
         finally:
             torch.set_num_threads(previous_threads)
         return
     initializer = partial(
-        _init_gate_worker, expected_source=source_fingerprint(),
+        _init_gate_worker, expected_source=expected_source, expected_hashes=expected_hashes,
         candidate_path=candidate_path, champion_path=champion_path,
         opponent_paths=opponent_paths, rules=rules, seed=seed,
     )
@@ -153,8 +159,9 @@ def _execute_jobs(
     ) as pool:
         for result in pool.run(jobs, on_tick=lambda _active: _check_deadline(deadline)):
             if isinstance(result, WorkerFailure):
+                _check_deadline(deadline)
                 if result.kind == "timeout":
-                    raise GateInterrupted("Gate job timed out. " + result.detail)
+                    raise RuntimeError("Gate job timed out. " + result.detail)
                 raise RuntimeError("Gate worker failed. " + result.detail)
             yield result.job, result.value
 
@@ -190,30 +197,42 @@ def _read_journal(stream, gate_id: str, jobs: Sequence[_GateJob]) -> dict:
     expected = {_job_key(job): job for job in jobs}
     completed = {}
     stream.seek(0)
-    last_line = ""
-    for line in stream:
-        last_line = line
+    valid_offset = 0
+    while line := stream.readline():
         try:
             record = json.loads(line)
-            if not isinstance(record, dict) or record.get("gate_id") != gate_id:
-                continue
+        except json.JSONDecodeError as error:
+            if line.endswith(b"\n"):
+                raise ValueError("Malformed gate journal") from error
+            stream.truncate(valid_offset)
+            stream.seek(valid_offset)
+            break
+        except UnicodeDecodeError as error:
+            raise ValueError("Malformed gate journal") from error
+        try:
+            if (
+                not isinstance(record, dict) or set(record) != {"gate_id", "job", "result"}
+                or record["gate_id"] != gate_id
+            ):
+                raise ValueError("invalid gate record")
             key = record["job"]
             if (
                 not isinstance(key, list) or len(key) != 3 or not isinstance(key[0], str)
                 or any(type(value) is not int for value in key[1:])
             ):
-                continue
+                raise ValueError("invalid gate job")
             key = tuple(key)
             result = _job_result(expected[key], record["result"])
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            continue
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("Malformed gate journal") from error
         if key in completed and completed[key] != result:
             raise ValueError("Conflicting completed gate job in journal")
         completed[key] = result
-    stream.seek(0, os.SEEK_END)
-    if last_line and not last_line.endswith("\n"):
-        stream.write("\n")
-        stream.flush()
+        if not line.endswith(b"\n"):
+            stream.write(b"\n")
+            stream.flush()
+        valid_offset = stream.tell()
+    stream.seek(valid_offset)
     return completed
 
 
@@ -258,9 +277,11 @@ def evaluate_gate(
     rules = GameConfig(max_turns=max_turns, recycle_discard=recycle_discard)
     paths = (str(candidate_path), str(champion_path), *(str(path) for path in opponent_paths))
     hashes = [file_sha256(Path(path)) for path in paths]
+    source_sha256 = source_fingerprint()
     gate_id = hashlib.sha256(json.dumps((
         evidence.GATE_SCHEMA_VERSION, ENCODING_VERSION, ARCHITECTURE,
         hashes[0], hashes[1], hashes[2:], rules.to_dict(), seed, seed_blocks, solo_games, counts,
+        {"source_sha256": source_sha256},
     ), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
     jobs: list[_GateJob] = [
         _MultiplayerJob(players, index)
@@ -274,22 +295,23 @@ def evaluate_gate(
             directory = Path(journal_dir)
             directory.mkdir(parents=True, exist_ok=True)
             journal = stack.enter_context((directory / (gate_id + ".jsonl")).open(
-                "a+", encoding="utf-8", errors="replace",
+                "a+b",
             ))
             completed = _read_journal(journal, gate_id, jobs)
         pending = [job for job in jobs if _job_key(job) not in completed]
         results = _execute_jobs(
             pending, paths[0], paths[1], paths[2:], rules, seed,
             workers, task_seconds, deadline,
+            source_sha256, hashes,
         )
         with closing(results):
             for job, raw in results:
                 key, value = _job_key(job), _job_result(job, raw)
                 if journal is not None:
-                    journal.write(json.dumps(
+                    journal.write((json.dumps(
                         {"gate_id": gate_id, "job": key, "result": value},
                         sort_keys=True, allow_nan=False,
-                    ) + "\n")
+                    ) + "\n").encode("utf-8"))
                     journal.flush()
                     os.fsync(journal.fileno())
                 completed[key] = value
@@ -328,6 +350,7 @@ def evaluate_gate(
         "gate_schema_version": evidence.GATE_SCHEMA_VERSION,
         "encoding_version": ENCODING_VERSION,
         "architecture": ARCHITECTURE,
+        "source_sha256": source_sha256,
         "candidate_sha256": hashes[0],
         "champion_sha256": hashes[1],
         "opponent_sha256": hashes[2:],

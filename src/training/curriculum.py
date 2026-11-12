@@ -3,61 +3,44 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
-import json
 import math
-import os
 from pathlib import Path
 import random
 import shutil
-import sys
 import time
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import torch
 
 from src.checkpoints.io import (
-    atomic_copy,
-    atomic_write_json,
     require_checkpoint_fields,
     require_checkpoint_int,
 )
 from src.checkpoints.tensor import (
-    atomic_torch_save,
     clone_model_state,
     validate_model_state,
 )
-from src.evaluate import minimum_penalty
 from src.evaluation.arena import EpsilonPolicy
+from src.evaluation.benchmark import evaluate_games
 from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv
-from src.game.outcome import SeatOutcome
+from src.game.multiplayer import TerminalSnapshot
+from src.game.outcome import DealOutcome
 from src.model.encoding import encode
 from src.model.network import (
     CHECKPOINT_VERSION,
     QNetwork,
-    build_checkpoint,
     load_checkpoint,
-    select_greedy_action,
-    select_random_legal,
 )
 from src.training.core import Decision, Trajectory
+from src.training import curriculum_io
+from src.training.curriculum_io import ALGORITHM, TRAINING_STATE_VERSION
 from src.training.optimization import Learner, LearnerConfig, LossWeights
 from src.model.search import TeacherConfig
 from src.model.spec import ModelSpec
 
 
-TRAINING_STATE_VERSION = 3
-STATUS_SCHEMA_VERSION = 1
-ALGORITHM = "full21_curriculum_nstep_ddqn"
 ORDINARY_VALIDATION_SEED = 30_000_000
 CURRICULUM_VALIDATION_SEED = 20_000_000
-PUBLISHED_SNAPSHOT_FILES = (
-    "latest-state.pt",
-    "latest-model.pt",
-    "best-model.pt",
-    "baseline-model.pt",
-    "metrics.jsonl",
-)
 
 
 class ValidationInterrupted(RuntimeError):
@@ -615,8 +598,11 @@ class TrainingSession:
                 self.at_episode_boundary = True
                 return None
 
-            points = minimum_penalty(obs.hand, obs.joker, self.config.required_sequences).points
-            outcome = SeatOutcome(1.0 if obs.won else -min(points, 100) / 100.0, obs.won, points)
+            outcome = DealOutcome.score(
+                TerminalSnapshot((tuple(obs.hand),), obs.joker),
+                0 if obs.won else None, "win" if obs.won else "turns_exhausted",
+                self.config.required_sequences,
+            ).seat(0)
             self.learner.append([Trajectory(1, tuple(steps), outcome)])
             replay_committed = True
             self.learner.update(self.config.updates_per_episode)
@@ -793,80 +779,24 @@ def evaluate_policy_pair(
     if distance is not None:
         _positive_int(distance, "distance")
 
-    was_training = network.training
-    network.eval()
     try:
         results: Dict[str, Any] = {}
         for policy in ("greedy", "random"):
-            wins = 0
-            for index in range(games):
-                _check_validation_budget(deadline, stop_requested)
-                env = PappluEnv(config)
-                obs = (
-                    env.reset(seed=seed + index)
-                    if distance is None
-                    else env.reset_curriculum(distance, seed=seed + index)
-                )
-                policy_rng = random.Random(seed + 10_000_000 + index)
-                while not obs.done:
-                    _check_validation_budget(deadline, stop_requested)
-                    if policy == "greedy":
-                        action = select_greedy_action(network, obs)
-                    else:
-                        action = select_random_legal(obs, policy_rng)
-                    obs = env.step(action)
-                wins += int(obs.won)
+            evaluated = evaluate_games(
+                network, config, games, seed, policy=policy, curriculum_distance=distance,
+                deadline=deadline, stop_requested=stop_requested,
+            )
+            wins = sum(evaluated.outcomes)
             results[policy] = {
                 "games": games,
                 "wins": wins,
                 "win_rate": wins / games,
             }
         return results
-    finally:
-        network.train(was_training)
-
-
-def _check_validation_budget(
-    deadline: Optional[float], stop_requested: Callable[[], bool]
-) -> None:
-    if stop_requested():
-        raise ValidationInterrupted("stopped")
-    if deadline is not None and time.monotonic() >= deadline:
-        raise ValidationInterrupted("budget")
-
-
-def save_session_checkpoint(
-    session: TrainingSession, output_dir: Path
-) -> Dict[str, Dict[str, Any]]:
-    if not session.at_episode_boundary:
-        raise RuntimeError("cannot checkpoint a partial episode")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "metrics.jsonl").touch(exist_ok=True)
-    staged_state = output_dir / ".staged-latest-state.pt"
-    staged_latest = output_dir / ".staged-latest-model.pt"
-    staged_best = output_dir / ".staged-best-model.pt"
-    staged_base = output_dir / ".staged-baseline-model.pt"
-    atomic_torch_save(session.state_dict(), staged_state)
-    atomic_torch_save(
-        _model_payload(session, session.network.state_dict(), "latest"),
-        staged_latest,
-    )
-    atomic_torch_save(
-        _model_payload(session, session.best_model_state, "best"),
-        staged_best,
-    )
-    atomic_torch_save(
-        _model_payload(session, session.baseline_model_state, "baseline"),
-        staged_base,
-    )
-    os.replace(str(staged_state), str(output_dir / "latest-state.pt"))
-    os.replace(str(staged_latest), str(output_dir / "latest-model.pt"))
-    os.replace(str(staged_best), str(output_dir / "best-model.pt"))
-    os.replace(str(staged_base), str(output_dir / "baseline-model.pt"))
-    active_metrics = output_dir / ".active-metrics.jsonl"
-    if active_metrics.exists():
-        atomic_copy(active_metrics, output_dir / "metrics.jsonl")
-    return _snapshot_file_manifest(output_dir)
+    except InterruptedError as error:
+        raise ValidationInterrupted("stopped") from error
+    except TimeoutError as error:
+        raise ValidationInterrupted("budget") from error
 
 
 def run(
@@ -892,10 +822,10 @@ def run(
     deadline = started + float(max_seconds)
     if (output_dir / "metrics.jsonl").exists():
         shutil.copyfile(output_dir / "metrics.jsonl", output_dir / ".active-metrics.jsonl")
-    files = save_session_checkpoint(session, output_dir)
-    _write_status(output_dir, session, files, "running", None, started)
+    files = curriculum_io.save_session_checkpoint(session, output_dir)
+    curriculum_io.write_status(output_dir, session, files, "running", None, started)
     if not initialize:
-        _append_metric(
+        curriculum_io.append_metric(
             output_dir,
             {
                 "event": "resume",
@@ -911,12 +841,12 @@ def run(
             full, curriculum = session.initialize_validation(deadline, stop_requested)
         except ValidationInterrupted as exc:
             reason = exc.reason
-            files = save_session_checkpoint(session, output_dir)
-            _write_status(output_dir, session, files, reason, reason, started)
+            files = curriculum_io.save_session_checkpoint(session, output_dir)
+            curriculum_io.write_status(output_dir, session, files, reason, reason, started)
             return reason
-        _append_validation_metrics(output_dir, session, full, curriculum, baseline=True)
-        files = save_session_checkpoint(session, output_dir)
-        _write_status(output_dir, session, files, "running", None, started)
+        curriculum_io.append_validation_metrics(output_dir, session, full, curriculum, baseline=True)
+        files = curriculum_io.save_session_checkpoint(session, output_dir)
+        curriculum_io.write_status(output_dir, session, files, "running", None, started)
     while True:
         if stop_requested():
             reason = "stopped"
@@ -936,7 +866,7 @@ def run(
             except ValidationInterrupted as exc:
                 reason = exc.reason
                 break
-            _append_validation_metrics(
+            curriculum_io.append_validation_metrics(
                 output_dir,
                 session,
                 validation["full"],
@@ -946,241 +876,22 @@ def run(
                 passed=validation["passed"],
                 promoted=validation["promoted"],
             )
-            files = save_session_checkpoint(session, output_dir)
-            _write_status(output_dir, session, files, "running", None, started)
+            files = curriculum_io.save_session_checkpoint(session, output_dir)
+            curriculum_io.write_status(output_dir, session, files, "running", None, started)
         if session.total_episodes >= max_episodes:
             break
         result = session.run_episode(deadline=deadline)
         if result is None:
             reason = "budget"
             break
-        _append_metric(output_dir, {"event": "episode", **result})
+        curriculum_io.append_metric(output_dir, {"event": "episode", **result})
         if session.total_episodes == 1 or session.total_episodes % checkpoint_every == 0:
-            files = save_session_checkpoint(session, output_dir)
-            _write_status(output_dir, session, files, "running", None, started)
+            files = curriculum_io.save_session_checkpoint(session, output_dir)
+            curriculum_io.write_status(output_dir, session, files, "running", None, started)
 
-    files = save_session_checkpoint(session, output_dir)
-    _write_status(output_dir, session, files, reason, reason, started)
+    files = curriculum_io.save_session_checkpoint(session, output_dir)
+    curriculum_io.write_status(output_dir, session, files, reason, reason, started)
     return reason
-
-
-def _append_validation_metrics(
-    output_dir: Path,
-    session: TrainingSession,
-    full: Mapping[str, Any],
-    curriculum: Mapping[str, Any],
-    baseline: bool = False,
-    validated_stage: Optional[int] = None,
-    validated_distance: Optional[int] = None,
-    passed: Optional[bool] = None,
-    promoted: Optional[bool] = None,
-) -> None:
-    if baseline:
-        _append_metric(
-            output_dir,
-            {
-                "event": "validation",
-                "source": "ordinary_full21_baseline",
-                "episode": session.total_episodes,
-                "stage": session.stage_index,
-                "distance": None,
-                **full,
-            },
-        )
-    _append_metric(
-        output_dir,
-        {
-            "event": "validation",
-            "source": "ordinary_full21",
-            "episode": session.total_episodes,
-            "stage": session.stage_index,
-            "distance": None,
-            "primary_score": full["greedy"]["win_rate"],
-            **full,
-        },
-    )
-    stage = session.stage_index if validated_stage is None else validated_stage
-    distance = (
-        session.current_distance
-        if validated_stage is None
-        else validated_distance
-    )
-    _append_metric(
-        output_dir,
-        {
-            "event": "validation",
-            "source": (
-                "curriculum_random_stage"
-                if distance is None
-                else "curriculum_distance_%d" % distance
-            ),
-            "episode": session.total_episodes,
-            "stage": stage,
-            "distance": distance,
-            "passed": passed,
-            "promoted": promoted,
-            **curriculum,
-        },
-    )
-
-
-def _model_payload(
-    session: TrainingSession,
-    state_dict: Mapping[str, Any],
-    role: str,
-) -> Dict[str, Any]:
-    checkpoint_episodes = {
-        "latest": session.total_episodes,
-        "best": session.best_episode,
-        "baseline": 0,
-    }[role]
-    payload = build_checkpoint(
-        session.network,
-        session.config.game_config,
-        meta={
-            "algorithm": ALGORITHM,
-            "role": role,
-            "training_state_version": TRAINING_STATE_VERSION,
-            "episodes": checkpoint_episodes,
-            "checkpoint_episodes": checkpoint_episodes,
-            "best_score": session.best_score,
-            "best_episode": session.best_episode,
-            "baseline_validation": session.baseline_validation,
-            "latest_full_validation": session.full_validation,
-            "training_config": session.config.to_dict(),
-        },
-    )
-    payload["model_state_dict"] = dict(state_dict)
-    return payload
-
-
-def _status_payload(
-    session: TrainingSession,
-    files: Mapping[str, Mapping[str, Any]],
-    status: str,
-    stop_reason: Optional[str],
-    started: float,
-) -> Dict[str, Any]:
-    return {
-        "status_schema_version": STATUS_SCHEMA_VERSION,
-        "status": status,
-        "stop_reason": stop_reason,
-        "elapsed_seconds": max(0.0, time.monotonic() - started),
-        "completed_episodes": session.total_episodes,
-        "cumulative_episodes": session.total_episodes,
-        "updates": session.total_updates,
-        "stage": session.stage_index,
-        "distance": session.current_distance,
-        "stage_episodes": session.stage_episodes,
-        "current_epsilon": session.current_epsilon,
-        "curriculum_episodes": session.curriculum_episodes,
-        "curriculum_wins": session.curriculum_wins,
-        "random_episodes": session.random_episodes,
-        "random_wins": session.random_wins,
-        "full_validation": session.full_validation,
-        "curriculum_validation": session.curriculum_validation,
-        "baseline_validation": session.baseline_validation,
-        "best_score": session.best_score,
-        "best_episode": session.best_episode,
-        "training_state_version": TRAINING_STATE_VERSION,
-        "encoding_version": ENCODING_VERSION,
-        "model_checkpoint_version": CHECKPOINT_VERSION,
-        "algorithm": ALGORITHM,
-        "rules": session.config.to_dict(),
-        "files": {name: dict(metadata) for name, metadata in files.items()},
-    }
-
-
-def _write_status(
-    output_dir: Path,
-    session: TrainingSession,
-    files: Mapping[str, Mapping[str, Any]],
-    status: str,
-    stop_reason: Optional[str],
-    started: float,
-) -> None:
-    atomic_write_json(
-        _status_payload(session, files, status, stop_reason, started),
-        output_dir / "status.json",
-    )
-
-
-def _write_error_status(
-    output_dir: Path,
-    session: TrainingSession,
-    files: Mapping[str, Mapping[str, Any]],
-    message: str,
-    started: float,
-) -> None:
-    payload = _status_payload(session, files, "error", "error", started)
-    payload["error"] = message
-    atomic_write_json(payload, output_dir / "status.json")
-
-
-def _publish_error(
-    output_dir: Path,
-    session: Optional[TrainingSession],
-    message: str,
-    started: float,
-) -> None:
-    if session is not None and session.at_episode_boundary:
-        try:
-            files = save_session_checkpoint(session, output_dir)
-            _write_error_status(output_dir, session, files, message, started)
-            return
-        except (OSError, RuntimeError, ValueError, KeyError) as export_error:
-            print("error: checkpoint export failed: %s" % export_error, file=sys.stderr, flush=True)
-    try:
-        atomic_write_json(
-            {
-                "status": "error",
-                "stop_reason": "error",
-                "error": message,
-                "completed_episodes": (
-                    session.total_episodes if session is not None else 0
-                ),
-                "elapsed_seconds": max(0.0, time.monotonic() - started),
-                "training_state_version": TRAINING_STATE_VERSION,
-                "encoding_version": ENCODING_VERSION,
-            },
-            output_dir / "error.json",
-        )
-    except OSError as diagnostic_error:
-        print("error: diagnostic export failed: %s" % diagnostic_error, file=sys.stderr, flush=True)
-
-
-def _append_metric(output_dir: Path, event: Mapping[str, Any]) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "algorithm": ALGORITHM,
-        "training_state_version": TRAINING_STATE_VERSION,
-        "encoding_version": ENCODING_VERSION,
-        "model_checkpoint_version": CHECKPOINT_VERSION,
-        **event,
-    }
-    with (output_dir / ".active-metrics.jsonl").open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, sort_keys=True) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-
-
-def _snapshot_file_manifest(output_dir: Path) -> Dict[str, Dict[str, Any]]:
-    files: Dict[str, Dict[str, Any]] = {}
-    for name in PUBLISHED_SNAPSHOT_FILES:
-        path = output_dir / name
-        if not path.is_file():
-            raise FileNotFoundError("Missing snapshot file: %s" % path)
-        digest = hashlib.sha256()
-        size = 0
-        with path.open("rb") as stream:
-            while True:
-                chunk = stream.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                digest.update(chunk)
-        files[name] = {"sha256": digest.hexdigest(), "bytes": size}
-    return files
 
 
 def _optional_validation(value: Any, name: str) -> Optional[Dict[str, Any]]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 import random
@@ -15,6 +16,7 @@ from src.evaluation.arena import (
     RandomPolicy,
     play_match,
     rotated_matches,
+    run_matches,
 )
 from src.cli.arena import main
 from src.game.environment import (
@@ -278,7 +280,10 @@ class TestArenaCli(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             output = os.path.join(tmp, "matches.json")
-            with mock.patch("src.evaluation.arena.play_match", return_value=fake) as play:
+            with mock.patch(
+                "src.evaluation.arena.run_matches",
+                side_effect=lambda deals, *_args, **_kwargs: [replace(fake, seed=deal.seed) for deal in deals],
+            ) as play:
                 code = main(
                     [
                         "--model",
@@ -310,9 +315,32 @@ class TestArenaCli(unittest.TestCase):
         )
         self.assertNotIn("trajectories", report["games"][0])
         self.assertEqual(
-            [call.kwargs["seed"] for call in play.call_args_list],
+            [deal.seed for deal in play.call_args.args[0]],
             [800, 801],
         )
+        self.assertEqual([game["seed"] for game in report["games"]], [800, 801])
+        self.assertFalse(play.call_args.kwargs["score_outcome"])
+
+    def test_cli_batches_across_the_chunk_boundary_without_scoring_unused_outcomes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = os.path.join(temporary, "matches.json")
+            with mock.patch("src.evaluation.arena.run_matches", wraps=run_matches) as runner, mock.patch(
+                "src.evaluation.arena.DealOutcome.score", side_effect=AssertionError("unused outcome scoring"),
+            ):
+                code = main([
+                    "--model", "random", "--model", "random", "--games", "33",
+                    "--seed", "800", "--max-turns", "1", "--output", output,
+                ])
+            with open(output, encoding="utf-8") as handle:
+                report = json.load(handle)
+        self.assertEqual(code, 0)
+        self.assertEqual([len(call.args[0]) for call in runner.call_args_list], [32, 1])
+        self.assertEqual([game["seed"] for game in report["games"]], list(range(800, 833)))
+        self.assertEqual(
+            [game["seat_order"] for game in report["games"]],
+            [[0, 1] if index % 2 == 0 else [1, 0] for index in range(33)],
+        )
+        self.assertEqual([game["action_count"] for game in report["games"]], [4] * 33)
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")

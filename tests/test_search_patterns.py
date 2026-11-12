@@ -7,16 +7,18 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from src.evaluate import evaluate_hand
+from src.evaluate import evaluate_hand, pure_sequence_upper_bound
 from src.game.belief import BeliefState
 from src.game.environment import (
     ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, GameConfig, Observation, Phase, discard_action,
 )
 from src.game.information import EventKind, InformationEvent, PlayerView
 from src.game.lookahead import (
-    Continues, Declares, after_discard, after_draw, can_declare_ub, expand, outs_1ply, winning_discard,
+    Continues, Declares, Terminates, after_discard, after_draw, can_declare_ub, expand, outs_1ply,
+    winning_discard,
 )
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.model.encoding import CONTEXT_CHANNELS, LAYOUT, encode, feature_values
 
 try:
     import torch
@@ -36,6 +38,17 @@ def draw_observation():
 
 
 class TestLongSequenceDeclarations(unittest.TestCase):
+    def test_exact_joker_is_not_also_counted_as_a_natural_sequence(self):
+        counts = tuple(int(face in (0, 1, 2, 17, 30, 43)) for face in range(52))
+        self.assertEqual(pure_sequence_upper_bound(counts, 2), 1)
+        obs = replace(
+            draw_observation(), hand=counts, joker=2,
+            config=GameConfig(cards_in_hand=6, required_sequences=2),
+        )
+        values = feature_values(encode(obs))
+        context_offset = next(field.offset for field in LAYOUT if field.name == "context")
+        self.assertEqual(values[context_offset + CONTEXT_CHANNELS.index("pure_quota_deficit")], 0.5)
+
     def test_two_exact_wildcards_can_fill_one_sequence_piece(self):
         counts = [0] * 52
         for face in (16, 7, 7, 19, 20, 21):
@@ -188,6 +201,33 @@ class TestBeliefLookahead(unittest.TestCase):
         self.assertEqual(expand(after), {})
         self.assertEqual(expand(replace(obs, phase=Phase.TERMINAL)), {})
 
+    def test_opponent_discard_views_do_not_expand_as_observer_decisions(self):
+        discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)
+        other = replace(discard, history=(*discard.history[:-1], replace(discard.history[-1], actor=1)))
+        self.assertEqual(expand(other), {})
+        self.assertEqual(expand(discard)[discard_action(30)], (Declares(1.0),))
+
+    def test_terminal_solo_discards_have_literal_losses_and_multiplayer_exhaustion_is_skipped(self):
+        discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)
+        solo = replace(discard, players=(replace(discard.players[0], next_player=0, previous_player=0),))
+        for obs in (
+            replace(solo, warm_start=True),
+            replace(solo, turns_remaining=1, players=(replace(solo.players[0], turns_remaining=1),)),
+        ):
+            branches = expand(obs)
+            self.assertEqual(branches, {
+                discard_action(0): (Terminates(1.0, -1.0),),
+                discard_action(1): (Terminates(1.0, -1.0),),
+                discard_action(2): (Terminates(1.0, -1.0),),
+                discard_action(30): (Declares(1.0),),
+            })
+        exhausted = replace(
+            discard, turns_remaining=1,
+            players=(replace(discard.players[0], turns_remaining=1),
+                     replace(discard.players[1], turns_remaining=0, active=False)),
+        )
+        self.assertEqual(expand(exhausted), {})
+
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class TestBudgetedTeacher(unittest.TestCase):
@@ -214,11 +254,49 @@ class TestBudgetedTeacher(unittest.TestCase):
     def test_child_budget_never_truncates_or_renormalizes_a_chance_node(self):
         result = teacher_targets(self.target, [draw_observation()], TeacherConfig(fraction=1, max_children=1),
                                  random.Random(1), 0.5, self.device)
-        self.assertEqual(result.mask[0].nonzero().flatten().tolist(), [1])
-        self.assertEqual(result.values[0, 1].item(), 0.5)
+        self.assertEqual(result.rows.tolist(), [])
+        self.assertEqual(result.values.shape, (0, 54))
+        complete = teacher_targets(
+            self.target, [draw_observation()], TeacherConfig(fraction=1, max_children=53),
+            random.Random(1), 0.5, self.device,
+        )
+        self.assertEqual(complete.mask[0].nonzero().flatten().tolist(), [0, 1])
+        self.assertAlmostEqual(complete.values[0, 0].item(), 1 - 2 / 151, places=6)
         disabled = teacher_targets(self.target, [draw_observation()], TeacherConfig(fraction=0),
                                    random.Random(1), 1.0, self.device)
         self.assertEqual(disabled.values.shape, (0, 54))
+
+    def test_exhausted_budget_stops_expansion_and_estimates_skip_oversized_rows(self):
+        discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)
+        rng = mock.Mock()
+        rng.shuffle.side_effect = lambda rows: None
+        for budget, expected_rows in ((3, [0]), (8, [0, 2])):
+            with mock.patch("src.model.search.expand", wraps=expand) as expanded:
+                result = teacher_targets(
+                    self.target, [discard, draw_observation(), discard],
+                    TeacherConfig(fraction=1, max_children=budget), rng, 0.5, self.device,
+                )
+            self.assertEqual(result.rows.tolist(), expected_rows)
+            self.assertEqual([call.args[0] for call in expanded.call_args_list], [discard] * len(expected_rows))
+            for position in range(len(expected_rows)):
+                self.assertEqual(result.mask[position].nonzero().flatten().tolist(), [2, 3, 4, 32])
+                self.assertAlmostEqual(result.values[position, 2].item(), 0.4)
+                self.assertEqual(result.values[position, 32].item(), 1.0)
+
+    def test_terminal_discards_need_no_child_forward_even_when_only_one_child_is_budgeted(self):
+        discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)
+        solo = replace(discard, warm_start=True, players=(replace(
+            discard.players[0], next_player=0, previous_player=0,
+        ),))
+        with mock.patch.object(self.target, "forward", side_effect=AssertionError("terminal Q forward")), mock.patch.object(
+            self.target, "outputs", side_effect=AssertionError("terminal afterstate forward"),
+        ):
+            result = teacher_targets(
+                self.target, [solo], TeacherConfig(fraction=1, max_children=1),
+                random.Random(1), 0.5, self.device,
+            )
+        self.assertEqual(result.mask[0].nonzero().flatten().tolist(), [2, 3, 4, 32])
+        self.assertEqual(result.values[0, [2, 3, 4, 32]].tolist(), [-1.0, -1.0, -1.0, 1.0])
 
     def test_discard_declarations_are_exact_and_afterstates_are_not_discounted(self):
         discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)

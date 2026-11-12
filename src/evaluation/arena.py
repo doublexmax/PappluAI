@@ -155,12 +155,14 @@ class MatchResult:
 
 def run_matches(
     deals: Sequence[Deal], policies: Sequence[Policy], game: GameConfig,
-    deadline: Optional[float] = None, *, record_terminal: bool = False,
+    deadline: Optional[float] = None, *, record_terminal: bool = False, score_outcome: bool = True,
 ) -> list[MatchResult]:
     if not isinstance(game, GameConfig):
         raise TypeError("game must be a GameConfig")
     if type(record_terminal) is not bool:
         raise TypeError("record_terminal must be a boolean")
+    if type(score_outcome) is not bool:
+        raise TypeError("score_outcome must be a boolean")
     if deadline is not None and (
         isinstance(deadline, bool) or not isinstance(deadline, Real) or not math.isfinite(float(deadline))
     ):
@@ -228,8 +230,11 @@ def run_matches(
         view = match.env.view()
         if view.terminal_reason is None:
             raise RuntimeError("terminal match has no reason")
-        snapshot = match.env.terminal_snapshot()
-        outcome = DealOutcome.score(snapshot, view.winner, view.terminal_reason, game.required_sequences)
+        snapshot = match.env.terminal_snapshot() if record_terminal or score_outcome else None
+        outcome = (
+            DealOutcome.score(snapshot, view.winner, view.terminal_reason, game.required_sequences)
+            if score_outcome else None
+        )
         _check_deadline(deadline)
         results.append(MatchResult(
             seed=deal.seed, winner=view.winner, terminal_reason=view.terminal_reason,
@@ -251,6 +256,7 @@ def play_match(
     deadline: Optional[float] = None,
     *,
     record_terminal: bool = False,
+    score_outcome: bool = True,
 ) -> MatchResult:
     if not isinstance(config, MatchConfig):
         raise TypeError("config must be a MatchConfig")
@@ -263,7 +269,7 @@ def play_match(
     return run_matches(
         [Deal(seed, tuple(range(config.players)), config.players,
               frozenset(range(config.players)) if record_trajectories else frozenset())],
-        policies, config.game, deadline, record_terminal=record_terminal,
+        policies, config.game, deadline, record_terminal=record_terminal, score_outcome=score_outcome,
     )[0]
 
 

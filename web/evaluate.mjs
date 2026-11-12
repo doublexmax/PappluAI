@@ -29,6 +29,21 @@ export function handReward(counts, joker, options = {}) {
   return isValidHand(counts, joker, options) ? 1 : 0;
 }
 
+export function pureSequenceUpperBound(hand, joker) {
+  let upper = hand[joker];
+  for (let suit = 0; suit < NUM_SUITS; suit += 1) {
+    const remaining = hand.slice(suit * NUM_RANKS, (suit + 1) * NUM_RANKS);
+    if (Math.floor(joker / NUM_RANKS) === suit) remaining[joker % NUM_RANKS] = 0;
+    let triples = sum(remaining.map(copies => Math.floor(copies / MIN_MELD)));
+    for (let start = 0; start <= NUM_RANKS - MIN_MELD; start += 1) {
+      triples += Math.min(...remaining.slice(start, start + MIN_MELD));
+    }
+    triples += Math.min(remaining[NUM_RANKS - 2], remaining[NUM_RANKS - 1], remaining[0]);
+    upper += Math.min(Math.floor(sum(remaining) / MIN_MELD), triples);
+  }
+  return Math.min(Math.floor(sum(hand) / MIN_MELD), upper);
+}
+
 export function minimumPenalty(counts, joker, { requiredSequences = 5 } = {}) {
   const hand = parseCounts(counts);
   const jokerFace = parseJoker(joker);
@@ -275,23 +290,7 @@ function fits(state, take) {
 
 function searchMelds(counts, pureNeeded, joker) {
   if (sum(counts) < pureNeeded * MIN_MELD) return null;
-  if (pureNeeded > 0) {
-    let upper = counts[joker];
-    if (upper < pureNeeded) {
-      for (let suit = 0; suit < NUM_SUITS; suit += 1) {
-        const rem = counts.slice(suit * NUM_RANKS, (suit + 1) * NUM_RANKS);
-        if (Math.floor(joker / NUM_RANKS) === suit) rem[joker % NUM_RANKS] = 0;
-        let triples = sum(rem.map((copies) => Math.floor(copies / MIN_MELD)));
-        for (let start = 0; start <= NUM_RANKS - MIN_MELD; start += 1) {
-          triples += Math.min(...rem.slice(start, start + MIN_MELD));
-        }
-        triples += Math.min(rem[NUM_RANKS - 2], rem[NUM_RANKS - 1], rem[0]);
-        upper += Math.min(Math.floor(sum(rem) / MIN_MELD), triples);
-        if (upper >= pureNeeded) break;
-      }
-      if (upper < pureNeeded) return null;
-    }
-  }
+  if (pureNeeded > 0 && pureSequenceUpperBound(counts, joker) < pureNeeded) return null;
   const { faces, options } = compileMeldOptions(counts, joker);
   const covered = Array(faces.length).fill(false);
   for (const anchored of options) {

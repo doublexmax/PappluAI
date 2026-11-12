@@ -6,7 +6,7 @@ import math
 import struct
 from typing import Sequence
 
-from src.evaluate import NUM_FACES, card_points
+from src.evaluate import NUM_FACES, card_points, pure_sequence_upper_bound
 from src.game.belief import BeliefState
 from src.game.environment import NUM_ACTIONS, Observation, Phase, legal_action_mask
 from src.game.information import EventKind
@@ -168,11 +168,7 @@ def encode(obs: Observation) -> Features:
         or obs.phase is Phase.DRAW and last.kind in (EventKind.DISCARD, EventKind.REFILL)
         and last.next_player == 0
     )
-    pure_upper = min(
-        sum(hand) // 3,
-        sum(copies // 3 for copies in hand) + hand[obs.joker]
-        + sum(min(hand[face] for face in run) for run in _RUN_FACES),
-    )
+    pure_upper = pure_sequence_upper_bound(hand, obs.joker)
     values.extend((
         float(obs.phase is Phase.DRAW), float(obs.phase is Phase.DISCARD), float(obs.done), float(to_act),
         obs.turns_remaining / cfg.max_turns, obs.stock_remaining / supply, len(obs.discard_pile) / supply,

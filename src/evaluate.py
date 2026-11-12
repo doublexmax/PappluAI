@@ -90,7 +90,6 @@ def _rank_patterns() -> Tuple[Tuple[int, ...], ...]:
         for end in range(start + MIN_MELD - 1, NUM_RANKS):
             patterns.append(tuple(range(start, end + 1)))
     for start in range(1, NUM_RANKS - 1):
-        # Ace-high runs: start..K,A (QKA, JQKA, ...). No KA2 wrap.
         patterns.append(tuple(range(start, NUM_RANKS)) + (0,))
     return tuple(patterns)
 
@@ -202,6 +201,24 @@ def _iter_sets(
                 yield _meld_from("set", actuals, represented, joker)
 
 
+def pure_sequence_upper_bound(hand: Sequence[int], joker: int) -> int:
+    upper = hand[joker]
+    for suit in range(NUM_SUITS):
+        remaining = list(hand[suit * NUM_RANKS:(suit + 1) * NUM_RANKS])
+        if joker // NUM_RANKS == suit:
+            remaining[joker % NUM_RANKS] = 0
+        triples = (
+            sum(copies // MIN_MELD for copies in remaining)
+            + sum(
+                min(remaining[start:start + MIN_MELD])
+                for start in range(NUM_RANKS - MIN_MELD + 1)
+            )
+            + min(remaining[-2], remaining[-1], remaining[0])
+        )
+        upper += min(sum(remaining) // MIN_MELD, triples)
+    return min(sum(hand) // MIN_MELD, upper)
+
+
 def _search(
     counts: Tuple[int, ...],
     pure_needed: int,
@@ -209,26 +226,8 @@ def _search(
 ) -> Optional[Tuple[Meld, ...]]:
     if sum(counts) < pure_needed * MIN_MELD:
         return None
-    if pure_needed > 0:
-        upper = counts[joker]
-        if upper < pure_needed:
-            for suit in range(NUM_SUITS):
-                rem = list(counts[suit * NUM_RANKS:(suit + 1) * NUM_RANKS])
-                if joker // NUM_RANKS == suit:
-                    rem[joker % NUM_RANKS] = 0
-                triples = (
-                    sum(copies // MIN_MELD for copies in rem)
-                    + sum(
-                        min(rem[start:start + MIN_MELD])
-                        for start in range(NUM_RANKS - MIN_MELD + 1)
-                    )
-                    + min(rem[-2], rem[-1], rem[0])
-                )
-                upper += min(sum(rem) // MIN_MELD, triples)
-                if upper >= pure_needed:
-                    break
-            if upper < pure_needed:
-                return None
+    if pure_needed > 0 and pure_sequence_upper_bound(counts, joker) < pure_needed:
+        return None
     faces, options = _compile_meld_options(counts, joker)
     covered = [False] * len(faces)
     for option in chain.from_iterable(options):

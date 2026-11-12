@@ -23,16 +23,17 @@ from src.game.environment import (
     Observation,
 )
 from src.training.curriculum import (
-    STATUS_SCHEMA_VERSION,
     TRAINING_STATE_VERSION,
     TrainingConfig,
     TrainingSession,
     run,
-    save_session_checkpoint,
 )
+from src.training.curriculum_io import STATUS_SCHEMA_VERSION, save_session_checkpoint
 from src.cli.curriculum import build_arg_parser
 from src.game.outcome import SeatOutcome
 from src.model.encoding import encode
+from src.model.search import TeacherConfig
+from src.model.spec import ModelSpec
 from src.training.core import Decision, Sample, Trajectory, TrajectoryReplay
 
 try:
@@ -175,6 +176,16 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
 
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestTrainingSession(unittest.TestCase):
+    def test_curriculum_losses_are_minus_one_with_the_exact_penalty_in_replay(self):
+        session = TrainingSession(
+            self.small_config(curriculum_fraction=1, teacher=TeacherConfig(fraction=0)),
+            19, model_spec=ModelSpec(8, 1, 1),
+        )
+        result = session.run_episode()
+        self.assertEqual(result["source"], "curriculum_distance_1")
+        self.assertFalse(result["won"])
+        self.assertEqual(session.replay.state_dict()["trajectories"][0]["outcome"], (-1.0, False, 24))
+
     @staticmethod
     def small_config(**overrides):
         values = {
@@ -791,14 +802,14 @@ class TestTrainingSession(unittest.TestCase):
                 self.assertEqual(meta["checkpoint_episodes"], episodes)
 
     def test_live_metric_append_preserves_the_published_checkpoint_hash(self):
-        from src.training.curriculum import _append_metric
+        from src.training.curriculum_io import append_metric
 
         session = TrainingSession(self.small_config(), seed=41)
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             manifest = save_session_checkpoint(session, output)
             published = (output / "metrics.jsonl").read_bytes()
-            _append_metric(output, {"event": "new-episode", "episode": 1})
+            append_metric(output, {"event": "new-episode", "episode": 1})
             self.assertEqual((output / "metrics.jsonl").read_bytes(), published)
             self.assertEqual(
                 hashlib.sha256(published).hexdigest(),
