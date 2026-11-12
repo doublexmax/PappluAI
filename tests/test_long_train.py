@@ -23,15 +23,18 @@ from src.game.environment import (
     Observation,
 )
 from src.training.curriculum import (
-    STATUS_SCHEMA_VERSION,
     TRAINING_STATE_VERSION,
     TrainingConfig,
     TrainingSession,
     run,
-    save_session_checkpoint,
 )
+from src.training.curriculum_io import STATUS_SCHEMA_VERSION, save_session_checkpoint
 from src.cli.curriculum import build_arg_parser
-from src.training.core import EpisodeReplay
+from src.game.outcome import SeatOutcome
+from src.model.encoding import encode
+from src.model.search import TeacherConfig
+from src.model.spec import ModelSpec
+from src.training.core import Decision, Sample, Trajectory, TrajectoryReplay
 
 try:
     import torch
@@ -82,6 +85,7 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
             "--output-dir",
             "--width",
             "--heads",
+            "--blocks",
             "--max-episodes",
             "--max-seconds",
             "--checkpoint-every",
@@ -91,6 +95,9 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
             "--recycle-discard",
             "--no-recycle-discard",
             "--seed",
+            "--epsilon-start",
+            "--epsilon-end",
+            "--epsilon-decay-episodes",
         ):
             self.assertIn(flag, text)
 
@@ -148,19 +155,19 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
                 "--max-episodes", "0", "--max-seconds", "0",
             ]
             fresh = subprocess.run(
-                command + ["--width", "128", "--heads", "8"],
+                command + ["--width", "128", "--heads", "8", "--blocks", "3"],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(fresh.returncode, 0, fresh.stderr)
             state_path = output / "latest-state.pt"
             state = torch.load(state_path, weights_only=True)
-            self.assertEqual(state["model_spec"], {"width": 128, "heads": 8})
+            self.assertEqual(state["model_spec"], {"width": 128, "heads": 8, "blocks": 3})
             resumed = subprocess.run(
-                command + ["--resume", str(state_path), "--width", "128", "--heads", "8"],
+                command + ["--resume", str(state_path), "--width", "128", "--heads", "8", "--blocks", "3"],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
-            for flag, value in (("--width", "192"), ("--heads", "4")):
+            for flag, value in (("--width", "192"), ("--heads", "4"), ("--blocks", "2")):
                 with self.subTest(flag=flag):
                     mismatch = subprocess.run(
                         command + ["--resume", str(state_path), flag, value],
@@ -169,69 +176,56 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
                     self.assertEqual(mismatch.returncode, 2)
                     self.assertIn("does not match model", mismatch.stderr)
 
+    @unittest.skipIf(torch is None, TORCH_REASON)
+    def test_real_cli_finetune_flags_persist_and_resume_rejects_both_option_forms(self):
+        from src.cli.curriculum import main
 
-class TestEpisodeReplayState(unittest.TestCase):
-    @staticmethod
-    def transition(index, action, target):
-        env = PappluEnv()
-        state = env.reset(seed=index)
-        if action >= 2:
-            state = env.step(0)
-            action = discard_action(next(face for face, count in enumerate(state.hand) if count))
-        return (state, action, target)
-
-    def test_roundtrip_preserves_episode_sampling(self):
-        replay = EpisodeReplay(capacity=8)
-        env = PappluEnv()
-        first = env.reset(seed=0)
-        second = env.step(1)
-        replay.append(
-            (
-                (first, 1, 0.5),
-                (second, discard_action(next(i for i, n in enumerate(second.hand) if n)), 1.0),
-            )
-        )
-        replay.append((self.transition(2, 3, 0.25),))
-        restored = EpisodeReplay(capacity=8)
-        restored.load_state_dict(replay.state_dict())
-        self.assertEqual(
-            replay.sample(random.Random(91), 50),
-            restored.sample(random.Random(91), 50),
-        )
-        self.assertEqual(replay.state_dict(), restored.state_dict())
-
-    def test_load_validation_is_atomic(self):
-        replay = EpisodeReplay(capacity=4)
-        replay.append((self.transition(0, 1, 0.5),))
-        before = replay.state_dict()
-        short = (0.0,)
-        wrong_length = (0.0, 1.0)
-        journal = before["episodes"][0]
-        valid, prefix, _action, target = journal["transitions"][0]
-        nonfinite = {**valid, "last_reward": float("nan")}
-        bad_states = (
-            {**before, "version": 999},
-            {**before, "capacity": 5},
-            *(
-                {**before, "episodes": ({
-                    **journal, "transitions": ((snapshot, prefix, action, target),),
-                },)}
-                for snapshot, action in (
-                    (short, 1), (wrong_length, 1), (nonfinite, 1),
-                    (valid, True), (valid, NUM_ACTIONS), (valid, 999),
-                )
-            ),
-        )
-        for state in bad_states:
-            with self.subTest(state=state), self.assertRaises(
-                (TypeError, ValueError)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "run"
+            base = ["--output-dir", str(output), "--max-episodes", "0", "--max-seconds", "0"]
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(main(base + [
+                    "--width", "8", "--heads", "1", "--blocks", "1",
+                    "--learning-rate=0.0001", "--epsilon-start", "0.1",
+                    "--epsilon-end=0.02", "--epsilon-decay-episodes", "42",
+                ]), 0)
+            state_path = output / "latest-state.pt"
+            fields = ("learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_episodes")
+            config = torch.load(state_path, weights_only=True)["training_config"]
+            self.assertEqual(tuple(config[field] for field in fields), (0.0001, 0.1, 0.02, 42))
+            resume = base + ["--resume", str(state_path)]
+            matching = resume + [
+                "--learning-rate", "0.0001", "--epsilon-start=0.1",
+                "--epsilon-end", "0.02", "--epsilon-decay-episodes=42",
+            ]
+            for arguments in (resume, matching):
+                with mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(main(arguments), 0)
+            for option, value, field in (
+                ("--learning-rate", "0.0002", "learning_rate"), ("--epsilon-start", "0.2", "epsilon_start"),
+                ("--epsilon-end", "0.03", "epsilon_end"), ("--epsilon-decay-episodes", "43", "epsilon_decay_episodes"),
             ):
-                replay.load_state_dict(state)
-            self.assertEqual(replay.state_dict(), before)
+                for extra in ([option, value], [option + "=" + value]):
+                    with self.subTest(extra=extra), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                        self.assertEqual(main(resume + extra), 2)
+                        self.assertIn("resume cannot change " + field, error.getvalue())
+                    saved = torch.load(state_path, weights_only=True)["training_config"]
+                    self.assertEqual(tuple(saved[name] for name in fields), (0.0001, 0.1, 0.02, 42))
 
 
 @unittest.skipIf(torch is None, TORCH_REASON)
 class TestTrainingSession(unittest.TestCase):
+    def test_curriculum_losses_record_deadwood_utility_and_exact_penalty(self):
+        session = TrainingSession(
+            self.small_config(curriculum_fraction=1, teacher=TeacherConfig(fraction=0)),
+            19, model_spec=ModelSpec(8, 1, 1),
+        )
+        result = session.run_episode()
+        self.assertEqual(result["source"], "curriculum_distance_1")
+        self.assertFalse(result["won"])
+        self.assertEqual((result["utility"], result["penalty"]), (-0.6875, 24))
+        self.assertEqual(session.replay.state_dict()["trajectories"][0]["outcome"], (-0.6875, False, 24))
+
     @staticmethod
     def small_config(**overrides):
         values = {
@@ -339,9 +333,9 @@ class TestTrainingSession(unittest.TestCase):
             )
 
             replay_rng = random.Random()
-            replay_rng.setstate(control.replay_rng.getstate())
+            replay_rng.setstate(control.learner.rng.getstate())
             resumed_replay_rng = random.Random()
-            resumed_replay_rng.setstate(resumed.replay_rng.getstate())
+            resumed_replay_rng.setstate(resumed.learner.rng.getstate())
             self.assertEqual(
                 control.replay.sample(replay_rng, 8),
                 resumed.replay.sample(resumed_replay_rng, 8),
@@ -374,13 +368,14 @@ class TestTrainingSession(unittest.TestCase):
                 control.state_dict()["curriculum"],
                 resumed.state_dict()["curriculum"],
             )
-            for name in ("deal", "action", "replay"):
+            for name in ("deal", "action"):
                 self.assertEqual(
                     control.state_dict()["rng_states"][name],
                     resumed.state_dict()["rng_states"][name],
                 )
+            self.assert_nested_equal(control.learner.state_dict(), resumed.learner.state_dict())
 
-    def test_full21_episode_updates_q_toward_monte_carlo_target(self):
+    def test_full21_episode_updates_q_toward_terminal_utility(self):
         from src.evaluate import hand_reward
 
         class Full21FixtureEnv(PappluEnv):
@@ -425,10 +420,15 @@ class TestTrainingSession(unittest.TestCase):
         ]
         captured = {}
 
-        def winning_action(network, observation, epsilon, rng, device):
-            del epsilon, rng, device
+        def capture_encoding(observation):
+            captured["current"] = observation
+            return encode(observation)
+
+        def winning_action(features, rngs):
+            del features, rngs
+            observation = captured["current"]
             if observation.phase is Phase.DRAW:
-                return ACTION_DRAW_STOCK
+                return [ACTION_DRAW_STOCK]
             action = next(
                 discard_action(face)
                 for face, count in enumerate(observation.hand)
@@ -444,27 +444,27 @@ class TestTrainingSession(unittest.TestCase):
                 )
                 == 1.0
             )
-            from src.model.encoding import collate_observations
+            from src.model.network import collate_observations
             state = observation
             with torch.no_grad():
-                value = network(
+                value = session.network(
                     collate_observations([state], torch.device("cpu"))
                 )[0, action]
             captured.update(state=state, action=action, before=float(value))
-            return action
+            return [action]
 
-        def final_transition(_rng, _batch_size):
-            state = session.replay.state_dict()
-            restored = EpisodeReplay(state["capacity"])
-            restored.load_state_dict(state)
-            return [restored._episodes[0][-1]]
+        def final_transition(_rng, _batch_size, **kwargs):
+            trajectory = session.replay._trajectories[0]
+            return [Sample(trajectory.decisions[-1], trajectory.outcome, None, 1.0)]
 
         with mock.patch(
             "src.training.curriculum.PappluEnv",
             Full21FixtureEnv,
         ), mock.patch(
-            "src.training.curriculum.select_action",
+            "src.training.curriculum.EpsilonPolicy.act_features",
             side_effect=winning_action,
+        ), mock.patch(
+            "src.training.curriculum.encode", side_effect=capture_encoding,
         ), mock.patch.object(
             session.replay,
             "sample",
@@ -473,14 +473,14 @@ class TestTrainingSession(unittest.TestCase):
             result = session.run_episode()
 
         with torch.no_grad():
-            from src.model.encoding import collate_observations
+            from src.model.network import collate_observations
             after = session.network(
                 collate_observations([captured["state"]], torch.device("cpu"))
             )[0, captured["action"]]
-        transitions = session.replay.state_dict()["episodes"][0]["transitions"]
+        trajectory = session.replay.state_dict()["trajectories"][0]
         self.assertEqual(result["source"], "ordinary_full21")
         self.assertTrue(result["won"])
-        self.assertEqual(transitions[-1][3], 1.0)
+        self.assertEqual(trajectory["outcome"], (1.0, True, 0))
         self.assertLess(
             abs(float(after) - 1.0),
             abs(captured["before"] - 1.0),
@@ -516,13 +516,10 @@ class TestTrainingSession(unittest.TestCase):
 
     def test_resume_rejects_nonfinite_model_states(self):
         session = TrainingSession(self.small_config(), seed=41)
-        for field in (
-            "network_state_dict",
-            "baseline_model_state_dict",
-            "best_model_state_dict",
-        ):
+        for field in ("online", "target", "baseline_model_state_dict", "best_model_state_dict"):
             payload = copy.deepcopy(session.state_dict())
-            tensor = next(iter(payload[field].values()))
+            values = payload["learner"][field] if field in ("online", "target") else payload[field]
+            tensor = next(iter(values.values()))
             tensor.reshape(-1)[0] = float("nan")
             with self.subTest(field=field), self.assertRaisesRegex(
                 ValueError,
@@ -532,18 +529,20 @@ class TestTrainingSession(unittest.TestCase):
 
     def test_failed_resume_preserves_torch_rng_and_rejects_invalid_replay(self):
         session = TrainingSession(self.small_config(), seed=41)
-        replay = EpisodeReplay(session.config.replay_capacity)
-        replay.append(((PappluEnv().reset(seed=1), 0, 0.0),))
-        journal = replay.state_dict()["episodes"][0]
-        snapshot, prefix, _action, target = journal["transitions"][0]
+        replay = TrajectoryReplay(session.config.replay_capacity)
+        obs = PappluEnv(session.config.game_config).reset(seed=1)
+        record = Decision(obs, encode(obs), 0, (obs.hand,) + ((0,) * 52,) * 5)
+        replay.append(Trajectory(1, (record,), SeatOutcome(0, False, 0)))
+        journal = replay.state_dict()["trajectories"][0]
+        snapshot, prefix, _action, hidden = journal["decisions"][0]
         cases = (
             ((0.0,), 0, "current information schema"),
-            (snapshot, NUM_ACTIONS, "must be in 0..53"),
+            (snapshot, NUM_ACTIONS, "legal action"),
         )
         for state, action, message in cases:
             payload = copy.deepcopy(session.state_dict())
-            payload["replay_state_dict"]["episodes"] = (
-                {**journal, "transitions": ((state, prefix, action, target),)},
+            payload["learner"]["replay"]["trajectories"] = (
+                {**journal, "decisions": ((state, prefix, action, hidden),)},
             )
             torch.manual_seed(8128)
             before = torch.get_rng_state().clone()
@@ -606,6 +605,7 @@ class TestTrainingSession(unittest.TestCase):
         session.best_score = 0.5
         session.stage_episodes = session.config.minimum_stage_episodes
         full = validation(0.4, 0.0)
+        full["greedy"]["utility_avg"] = 1.0
         curriculum = validation(1.0, 0.0)
         before = {
             name: value.clone()
@@ -626,9 +626,9 @@ class TestTrainingSession(unittest.TestCase):
         before = session.state_dict()["rng_states"]
         session.initialize_validation()
         after = session.state_dict()["rng_states"]
-        for name in ("deal", "action", "replay"):
+        for name in ("deal", "action"):
             self.assertEqual(before[name], after[name])
-        self.assertTrue(torch.equal(before["torch"], after["torch"]))
+        self.assertEqual(session.learner.update_count, 0)
         self.assertEqual(session.baseline_validation, session.full_validation)
 
     def test_budget_abort_rewinds_partial_trajectory(self):
@@ -679,15 +679,15 @@ class TestTrainingSession(unittest.TestCase):
                 current["counters"],
                 expected_state["counters"],
             )
-            for name in ("deal", "action", "replay"):
+            for name in ("deal", "action"):
                 self.assertEqual(
                     current["rng_states"][name],
                     expected_state["rng_states"][name],
                 )
             self.assertTrue(
                 torch.equal(
-                    current["rng_states"]["torch"],
-                    expected_state["rng_states"]["torch"],
+                    current["learner"]["torch_rng_state"],
+                    expected_state["learner"]["torch_rng_state"],
                 )
             )
 
@@ -733,7 +733,7 @@ class TestTrainingSession(unittest.TestCase):
         self.assertIsNone(session.curriculum_validation)
         self.assertTrue(session.network.training)
         after = session.state_dict()["rng_states"]
-        for name in ("deal", "action", "replay"):
+        for name in ("deal", "action"):
             self.assertEqual(before[name], after[name])
 
     def test_atomic_checkpoint_has_resumable_and_standard_models(self):
@@ -741,7 +741,7 @@ class TestTrainingSession(unittest.TestCase):
 
         session = TrainingSession(self.small_config(), seed=41)
         session.total_episodes = 6
-        session.total_updates = 6
+        session.learner.update_count = 6
         session.random_episodes = 6
         session.stage_episodes = 6
         session.epsilon_progress = 6
@@ -827,8 +827,8 @@ class TestTrainingSession(unittest.TestCase):
                 state["training_state_version"],
                 TRAINING_STATE_VERSION,
             )
-            self.assertIn("optimizer_state_dict", state)
-            self.assertIn("replay_state_dict", state)
+            self.assertIn("optimizer", state["learner"])
+            self.assertIn("replay", state["learner"])
             self.assertIn("rng_states", state)
             expected_episodes = {
                 "latest-model.pt": 6,
@@ -843,14 +843,14 @@ class TestTrainingSession(unittest.TestCase):
                 self.assertEqual(meta["checkpoint_episodes"], episodes)
 
     def test_live_metric_append_preserves_the_published_checkpoint_hash(self):
-        from src.training.curriculum import _append_metric
+        from src.training.curriculum_io import append_metric
 
         session = TrainingSession(self.small_config(), seed=41)
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             manifest = save_session_checkpoint(session, output)
             published = (output / "metrics.jsonl").read_bytes()
-            _append_metric(output, {"event": "new-episode", "episode": 1})
+            append_metric(output, {"event": "new-episode", "episode": 1})
             self.assertEqual((output / "metrics.jsonl").read_bytes(), published)
             self.assertEqual(
                 hashlib.sha256(published).hexdigest(),

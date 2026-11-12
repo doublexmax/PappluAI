@@ -1,6 +1,6 @@
 # PappluAI
 
-Papplu hand correctness and a binary reward function for model training.
+Papplu hand evaluation, shared-deck play, and placement-based model training.
 The evaluator uses this project's house rules, not a universal rummy ruleset.
 The browser play area provides a hand builder and a card table with Human and AI seats.
 The optional training tools use PyTorch.
@@ -80,7 +80,7 @@ If both piles are empty, deal again.
 
 ### AI tiers
 
-- **Neural + Search** runs the `dynamic_table` QNetwork in JavaScript.
+- **Neural + Search** runs the `axial_table` `PolicyNet` in JavaScript.
   It uses public-card beliefs, feed risk, exact winning checks, draw lookahead,
   and a four-candidate one-ply outs search.
 - **Tactical** minimizes exact deadwood penalty and uses feed risk and a
@@ -277,8 +277,14 @@ indices, and invalid configuration values, raise `TypeError` or `ValueError`.
 Booleans are not accepted as integers. The evaluator does not mutate its inputs.
 
 The old `matched_rate` prototype and its matching helpers have been removed.
-Use `hand_reward` for training rewards and `evaluate_hand` for a grouping.
-The new reward is not the old prototype's unmatched-card count.
+Use `hand_reward` for a declaration verdict and `evaluate_hand` for a grouping.
+The binary reward is not the old prototype's unmatched-card count.
+`Learner` trains on shaped terminal utility, not this binary reward.
+Solo declaration earns +1. A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`.
+Zero deadwood without a declaration still earns only -0.5.
+Multiplayer utility weights each pairwise margin by 1 when either seat declared, and by 0.5 otherwise.
+The declarer earns +1, while the best exhausted hand earns at most +0.5.
+Ratings and promotion still use unshaped `DealOutcome.margin` values.
 
 `minimum_penalty(hand, joker, required_sequences=5)` returns an exact
 `HandPenalty` for a hand of any size. Its `points`, `exempt_melds`, and
@@ -292,7 +298,7 @@ The evaluator searches alternative groupings instead of greedily removing the
 first sequence it finds. It caches remaining card counts and the unmet sequence
 quota within each call. The search is exact, but its worst-case cost grows
 combinatorially. Joker-heavy hands can be slower than ordinary deals.
-This version provides correctness, not an optimized batch-training engine.
+The exact evaluator can remain the limiting cost for joker-heavy hands.
 
 ## Train a model
 
@@ -303,51 +309,62 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements-training.txt
 ```
 
-The executable commands live under `src.cli`; they parse arguments before
+The executable commands live under `src.cli`. They parse arguments before
 loading the optional PyTorch runtime. Implementation modules are grouped by
-responsibility:
+responsibility.
 
 | Package | Responsibility |
 |---|---|
 | `src.game` | Rules, immutable information observations, stock handling, and multiplayer state |
-| `src.model` | Dynamic collation, one history-aware network, and model checkpoints |
+| `src.model` | Pure `Features`, axial inference, training-only auxiliary heads, and model checkpoints |
 | `src.training` | Replay, optimization, solo, curriculum, league, and improvement training |
 | `src.evaluation` | Benchmarks, arena matches, ratings, and promotion gates |
 | `src.checkpoints` | Atomic files, tensor validation, evidence, and registries |
 
-`src.cli.solo` runs episodic Monte Carlo Q-value regression. It does not use
-DQN, tree search, or genetic algorithms. See [TRAINING.md](TRAINING.md) for a
+`src.cli.solo` uses `Learner` for 5-step Double DQN with `gamma = 1.0`.
+Multiplayer training uses the same learner with declaration-weighted pairwise utility.
+See [TRAINING.md](TRAINING.md) for a
 fresh-clone walkthrough of every training workflow.
 See [RATINGS.md](RATINGS.md) for persistent multiplayer tournaments,
 point-based placements, uncertainty, and capped-game evidence.
 
 ### Current model contract
 
-`dynamic_table` is the only supported architecture. `Observation` contains the
+`axial_table` is the only supported architecture. `Observation` contains the
 observer's current hand, public player views, and complete visible event history.
 Seats are relative to the observer. Public stock draws reveal the source and
 hand count, not the face. The observer retains their initial hand and own drawn
 faces after those cards leave their hand.
 
-The network reconstructs history with a shared causal GRU. Shared card features
-and card attention model meld relationships. Relative next-player and
-previous-player relations feed player attention. Each candidate action attends
-to those players and cards before a shared scalar scorer values it.
+`src.model.encoding.encode` is pure Python and returns a fixed `Features` record.
+Each record contains 3,208 little-endian float32 values, or 12,832 bytes.
+Card channels include meld membership, public-card beliefs, and deadwood context.
+History channels retain public take, discard, and pass counts and separate recencies.
+Six relative seat slots include the observer and zero-padded absent seats.
+The encoder never reads an opponent's private hand or the stock order.
+
+`src.model.network.collate` batches cached `Features` without rescanning history.
+`PolicyNet` uses rank convolutions, suit pooling, table attention, and FiLM on
+the four-suit, 13-rank grid. Its dueling Q values center advantages over legal actions.
 The stock action has no hidden drawn-card input.
+`AuxHeads` predict wins, penalties, opponent cards, and afterstate values during training.
+Browser exports use `formatVersion == 2` and contain only `policy.*` tensors.
 
-`src.model.encoding.collate_observations` pads actual player counts and history
-lengths for a batch. Masks exclude padding. There is no fixed opponent slot or
-history window. `ModelSpec` defaults to width 64 and four attention heads.
-Shared policies cache weights, not private recurrent state.
-Replay keeps immutable decision observations and uses the same collation.
-Replay checkpoints store each episode's visible history once, with a prefix
-length for each decision. Resume restores shared immutable events without
-discarding earlier knowledge or exposing later events.
+`ModelSpec(width=64, heads=4, blocks=2)` is the default.
+`src.cli.solo` and `src.cli.curriculum` accept `--width`, `--heads`, and `--blocks`.
+League and improvement runs inherit the initial checkpoint's spec.
+The browser accepts any valid spec, including width 128, eight heads, and three blocks.
 
-Model checkpoints use checkpoint version 3 and information encoding version 2.
-Replay uses version 2. Loaders reject old models and replay explicitly.
+`TrajectoryReplay` v4 caches decision features and samples decisions uniformly
+within each player count. Counts receive equal sampling shares.
+Checkpoints store each trajectory's visible history once, with a prefix for each decision.
+Hidden hands provide training targets only and never enter `Features`.
+Model checkpoints use `checkpoint_version == 4` and `encoding_version == 2`.
+Existing `axial_table` v4 weights remain valid warm starts.
+Resume rejects replay v3 because its stored utilities predate deadwood shaping.
+Use `--initial-model` with a fresh output directory instead of resuming that state.
 There is no checkpoint conversion or old architecture selector.
-Historical artifacts can remain on disk, but they cannot seed a current run.
+Old model architectures remain unsupported.
 Fresh weights and tiny updates establish working software, not competitive play.
 
 ### Run a short discard-puzzle smoke test
@@ -372,11 +389,26 @@ and replay buffer.
 
 `src.cli.curriculum` trains from scratch when you omit both `--initial-model` and
 `--resume`. The default configuration uses three decks, 21 cards, five pure
-sequences, a 60-turn limit, and the same `dynamic_table` network used in multiplayer.
+sequences, a 60-turn limit, and the same `axial_table` network used in multiplayer.
 
 ```powershell
 .\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21
 ```
+
+For a larger model, set its spec when the run starts.
+
+```powershell
+.\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21-wide --width 128 --heads 8 --blocks 3
+```
+
+To warm-start existing v4 weights with fresh optimizer and replay state, set the curriculum stage and exploration schedule.
+
+```powershell
+.\.venv\Scripts\python -m src.cli.curriculum --initial-model runs\full21\best-model.pt --initial-stage 2 --output-dir runs\full21-finetune --learning-rate 0.0001 --epsilon-start 0.08 --epsilon-end 0.02 --epsilon-decay-episodes 10000
+```
+
+`--epsilon-start`, `--epsilon-end`, and `--epsilon-decay-episodes` persist in the training state.
+Validation and best-model selection still use binary greedy declaration rates.
 
 The trainer writes standard model checkpoints and `latest-state.pt`.
 The state checkpoint includes the model, optimizer, replay buffer, counters,
@@ -403,6 +435,7 @@ once per seat. Use `random` for a random legal policy.
 .\.venv\Scripts\python -m src.cli.arena --model runs\full21\latest-model.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
 ```
 
+`run_matches` advances multiple deals in lockstep and batches inference by policy.
 The report records each seat order, winner label, terminal reason, action
 count, and remaining stock. Checkpoint policies load lazily and must match the
 saved deck, hand, and sequence rules.
@@ -417,57 +450,96 @@ opponents, and random policy stay frozen.
 ```powershell
 New-Item -ItemType Directory -Force checkpoints
 Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
-.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --matches 128 --matches-per-round 16 --max-seconds 3600 --checkpoint-every 16
 .\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
 ```
 
 The state checkpoint is written only after a complete match. It contains the
-network, Adam state, replay, counters, opponent-pool identity, and random
+network, AdamW state, replay, counters, opponent-pool identity, and random
 number generator states. A pool refresh freezes the new snapshots and keeps
 the replay.
 
 League training defaults to two, three, and four players. Counts cycle
 deterministically. Challenger seats cycle independently within each count.
-`--players 2 3 4` selects the counts explicitly. Replay samples a count first,
-then an episode and decision within that count. Checkpoints retain both
+`--players 2 3 4` selects the counts explicitly. `TrajectoryReplay` samples
+decisions uniformly within each count, rather than sampling episodes first.
+Checkpoints retain both
 schedule cursors. Resume preserves saved settings unless you supply a matching
 explicit setting.
 
 `--max-turns` sets the per-seat turn budget and defaults to 60.
-`--batch-size` caps replay samples per optimizer update and defaults to 64.
+`--batch-size` caps replay samples per optimizer update and defaults to 128.
 `--updates-per-match` sets updates after a match with challenger actions and defaults to 4.
+`--matches-per-round` batches up to 16 deals by default.
+`--learning-rate` defaults to 0.0003.
+`--epsilon-start`, `--epsilon-end`, and `--epsilon-decay-matches` default to 0.2, 0.05, and 10000.
 On resume, omit these options to restore their saved values, or supply the same values.
 Changed values for these options, `--players`, or `--seed` fail before checkpoint publication.
 Player counts must be sorted and distinct.
 
+`OpponentScheduler` uses prioritized fictitious self-play, or PFSP.
+It weights other frozen opponents by `(1 - p)^2`, where `p` is the smoothed pairwise placement score.
+The default schedule reserves 35% for the champion and 15% for available baseline and random opponents.
+The remaining share favors opponents the challenger places below.
+
 ### Run finite improvement cycles
 
-`src.cli.improve` alternates league matches and independent research episodes. It
-then evaluates both candidates against the frozen champion.
+`ImprovementController` v4 trains one league challenger per cycle.
+It evaluates that challenger against a frozen champion, then confirms a passing result on fresh seeds.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.improve --initial-model runs\full21\latest-model.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1
-.\.venv\Scripts\python -m src.cli.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600
+.\.venv\Scripts\python -m src.cli.improve --initial-model runs\full21\latest-model.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1 --matches-per-round 16 --workers 4
+.\.venv\Scripts\python -m src.cli.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600 --workers 2
 ```
 
 `champion.json` is the only champion authority. Model snapshots are immutable.
-Selection uses at least 32 independent seed blocks per player count.
-Confirmation uses a fresh bank of at least 128 blocks per count and confirms
-only the selected nominee. Four-player evaluation uses all 24 seat permutations.
-Promotion requires positive lower 95% confidence bounds for each count,
-an aggregate gain of at least 0.05, and 256 paired solo retention games.
+The controller follows champion lineage at cycle boundaries.
+Self-promotion preserves weights, AdamW moments, and replay.
+An external champion change reloads its weights and resets the optimizer.
+Eight consecutive rejections trigger the same rebase by default.
+Replay and random streams survive a rebase.
+
+Without verified solo mastery, finetuning defaults to learning rate 0.0001 and epsilon 0.08 to 0.02.
+Verified ordinary full21 win rate of at least 0.95 selects learning rate 0.00002 and epsilon 0.04 to 0.01.
+The controller reads matching `final-best.json` evidence beside the initial model.
+`--learning-rate`, `--epsilon-start`, and `--epsilon-end` override those defaults.
+`--epsilon-decay-matches` defaults to 10000.
+Resume uses the saved `LeagueConfig` and rejects changed finetune settings in both spaced and `=` argument forms.
+
+`evaluate_gate` writes `gate_schema_version == 4` evidence.
+`--selection-blocks 32` produces 128 two-player, 64 three-player, and 32 four-player blocks.
+`--confirmation-blocks 128` produces 512, 256, and 128 blocks respectively.
+Each block batches all 2, 6, or 24 seat orders in one `run_matches` call.
+Placement margins count better loser placements even when another seat declares.
+Declaration margins remain a separate retention check.
+Each base block shares seeds `seed + 4 * base_block + replica` across active counts.
+The gate averages replicas within each count, gives counts equal weight, and bootstraps whole joint base blocks.
+
+Selection screens mean gains at 32 base blocks.
+Confirmation requires a positive aggregate placement gain and lower 95% bound at 128 base blocks.
+Per-count placement, declaration, and paired solo checks allow bounded noninferiority.
+Both phases still require at least 256 paired solo games through `--solo-games`.
+Evidence includes `phase`, `gate_failures`, and `declaration_ci95`.
+See the [complete promotion limits](RATINGS.md#promotion-evidence-stays-separate).
 Reduced-cap or undersized smoke evidence cannot promote.
+The registry recomputes these metrics from raw margins and requires disjoint selection and confirmation seeds.
+
+`--workers` defaults to 1 and controls gate processes, not the training algorithm.
+Workers load their own frozen policies once and use one PyTorch thread.
+Only the coordinator appends completed jobs to `gates/<gate_id>.jsonl`.
+Resume skips valid completed jobs and reconstructs evidence in block and solo-slice order.
+Changing `--workers`, `--checkpoint-every`, or `--max-cycles` on resume does not change gate results.
 Training updates are stochastic and are
 not an atomic group, so published metrics need not improve monotonically.
 `status.json` is written last and describes the stable published snapshot.
 
-New current runs require fresh weights. Old champion conversion and rule
-migration commands are removed. Use a new output directory rather than resume
-an incompatible historical run.
+Existing v4 model weights can start a fresh run.
+Old champion conversion and rule migration commands remain removed.
+Use a new output directory rather than resume an incompatible replay or controller state.
 
 ## Verification
 
-From the repository root, the standard-library test command is:
+Run these checks from the repository root.
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -476,10 +548,12 @@ node --test tests\*.test.mjs
 .\.venv\Scripts\python tools\verify_dynamic_model.py --output-dir "$env:TEMP\papplu-dynamic-verification"
 ```
 
-The dynamic verification script creates a timestamped output directory.
+`tools/verify_dynamic_model.py` creates a timestamped output directory.
 It runs legal full 21-card, 60-turn games for two, three, and four players.
 It also checks bounded training, exact resume, current snapshots, and a
-persisted tournament with restart and reporting. `evidence.json` records the
+persisted tournament with restart and reporting.
+It compares gate evidence across worker counts and reuses the gate journal.
+`evidence.json` records the
 commands, exit codes, output paths, and strength limitations.
 The shorter lifecycle games use explicit one-turn caps, not promotion evidence.
 

@@ -31,18 +31,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=128,
     )
-    parser.add_argument(
-        "--research-episodes",
-        "--research-episodes-per-cycle",
-        dest="research_episodes_per_cycle",
-        type=int,
-        default=128,
-    )
+    parser.add_argument("--rebase-after-rejections", type=int, default=8)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--selection-blocks", type=int, default=32)
     parser.add_argument("--confirmation-blocks", type=int, default=128)
     parser.add_argument("--solo-games", type=int, default=256)
     parser.add_argument("--checkpoint-every", type=int, default=16)
+    parser.add_argument("--matches-per-round", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--epsilon-start", type=float, default=None)
+    parser.add_argument("--epsilon-end", type=float, default=None)
+    parser.add_argument("--epsilon-decay-matches", type=int, default=None)
     parser.add_argument(
         "--max-turns", type=int, default=60,
         help="Explicit per-player cap. Reduced-cap smoke runs cannot promote.",
@@ -93,16 +93,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 config=runtime.ImproveConfig(
                     max_cycles=args.max_cycles,
                     league_matches_per_cycle=args.league_matches_per_cycle,
-                    research_episodes_per_cycle=args.research_episodes_per_cycle,
+                    rebase_after_rejections=args.rebase_after_rejections,
                     seed=args.seed,
                     selection_blocks=args.selection_blocks,
                     confirmation_blocks=args.confirmation_blocks,
                     solo_games=args.solo_games,
                     checkpoint_every=args.checkpoint_every,
+                    matches_per_round=args.matches_per_round,
+                    gate_workers=args.workers,
                     max_turns=args.max_turns,
                     player_counts=(2, 3, 4) if args.players is None else tuple(args.players),
                 ),
                 snapshots_dir=args.snapshots,
+                learning_rate=args.learning_rate,
+                epsilon_start=args.epsilon_start,
+                epsilon_end=args.epsilon_end,
+                epsilon_decay_matches=args.epsilon_decay_matches,
             )
         reason = controller.run(
             args.max_seconds,
@@ -115,8 +121,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "cycle": controller.cycle_index,
                     "champion_id": controller.registry.champion().id,
                     "league_matches": controller.league.completed_matches,
-                    "research_episodes": controller.research.total_episodes,
                     "promotions": controller.promotions,
+                    "consecutive_rejections": controller.consecutive_rejections,
                 },
                 sort_keys=True,
             ),
@@ -144,17 +150,21 @@ def _validate_resume_options(
     learning_options = {
         "--league-matches": "league_matches_per_cycle",
         "--league-matches-per-cycle": "league_matches_per_cycle",
-        "--research-episodes": "research_episodes_per_cycle",
-        "--research-episodes-per-cycle": "research_episodes_per_cycle",
+        "--rebase-after-rejections": "rebase_after_rejections",
         "--selection-blocks": "selection_blocks",
         "--confirmation-blocks": "confirmation_blocks",
         "--solo-games": "solo_games",
         "--seed": "seed",
         "--max-turns": "max_turns",
+        "--matches-per-round": "matches_per_round",
     }
     for option, field in learning_options.items():
         if option in explicit and getattr(args, field) != getattr(controller.config, field):
             raise ValueError("Resume cannot change %s" % option)
+    for field in ("learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_matches"):
+        value = getattr(args, field)
+        if value is not None and value != getattr(controller.league.config, field):
+            raise ValueError("Resume cannot change --%s" % field.replace("_", "-"))
     if "--players" in explicit and tuple(args.players) != controller.config.player_counts:
         raise ValueError("Resume cannot change --players")
     for path in args.opponent:
@@ -186,6 +196,9 @@ def _validate_resume_options(
             minimum=1,
         )
         changes["checkpoint_every"] = args.checkpoint_every
+    if "--workers" in explicit:
+        runtime.require_checkpoint_int(args.workers, "gate_workers", minimum=1)
+        changes["gate_workers"] = args.workers
     if changes:
         controller.config = replace(controller.config, **changes)
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from dataclasses import asdict
 import hashlib
 import itertools
@@ -8,7 +7,6 @@ import json
 from pathlib import Path
 import random
 import sys
-from typing import Optional, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +15,9 @@ sys.path.insert(0, str(ROOT))
 
 from src.evaluate import (
     NUM_FACES, SCORING_VERSION, evaluate_hand, hand_reward, is_valid_hand, minimum_penalty,
+    pure_sequence_upper_bound,
 )
+from src.game.lookahead import can_declare_ub, winning_discard
 
 
 OUTPUT = ROOT / "tests" / "fixtures" / "evaluate-parity.json"
@@ -26,25 +26,7 @@ RANDOM_CASES = 400
 NEAR_WIN_CASES = 200
 SUITS = "shdc"
 RANKS = ("A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K")
-SOURCES = ("src/evaluate.py", "src/model/search.py", "tools/export_parity_fixtures.py")
-
-
-def load_search_functions():
-    path = ROOT / "src" / "model" / "search.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
-    names = {"can_declare_ub", "winning_discard"}
-    definitions = [
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names
-    ]
-    if {node.name for node in definitions} != names:
-        raise RuntimeError("search parity functions are missing")
-    namespace = {"is_valid_hand": is_valid_hand, "Sequence": Sequence, "Optional": Optional}
-    module = ast.Module(body=definitions, type_ignores=[])
-    exec(compile(module, str(path), "exec"), namespace)
-    return namespace["can_declare_ub"], namespace["winning_discard"]
-
-
-can_declare_ub, winning_discard = load_search_functions()
+SOURCES = ("src/evaluate.py", "src/game/lookahead.py", "tools/export_parity_fixtures.py")
 
 
 def face(name):
@@ -85,6 +67,7 @@ def parity_case(name, group, hand, joker, required=5, size=21):
         entry["is_valid_hand"] = is_valid_hand(hand, joker, required, size)
         entry["hand_reward"] = hand_reward(hand, joker, required, size)
     if "errors" not in entry:
+        entry["pure_sequence_upper_bound"] = pure_sequence_upper_bound(hand, joker)
         entry["can_declare_ub"] = can_declare_ub(hand, joker, required)
         entry["winning_discard"] = winning_discard(hand, joker, required, size)
     return entry

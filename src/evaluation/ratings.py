@@ -19,10 +19,10 @@ from src.checkpoints.io import atomic_write_json
 from src.evaluate import SCORING_VERSION, validate_hand_penalty
 from src.game.environment import ENCODING_VERSION, GameConfig
 from src.game.multiplayer import MatchConfig
+from src.game.outcome import CAP_POLICIES, placements
 
 
 OPEN_SKILL_VERSION = "6.2.0"
-CAP_POLICIES = ("undecided", "points", "weighted-points", "tie", "exclude")
 APPLICATION_ID = 0x50415052
 SCHEMA_VERSION = 1
 RATING_PARAMETERS = {
@@ -55,30 +55,6 @@ def _decode_job(row: sqlite3.Row) -> dict:
         "participants": json.loads(row["participants"]), "seat_order": json.loads(row["seat_order"]),
         "config": json.loads(row["config"]), "raw": raw,
     }
-
-
-def placements(points: Sequence[int], winner: Optional[int], ending: str, cap_policy: str) -> Optional[tuple[int, ...]]:
-    if cap_policy not in CAP_POLICIES:
-        raise ValueError("unknown cap policy")
-    if len(points) < 2 or any(type(point) is not int or point < 0 for point in points):
-        raise ValueError("penalties must contain nonnegative integer points for every player")
-    if ending == "win":
-        if type(winner) is not int or not 0 <= winner < len(points) or points[winner] != 0:
-            raise ValueError("a declaration needs a winning seat with zero penalty")
-        return tuple(
-            1 if seat == winner else 2 + sum(
-                other != winner and points[other] < mine
-                for other in range(len(points))
-            )
-            for seat, mine in enumerate(points)
-        )
-    if ending != "turns_exhausted" or winner is not None:
-        raise ValueError("only completed declarations and draw-limit endings have placements")
-    if cap_policy in ("points", "weighted-points"):
-        return tuple(1 + sum(other < mine for other in points) for mine in points)
-    if cap_policy == "tie":
-        return (1,) * len(points)
-    return None
 
 
 class RatingStore:

@@ -28,42 +28,53 @@ from src.checkpoints.tensor import atomic_torch_save
 from src.evaluation.arena import MatchInterrupted
 from src.evaluation.promotion import GateInterrupted, evaluate_gate
 from src.game.environment import ENCODING_VERSION, GameConfig
-from src.model.network import CHECKPOINT_VERSION, build_checkpoint
+from src.model.network import CHECKPOINT_VERSION
 from src.model.spec import ARCHITECTURE
-from src.training.core import TerminalShaping
 from src.training.league import LeagueConfig, LeagueSession, RANDOM_OPPONENT
-from src.training.curriculum import (
-    STATUS_SCHEMA_VERSION,
-    TrainingConfig,
-    TrainingSession,
-)
+from src.training.curriculum_io import STATUS_SCHEMA_VERSION
 
 
-IMPROVEMENT_STATE_VERSION = 2
-ALGORITHM = "champion_league_mc"
+IMPROVEMENT_STATE_VERSION = 4
+ALGORITHM = "champion_league_nstep_ddqn"
 PHASES = ("training", "selection", "confirmation")
-LEAGUE_FINETUNE_LR = 2e-5
-LEAGUE_FINETUNE_EPSILON_START = 0.04
-LEAGUE_FINETUNE_EPSILON_END = 0.01
-RESEARCH_FINETUNE_LR = 2e-5
-RESEARCH_FINETUNE_EPSILON_START = 0.04
-RESEARCH_FINETUNE_EPSILON_END = 0.01
-DEFAULT_IMPROVE_SHAPING = TerminalShaping(speed=0.35, margin=0.25)
+
+
+@dataclass(frozen=True)
+class FinetuneSchedule:
+    learning_rate: float = 1e-4
+    epsilon_start: float = 0.08
+    epsilon_end: float = 0.02
+
+    def __post_init__(self) -> None:
+        if type(self.learning_rate) not in (int, float) or not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("learning_rate must be finite and positive")
+        for name in ("epsilon_start", "epsilon_end"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError("%s must be in [0, 1]" % name)
+        if self.epsilon_end > self.epsilon_start:
+            raise ValueError("epsilon_end cannot exceed epsilon_start")
+
+    @classmethod
+    def for_solo_win_rate(cls, win_rate: Optional[float]) -> "FinetuneSchedule":
+        return cls(2e-5, 0.04, 0.01) if win_rate is not None and win_rate >= 0.95 else cls()
 
 
 @dataclass(frozen=True)
 class ImproveConfig:
     max_cycles: int = 64
     league_matches_per_cycle: int = 128
-    research_episodes_per_cycle: int = 128
+    rebase_after_rejections: int = 8
     seed: int = 41
     selection_blocks: int = evidence.MIN_SELECTION_SEED_BLOCKS
     confirmation_blocks: int = evidence.MIN_CONFIRMATION_SEED_BLOCKS
     solo_games: int = evidence.MIN_SOLO_GAMES
     checkpoint_every: int = 16
+    matches_per_round: int = 16
     max_turns: int = 60
     player_counts: Tuple[int, ...] = (2, 3, 4)
     gate_samples: int = 2_000
+    gate_workers: int = 1
     recycle_discard: bool = True
 
     def __post_init__(self) -> None:
@@ -72,13 +83,15 @@ class ImproveConfig:
         for name in (
             "max_cycles",
             "league_matches_per_cycle",
-            "research_episodes_per_cycle",
+            "rebase_after_rejections",
             "selection_blocks",
             "confirmation_blocks",
             "solo_games",
             "checkpoint_every",
+            "matches_per_round",
             "max_turns",
             "gate_samples",
+            "gate_workers",
         ):
             require_checkpoint_int(getattr(self, name), name, minimum=1)
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
@@ -108,6 +121,12 @@ class ImprovementController:
         opponent_paths: Sequence[str] = (),
         config: Optional[ImproveConfig] = None,
         snapshots_dir: Optional[Path] = None,
+        finetune: Optional[FinetuneSchedule] = None,
+        *,
+        learning_rate: Optional[float] = None,
+        epsilon_start: Optional[float] = None,
+        epsilon_end: Optional[float] = None,
+        epsilon_decay_matches: Optional[int] = None,
     ) -> None:
         self.config = ImproveConfig() if config is None else config
         self.snapshots_dir = None if snapshots_dir is None else Path(snapshots_dir)
@@ -143,38 +162,36 @@ class ImprovementController:
 
         baseline_path = str(self.registry.model_path(self.baseline_id))
         league_paths = self._opponent_paths()
+        schedule = finetune if finetune is not None else FinetuneSchedule.for_solo_win_rate(
+            initial_evidence.get("current_solo_reference", {}).get("win_rate"),
+        )
+        league_settings = asdict(schedule)
+        for name, value in (
+            ("learning_rate", learning_rate), ("epsilon_start", epsilon_start),
+            ("epsilon_end", epsilon_end), ("epsilon_decay_matches", epsilon_decay_matches),
+        ):
+            if value is not None:
+                league_settings[name] = value
         self.league = LeagueSession(
             baseline_path,
             league_paths,
             config=LeagueConfig(
                 game=GameConfig(max_turns=self.config.max_turns, recycle_discard=self.config.recycle_discard),
                 player_counts=self.config.player_counts,
-                learning_rate=LEAGUE_FINETUNE_LR,
-                epsilon_start=LEAGUE_FINETUNE_EPSILON_START,
-                epsilon_end=LEAGUE_FINETUNE_EPSILON_END,
-                shaping=DEFAULT_IMPROVE_SHAPING,
+                matches_per_round=self.config.matches_per_round,
+                **league_settings,
             ),
             seed=self.config.seed,
         )
         self._ingest_snapshots()
-        self.research = TrainingSession(
-            config=_research_config(self.config),
-            seed=self.config.seed + 1,
-            initial_model=baseline_path,
-            initial_stage_index=2,
-        )
-
         self.cycle_index = 0
         self.phase = "training"
         self.league_in_cycle = 0
-        self.research_in_cycle = 0
-        self.next_learner = "league"
-        self.candidate_ids: Dict[str, str] = {}
-        self.selection_results: Dict[str, Dict[str, Any]] = {}
-        self.nominee_origin: Optional[str] = None
-        self.nominee_id: Optional[str] = None
+        self.candidate_id: Optional[str] = None
+        self.selection_result: Optional[Dict[str, Any]] = None
         self.confirmation_result: Optional[Dict[str, Any]] = None
         self.champion_at_cycle_id: Optional[str] = None
+        self.consecutive_rejections = 0
         self.promotions = 0
         self.promoted_cycles: Tuple[int, ...] = ()
         self.last_gate: Optional[Dict[str, Any]] = None
@@ -191,6 +208,12 @@ class ImprovementController:
         snapshots_dir: Optional[Path] = None,
     ) -> "ImprovementController":
         payload = torch.load(path, map_location="cpu", weights_only=True)
+        if (
+            not isinstance(payload, dict)
+            or type(payload.get("improvement_state_version")) is not int
+            or payload["improvement_state_version"] != IMPROVEMENT_STATE_VERSION
+        ):
+            raise ValueError("improvement checkpoint version is incompatible; expected version 4; warm-start with --initial-model")
         required = {
             "improvement_state_version",
             "encoding_version",
@@ -204,15 +227,13 @@ class ImprovementController:
             "evaluation",
             "promotions",
             "promoted_cycles",
+            "consecutive_rejections",
             "last_gate",
             "best_score",
             "league_state",
-            "research_state",
         }
-        if not isinstance(payload, dict) or set(payload) != required:
+        if set(payload) != required:
             raise ValueError("improvement checkpoint fields do not match controller")
-        if payload["improvement_state_version"] != IMPROVEMENT_STATE_VERSION:
-            raise ValueError("improvement checkpoint version is incompatible")
         if payload["encoding_version"] != ENCODING_VERSION:
             raise ValueError("improvement checkpoint encoding is incompatible")
         if payload["algorithm"] != ALGORITHM:
@@ -250,7 +271,7 @@ class ImprovementController:
             raise ValueError("improvement phase is invalid")
         cursors = require_checkpoint_fields(
             payload["cursors"],
-            {"league", "research", "next_learner"},
+            {"league"},
             "cursors",
         )
         controller.league_in_cycle = require_checkpoint_int(
@@ -258,39 +279,22 @@ class ImprovementController:
             "league cursor",
             minimum=0,
         )
-        controller.research_in_cycle = require_checkpoint_int(
-            cursors["research"],
-            "research cursor",
-            minimum=0,
-        )
-        controller.next_learner = cursors["next_learner"]
-        if controller.next_learner not in ("league", "research"):
-            raise ValueError("next_learner is invalid")
-
         evaluation = require_checkpoint_fields(
             payload["evaluation"],
             {
-                "candidate_ids",
-                "selection_results",
-                "nominee_origin",
-                "nominee_id",
+                "candidate_id",
+                "selection_result",
                 "confirmation_result",
                 "champion_at_cycle_id",
                 "pending_gate_seed",
             },
             "evaluation",
         )
-        controller.candidate_ids = _string_dict(
-            evaluation["candidate_ids"], "candidate_ids"
+        controller.candidate_id = _optional_string(
+            evaluation["candidate_id"], "candidate_id"
         )
-        controller.selection_results = _mapping_dict(
-            evaluation["selection_results"], "selection_results"
-        )
-        controller.nominee_origin = _optional_string(
-            evaluation["nominee_origin"], "nominee_origin"
-        )
-        controller.nominee_id = _optional_string(
-            evaluation["nominee_id"], "nominee_id"
+        controller.selection_result = _optional_dict(
+            evaluation["selection_result"], "selection_result"
         )
         controller.confirmation_result = _optional_dict(
             evaluation["confirmation_result"], "confirmation_result"
@@ -314,6 +318,11 @@ class ImprovementController:
         ):
             raise ValueError("promoted_cycles is invalid")
         controller.promoted_cycles = raw_promoted
+        controller.consecutive_rejections = require_checkpoint_int(
+            payload["consecutive_rejections"],
+            "consecutive_rejections",
+            minimum=0,
+        )
         controller.last_gate = _optional_dict(payload["last_gate"], "last_gate")
         score = payload["best_score"]
         if score is not None and (
@@ -325,21 +334,20 @@ class ImprovementController:
             raise ValueError("best_score is invalid")
         controller.best_score = None if score is None else float(score)
 
-        baseline_path = str(controller.registry.model_path(controller.baseline_id))
+        parent_id = _record_id(
+            payload["league_state"]["parent_sha256"], "parent_sha256",
+        )[:20]
+        parent_path = str(controller.registry.model_path(parent_id))
         league_config = LeagueConfig.from_dict(
             payload["league_state"]["league_config"]
         )
         controller.league = LeagueSession(
-            baseline_path,
+            parent_path,
             controller._opponent_paths(),
             config=league_config,
             seed=payload["league_state"]["initial_seed"],
         )
         controller.league.load_state_dict(payload["league_state"])
-        controller.research = TrainingSession.from_state_dict(
-            payload["research_state"],
-            expected_config=_research_config(controller.config),
-        )
         controller._validate_cursors()
         controller._reconcile_promotion()
         return controller
@@ -365,24 +373,20 @@ class ImprovementController:
             "phase": self.phase,
             "cursors": {
                 "league": self.league_in_cycle,
-                "research": self.research_in_cycle,
-                "next_learner": self.next_learner,
             },
             "evaluation": {
-                "candidate_ids": dict(self.candidate_ids),
-                "selection_results": dict(self.selection_results),
-                "nominee_origin": self.nominee_origin,
-                "nominee_id": self.nominee_id,
+                "candidate_id": self.candidate_id,
+                "selection_result": self.selection_result,
                 "confirmation_result": self.confirmation_result,
                 "champion_at_cycle_id": self.champion_at_cycle_id,
                 "pending_gate_seed": self.pending_gate_seed,
             },
             "promotions": self.promotions,
             "promoted_cycles": self.promoted_cycles,
+            "consecutive_rejections": self.consecutive_rejections,
             "last_gate": self.last_gate,
             "best_score": self.best_score,
             "league_state": self.league.state_dict(),
-            "research_state": self.research.state_dict(),
         }
 
     def run(
@@ -419,26 +423,35 @@ class ImprovementController:
             return True
         if started is None:
             started = time.monotonic()
-        if self.phase == "training":
-            if (
-                self.league_in_cycle == 0
-                and self.research_in_cycle == 0
-                and self._ingest_snapshots()
-            ):
+        if self.phase in ("selection", "confirmation"):
+            self._reconcile_promotion()
+            if self.phase == "training":
                 self.save_checkpoint("running", None, started)
+                return True
+        if self.phase == "training":
+            if self.league_in_cycle == 0:
+                champion = self.registry.champion()
+                parent_sha256 = self.league.parent_sha256
+                rebased = self.league.follow_champion(
+                    str(self.registry.model_path(champion.id)),
+                )
+                if rebased:
+                    self.consecutive_rejections = 0
+                lineage_changed = self.league.parent_sha256 != parent_sha256
+                if lineage_changed or rebased:
+                    self.league.refresh_opponent_pool(self._opponent_paths())
+                if self._ingest_snapshots() or lineage_changed or rebased:
+                    self.save_checkpoint("running", None, started)
             progressed = self._training_step(deadline)
             if not progressed:
                 return False
             if self._training_complete():
-                self._prepare_candidates()
+                self._prepare_candidate()
                 self.save_checkpoint("running", None, started)
-            elif (
-                self.league_in_cycle + self.research_in_cycle
-            ) % self.config.checkpoint_every == 0:
+            elif self.league_in_cycle % self.config.checkpoint_every == 0:
                 self.save_checkpoint("running", None, started)
             return True
         if self.phase == "selection":
-            self.save_checkpoint("running", None, started)
             try:
                 self._selection_step(deadline)
             except (GateInterrupted, MatchInterrupted, TimeoutError):
@@ -446,9 +459,8 @@ class ImprovementController:
             self.save_checkpoint("running", None, started)
             return True
 
-        self.save_checkpoint("running", None, started)
         try:
-            self._confirmation_step(deadline)
+            self._confirmation_step(deadline, started)
         except (GateInterrupted, MatchInterrupted, TimeoutError):
             return False
         self.save_checkpoint("running", None, started)
@@ -460,14 +472,17 @@ class ImprovementController:
         stop_reason: Optional[str] = None,
         started: Optional[float] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        if not self.league.at_match_boundary or not self.research.at_episode_boundary:
+        if not self.league.at_match_boundary:
             raise RuntimeError("cannot checkpoint partial learner work")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "metrics.jsonl").touch(exist_ok=True)
         staged_state = self.output_dir / ".staged-latest-state.pt"
         staged_model = self.output_dir / ".staged-latest-model.pt"
+        if self.candidate_id is None:
+            self.league.export_model(staged_model)
+        else:
+            atomic_copy(self.registry.model_path(self.candidate_id), staged_model)
         atomic_torch_save(self.state_dict(), staged_state)
-        self.league.export_model(staged_model)
         os.replace(str(staged_state), str(self.output_dir / "latest-state.pt"))
         os.replace(str(staged_model), str(self.output_dir / "latest-model.pt"))
         atomic_copy(
@@ -494,60 +509,29 @@ class ImprovementController:
         return files
 
     def _training_step(self, deadline: float) -> bool:
-        can_league = (
-            self.league_in_cycle < self.config.league_matches_per_cycle
-        )
-        can_research = (
-            self.research_in_cycle < self.config.research_episodes_per_cycle
-        )
-        if not can_league and not can_research:
+        if self._training_complete():
             return True
-        learner = self.next_learner
-        if learner == "league" and not can_league:
-            learner = "research"
-        elif learner == "research" and not can_research:
-            learner = "league"
-        if learner == "league":
-            try:
-                result = self.league.train_match(deadline=deadline)
-            except MatchInterrupted:
-                return False
+        remaining = self.config.league_matches_per_cycle - self.league_in_cycle
+        until_checkpoint = self.config.checkpoint_every - self.league_in_cycle % self.config.checkpoint_every
+        try:
+            results = self.league.train_round(
+                min(self.config.matches_per_round, until_checkpoint, remaining), deadline=deadline,
+            )
+        except MatchInterrupted:
+            return False
+        for result in results:
             self.league_in_cycle += 1
-            self.next_learner = "research"
             _append_metric_once(
                 self.output_dir,
-                "cycle-%d-league-%d"
-                % (self.cycle_index, self.league_in_cycle),
-                {
-                    "event": "league_match",
-                    "cycle": self.cycle_index,
-                    **result,
-                },
+                "cycle-%d-league-%d" % (self.cycle_index, self.league_in_cycle),
+                {"event": "league_match", "cycle": self.cycle_index, **result},
                 self.metric_ids,
             )
-            return True
-        result = self.research.run_episode(deadline=deadline)
-        if result is None:
-            return False
-        self.research_in_cycle += 1
-        self.next_learner = "league"
-        _append_metric_once(
-            self.output_dir,
-            "cycle-%d-research-%d"
-            % (self.cycle_index, self.research_in_cycle),
-            {
-                "event": "research_episode",
-                "cycle": self.cycle_index,
-                **result,
-            },
-            self.metric_ids,
-        )
         return True
 
-    def _prepare_candidates(self) -> None:
+    def _prepare_candidate(self) -> None:
         champion = self.registry.champion()
         self.champion_at_cycle_id = champion.id
-        candidates = {}
         temporary = self.output_dir / ".league-candidate.pt"
         try:
             self.league.export_model(temporary, role="candidate")
@@ -561,107 +545,59 @@ class ImprovementController:
                 },
                 parents=(champion.id,),
             )
-            candidates["league"] = record.id
+            self.candidate_id = record.id
         finally:
             temporary.unlink(missing_ok=True)
 
-        temporary = self.output_dir / ".research-candidate.pt"
-        try:
-            atomic_torch_save(
-                _research_model_payload(self.research, self.cycle_index),
-                temporary,
-            )
-            record = self.registry.register(
-                str(temporary),
-                origin="research",
-                evidence={
-                    "cycle": self.cycle_index,
-                    "episodes": self.research.total_episodes,
-                    "updates": self.research.total_updates,
-                },
-                parents=(champion.id,),
-            )
-            candidates["research"] = record.id
-        finally:
-            temporary.unlink(missing_ok=True)
-
-        self.candidate_ids = candidates
-        self.selection_results = {}
-        self.nominee_origin = None
-        self.nominee_id = None
+        self.selection_result = None
         self.confirmation_result = None
         self.phase = "selection"
 
-    def _selection_step(self, deadline: Optional[float] = None) -> None:
+    def _run_gate(self, phase: str, deadline: Optional[float]) -> Dict[str, Any]:
         champion = self.registry.get(self.champion_at_cycle_id)
-        for origin in ("league", "research"):
-            if origin in self.selection_results:
-                continue
-            candidate_id = self.candidate_ids[origin]
-            result = evaluate_gate(
-                candidate_path=str(self.registry.model_path(candidate_id)),
-                champion_path=str(self.registry.model_path(champion.id)),
-                opponent_paths=self._gate_opponent_paths(champion.id),
-                seed=self.pending_gate_seed,
-                seed_blocks=self.config.selection_blocks,
-                solo_games=self.config.solo_games,
-                max_turns=self.config.max_turns,
-                player_counts=self.config.player_counts,
-                samples=self.config.gate_samples,
-                deadline=deadline,
-                recycle_discard=self.config.recycle_discard,
-            )
-            checked = _gate_result(result, "selection")
-            self.selection_results[origin] = checked
-            self.last_gate = checked
-            _append_metric_once(
-                self.output_dir,
-                "cycle-%d-selection-%s" % (self.cycle_index, origin),
-                {
-                    "event": "gate",
-                    "cycle": self.cycle_index,
-                    "candidate_origin": origin,
-                    **checked,
-                },
-                self.metric_ids,
-            )
-            return
-
-        eligible = [
-            origin
-            for origin, result in self.selection_results.items()
-            if result["accepted"]
-        ]
-        if not eligible:
-            self._finish_cycle(promoted=False)
-            return
-        self.nominee_origin = max(
-            eligible,
-            key=lambda origin: (
-                _gate_score(self.selection_results[origin]),
-                origin == "league",
-            ),
+        result = evaluate_gate(
+            candidate_path=str(self.registry.model_path(self.candidate_id)),
+            champion_path=str(self.registry.model_path(champion.id)),
+            opponent_paths=self._gate_opponent_paths(champion.id),
+            seed=self.pending_gate_seed,
+            seed_blocks=self.config.selection_blocks if phase == "selection" else self.config.confirmation_blocks,
+            solo_games=self.config.solo_games,
+            max_turns=self.config.max_turns,
+            player_counts=self.config.player_counts,
+            samples=self.config.gate_samples,
+            deadline=deadline,
+            recycle_discard=self.config.recycle_discard,
+            workers=self.config.gate_workers,
+            journal_dir=self.output_dir / "gates",
+            phase=phase,
         )
-        self.nominee_id = self.candidate_ids[self.nominee_origin]
-        self.phase = "confirmation"
+        return _gate_result(result, phase)
 
-    def _confirmation_step(self, deadline: Optional[float] = None) -> None:
+    def _selection_step(self, deadline: Optional[float] = None) -> None:
+        checked = self._run_gate("selection", deadline)
+        self.selection_result = checked
+        self.last_gate = checked
+        _append_metric_once(
+            self.output_dir,
+            "cycle-%d-selection" % self.cycle_index,
+            {
+                "event": "gate",
+                "cycle": self.cycle_index,
+                **checked,
+            },
+            self.metric_ids,
+        )
+        if checked["accepted"]:
+            self.phase = "confirmation"
+        else:
+            self._reject_cycle()
+
+    def _confirmation_step(
+        self, deadline: Optional[float] = None, started: Optional[float] = None,
+    ) -> None:
         champion = self.registry.get(self.champion_at_cycle_id)
         if self.confirmation_result is None:
-            result = evaluate_gate(
-                candidate_path=str(self.registry.model_path(self.nominee_id)),
-                champion_path=str(self.registry.model_path(champion.id)),
-                opponent_paths=self._gate_opponent_paths(champion.id),
-                seed=self.pending_gate_seed,
-                seed_blocks=self.config.confirmation_blocks,
-                solo_games=self.config.solo_games,
-                max_turns=self.config.max_turns,
-                player_counts=self.config.player_counts,
-                samples=self.config.gate_samples,
-                deadline=deadline,
-                recycle_discard=self.config.recycle_discard,
-            )
-            checked = _gate_result(result, "confirmation")
+            checked = self._run_gate("confirmation", deadline)
             checked["selection_passed"] = True
             self.confirmation_result = checked
             self.last_gate = checked
@@ -671,50 +607,47 @@ class ImprovementController:
                 {
                     "event": "gate",
                     "cycle": self.cycle_index,
-                    "candidate_origin": self.nominee_origin,
                     **checked,
                 },
                 self.metric_ids,
             )
-            return
+            if checked["accepted"]:
+                self.save_checkpoint("running", None, started)
 
         promoted = bool(self.confirmation_result["accepted"])
         if promoted:
             current = self.registry.champion()
             if current.id != champion.id:
-                if current.id == self.nominee_id:
-                    self._record_promotion()
-                    self._finish_cycle(promoted=True)
-                    return
-                raise RuntimeError("champion changed outside this controller")
+                self._reconcile_promotion()
+                return
             evidence = {
                 **self.confirmation_result,
                 "phase": "confirmation",
                 "selection_passed": True,
                 "accepted": True,
-                "selection": self.selection_results[self.nominee_origin],
+                "selection": self.selection_result,
                 "cycle": self.cycle_index,
-                "candidate_origin": self.nominee_origin,
-                "selection_seed": self.selection_results[
-                    self.nominee_origin
-                ]["seed"],
+                "candidate_origin": "league",
+                "selection_seed": self.selection_result["seed"],
                 "expected_champion_id": champion.id,
                 "expected_champion_sha256": champion.sha256,
             }
             self.registry.promote(
-                self.nominee_id,
+                self.candidate_id,
                 expected_id=champion.id,
                 evidence=evidence,
                 player_counts=self.config.player_counts,
             )
             self._record_promotion()
-        self._finish_cycle(promoted=promoted)
+            self._finish_cycle(promoted=True)
+        else:
+            self._reject_cycle()
 
     def _record_promotion(self) -> None:
         if self.cycle_index not in self.promoted_cycles:
             self.promoted_cycles = (*self.promoted_cycles, self.cycle_index)
             self.promotions += 1
-            solo = self.confirmation_result.get("solo", {})
+            solo = (self.confirmation_result or {}).get("solo", {})
             games = solo.get("games")
             wins = solo.get("candidate_wins")
             if (
@@ -727,24 +660,35 @@ class ImprovementController:
                 self.best_score = float(wins) / games
 
     def _finish_cycle(self, promoted: bool) -> None:
-        if promoted and self.nominee_id is not None:
+        if promoted:
+            self.consecutive_rejections = 0
+            self.league.follow_champion(
+                str(self.registry.model_path(self.candidate_id)),
+            )
             self.opponent_ids = _bounded_pool(
-                (*self.opponent_ids, self.nominee_id),
+                (*self.opponent_ids, self.candidate_id),
                 self.baseline_id,
             )
             self.league.refresh_opponent_pool(self._opponent_paths())
         self.cycle_index += 1
         self.phase = "training"
         self.league_in_cycle = 0
-        self.research_in_cycle = 0
-        self.next_learner = "league"
-        self.candidate_ids = {}
-        self.selection_results = {}
-        self.nominee_origin = None
-        self.nominee_id = None
+        self.candidate_id = None
+        self.selection_result = None
         self.confirmation_result = None
         self.champion_at_cycle_id = None
         self._ingest_snapshots()
+
+    def _reject_cycle(self) -> None:
+        self.consecutive_rejections += 1
+        if self.consecutive_rejections >= self.config.rebase_after_rejections:
+            champion = self.registry.champion()
+            self.league.follow_champion(
+                str(self.registry.model_path(champion.id)), force_rebase=True,
+            )
+            self.league.refresh_opponent_pool(self._opponent_paths())
+            self.consecutive_rejections = 0
+        self._finish_cycle(promoted=False)
 
     def _reconcile_promotion(self) -> None:
         current = self.registry.champion()
@@ -753,20 +697,15 @@ class ImprovementController:
                 return
             if (
                 self.phase == "confirmation"
-                and self.nominee_id is not None
-                and current.id == self.nominee_id
+                and current.id == self.candidate_id
             ):
                 self._record_promotion()
                 self._finish_cycle(promoted=True)
                 return
-            raise RuntimeError("champion pointer disagrees with controller state")
+            self._finish_cycle(promoted=False)
 
     def _training_complete(self) -> bool:
-        return (
-            self.league_in_cycle >= self.config.league_matches_per_cycle
-            and self.research_in_cycle
-            >= self.config.research_episodes_per_cycle
-        )
+        return self.league_in_cycle >= self.config.league_matches_per_cycle
 
     def _ingest_snapshots(self) -> bool:
         if self.snapshots_dir is None or not self.snapshots_dir.is_dir():
@@ -795,7 +734,6 @@ class ImprovementController:
         return tuple(
             str(self.registry.model_path(record_id))
             for record_id in self.opponent_ids
-            if record_id != self.baseline_id
         )
 
     def _gate_opponent_paths(self, champion_id: str) -> list[str]:
@@ -808,30 +746,22 @@ class ImprovementController:
     def _validate_cursors(self) -> None:
         if self.league_in_cycle > self.config.league_matches_per_cycle:
             raise ValueError("league cycle cursor exceeds configured work")
-        if self.research_in_cycle > self.config.research_episodes_per_cycle:
-            raise ValueError("research cycle cursor exceeds configured work")
         if self.phase != "training" and not self._training_complete():
             raise ValueError("evaluation phase requires complete training cursors")
         if self.phase == "training" and (
-            self.candidate_ids
-            or self.selection_results
-            or self.nominee_id is not None
+            self.candidate_id is not None
+            or self.selection_result is not None
+            or self.confirmation_result is not None
             or self.champion_at_cycle_id is not None
         ):
             raise ValueError("training phase cannot retain evaluation state")
         if self.phase in ("selection", "confirmation"):
-            if set(self.candidate_ids) != {"league", "research"}:
-                raise ValueError("evaluation phase requires both candidates")
-            if self.champion_at_cycle_id is None:
-                raise ValueError("evaluation phase requires a frozen champion")
+            if self.candidate_id is None or self.champion_at_cycle_id is None:
+                raise ValueError("evaluation phase requires a candidate and frozen champion")
         if self.phase == "confirmation" and (
-            self.nominee_origin not in ("league", "research")
-            or self.nominee_id != self.candidate_ids[self.nominee_origin]
-            or not self.selection_results.get(
-                self.nominee_origin, {}
-            ).get("accepted", False)
+            not (self.selection_result or {}).get("accepted", False)
         ):
-            raise ValueError("confirmation phase requires a selected nominee")
+            raise ValueError("confirmation phase requires a passed selection gate")
 
     def _status_payload(
         self,
@@ -847,13 +777,9 @@ class ImprovementController:
             "stop_reason": stop_reason,
             "elapsed_seconds": max(0.0, time.monotonic() - started),
             "completed_cycles": self.cycle_index,
-            "completed_episodes": (
-                self.league.completed_matches + self.research.total_episodes
-            ),
-            "cumulative_episodes": (
-                self.league.completed_matches + self.research.total_episodes
-            ),
-            "updates": self.league.total_updates + self.research.total_updates,
+            "completed_episodes": self.league.completed_matches,
+            "cumulative_episodes": self.league.completed_matches,
+            "updates": self.league.total_updates,
             "best_score": self.best_score,
             "stage": "%d/%s" % (self.cycle_index, self.phase),
             "distance": None,
@@ -871,44 +797,11 @@ class ImprovementController:
             },
             "champion_id": champion.id,
             "league_matches": self.league.completed_matches,
-            "research_episodes": self.research.total_episodes,
             "promotions": self.promotions,
+            "consecutive_rejections": self.consecutive_rejections,
             "last_gate": self.last_gate,
             "files": {name: dict(metadata) for name, metadata in files.items()},
         }
-
-
-def _research_config(config: ImproveConfig) -> TrainingConfig:
-    return TrainingConfig(
-        learning_rate=RESEARCH_FINETUNE_LR,
-        epsilon_start=RESEARCH_FINETUNE_EPSILON_START,
-        epsilon_end=RESEARCH_FINETUNE_EPSILON_END,
-        curriculum_fraction=0.25,
-        max_turns=config.max_turns,
-        replay_capacity=10_000,
-        batch_size=64,
-        updates_per_episode=4,
-        validation_games=config.solo_games,
-        recycle_discard=config.recycle_discard,
-        shaping=DEFAULT_IMPROVE_SHAPING,
-    )
-
-
-def _research_model_payload(
-    session: TrainingSession, cycle: int
-) -> Dict[str, Any]:
-    return build_checkpoint(
-        session.network,
-        session.config.game_config,
-        meta={
-            "algorithm": ALGORITHM,
-            "origin": "research",
-            "cycle": cycle,
-            "episodes": session.total_episodes,
-            "updates": session.total_updates,
-            "training_config": session.config.to_dict(),
-        },
-    )
 
 
 def _gate_result(raw: Any, phase: str) -> Dict[str, Any]:
@@ -916,26 +809,11 @@ def _gate_result(raw: Any, phase: str) -> Dict[str, Any]:
         raise ValueError("promotion gate must return a dict")
     if not isinstance(raw.get("accepted"), bool):
         raise ValueError("promotion gate accepted result must be bool")
+    if raw.get("phase") != phase:
+        raise ValueError("promotion gate phase must match %s" % phase)
     result = dict(raw)
-    result["phase"] = phase
+    result["candidate_origin"] = "league"
     return result
-
-
-def _gate_score(result: Mapping[str, Any]) -> Tuple[float, float]:
-    return (
-        _finite_number(result.get("multiplayer_gain"), "multiplayer_gain"),
-        _finite_number(result.get("solo_gain"), "solo_gain"),
-    )
-
-
-def _finite_number(value: Any, name: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-    ):
-        raise ValueError("%s must be finite" % name)
-    return float(value)
 
 
 def _initial_evidence(
@@ -1091,20 +969,6 @@ def _optional_string(value: Any, name: str) -> Optional[str]:
     if value is None:
         return None
     return _record_id(value, name)
-
-
-def _string_dict(value: Any, name: str) -> Dict[str, str]:
-    if not isinstance(value, dict):
-        raise ValueError("%s must be a dict" % name)
-    return {str(key): _record_id(item, name) for key, item in value.items()}
-
-
-def _mapping_dict(value: Any, name: str) -> Dict[str, Dict[str, Any]]:
-    if not isinstance(value, dict) or any(
-        not isinstance(item, dict) for item in value.values()
-    ):
-        raise ValueError("%s must contain dict values" % name)
-    return {str(key): dict(item) for key, item in value.items()}
 
 
 def _optional_dict(value: Any, name: str) -> Optional[Dict[str, Any]]:

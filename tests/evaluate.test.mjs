@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
-  evaluateHand, handReward, isValidHand, minimumPenalty, qualifyingSequences, scoreHands,
+  evaluateHand, handReward, isValidHand, minimumPenalty, pureSequenceUpperBound,
+  qualifyingSequences, scoreHands,
 } from "../web/evaluate.mjs";
 
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/evaluate-parity.json", import.meta.url), "utf8"));
@@ -40,6 +41,18 @@ test("evaluateHand matches every Python witness and validation error", () => {
       assert.deepEqual(call(), entry.evaluation, entry.name);
     }
   }
+});
+
+test("pureSequenceUpperBound matches Python without double counting exact jokers", () => {
+  for (const entry of fixture.cases) {
+    if (entry.errors) continue;
+    assert.equal(pureSequenceUpperBound(entry.hand, entry.joker), entry.pure_sequence_upper_bound, entry.name);
+  }
+  const hand = new Array(52).fill(0);
+  for (const face of [0, 1, 2, 17, 30, 43]) hand[face] += 1;
+  assert.equal(pureSequenceUpperBound(hand, 2), 1);
+  assert.equal(pureSequenceUpperBound(Uint8Array.from(hand), 2), 1);
+  assert.deepEqual(hand.slice(0, 3), [1, 1, 1]);
 });
 
 test("isValidHand and handReward match every Python result and error", () => {

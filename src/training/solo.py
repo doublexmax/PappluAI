@@ -1,44 +1,35 @@
-"""Episodic Monte Carlo Q-value regression for solo Papplu.
-
-Each episode records (state, action, reward). After the episode ends, discounted
-returns G_t = r_t + gamma * G_{t+1} become regression targets for Q(s_t, a_t).
-There is no next-state max, target network, or tree search. This is not DQN.
-
-Optional --warm-start-fraction mixes evaluator-confirmed winning-hand-plus-extra
-discard-phase starts with ordinary random deals. Warm-start metrics are labeled
-separately and are not held-out full-game wins.
-"""
-
 from __future__ import annotations
 
-from collections import deque
 import json
 import math
 import random
-from typing import Deque, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn as nn
 
-import src.training.core as training_core
-import src.training.optimization as training_optimization
+from src.evaluation.arena import EpsilonPolicy
+from src.evaluation.benchmark import evaluate_games
 from src.game.environment import (
     ENCODING_VERSION,
     GameConfig,
     Observation,
     PappluEnv,
 )
+from src.game.outcome import solo_outcome
+from src.model.encoding import encode
 from src.model.network import (
     CHECKPOINT_VERSION,
     QNetwork,
     load_checkpoint,
     save_checkpoint,
-    select_action,
-    select_greedy_action,
-    select_random_legal,
 )
+from src.model.search import TeacherConfig
+from src.model.spec import ModelSpec
+from src.training.core import Decision, Trajectory
+from src.training.optimization import Learner, LearnerConfig
 
-EpisodeStep = Tuple[Observation, int, float]
+
+ALGORITHM = "solo_nstep_ddqn"
 
 
 def run_episode(
@@ -48,24 +39,28 @@ def run_episode(
     rng: random.Random,
     warm_start: bool = False,
     device: Optional["torch.device"] = None,
-) -> Tuple[List[EpisodeStep], Observation]:
+) -> Tuple[List[Decision], Observation]:
+    del device
     obs = env.reset_warm_start() if warm_start else env.reset()
-    steps: List[EpisodeStep] = []
+    steps: List[Decision] = []
+    policy = EpsilonPolicy(network, epsilon)
     while not obs.done:
-        action = select_action(network, obs, epsilon=epsilon, rng=rng, device=device)
-        state = obs
+        features = encode(obs)
+        action = policy.act_features([features], [rng])[0]
+        steps.append(Decision(
+            obs, features, action, (tuple(obs.hand),) + ((0,) * 52,) * 5,
+        ))
         obs = env.step(action)
-        steps.append((state, action, float(obs.last_reward)))
     return steps, obs
 
 
 def train(
     episodes: int = 100,
     seed: int = 0,
-    gamma: float = 0.99,
-    lr: float = 1e-3,
-    batch_size: int = 32,
-    replay_capacity: int = 5000,
+    gamma: float = 1.0,
+    lr: float = 3e-4,
+    batch_size: int = 128,
+    replay_capacity: int = 50_000,
     epsilon_start: float = 1.0,
     epsilon_end: float = 0.05,
     epsilon_decay_episodes: int = 200,
@@ -80,9 +75,10 @@ def train(
     eval_episodes: int = 0,
     eval_seed: int = 12345,
     log_every: int = 10,
-    replay_sampling: str = "transition",
+    n_step: int = 5,
+    model_spec: Optional[ModelSpec] = None,
+    teacher: TeacherConfig = TeacherConfig(),
 ) -> Dict[str, object]:
-    """Train Q via episodic Monte Carlo regression. Returns summary metrics."""
     for name, value, minimum in (
         ("episodes", episodes, 0),
         ("batch_size", batch_size, 1),
@@ -110,15 +106,16 @@ def train(
         raise ValueError("epsilon_end cannot exceed epsilon_start")
     if eval_episodes and eval_seed == seed:
         raise ValueError("eval_seed must differ from the training seed")
-    if replay_sampling not in ("transition", "episode"):
-        raise ValueError("replay_sampling must be 'transition' or 'episode'")
+    learner_config = LearnerConfig(
+        batch_size=batch_size, replay_capacity=replay_capacity, learning_rate=lr,
+        gamma=gamma, n_step=n_step, grad_clip=grad_clip, teacher=teacher,
+    )
 
     cfg = config if config is not None else GameConfig()
     torch_device = torch.device(device)
     seed_source = random.Random(seed)
     source_rng = random.Random(seed_source.getrandbits(64))
     action_rng = random.Random(seed_source.getrandbits(64))
-    replay_rng = random.Random(seed_source.getrandbits(64))
     torch.manual_seed(seed)
     torch.set_num_threads(torch_threads)
 
@@ -128,23 +125,16 @@ def train(
             device=torch_device,
             expected_config=config,
         )
+        if model_spec is not None and network.spec != model_spec:
+            raise ValueError("requested model_spec does not match model")
     else:
-        network = QNetwork().to(torch_device)
+        network = QNetwork(ModelSpec() if model_spec is None else model_spec).to(torch_device)
     if warm_start_fraction and cfg.cards_in_hand < 3:
         raise ValueError("warm starts require at least three cards")
-    optimizer = torch.optim.Adam(network.parameters(), lr=lr)
-    loss_fn = nn.SmoothL1Loss()
+    learner = Learner(network, learner_config, seed_source.getrandbits(63))
 
     env = PappluEnv(cfg)
     env.seed(seed)
-    replay: Union[
-        Deque[training_core.Transition],
-        training_core.EpisodeReplay,
-    ]
-    if replay_sampling == "transition":
-        replay = deque(maxlen=replay_capacity)
-    else:
-        replay = training_core.EpisodeReplay(replay_capacity)
 
     reward_sum = 0.0
     win_count = 0
@@ -174,21 +164,10 @@ def train(
             warm_start=use_warm,
             device=torch_device,
         )
-        rewards = [r for _, _, r in steps]
-        returns = training_core.discounted_returns(rewards, gamma)
-        completed_episode = tuple(
-            (state, action, ret)
-            for (state, action, _reward), ret in zip(steps, returns)
-        )
-        if isinstance(replay, training_core.EpisodeReplay):
-            replay.append(completed_episode)
-        else:
-            for transition in completed_episode:
-                replay.append(transition)
-
-        episode_reward = sum(rewards)
+        outcome = solo_outcome(final_obs.hand, final_obs.joker, bool(final_obs.won), cfg.required_sequences)
+        episode_reward = outcome.utility
         reward_sum += episode_reward
-        return_sum += returns[0] if returns else 0.0
+        return_sum += gamma ** (len(steps) - 1) * outcome.utility
         won = bool(final_obs.won)
         if won:
             win_count += 1
@@ -201,21 +180,12 @@ def train(
             if won:
                 normal_wins += 1
 
-        network.train()
-        for _ in range(updates_per_episode):
-            if isinstance(replay, training_core.EpisodeReplay):
-                batch = replay.sample(replay_rng, min(batch_size, len(replay)))
-            else:
-                batch = replay_rng.sample(
-                    list(replay),
-                    min(batch_size, len(replay)),
-                )
-            loss_val = training_optimization.train_batch(
-                network, optimizer, loss_fn, batch, torch_device, grad_clip
-            )
-            loss_sum += loss_val
-            loss_count += 1
-            train_steps += 1
+        stats = learner.learn(
+            [Trajectory(1, tuple(steps), outcome)], updates=updates_per_episode, device=torch_device,
+        )
+        loss_sum += stats.loss * stats.updates
+        loss_count += stats.updates
+        train_steps += stats.updates
 
         if log_every and (ep + 1) % log_every == 0:
             avg_loss = loss_sum / loss_count if loss_count else 0.0
@@ -231,18 +201,19 @@ def train(
                         "warm_wins": warm_wins,
                         "normal_episodes": normal_episodes,
                         "normal_wins": normal_wins,
-                        "replay": len(replay),
-                        "replay_sampling": replay_sampling,
+                        "replay": len(learner.replay),
+                        "replay_sampling": "decision",
                     }
                 ),
                 flush=True,
             )
 
     summary: Dict[str, object] = {
-        "algorithm": "episodic_monte_carlo_q_regression",
+        "algorithm": ALGORITHM,
         "episodes": episodes,
         "seed": seed,
         "gamma": gamma,
+        "n_step": n_step,
         "epsilon_end": epsilon_at(max(0, episodes - 1)) if episodes else epsilon_end,
         "reward_avg": reward_sum / episodes if episodes else 0.0,
         "win_rate": win_count / episodes if episodes else 0.0,
@@ -259,7 +230,8 @@ def train(
         "checkpoint_version": CHECKPOINT_VERSION,
         "architecture": network.architecture,
         "param_count": sum(parameter.numel() for parameter in network.parameters()),
-        "replay_sampling": replay_sampling,
+        "replay_sampling": "decision",
+        "model_spec": network.spec.to_dict(),
         "game_config": cfg.to_dict(),
         "torch_threads": torch_threads,
     }
@@ -279,7 +251,7 @@ def train(
             network,
             cfg,
             meta={
-                "algorithm": "episodic_monte_carlo_q_regression",
+                "algorithm": ALGORITHM,
                 "summary": {
                     k: summary[k]
                     for k in (
@@ -311,49 +283,10 @@ def evaluate_policy(
     if isinstance(games, bool) or not isinstance(games, int) or games <= 0:
         raise ValueError("games must be a positive integer")
     cfg = config if config is not None else GameConfig()
-    if device is None:
-        device = next(network.parameters()).device
-
-    was_training = network.training
-    network.eval()
-    env = PappluEnv(cfg)
-
-    greedy_rewards = 0.0
-    greedy_wins = 0
-    for i in range(games):
-        obs = env.reset(seed=seed + i)
-        total_r = 0.0
-        while not obs.done:
-            action = select_greedy_action(network, obs, device=device)
-            obs = env.step(action)
-            total_r += obs.last_reward
-        greedy_rewards += total_r
-        if obs.won:
-            greedy_wins += 1
-
-    result: Dict[str, float] = {
-        "games": float(games),
-        "greedy_reward_avg": greedy_rewards / games if games else 0.0,
-        "greedy_win_rate": greedy_wins / games if games else 0.0,
-    }
-
-    if compare_random:
-        rand_rewards = 0.0
-        rand_wins = 0
-        for i in range(games):
-            obs = env.reset(seed=seed + i)
-            total_r = 0.0
-            step_rng = random.Random(seed + 10_000 + i)
-            while not obs.done:
-                action = select_random_legal(obs, step_rng)
-                obs = env.step(action)
-                total_r += obs.last_reward
-            rand_rewards += total_r
-            if obs.won:
-                rand_wins += 1
-        result["random_reward_avg"] = rand_rewards / games if games else 0.0
-        result["random_win_rate"] = rand_wins / games if games else 0.0
-
-    if was_training:
-        network.train()
+    result: Dict[str, float] = {"games": float(games)}
+    for policy in ("greedy", "random") if compare_random else ("greedy",):
+        evaluated = evaluate_games(network, cfg, games, seed, policy=policy)
+        rate = sum(evaluated.outcomes) / games
+        result[policy + "_reward_avg"] = rate
+        result[policy + "_win_rate"] = rate
     return result

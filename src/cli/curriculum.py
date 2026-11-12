@@ -25,6 +25,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--heads", type=int, default=None)
+    parser.add_argument("--blocks", type=int, default=None)
     parser.add_argument("--max-episodes", type=int, default=1_000_000)
     parser.add_argument("--max-seconds", type=float, default=82_800)
     parser.add_argument("--checkpoint-every", type=int, default=100)
@@ -56,8 +57,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--learning-rate",
         type=float,
         default=None,
-        help="Optimizer learning rate. New sessions default to 0.001.",
+        help="Optimizer learning rate. New sessions default to 0.0003.",
     )
+    parser.add_argument("--epsilon-start", type=float, default=None)
+    parser.add_argument("--epsilon-end", type=float, default=None)
+    parser.add_argument("--epsilon-decay-episodes", type=int, default=None)
     parser.add_argument(
         "--curriculum-fraction",
         type=float,
@@ -137,8 +141,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     else args.recycle_discard
                 ),
                 learning_rate=(
-                    1e-3 if args.learning_rate is None else args.learning_rate
+                    3e-4 if args.learning_rate is None else args.learning_rate
                 ),
+                epsilon_start=0.3 if args.epsilon_start is None else args.epsilon_start,
+                epsilon_end=0.1 if args.epsilon_end is None else args.epsilon_end,
+                epsilon_decay_episodes=10_000 if args.epsilon_decay_episodes is None else args.epsilon_decay_episodes,
                 curriculum_fraction=(
                     0.75
                     if args.curriculum_fraction is None
@@ -162,6 +169,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 model_spec=runtime.ModelSpec(
                     width=default_spec.width if args.width is None else args.width,
                     heads=default_spec.heads if args.heads is None else args.heads,
+                    blocks=default_spec.blocks if args.blocks is None else args.blocks,
                 ),
             )
             _validate_model_arguments(session, args)
@@ -191,11 +199,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 0
     except (TypeError, ValueError, OSError, RuntimeError, KeyError) as exc:
-        runtime._publish_error(output_dir, session, str(exc), started)
+        runtime.curriculum_io.publish_error(output_dir, session, str(exc), started)
         print("error: %s" % exc, file=sys.stderr, flush=True)
         return 2
     except BaseException as exc:
-        runtime._publish_error(output_dir, session, str(exc), started)
+        runtime.curriculum_io.publish_error(output_dir, session, str(exc), started)
         print("error: %s" % exc, file=sys.stderr, flush=True)
         return 1
     finally:
@@ -211,6 +219,9 @@ def _validate_resume_arguments(
         "max_turns": args.max_turns,
         "recycle_discard": args.recycle_discard,
         "learning_rate": args.learning_rate,
+        "epsilon_start": args.epsilon_start,
+        "epsilon_end": args.epsilon_end,
+        "epsilon_decay_episodes": args.epsilon_decay_episodes,
         "curriculum_fraction": args.curriculum_fraction,
         "validation_games": args.validation_games,
         "validate_every": args.validate_every,
@@ -232,7 +243,7 @@ def _validate_resume_arguments(
 
 
 def _validate_model_arguments(session, args: argparse.Namespace) -> None:
-    for name in ("width", "heads"):
+    for name in ("width", "heads", "blocks"):
         requested = getattr(args, name)
         saved = getattr(session.network.spec, name)
         if requested is not None and requested != saved:

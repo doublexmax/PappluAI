@@ -9,7 +9,9 @@ import unittest
 from unittest import mock
 
 from src.checkpoints.io import atomic_write_json, file_sha256
-from src.checkpoints.evidence import GATE_SCHEMA_VERSION, balanced_seat_orders, evidence_metrics
+from src.checkpoints.evidence import (
+    GATE_SCHEMA_VERSION, balanced_seat_orders, blocks_for_count, evidence_metrics,
+)
 from src.checkpoints.registry import ModelRecord, ModelRegistry
 from src.game.environment import GameConfig
 
@@ -22,8 +24,8 @@ except ImportError:
 def install_record(registry, data, origin):
     digest = hashlib.sha256(data).hexdigest()
     metadata = {
-        "architecture": "dynamic_table", "checkpoint_version": 3, "encoding_version": 2,
-        "model_spec": {"width": 64, "heads": 4},
+        "architecture": "axial_table", "checkpoint_version": 4, "encoding_version": 2,
+        "model_spec": {"width": 64, "heads": 4, "blocks": 2},
     }
     record = ModelRecord(digest[:20], digest, "model-" + digest + ".pt", origin, metadata, {}, ())
     (registry.root / record.filename).write_bytes(data)
@@ -34,18 +36,18 @@ def install_record(registry, data, origin):
 
 
 def gate_evidence(candidate, champion, blocks, seed, player_counts=(2, 3, 4)):
-    margins = [0.5] * (blocks // 4) + [0.0] * (
-        blocks - blocks // 4
-    )
-    margin = sum(margins) / blocks
-    multiplayer = {
-        str(count): {
-            "candidate_minus_champion": margin,
-            "seed_block_margins": margins,
-            "games": blocks * len(balanced_seat_orders(count)),
+    multiplayer = {}
+    for count in player_counts:
+        count_blocks = blocks_for_count(blocks, count)
+        margins = [0.5] * (count_blocks // 4) + [0.0] * (count_blocks - count_blocks // 4)
+        multiplayer[str(count)] = {
+            "blocks": count_blocks,
+            "candidate_minus_champion": sum(margins) / count_blocks,
+            "placement_margins": margins,
+            "declaration_margins": [0.0] * count_blocks,
+            "declaration_delta": 0.0,
+            "games": count_blocks * len(balanced_seat_orders(count)),
         }
-        for count in player_counts
-    }
     solo = {
         "games": 256,
         "candidate_outcomes": [1] * 16 + [0] * 240,
@@ -55,11 +57,12 @@ def gate_evidence(candidate, champion, blocks, seed, player_counts=(2, 3, 4)):
     }
     return {
         "accepted": True,
+        "gate_failures": [],
         "candidate_sha256": candidate.sha256,
         "champion_sha256": champion.sha256,
         "gate_schema_version": GATE_SCHEMA_VERSION,
         "encoding_version": 2,
-        "architecture": "dynamic_table",
+        "architecture": "axial_table",
         "player_counts": list(player_counts),
         "seed_blocks": blocks,
         "seed": seed,
@@ -159,6 +162,87 @@ class TestModelRegistration(unittest.TestCase):
 
 
 class TestChampionProtection(unittest.TestCase):
+    def test_pre_joint_gate_schemas_are_explicitly_rejected_with_current_model_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            champion = install_record(registry, b"frozen", "initial")
+            candidate = install_record(registry, b"new", "league")
+            registry.initialize_champion(champion.id)
+            for version in (2, 3):
+                for phase in ("selection", "confirmation"):
+                    bad = evidence(candidate, champion)
+                    target = bad if phase == "confirmation" else bad["selection"]
+                    target["gate_schema_version"] = version
+                    with self.subTest(phase=phase, version=version), self.assertRaisesRegex(ValueError, "re-run gates under schema v4"):
+                        registry.promote(candidate.id, champion.id, bad)
+                    self.assertEqual(registry.champion().id, champion.id)
+
+    def test_declared_architecture_must_match_axial_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            champion = install_record(registry, b"frozen", "initial")
+            candidate = install_record(registry, b"new", "league")
+            registry.initialize_champion(champion.id)
+            bad = evidence(candidate, champion)
+            bad["architecture"] = "dynamic_table"
+            with self.assertRaisesRegex(ValueError, "axial_table gate schema v4"):
+                registry.promote(candidate.id, champion.id, bad)
+            self.assertEqual(registry.champion().id, champion.id)
+
+    def test_scaled_seed_banks_must_be_disjoint_including_the_solo_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            champion = install_record(registry, b"frozen", "initial")
+            candidate = install_record(registry, b"new", "league")
+            registry.initialize_champion(champion.id)
+            base = evidence(candidate, champion)
+            for distance in (100_511, 100_512):
+                result = {
+                    **base,
+                    **gate_evidence(candidate, champion, 128, base["selection_seed"] + distance),
+                }
+                if distance == 100_511:
+                    with self.assertRaisesRegex(ValueError, "disjoint"):
+                        registry.promote(candidate.id, champion.id, result)
+                    self.assertEqual(registry.champion().id, champion.id)
+                else:
+                    registry.promote(candidate.id, champion.id, result)
+                    self.assertEqual(registry.champion().id, candidate.id)
+
+    def test_placement_gain_cannot_hide_a_declaration_regression(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            champion = install_record(registry, b"frozen", "initial")
+            candidate = install_record(registry, b"new", "league")
+            registry.initialize_champion(champion.id)
+            bad = evidence(candidate, champion)
+            for raw in bad["multiplayer"].values():
+                raw["declaration_margins"] = [-0.5] * raw["blocks"]
+                raw["declaration_delta"] = -0.5
+            bad.update(evidence_metrics(bad["multiplayer"], bad["solo"], 128, bad["seed"], 100))
+            self.assertEqual(bad["multiplayer_gain"], 0.125)
+            self.assertEqual(bad["declaration_gain"], -0.5)
+            with self.assertRaisesRegex(ValueError, "gate_failures=.*declaration"):
+                registry.promote(candidate.id, champion.id, bad)
+            self.assertEqual(registry.champion().id, champion.id)
+
+    def test_raw_block_counts_and_both_margin_summaries_are_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory))
+            champion = install_record(registry, b"frozen", "initial")
+            candidate = install_record(registry, b"new", "league")
+            registry.initialize_champion(champion.id)
+            for field, value in (
+                ("blocks", 128), ("games", 256), ("placement_margins", [0.5] * 128),
+                ("declaration_margins", [0.0] * 128), ("declaration_delta", 0.5),
+                ("candidate_minus_champion", 0.5),
+            ):
+                bad = evidence(candidate, champion)
+                bad["multiplayer"]["2"][field] = value
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    registry.promote(candidate.id, champion.id, bad)
+                self.assertEqual(registry.champion().id, champion.id)
+
     def test_specialists_can_promote_with_matching_scoped_evidence(self):
         for count in (2, 3, 4):
             with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
@@ -225,7 +309,7 @@ class TestChampionProtection(unittest.TestCase):
             database = json.loads(registry.path.read_text(encoding="utf-8"))
             database["models"][record.id]["metadata"] = {"architecture": "mlp", "encoding_version": 1}
             atomic_write_json(database, registry.path)
-            with self.assertRaisesRegex(ValueError, "current dynamic"):
+            with self.assertRaisesRegex(ValueError, "current axial_table v4"):
                 registry.get(record.id)
 
     def test_four_player_failure_cannot_be_hidden_by_other_counts(self):
@@ -237,12 +321,12 @@ class TestChampionProtection(unittest.TestCase):
             bad = evidence(candidate, champion)
             for count, margin in (("2", 0.5), ("3", 0.5), ("4", -0.1)):
                 raw = bad["multiplayer"][count]
-                raw["seed_block_margins"] = [margin] * 128
+                raw["placement_margins"] = [margin] * raw["blocks"]
                 raw["candidate_minus_champion"] = margin
             bad.update(evidence_metrics(bad["multiplayer"], bad["solo"], 128, bad["seed"], 100))
             self.assertGreater(bad["multiplayer_gain"], 0.05)
             self.assertGreater(bad["multiplayer_ci95"][0], 0)
-            with self.assertRaisesRegex(ValueError, "gate did not pass"):
+            with self.assertRaisesRegex(ValueError, "gate_failures=.*placement_4p"):
                 registry.promote(candidate.id, champion.id, bad)
             self.assertEqual(registry.champion().id, champion.id)
 
@@ -264,7 +348,7 @@ class TestChampionProtection(unittest.TestCase):
         mutations = [
             {"accepted": False}, {"selection_passed": False}, {"phase": "selection"},
             {"multiplayer_gain": 0.02}, {"multiplayer_ci95": [-0.01, 0.1]},
-            {"solo_gain": -0.01}, {"solo_ci95": [-0.04, 0.1]},
+            {"declaration_gain": -0.01}, {"solo_gain": -0.01}, {"solo_ci95": [-0.04, 0.1]},
             {"seed_blocks": 2}, {"solo": {"games": 2}},
             {"selection_seed": 60_500_000}, {"candidate_sha256": "wrong"},
         ]
@@ -293,7 +377,7 @@ class TestChampionProtection(unittest.TestCase):
             champion = install_record(registry, b"original", "initial")
             candidate = install_record(registry, b"new", "league")
             registry.initialize_champion(champion.id)
-            for field, value in (("solo_gain", 1.0), ("multiplayer_gain", 0.99)):
+            for field, value in (("solo_gain", 1.0), ("multiplayer_gain", 0.99), ("declaration_gain", 0.5)):
                 bad = evidence(candidate, champion)
                 bad[field] = value
                 with self.subTest(field=field), self.assertRaisesRegex(ValueError, "raw evidence"):
@@ -319,7 +403,7 @@ class TestChampionProtection(unittest.TestCase):
                 short_confirmation["seed"],
             )
             short_confirmation.update(replacement)
-            with self.assertRaisesRegex(ValueError, "confirmation requires"):
+            with self.assertRaisesRegex(ValueError, "confirmation.*seed_blocks"):
                 registry.promote(
                     candidate.id,
                     champion.id,
@@ -336,7 +420,7 @@ class TestChampionProtection(unittest.TestCase):
                 ),
                 "phase": "selection",
             }
-            with self.assertRaisesRegex(ValueError, "selection requires"):
+            with self.assertRaisesRegex(ValueError, "selection.*seed_blocks"):
                 registry.promote(
                     candidate.id,
                     champion.id,

@@ -141,6 +141,7 @@ def _play_case(case: CalibrationCase, snapshots: str, match_seconds: float) -> d
             MatchConfig(game=GameConfig(max_turns=case.cap), players=case.players),
             case.seed,
             deadline=started + match_seconds,
+            score_outcome=False,
         )
     except MatchInterrupted as error:
         return {

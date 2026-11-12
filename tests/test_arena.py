@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 import random
@@ -15,6 +16,7 @@ from src.evaluation.arena import (
     RandomPolicy,
     play_match,
     rotated_matches,
+    run_matches,
 )
 from src.cli.arena import main
 from src.game.environment import (
@@ -62,7 +64,7 @@ class TestArenaMatches(unittest.TestCase):
             max_turns=2,
         )
 
-    def test_draw_records_complete_zero_reward_trajectories(self):
+    def test_draw_records_complete_cached_decisions(self):
         config = MatchConfig(game=self.game, players=3)
         policies = [FirstLegalPolicy() for _ in range(3)]
         with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
@@ -81,15 +83,16 @@ class TestArenaMatches(unittest.TestCase):
         self.assertEqual(result.telemetry.refill_turns, ())
         self.assertEqual(tuple(map(len, result.trajectories)), (4, 4, 4))
         for trajectory in result.trajectories:
-            for state, action, reward in trajectory:
+            for decision in trajectory:
+                state, action = decision.observation, decision.action
                 self.assertEqual(len(state.players), 3)
-                self.assertEqual(state.history[0].initial_hand, trajectory[0][0].hand)
+                self.assertEqual(state.history[0].initial_hand, trajectory[0].observation.hand)
                 self.assertTrue(legal_action_mask(state)[action])
-                self.assertEqual(reward, 0.0)
+                self.assertEqual(decision.hidden_hands[0], state.hand)
         for policy, trajectory in zip(policies, result.trajectories):
-            self.assertEqual(policy.observations, [step[0] for step in trajectory])
+            self.assertEqual(policy.observations, [step.observation for step in trajectory])
 
-    def test_only_winning_discard_receives_reward(self):
+    def test_winning_discard_stops_recording_before_the_other_seat_acts(self):
         config = MatchConfig(game=self.game, players=2)
         with mock.patch("src.game.multiplayer.hand_reward", return_value=1.0):
             result = play_match(
@@ -101,10 +104,9 @@ class TestArenaMatches(unittest.TestCase):
         self.assertEqual(result.winner, 0)
         self.assertEqual(result.terminal_reason, "win")
         self.assertEqual(result.action_count, 2)
-        self.assertEqual(
-            [step[2] for step in result.trajectories[0]],
-            [0.0, 1.0],
-        )
+        self.assertEqual(result.trajectories[0][0].action, 0)
+        self.assertGreaterEqual(result.trajectories[0][1].action, 2)
+        self.assertEqual(result.outcome.winner, 0)
         self.assertEqual(result.trajectories[1], ())
         self.assertIsNone(result.terminal_snapshot)
 
@@ -239,7 +241,7 @@ class TestArenaMatches(unittest.TestCase):
             telemetry=MatchTelemetry((2, 2, 2), (0, 0, 0), ()),
             trajectories=((), (), ()),
         )
-        with mock.patch("src.evaluation.arena.play_match", return_value=result) as play:
+        with mock.patch("src.evaluation.arena.run_matches", return_value=[result] * 3) as play:
             results = rotated_matches(
                 policies,
                 MatchConfig(game=self.game, players=3),
@@ -247,15 +249,11 @@ class TestArenaMatches(unittest.TestCase):
             )
         self.assertEqual(results, [result, result, result])
         self.assertEqual(
-            [tuple(call.args[0]) for call in play.call_args_list],
-            [
-                policies,
-                policies[1:] + policies[:1],
-                policies[2:] + policies[:2],
-            ],
+            [deal.seats for deal in play.call_args.args[0]],
+            [(0, 1, 2), (1, 2, 0), (2, 0, 1)],
         )
         self.assertEqual(
-            [call.args[2] for call in play.call_args_list],
+            [deal.seed for deal in play.call_args.args[0]],
             [78, 78, 78],
         )
 
@@ -282,7 +280,10 @@ class TestArenaCli(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             output = os.path.join(tmp, "matches.json")
-            with mock.patch("src.evaluation.arena.play_match", return_value=fake) as play:
+            with mock.patch(
+                "src.evaluation.arena.run_matches",
+                side_effect=lambda deals, *_args, **_kwargs: [replace(fake, seed=deal.seed) for deal in deals],
+            ) as play:
                 code = main(
                     [
                         "--model",
@@ -314,9 +315,32 @@ class TestArenaCli(unittest.TestCase):
         )
         self.assertNotIn("trajectories", report["games"][0])
         self.assertEqual(
-            [call.kwargs["seed"] for call in play.call_args_list],
+            [deal.seed for deal in play.call_args.args[0]],
             [800, 801],
         )
+        self.assertEqual([game["seed"] for game in report["games"]], [800, 801])
+        self.assertFalse(play.call_args.kwargs["score_outcome"])
+
+    def test_cli_batches_across_the_chunk_boundary_without_scoring_unused_outcomes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = os.path.join(temporary, "matches.json")
+            with mock.patch("src.evaluation.arena.run_matches", wraps=run_matches) as runner, mock.patch(
+                "src.evaluation.arena.DealOutcome.score", side_effect=AssertionError("unused outcome scoring"),
+            ):
+                code = main([
+                    "--model", "random", "--model", "random", "--games", "33",
+                    "--seed", "800", "--max-turns", "1", "--output", output,
+                ])
+            with open(output, encoding="utf-8") as handle:
+                report = json.load(handle)
+        self.assertEqual(code, 0)
+        self.assertEqual([len(call.args[0]) for call in runner.call_args_list], [32, 1])
+        self.assertEqual([game["seed"] for game in report["games"]], list(range(800, 833)))
+        self.assertEqual(
+            [game["seat_order"] for game in report["games"]],
+            [[0, 1] if index % 2 == 0 else [1, 0] for index in range(33)],
+        )
+        self.assertEqual([game["action_count"] for game in report["games"]], [4] * 33)
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
@@ -331,7 +355,7 @@ class TestArenaCheckpoints(unittest.TestCase):
             policy = CheckpointPolicy(path)
             self.assertIsNone(policy._network)
             self.assertEqual(policy.game_config, checkpoint_config)
-            self.assertEqual(policy.network.architecture, "dynamic_table")
+            self.assertEqual(policy.network.architecture, "axial_table")
             self.assertFalse(policy.network.training)
 
     def test_current_checkpoint_plays_all_supported_full21_tables(self):
@@ -355,7 +379,7 @@ class TestArenaCheckpoints(unittest.TestCase):
                         )
                     self.assertEqual(result.winner, players - 1)
                     self.assertEqual(result.action_count, players * 2)
-                    observation = result.trajectories[-1][0][0]
+                    observation = result.trajectories[-1][0].observation
                     self.assertEqual(len(observation.players), players)
                     self.assertEqual(len(observation.history), 2 * players - 1)
 

@@ -258,6 +258,7 @@ def pure_modules(trees: dict[Path, ast.Module]) -> list[str]:
         "checkpoints/io.py",
         "checkpoints/registry.py",
         "model/spec.py",
+        "model/encoding.py",
     ):
         path = SRC / relative
         if path in trees:
@@ -274,8 +275,8 @@ def check_pure_imports(
         "real=builtins.__import__;"
         "builtins.__import__=lambda name,*a,**k: "
         "(_ for _ in ()).throw(ModuleNotFoundError("
-        "'blocked optional dependency',name='torch')) "
-        "if name=='torch' or name.startswith('torch.') else real(name,*a,**k);"
+        "'blocked optional dependency',name=name)) "
+        "if name.split('.')[0] in ('torch','numpy') else real(name,*a,**k);"
         "importlib.import_module(sys.argv[1])"
     )
     for module in pure_modules(trees):

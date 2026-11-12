@@ -1,4 +1,4 @@
-import { evaluateHand, minimumPenalty } from "./evaluate.mjs";
+import { evaluateHand, minimumPenalty, pureSequenceUpperBound } from "./evaluate.mjs";
 import { qValues } from "./qnet.mjs";
 
 const INITIAL = 0;
@@ -87,19 +87,7 @@ export function observationFromView(view, maxTurns = DEFAULT_MAX_TURNS) {
 }
 
 export function canDeclareUpperBound(hand, joker, requiredSequences) {
-  let upper = hand[joker];
-  if (upper >= requiredSequences) return true;
-  for (let suit = 0; suit < 4; suit += 1) {
-    const remaining = hand.slice(suit * 13, (suit + 1) * 13);
-    if (Math.floor(joker / 13) === suit) remaining[joker % 13] = 0;
-    let triples = remaining.reduce((total, copies) => total + Math.floor(copies / 3), 0);
-    const extended = [...remaining, remaining[0]];
-    for (let start = 0; start < 12; start += 1) {
-      triples += Math.min(...extended.slice(start, start + 3));
-    }
-    upper += Math.min(Math.floor(remaining.reduce((a, b) => a + b, 0) / 3), triples);
-  }
-  return upper >= requiredSequences;
+  return pureSequenceUpperBound(hand, joker) >= requiredSequences;
 }
 
 export function winningDiscard(hand, joker, { requiredSequences = 5, cardsInHand = 21 } = {}) {
@@ -109,12 +97,9 @@ export function winningDiscard(hand, joker, { requiredSequences = 5, cardsInHand
   for (let face = 0; face < 52; face += 1) {
     if (!hand[face]) continue;
     remaining[face] -= 1;
-    let evaluation = null;
-    if (canDeclareUpperBound(remaining, joker, requiredSequences)) {
-      evaluation = evaluateHand(remaining, joker, { requiredSequences, cardsInHand });
-    }
+    const evaluation = evaluateHand(remaining, joker, { requiredSequences, cardsInHand });
     remaining[face] += 1;
-    if (evaluation?.is_valid) return { face, evaluation };
+    if (evaluation.is_valid) return { face, evaluation };
   }
   return null;
 }

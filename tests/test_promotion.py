@@ -1,20 +1,27 @@
 import random
 from collections import Counter
+import json
 from pathlib import Path
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from src.checkpoints.evidence import (
+    assess_gate,
     balanced_seat_orders,
+    blocks_for_count,
     clustered_interval,
     evidence_metrics,
-    gate_accepted,
     require_player_counts,
+    validate_gate_evidence,
 )
 from src.evaluation.promotion import (
+    GateInterrupted,
     evaluate_gate,
 )
+from src.game.environment import GameConfig
 
 try:
     import torch
@@ -22,7 +29,62 @@ except ImportError:
     torch = None
 
 
+def block_result(players, placement, declaration):
+    return {
+        "blocks": len(placement), "games": len(placement) * {2: 2, 3: 6, 4: 24}[players],
+        "placement_margins": placement, "declaration_margins": declaration,
+        "candidate_minus_champion": sum(placement) / len(placement),
+        "declaration_delta": sum(declaration) / len(declaration),
+    }
+
+
+def solo_result(candidate, champion):
+    return {
+        "games": len(candidate), "candidate_outcomes": candidate, "champion_outcomes": champion,
+        "candidate_wins": sum(candidate), "champion_wins": sum(champion),
+    }
+
+
 class TestPlayerCountEvidence(unittest.TestCase):
+    def test_joint_bootstrap_preserves_cross_count_covariance_for_placement_and_declarations(self):
+        multiplayer = {
+            "2": block_result(2, [1.0] * 4 + [-1.0] * 4, [1.0] * 4 + [-1.0] * 4),
+            "3": block_result(3, [-1.0] * 2 + [1.0] * 2, [-1.0] * 2 + [1.0] * 2),
+            "4": block_result(4, [0.0, 0.0], [0.0, 0.0]),
+        }
+        result = evidence_metrics(multiplayer, solo_result([1, 0], [0, 1]), 2, 41, 100)
+        self.assertEqual(result, {
+            "multiplayer_gain": 0.0, "declaration_gain": 0.0,
+            "multiplayer_ci95": [0.0, 0.0], "declaration_ci95": [0.0, 0.0],
+            "multiplayer_ci95_by_count": {"2": [-1.0, 1.0], "3": [-1.0, 1.0], "4": [0.0, 0.0]},
+            "solo_gain": 0.0, "solo_ci95": [-1.0, 1.0],
+        })
+
+    def test_replica_variation_is_averaged_inside_each_base_block(self):
+        multiplayer = {
+            "2": block_result(2, [1.0, -1.0] * 4, [-1.0, 1.0] * 4),
+            "3": block_result(3, [0.0] * 4, [0.0] * 4),
+            "4": block_result(4, [0.0] * 2, [0.0] * 2),
+        }
+        result = evidence_metrics(multiplayer, solo_result([0, 0], [0, 0]), 2, 41, 100)
+        self.assertEqual(result["multiplayer_ci95"], [0.0, 0.0])
+        self.assertEqual(result["declaration_ci95"], [0.0, 0.0])
+        self.assertEqual(result["multiplayer_ci95_by_count"], {
+            "2": [0.0, 0.0], "3": [0.0, 0.0], "4": [0.0, 0.0],
+        })
+
+    def test_scaled_blocks_produce_the_selection_and_confirmation_game_budgets(self):
+        for blocks, expected in (
+            (32, [(128, 256), (64, 384), (32, 768)]),
+            (128, [(512, 1024), (256, 1536), (128, 3072)]),
+        ):
+            with self.subTest(blocks=blocks):
+                self.assertEqual([
+                    (blocks_for_count(blocks, count),
+                     blocks_for_count(blocks, count) * len(balanced_seat_orders(count)))
+                    for count in (2, 3, 4)
+                ], expected)
+
     def test_scope_requires_sorted_distinct_integer_counts(self):
         for counts in ((2,), (3,), (4,), (2, 3), (2, 4), (3, 4), (2, 3, 4)):
             with self.subTest(counts=counts):
@@ -37,13 +99,19 @@ class TestPlayerCountEvidence(unittest.TestCase):
     def test_metrics_average_only_the_configured_counts(self):
         multiplayer = {
             "2": {
+                "blocks": 128,
                 "candidate_minus_champion": 0.25,
-                "seed_block_margins": [0.25] * 32,
-                "games": 64,
+                "placement_margins": [0.25] * 128,
+                "declaration_margins": [0.0] * 128,
+                "declaration_delta": 0.0,
+                "games": 256,
             },
             "4": {
+                "blocks": 32,
                 "candidate_minus_champion": 0.5,
-                "seed_block_margins": [0.5] * 32,
+                "placement_margins": [0.5] * 32,
+                "declaration_margins": [0.25] * 32,
+                "declaration_delta": 0.25,
                 "games": 768,
             },
         }
@@ -57,19 +125,26 @@ class TestPlayerCountEvidence(unittest.TestCase):
         metrics = evidence_metrics(multiplayer, solo, 32, 41, 100, player_counts=[2, 4])
         self.assertEqual(metrics, {
             "multiplayer_gain": 0.375,
+            "declaration_gain": 0.125,
+            "declaration_ci95": [0.125, 0.125],
             "multiplayer_ci95": [0.375, 0.375],
             "multiplayer_ci95_by_count": {"2": [0.25, 0.25], "4": [0.5, 0.5]},
             "solo_gain": 0.0,
             "solo_ci95": [0.0, 0.0],
         })
-        self.assertTrue(gate_accepted(multiplayer, metrics, 32, 256, player_counts=(2, 4)))
-        self.assertFalse(gate_accepted(multiplayer, metrics, 32, 256))
+        self.assertEqual(
+            assess_gate("selection", GameConfig(max_turns=60), multiplayer, metrics, 32, 256, player_counts=(2, 4)),
+            (True, []),
+        )
         specialist = evidence_metrics(
             {"2": multiplayer["2"]}, solo, 32, 41, 100, player_counts=(2,),
         )
         self.assertEqual(specialist["multiplayer_gain"], 0.25)
         self.assertEqual(specialist["multiplayer_ci95_by_count"], {"2": [0.25, 0.25]})
-        self.assertTrue(gate_accepted({"2": multiplayer["2"]}, specialist, 32, 256, (2,)))
+        self.assertEqual(
+            assess_gate("selection", GameConfig(max_turns=60), {"2": multiplayer["2"]}, specialist, 32, 256, (2,)),
+            (True, []),
+        )
         for counts in ((2,), (2, 3, 4)):
             with self.subTest(counts=counts), self.assertRaisesRegex(ValueError, "player_counts"):
                 evidence_metrics(multiplayer, solo, 32, 41, 100, player_counts=counts)
@@ -93,11 +168,13 @@ class TestPlayerCountEvidence(unittest.TestCase):
                     self.assertEqual(set(result["multiplayer"]), {str(count)})
                     self.assertEqual(
                         result["multiplayer"][str(count)]["games"],
-                        {2: 2, 3: 6, 4: 24}[count],
+                        {2: 8, 3: 12, 4: 24}[count],
                     )
                     self.assertEqual(result["multiplayer_gain"], 0.0)
                     self.assertEqual(result["multiplayer_ci95_by_count"], {str(count): [0.0, 0.0]})
                     self.assertFalse(result["accepted"])
+                    self.assertEqual(result["phase"], "confirmation")
+                    self.assertEqual(result["gate_failures"], ["rules", "seed_blocks", "solo_games", "placement"])
 
     def test_gate_rejects_invalid_scopes_before_loading_models(self):
         for counts in ((), (True,), (2.0,), (2, 2), (4, 2), (5,)):
@@ -143,8 +220,7 @@ class TestSeatClusterBootstrap(unittest.TestCase):
 
     def test_bootstrap_preserves_global_random_state(self):
         before = random.getstate()
-        values = [0, 0.5, -0.5, 1] * 32
-        self.assertEqual(clustered_interval(values, samples=100), clustered_interval(values, samples=100))
+        self.assertEqual(clustered_interval([-1.0, 1.0], samples=100), [-1.0, 1.0])
         self.assertEqual(before, random.getstate())
 
     def test_invalid_or_nonfinite_scores_are_rejected(self):
@@ -161,24 +237,427 @@ class TestSeatClusterBootstrap(unittest.TestCase):
 
     @unittest.skipIf(torch is None, "PyTorch not installed")
     def test_gate_restores_torch_threads_when_checkpoint_loading_fails(self):
+        from src.game.environment import GameConfig
+        from src.model.network import QNetwork, save_checkpoint
+        from src.model.spec import ModelSpec
+
         previous = torch.get_num_threads()
         torch.set_num_threads(2)
         try:
-            with mock.patch(
-                "src.evaluation.promotion.CheckpointPolicy",
-                side_effect=RuntimeError("bad checkpoint"),
-            ), self.assertRaisesRegex(RuntimeError, "bad checkpoint"):
-                evaluate_gate(
-                    "candidate.pt",
-                    "champion.pt",
-                    (),
-                    seed=1,
-                    seed_blocks=32,
-                    solo_games=256,
-                )
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "model.pt"
+                save_checkpoint(str(path), QNetwork(ModelSpec(8, 1, 1)), GameConfig())
+                with mock.patch(
+                    "src.evaluation.promotion.CheckpointPolicy",
+                    side_effect=RuntimeError("bad checkpoint"),
+                ), self.assertRaisesRegex(RuntimeError, "bad checkpoint"):
+                    evaluate_gate(str(path), str(path), (), seed=1, seed_blocks=32, solo_games=256)
             self.assertEqual(torch.get_num_threads(), 2)
         finally:
             torch.set_num_threads(previous)
+
+
+class TestPhaseGateAssessment(unittest.TestCase):
+    def setUp(self):
+        self.multiplayer = {str(count): {"candidate_minus_champion": 0.1} for count in (2, 3, 4)}
+        self.metrics = {
+            "multiplayer_gain": 0.1, "multiplayer_ci95": [0.05, 0.15],
+            "multiplayer_ci95_by_count": {str(count): [0.05, 0.15] for count in (2, 3, 4)},
+            "declaration_gain": 0.0, "declaration_ci95": [-0.02, 0.02],
+            "solo_gain": 0.0, "solo_ci95": [-0.02, 0.02],
+        }
+
+    def assess(self, phase, *, rules=None, blocks=None, games=256):
+        return assess_gate(
+            phase, GameConfig(max_turns=60) if rules is None else rules, self.multiplayer, self.metrics,
+            (32 if phase == "selection" else 128) if blocks is None else blocks, games,
+        )
+
+    def test_selection_accepts_noisy_positive_placement_without_count_superiority(self):
+        for count, mean in (("2", 0.029), ("3", 0.1339), ("4", 0.0375)):
+            self.multiplayer[count]["candidate_minus_champion"] = mean
+        self.metrics.update({
+            "multiplayer_gain": 0.0668, "multiplayer_ci95": [0.0152, 0.1185],
+            "multiplayer_ci95_by_count": {
+                "2": [-0.078, 0.137], "3": [0.04, 0.22], "4": [-0.025, 0.104],
+            },
+            "declaration_gain": 0.0477, "declaration_ci95": [0.0, 0.1],
+            "solo_gain": 0.0625, "solo_ci95": [0.01, 0.12],
+        })
+        self.assertEqual(self.assess("selection"), (True, []))
+        self.assertEqual(self.assess("confirmation"), (False, ["placement_2p"]))
+
+    def test_only_confirmation_requires_a_positive_aggregate_lower_bound(self):
+        self.metrics["multiplayer_ci95"] = [0.0, 0.2]
+        self.assertEqual(self.assess("selection"), (True, []))
+        self.assertEqual(self.assess("confirmation"), (False, ["placement"]))
+        self.metrics["multiplayer_gain"] = 0.0
+        self.assertEqual(self.assess("selection"), (False, ["placement"]))
+
+    def test_selection_mean_boundaries_are_inclusive_except_aggregate_superiority(self):
+        self.multiplayer["2"]["candidate_minus_champion"] = -0.05
+        self.metrics.update({"multiplayer_gain": 0.05, "declaration_gain": -0.02, "solo_gain": -0.02})
+        self.assertEqual(self.assess("selection"), (True, []))
+        for field, value, failure in (
+            ("multiplayer_gain", 0.0, "placement"),
+            ("declaration_gain", -0.020001, "declaration"),
+            ("solo_gain", -0.020001, "solo"),
+        ):
+            with self.subTest(field=field), mock.patch.dict(self.metrics, {field: value}):
+                self.assertEqual(self.assess("selection"), (False, [failure]))
+        with mock.patch.dict(self.multiplayer["2"], {"candidate_minus_champion": -0.050001}):
+            self.assertEqual(self.assess("selection"), (False, ["placement_2p"]))
+
+    def test_confirmation_noninferiority_boundaries_apply_to_every_player_count(self):
+        self.metrics.update({
+            "multiplayer_gain": 0.06, "declaration_gain": -0.01, "declaration_ci95": [-0.05, 0.03],
+            "solo_gain": -0.01, "solo_ci95": [-0.05, 0.03],
+        })
+        for count in ("2", "3", "4"):
+            with self.subTest(count=count), mock.patch.dict(
+                self.multiplayer[count], {"candidate_minus_champion": -0.02},
+            ), mock.patch.dict(self.metrics["multiplayer_ci95_by_count"], {count: [-0.06, 0.1]}):
+                self.assertEqual(self.assess("confirmation"), (True, []))
+                with mock.patch.dict(self.multiplayer[count], {"candidate_minus_champion": -0.020001}):
+                    self.assertEqual(self.assess("confirmation"), (False, ["placement_%sp" % count]))
+                with mock.patch.dict(self.metrics["multiplayer_ci95_by_count"], {count: [-0.060001, 0.1]}):
+                    self.assertEqual(self.assess("confirmation"), (False, ["placement_%sp" % count]))
+        for field, value, failure in (
+            ("declaration_gain", -0.010001, "declaration"),
+            ("declaration_ci95", [-0.050001, 0.03], "declaration"),
+            ("solo_gain", -0.010001, "solo"),
+            ("solo_ci95", [-0.050001, 0.03], "solo"),
+        ):
+            with self.subTest(field=field), mock.patch.dict(self.metrics, {field: value}):
+                self.assertEqual(self.assess("confirmation"), (False, [failure]))
+
+    def test_four_player_improvement_cannot_hide_a_two_player_regression(self):
+        for count, mean in (("2", -0.15), ("3", 0.3), ("4", 0.3)):
+            self.multiplayer[count]["candidate_minus_champion"] = mean
+        self.metrics["multiplayer_gain"] = 0.15
+        self.metrics["multiplayer_ci95_by_count"]["2"] = [-0.15, -0.15]
+        for phase in ("selection", "confirmation"):
+            self.assertEqual(self.assess(phase), (False, ["placement_2p"]))
+
+    def test_common_checks_report_all_failures_and_phase_specific_sample_floors(self):
+        for phase, blocks in (("selection", 31), ("confirmation", 127)):
+            self.assertEqual(
+                self.assess(phase, rules=GameConfig(max_turns=60, recycle_discard=False), blocks=blocks, games=255),
+                (False, ["rules", "seed_blocks", "solo_games"]),
+            )
+        for changes in (
+            {"num_decks": 2}, {"cards_in_hand": 18}, {"required_sequences": 4},
+            {"max_turns": 59}, {"recycle_discard": False},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(
+                    self.assess("confirmation", rules=GameConfig(**{"max_turns": 60, **changes})),
+                    (False, ["rules"]),
+                )
+        self.assertEqual(self.assess("confirmation"), (True, []))
+
+    def test_unknown_phases_fail_before_loading_checkpoints(self):
+        with self.assertRaisesRegex(ValueError, "phase"):
+            evaluate_gate("missing.pt", "missing.pt", (), 41, 32, 256, phase="screen")
+
+
+@unittest.skipIf(torch is None, "PyTorch not installed")
+class TestGateExecution(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+
+    @classmethod
+    def tearDownClass(cls):
+        torch.set_num_threads(cls.previous_threads)
+
+    def setUp(self):
+        from src.game.environment import GameConfig
+        from src.model.network import QNetwork, save_checkpoint
+        from src.model.spec import ModelSpec
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.candidate, self.champion = self.root / "candidate.pt", self.root / "champion.pt"
+        with torch.random.fork_rng(devices=[]):
+            for path, seed in ((self.candidate, 17), (self.champion, 31)):
+                torch.manual_seed(seed)
+                save_checkpoint(str(path), QNetwork(ModelSpec(8, 1, 1)), GameConfig())
+
+    def gate(self, **overrides):
+        arguments = {
+            "candidate_path": str(self.candidate), "champion_path": str(self.champion),
+            "opponent_paths": (), "seed": 41, "seed_blocks": 1,
+            "solo_games": 35, "max_turns": 1, "samples": 100,
+        }
+        return evaluate_gate(**{**arguments, **overrides})
+
+    def test_joint_base_blocks_use_disjoint_seed_groups_and_canonical_replica_order(self):
+        from src.evaluation.arena import run_matches
+
+        played = []
+
+        def record(deals, *args, **kwargs):
+            played.append((deals[0].players, deals[0].seed))
+            return run_matches(deals, *args, **kwargs)
+
+        with mock.patch("src.evaluation.promotion.run_matches", side_effect=record):
+            result = self.gate(seed_blocks=2, solo_games=1)
+        self.assertEqual(played, [
+            (2, 41), (2, 42), (2, 43), (2, 44), (3, 41), (3, 42), (4, 41),
+            (2, 45), (2, 46), (2, 47), (2, 48), (3, 45), (3, 46), (4, 45),
+        ])
+        self.assertEqual(
+            [(raw["blocks"], raw["games"]) for raw in result["multiplayer"].values()],
+            [(8, 16), (4, 24), (2, 48)],
+        )
+
+    def test_evaluator_and_validator_share_phase_verdicts_and_failure_recomputation(self):
+        from src.evaluation.promotion import _SoloJob
+
+        for phase, blocks in (("selection", 32), ("confirmation", 128)):
+            for placement, expected in ((0.125, (True, [])), (0.0, (False, ["placement"]))):
+                with self.subTest(phase=phase, placement=placement):
+                    def finish(_runner, job, **_kwargs):
+                        if isinstance(job, _SoloJob):
+                            return {"candidate_outcomes": [0] * job.games, "champion_outcomes": [0] * job.games}
+                        return {"placement_margin": placement, "declaration_margin": 0.0}
+
+                    with mock.patch("src.evaluation.promotion._GateRunner.run", autospec=True, side_effect=finish):
+                        result = self.gate(seed_blocks=blocks, solo_games=256, max_turns=60, phase=phase)
+                    self.assertEqual((result["accepted"], result["gate_failures"]), expected)
+                    self.assertEqual(result["phase"], phase)
+                    self.assertEqual(result["declaration_ci95"], [0.0, 0.0])
+                    arguments = (phase, result["candidate_sha256"], result["champion_sha256"])
+                    if expected[0]:
+                        validated = validate_gate_evidence(result, *arguments)
+                        self.assertEqual((validated.phase, validated.seed_blocks, validated.solo_games), (phase, blocks, 256))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "gate did not pass: placement"):
+                            validate_gate_evidence(result, *arguments)
+                    with self.assertRaisesRegex(ValueError, "verdict disagrees"):
+                        validate_gate_evidence({**result, "gate_failures": ["solo"]}, *arguments)
+
+    def test_phase_changes_reuse_the_same_raw_journal(self):
+        directory = self.root / "phase-shared"
+        selection = self.gate(phase="selection", journal_dir=directory)
+        with mock.patch("src.evaluation.promotion._GateRunner", side_effect=AssertionError("replayed raw evidence")):
+            confirmation = self.gate(phase="confirmation", journal_dir=directory)
+        self.assertEqual(selection["phase"], "selection")
+        self.assertEqual(confirmation["phase"], "confirmation")
+        self.assertEqual(selection["multiplayer"], confirmation["multiplayer"])
+        self.assertEqual(selection["solo"], confirmation["solo"])
+        self.assertEqual(len(list(directory.glob("*.jsonl"))), 1)
+
+    def test_loser_placement_improves_without_either_contender_declaring(self):
+        from src.evaluate import HandPenalty
+        from src.game.outcome import DealOutcome
+
+        def third_seat_wins(deals, *_args, **_kwargs):
+            matches = []
+            for deal in deals:
+                candidate, champion, winner = (deal.seats.index(index) for index in range(3))
+                points = [0] * 3
+                points[candidate], points[champion] = 40, 80
+                outcome = DealOutcome(winner, "win", tuple(
+                    HandPenalty(value, (), (0,) * 52) for value in points
+                ))
+                matches.append(SimpleNamespace(winner=winner, outcome=outcome))
+            return matches
+
+        with mock.patch("src.evaluation.promotion.run_matches", side_effect=third_seat_wins):
+            result = self.gate(player_counts=(3,), solo_games=1)
+        self.assertEqual(result["multiplayer"]["3"], {
+            "blocks": 2, "games": 12,
+            "placement_margins": [1.0, 1.0], "declaration_margins": [0.0, 0.0],
+            "candidate_minus_champion": 1.0, "declaration_delta": 0.0,
+        })
+        self.assertEqual(result["multiplayer_gain"], 1.0)
+        self.assertEqual(result["declaration_gain"], 0.0)
+        self.assertEqual(result["multiplayer_ci95"], [1.0, 1.0])
+
+    def test_parallel_workers_produce_byte_identical_evidence_to_in_process_execution(self):
+        serial = self.gate(workers=1)
+        self.assertEqual(
+            [(raw["blocks"], raw["games"]) for raw in serial["multiplayer"].values()],
+            [(4, 8), (2, 12), (1, 24)],
+        )
+        self.assertEqual(serial["solo"]["candidate_outcomes"], [0] * 35)
+        for workers in (2, 4):
+            with self.subTest(workers=workers):
+                parallel = self.gate(workers=workers)
+                self.assertEqual(serial["multiplayer"], parallel["multiplayer"])
+                self.assertEqual(serial["solo"], parallel["solo"])
+                self.assertEqual(serial["multiplayer_ci95"], parallel["multiplayer_ci95"])
+                self.assertEqual(json.dumps(serial), json.dumps(parallel))
+
+    def test_interrupted_journal_preserves_blocks_and_resume_skips_them(self):
+        from src.evaluation.arena import run_matches
+
+        journal_dir = self.root / "gates"
+        played = []
+
+        def interrupt(deals, *args, **kwargs):
+            if len(played) == 2:
+                raise GateInterrupted("injected interruption")
+            played.append((deals[0].players, deals[0].seed))
+            return run_matches(deals, *args, **kwargs)
+
+        with mock.patch("src.evaluation.promotion.run_matches", side_effect=interrupt):
+            with self.assertRaisesRegex(GateInterrupted, "injected interruption"):
+                self.gate(journal_dir=journal_dir)
+        journal, = journal_dir.glob("*.jsonl")
+        prefix = journal.read_bytes()
+        records = [json.loads(line) for line in prefix.splitlines()]
+        self.assertEqual([record["job"] for record in records], [
+            ["multiplayer", 2, 0], ["multiplayer", 2, 1],
+        ])
+        self.assertEqual(played, [(2, 41), (2, 42)])
+        with journal.open("a", encoding="utf-8") as stream:
+            stream.write('{"interrupted":')
+        played.clear()
+
+        def record(deals, *args, **kwargs):
+            played.append((deals[0].players, deals[0].seed))
+            return run_matches(deals, *args, **kwargs)
+
+        with mock.patch("src.evaluation.promotion.run_matches", side_effect=record):
+            resumed = self.gate(journal_dir=journal_dir)
+        self.assertEqual(played, [(2, 43), (2, 44), (3, 41), (3, 42), (4, 41)])
+        self.assertTrue(journal.read_bytes().startswith(prefix))
+        resumed_records = [json.loads(line) for line in journal.read_bytes().splitlines()]
+        self.assertEqual(len(resumed_records), 9)
+        self.assertTrue(journal.read_bytes().endswith(b"\n"))
+        uninterrupted = self.gate()
+        self.assertEqual(json.dumps(resumed), json.dumps(uninterrupted))
+        with mock.patch("src.evaluation.promotion._GateRunner", side_effect=AssertionError("replayed cached work")):
+            cached = self.gate(journal_dir=journal_dir, workers=2)
+        self.assertEqual(json.dumps(cached), json.dumps(uninterrupted))
+
+    def test_resume_skips_completed_paired_solo_slices(self):
+        from src.evaluation.benchmark import evaluate_games
+
+        journal_dir = self.root / "solo-journal"
+
+        def interrupt(network, rules, games, seed, **kwargs):
+            if seed == 100_073:
+                raise GateInterrupted("second solo slice")
+            return evaluate_games(network, rules, games, seed, **kwargs)
+
+        with mock.patch("src.evaluation.promotion.evaluate_games", side_effect=interrupt):
+            with self.assertRaisesRegex(GateInterrupted, "second solo slice"):
+                self.gate(journal_dir=journal_dir)
+        journal, = journal_dir.glob("*.jsonl")
+        records = [json.loads(line) for line in journal.read_text().splitlines()]
+        self.assertEqual(len(records), 8)
+        self.assertEqual(records[-1]["job"], ["solo", 0, 32])
+        self.assertEqual(records[-1]["result"]["candidate_outcomes"], [0] * 32)
+        with mock.patch(
+            "src.evaluation.promotion.run_matches", side_effect=AssertionError("replayed completed block"),
+        ), mock.patch(
+            "src.evaluation.promotion.evaluate_games", wraps=evaluate_games,
+        ) as solo:
+            resumed = self.gate(journal_dir=journal_dir)
+        self.assertEqual([call.args[3] for call in solo.call_args_list], [100_073, 100_073])
+        self.assertEqual(json.dumps(resumed), json.dumps(self.gate()))
+
+    def test_parallel_task_timeout_is_a_failure_and_restores_parent_threads(self):
+        with self.assertRaisesRegex(RuntimeError, "Gate job timed out") as failure:
+            self.gate(workers=2, task_seconds=0.000001)
+        self.assertNotIsInstance(failure.exception, GateInterrupted)
+        self.assertEqual(torch.get_num_threads(), 1)
+
+    def test_serial_task_timeouts_are_distinct_from_the_global_deadline(self):
+        from src.evaluation.arena import MatchInterrupted
+
+        for error in (TimeoutError("task deadline"), MatchInterrupted("match deadline")):
+            with mock.patch("src.evaluation.promotion._GateRunner.run", side_effect=error):
+                with self.assertRaisesRegex(RuntimeError, "Gate job timed out") as failure:
+                    self.gate(deadline=time.monotonic() + 120)
+            self.assertNotIsInstance(failure.exception, GateInterrupted)
+        for workers in (1, 2):
+            with self.subTest(workers=workers), self.assertRaises(GateInterrupted):
+                self.gate(workers=workers, deadline=0)
+
+    def test_a_completed_serial_result_is_journaled_before_the_next_deadline_check(self):
+        clock = [0.0]
+        deadlines = []
+
+        def finish(_runner, _job, *, deadline):
+            deadlines.append(deadline)
+            clock[0] = 11.0
+            return {"placement_margin": 0.0, "declaration_margin": 0.0}
+
+        directory = self.root / "finished-job"
+        with mock.patch("src.evaluation.promotion.time.monotonic", side_effect=lambda: clock[0]), mock.patch(
+            "src.evaluation.promotion._GateRunner.run", autospec=True, side_effect=finish,
+        ), self.assertRaises(GateInterrupted):
+            self.gate(journal_dir=directory, deadline=10.0, task_seconds=5.0)
+        journal, = directory.glob("*.jsonl")
+        records = [json.loads(line) for line in journal.read_bytes().splitlines()]
+        self.assertEqual(deadlines, [5.0])
+        self.assertEqual([record["job"] for record in records], [["multiplayer", 2, 0]])
+        self.assertEqual(records[0]["result"], {"placement_margin": 0.0, "declaration_margin": 0.0})
+
+    def test_settled_journal_corruption_is_never_silently_replayed(self):
+        directory = self.root / "corrupt"
+        self.gate(journal_dir=directory, player_counts=(2,), solo_games=1)
+        journal, = directory.glob("*.jsonl")
+        original = journal.read_bytes()
+        record = json.loads(original.splitlines()[0])
+        corruptions = [
+            b"{broken}\n",
+            (json.dumps({**record, "job": ["multiplayer", 2, 99]}) + "\n").encode(),
+            (json.dumps({**record, "result": {"placement_margin": 2, "declaration_margin": 0}}) + "\n").encode(),
+            (json.dumps({**record, "gate_id": "wrong"}) + "\n").encode(),
+        ]
+        for corruption in corruptions:
+            with self.subTest(corruption=corruption):
+                journal.write_bytes(corruption + original)
+                with self.assertRaisesRegex(ValueError, "Malformed gate journal"):
+                    self.gate(journal_dir=directory, player_counts=(2,), solo_games=1)
+
+    def test_source_changes_use_a_different_journal_and_evidence_identity(self):
+        directory = self.root / "source-bound"
+        with mock.patch("src.evaluation.promotion.source_fingerprint", return_value="a" * 64):
+            first = self.gate(journal_dir=directory, player_counts=(2,), solo_games=1)
+        with mock.patch("src.evaluation.promotion.source_fingerprint", return_value="b" * 64):
+            second = self.gate(journal_dir=directory, player_counts=(2,), solo_games=1)
+        self.assertEqual(first["source_sha256"], "a" * 64)
+        self.assertEqual(second["source_sha256"], "b" * 64)
+        self.assertEqual(first["multiplayer"], second["multiplayer"])
+        self.assertEqual(len(list(directory.glob("*.jsonl"))), 2)
+
+    def test_gate_runner_rejects_checkpoint_swaps_before_loading_the_network(self):
+        from src.checkpoints.io import file_sha256
+        from src.evaluation.promotion import _GateRunner
+        from src.game.environment import GameConfig
+
+        hashes = [file_sha256(path) for path in (self.candidate, self.champion)]
+        self.candidate.write_bytes(b"replaced checkpoint")
+        with mock.patch("src.evaluation.arena.load_checkpoint", side_effect=AssertionError("loaded swapped model")):
+            with self.assertRaisesRegex(ValueError, "Checkpoint changed"):
+                _GateRunner(str(self.candidate), str(self.champion), (), GameConfig(), 41, hashes)
+
+    def test_worker_source_mismatch_fails_before_loading_checkpoints(self):
+        from src.evaluation.promotion import _init_gate_worker
+        from src.game.environment import GameConfig
+
+        with self.assertRaisesRegex(RuntimeError, "source differs"):
+            _init_gate_worker(
+                expected_source="wrong", candidate_path="missing.pt", champion_path="missing.pt",
+                opponent_paths=(), rules=GameConfig(), seed=41, expected_hashes=(),
+            )
+
+    def test_invalid_execution_settings_fail_before_loading_checkpoints(self):
+        for arguments in (
+            {"workers": 0}, {"workers": True}, {"workers": 1.5},
+            {"task_seconds": 0}, {"task_seconds": float("nan")}, {"samples": 99},
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                evaluate_gate("missing.pt", "missing.pt", (), 41, 1, 1, **arguments)
 
 
 if __name__ == "__main__":

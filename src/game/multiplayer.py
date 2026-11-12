@@ -145,6 +145,15 @@ class MultiplayerEnv:
             warm_start=False,
         )
 
+    def private_hands(self, observer: int) -> tuple[tuple[int, ...], ...]:
+        if type(observer) is not int or not 0 <= observer < self.config.players:
+            raise ValueError("observer must name a seat in this match")
+        return tuple(
+            tuple(self._hands[(observer + relative) % self.config.players])
+            if relative < self.config.players else (0,) * NUM_FACES
+            for relative in range(6)
+        )
+
     def step(self, action: int) -> MatchView:
         if self._phase is Phase.TERMINAL:
             raise ValueError("match is terminal; call reset")

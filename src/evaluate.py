@@ -90,7 +90,6 @@ def _rank_patterns() -> Tuple[Tuple[int, ...], ...]:
         for end in range(start + MIN_MELD - 1, NUM_RANKS):
             patterns.append(tuple(range(start, end + 1)))
     for start in range(1, NUM_RANKS - 1):
-        # Ace-high runs: start..K,A (QKA, JQKA, ...). No KA2 wrap.
         patterns.append(tuple(range(start, NUM_RANKS)) + (0,))
     return tuple(patterns)
 
@@ -202,6 +201,24 @@ def _iter_sets(
                 yield _meld_from("set", actuals, represented, joker)
 
 
+def pure_sequence_upper_bound(hand: Sequence[int], joker: int) -> int:
+    upper = hand[joker]
+    for suit in range(NUM_SUITS):
+        remaining = list(hand[suit * NUM_RANKS:(suit + 1) * NUM_RANKS])
+        if joker // NUM_RANKS == suit:
+            remaining[joker % NUM_RANKS] = 0
+        triples = (
+            sum(copies // MIN_MELD for copies in remaining)
+            + sum(
+                min(remaining[start:start + MIN_MELD])
+                for start in range(NUM_RANKS - MIN_MELD + 1)
+            )
+            + min(remaining[-2], remaining[-1], remaining[0])
+        )
+        upper += min(sum(remaining) // MIN_MELD, triples)
+    return min(sum(hand) // MIN_MELD, upper)
+
+
 def _search(
     counts: Tuple[int, ...],
     pure_needed: int,
@@ -209,7 +226,15 @@ def _search(
 ) -> Optional[Tuple[Meld, ...]]:
     if sum(counts) < pure_needed * MIN_MELD:
         return None
+    if pure_needed > 0 and pure_sequence_upper_bound(counts, joker) < pure_needed:
+        return None
     faces, options = _compile_meld_options(counts, joker)
+    covered = [False] * len(faces)
+    for option in chain.from_iterable(options):
+        for position, _ in option.take:
+            covered[position] = True
+    if not all(covered):
+        return None
     initial = tuple(counts[face] for face in faces)
     memo: Dict[Tuple[Tuple[int, ...], int], Optional[Tuple[Meld, ...]]] = {}
 
@@ -490,6 +515,13 @@ def minimum_penalty(
 def _card_points(face: int, joker: int) -> int:
     rank = face % NUM_RANKS
     return 0 if rank == joker % NUM_RANKS else _RANK_POINTS[rank]
+
+
+def card_points(face: int, joker: int) -> int:
+    card = _require_integral(face, "face")
+    if not 0 <= card < NUM_FACES:
+        raise ValueError("face must be in 0..51, got %d" % card)
+    return _card_points(card, _parse_joker(joker))
 
 
 class _PenaltySearch:

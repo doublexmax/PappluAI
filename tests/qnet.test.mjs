@@ -2,29 +2,20 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import { encodeObservation, historyChannels, parseQModel, qValues } from "../web/qnet.mjs";
+import {
+  CHANNELS, FEATURE_LAYOUT, FEATURE_SIZE, encodeObservation, parseQModel, qValues, tensorShapes,
+} from "../web/qnet.mjs";
 
 const ROOT = new URL("../", import.meta.url);
 const MODEL = readJson("web/papplu-model.json");
 const GOLDEN = readJson("tests/fixtures/qnet-golden.json");
-const [INITIAL, DRAW_STOCK, TAKE_DISCARD, DISCARD, REFILL, TERMINAL] = [0, 1, 2, 3, 4, 5];
-const STATE_DICT = [
-  ["suit_conv1.weight", [64, 5, 3]], ["suit_conv1.bias", [64]],
-  ["suit_conv2.weight", [64, 64, 3]], ["suit_conv2.bias", [64]],
-  ["card_attention.in_proj_weight", [192, 64]], ["card_attention.in_proj_bias", [192]],
-  ["card_attention.out_proj.weight", [64, 64]], ["card_attention.out_proj.bias", [64]],
-  ["card_norm.weight", [64]], ["card_norm.bias", [64]],
-  ["history_proj.weight", [1, 5]], ["history_proj.bias", [1]],
-  ["context_features.weight", [64, 11]], ["context_features.bias", [64]],
-  ["player_features.weight", [64, 6]], ["player_features.bias", [64]],
-  ["event_summary.weight", [64, 8]], ["event_summary.bias", [64]],
-  ["turn_relations.weight", [64, 192]], ["turn_relations.bias", [64]],
-  ["context_gate.weight", [2, 64]], ["context_gate.bias", [2]],
-  ["draw_head.0.weight", [64, 197]], ["draw_head.0.bias", [64]],
-  ["draw_head.2.weight", [2, 64]], ["draw_head.2.bias", [2]],
-  ["score.0.weight", [64, 210]], ["score.0.bias", [64]],
-  ["score.2.weight", [1, 64]], ["score.2.bias", [1]],
-];
+const OFFSETS = {};
+let offset = 0;
+for (const [name, shape] of FEATURE_LAYOUT) {
+  const size = shape.reduce((a, b) => a * b, 1);
+  OFFSETS[name] = offset;
+  offset += size;
+}
 
 function readJson(path) {
   return JSON.parse(readFileSync(new URL(path, ROOT), "utf8"));
@@ -37,132 +28,113 @@ function assertClose(actual, expected, tolerance, label) {
   });
 }
 
-function faces(counts) {
-  const result = new Array(52).fill(0);
-  for (const [face, n] of Object.entries(counts)) result[face] = n;
-  return result;
+function counts(cards) {
+  const hand = new Array(52).fill(0);
+  cards.forEach(face => { hand[face] += 1; });
+  return hand;
 }
 
-function event(kind, actor, fields = {}) {
+function observation(cards = [0, 1, 30], joker = 7) {
+  const hand = counts(cards);
   return {
-    kind, actor, handSize: 13, turnsRemaining: 10, stockRemaining: 52, nextPlayer: (actor + 1) % 3,
-    face: null, offeredTop: null, initialHand: faces({}), ...fields,
+    hand, joker, discardPile: [2], phase: 0, turnsRemaining: 40, stockRemaining: 151,
+    config: { numDecks: 3, cardsInHand: 3, requiredSequences: 1, maxTurns: 40, recycleDiscard: true },
+    players: [{ handSize: cards.length, turnsRemaining: 40, nextPlayer: 0, previousPlayer: 0, active: true }],
+    history: [{
+      kind: 0, actor: 0, handSize: cards.length, turnsRemaining: 40, stockRemaining: 151, nextPlayer: 0,
+      face: null, offeredTop: 2, initialHand: hand.slice(),
+    }],
   };
 }
 
-function threeSeatObservation() {
-  return {
-    hand: faces({ 0: 2, 14: 1 }),
-    discardPile: [5, 7, 5],
-    joker: 16,
-    phase: 1,
-    turnsRemaining: 20,
-    stockRemaining: 60,
-    config: { numDecks: 2, cardsInHand: 13, requiredSequences: 4, maxTurns: 30, recycleDiscard: true },
-    players: [0, 1, 2].map((seat) => ({
-      handSize: 13 - seat, turnsRemaining: 20, nextPlayer: (seat + 1) % 3, previousPlayer: (seat + 2) % 3, active: seat !== 2,
-    })),
-    history: [
-      event(INITIAL, 0, { initialHand: faces({ 0: 1, 3: 1 }) }),
-      event(DISCARD, 0, { face: 3 }),
-      event(DRAW_STOCK, 1, { offeredTop: 3 }),
-      event(TAKE_DISCARD, 2, { face: 3 }),
-      event(DISCARD, 2, { face: 9 }),
-      event(TAKE_DISCARD, 1, { face: 9 }),
-      event(DISCARD, 1, { face: 11 }),
-      event(DRAW_STOCK, 2, { offeredTop: 11 }),
-      event(REFILL, 1, { face: 20 }),
-      event(TERMINAL, 2, { face: 21 }),
-      event(DRAW_STOCK, 0, { face: 14, offeredTop: 11 }),
-    ],
-  };
+function cardChannel(features, face, name) {
+  return features[OFFSETS.card + face * 17 + CHANNELS.card.indexOf(name)];
 }
 
-function turn(seat, seats) {
-  return [Math.sin(2 * Math.PI * seat / seats), Math.cos(2 * Math.PI * seat / seats)];
+function context(features, name) {
+  return features[OFFSETS.context + CHANNELS.context.indexOf(name)];
 }
 
 describe("qnet golden parity", () => {
-  const cases = GOLDEN.cases;
-
-  it("pins real tables from one to six seats with every event kind", () => {
-    assert.deepEqual([...new Set(cases.map((c) => c.seats))].sort(), [1, 2, 3, 4, 5, 6]);
-    for (const c of cases) assert.equal(c.observation.players.length, c.seats, c.name);
-    for (let seats = 1; seats <= 6; seats += 1) {
-      const longest = Math.max(...cases.filter((c) => c.seats === seats).map((c) => c.observation.history.length));
-      assert.ok(longest >= 10, `${seats} seats need a case with real history`);
+  it("encodes real solo through hexa tables with every public event kind", () => {
+    const kinds = new Set();
+    const seats = new Set();
+    for (const c of GOLDEN.cases) {
+      seats.add(c.seats);
+      assert.equal(c.observation.players.length, c.seats, c.name);
+      c.observation.history.forEach(e => kinds.add(e.kind));
+      const actual = encodeObservation(c.observation);
+      assert.ok(actual instanceof Float32Array);
+      assert.equal(actual.length, 3208);
+      assert.deepEqual(Array.from(actual), c.features, c.name);
     }
-    const kinds = new Set(cases.flatMap((c) => c.observation.history.map((e) => e.kind)));
+    assert.deepEqual([...seats].sort(), [1, 2, 3, 4, 5, 6]);
     assert.deepEqual([...kinds].sort(), [0, 1, 2, 3, 4, 5]);
+    assert.deepEqual(FEATURE_LAYOUT, GOLDEN.featureLayout);
+    assert.deepEqual(CHANNELS, GOLDEN.channels);
+    assert.equal(FEATURE_SIZE, offset);
   });
 
-  it("was written for the committed model and the current Python sources", () => {
+  it("reproduces all 54 reference Q values on all 15 cases within 1e-4", () => {
+    const results = qValues(parseQModel(MODEL), GOLDEN.cases.map(c => c.observation));
+    assert.equal(results.length, 15);
+    results.forEach((q, i) => {
+      assert.ok(q instanceof Float32Array);
+      assertClose(Array.from(q), GOLDEN.cases[i].q, 1e-4, GOLDEN.cases[i].name);
+    });
+  });
+
+  it("binds the golden oracle to the model bytes and current Python sources", () => {
     assert.equal(GOLDEN.modelSha256, MODEL.source.sha256);
     assert.equal(GOLDEN.tensorsSha256, MODEL.source.tensorsSha256);
     assert.deepEqual(Object.keys(GOLDEN.sources).sort(), [
+      "src/evaluate.py", "src/game/belief.py", "src/game/environment.py", "src/game/lookahead.py",
       "src/model/encoding.py", "src/model/network.py", "tools/weights_export.py",
     ]);
     for (const [path, digest] of Object.entries(GOLDEN.sources)) {
-      // Python hashed read_text(), which folds CRLF, so a CRLF checkout must hash the same.
       const text = readFileSync(new URL(path, ROOT), "utf8").replace(/\r\n?/g, "\n");
       assert.equal(createHash("sha256").update(text).digest("hex"), digest, `${path} changed; rerun tools/weights_export.py`);
     }
-  });
-
-  it("encodes every observation as encoding.py does", () => {
-    for (const c of cases) {
-      const encoded = encodeObservation(c.observation);
-      assert.deepEqual(Object.keys(encoded).sort(), Object.keys(c.encoded).sort());
-      for (const [key, expected] of Object.entries(c.encoded)) {
-        if (typeof expected === "number") assert.equal(encoded[key], expected, `${c.name} ${key}`);
-        else assertClose(Array.from(encoded[key]), expected, 1e-12, `${c.name} ${key}`);
-      }
-    }
-  });
-
-  it("weighs history as QNetwork._history_channels does", () => {
-    for (const c of cases) assertClose(Array.from(historyChannels(c.observation)), c.historyChannels, 1e-12, c.name);
-  });
-
-  it("reproduces all 54 reference Q values within 1e-4", () => {
-    assert.equal(GOLDEN.tolerance, 1e-4);
-    const results = qValues(parseQModel(MODEL), cases.map((c) => c.observation));
-    assert.equal(results.length, cases.length);
-    results.forEach((q, i) => {
-      assert.ok(q instanceof Float32Array);
-      assertClose(Array.from(q), cases[i].q, GOLDEN.tolerance, cases[i].name);
-    });
-  });
-});
-
-describe("papplu-model.json", () => {
-  it("stores 70,795 float32 parameters in state_dict order under its tensor SHA-256", () => {
-    assert.deepEqual(Object.keys(MODEL.tensors).sort(), STATE_DICT.map(([name]) => name).sort());
+    const shapes = tensorShapes(MODEL.modelSpec);
+    assert.deepEqual(Object.keys(MODEL.tensors), shapes.map(([name]) => name));
     const hash = createHash("sha256");
-    let parameters = 0;
-    for (const [name, shape] of STATE_DICT) {
-      const size = shape.reduce((a, b) => a * b, 1);
+    for (const [name, shape] of shapes) {
+      assert.ok(name.startsWith("policy."));
       const bytes = Buffer.from(MODEL.tensors[name].data, "base64");
       assert.deepEqual(MODEL.tensors[name].shape, shape, name);
-      assert.equal(bytes.length, 4 * size, name);
-      parameters += size;
+      assert.equal(bytes.length, 4 * shape.reduce((a, b) => a * b, 1), name);
       hash.update(bytes);
     }
-    assert.equal(parameters, 70795);
     assert.equal(hash.digest("hex"), MODEL.source.tensorsSha256);
+  });
+
+  it("evaluates dynamically shaped width-128, eight-head, three-block weights", () => {
+    const json = structuredClone(MODEL);
+    json.modelSpec = { width: 128, heads: 8, blocks: 3 };
+    json.tensors = Object.fromEntries(tensorShapes(json.modelSpec).map(([name, shape]) => {
+      const data = new Float32Array(shape.reduce((a, b) => a * b, 1));
+      if (name === "policy.value_out.bias") data[0] = 3;
+      return [name, { shape, data: Buffer.from(data.buffer).toString("base64") }];
+    }));
+    const model = parseQModel(json);
+    assert.deepEqual(model.spec, { width: 128, heads: 8, blocks: 3 });
+    for (const q of qValues(model, [observation(), GOLDEN.cases.at(-1).observation])) {
+      assert.deepEqual(Array.from(q), new Array(54).fill(3));
+    }
   });
 });
 
 describe("parseQModel", () => {
-  it("returns a frozen handle that keeps the tensors private", () => {
+  it("returns a frozen model handle with private policy weights", () => {
     const model = parseQModel(MODEL);
-    assert.deepEqual(Object.keys(model), ["kind", "gameConfig", "source"]);
+    assert.deepEqual(Object.keys(model), ["kind", "spec", "gameConfig", "source"]);
     assert.equal(model.kind, "papplu-qnet");
-    assert.ok(Object.isFrozen(model) && Object.isFrozen(model.gameConfig) && Object.isFrozen(model.source));
-    assert.throws(() => qValues({ ...model }, []), { name: "TypeError", message: /must come from parseQModel/ });
+    assert.ok(Object.isFrozen(model) && Object.isFrozen(model.spec) && Object.isFrozen(model.gameConfig) && Object.isFrozen(model.source));
+    assert.throws(() => qValues({ ...model }, []), /must come from parseQModel/);
+    assert.deepEqual(qValues(model, []), []);
   });
 
-  it("accepts checkpoint and registry labels", () => {
+  it("accepts checkpoint and registry source identities", () => {
     for (const source of [
       { kind: "checkpoint", trained: true, champion: false, seed: null, registryId: null },
       { kind: "registry", trained: true, champion: true, seed: null, registryId: "gen-12" },
@@ -173,71 +145,57 @@ describe("parseQModel", () => {
     }
   });
 
-  it("rejects anything but an object", () => {
-    for (const value of [null, [], "model", 3]) {
-      assert.throws(() => parseQModel(value), { name: "TypeError", message: /^model: expected an object$/ });
-    }
+  it("accepts a different valid head partition without changing tensor dimensions", () => {
+    const json = structuredClone(MODEL);
+    json.modelSpec.heads = 8;
+    const model = parseQModel(json);
+    assert.equal(model.spec.heads, 8);
+    assert.equal(qValues(model, [observation()])[0].length, 54);
+  });
+
+  it("rejects values that are not model objects", () => {
+    for (const value of [null, [], "model", 3]) assert.throws(() => parseQModel(value), /^TypeError: model: expected an object$/);
   });
 
   const MALFORMED = [
-    ["a missing field", (m) => { delete m.source; }, /^model\.source: missing$/],
-    ["an unexpected field", (m) => { m.comment = "hi"; }, /^model\.comment: unexpected field$/],
-    ["another format", (m) => { m.format = "onnx"; }, /^model\.format: /],
-    ["a string format version", (m) => { m.formatVersion = "1"; }, /^model\.formatVersion: /],
-    ["checkpoint version 2", (m) => { m.checkpointVersion = 2; }, /^model\.checkpointVersion: /],
-    ["encoding version 1", (m) => { m.encodingVersion = 1; }, /^model\.encodingVersion: /],
-    ["another architecture", (m) => { m.architecture = "conv"; }, /^model\.architecture: /],
-    ["53 actions", (m) => { m.numActions = 53; }, /^model\.numActions: /],
-    ["width 128", (m) => { m.modelSpec.width = 128; }, /^model\.modelSpec: expected width 64 and heads 4$/],
-    ["8 heads", (m) => { m.modelSpec.heads = 8; }, /^model\.modelSpec: expected width 64 and heads 4$/],
-    ["an extra spec field", (m) => { m.modelSpec.dropout = 0; }, /^model\.modelSpec\.dropout: unexpected field$/],
-    ["zero decks", (m) => { m.gameConfig.numDecks = 0; }, /^model\.gameConfig\.numDecks: expected a positive integer$/],
-    ["zero turns", (m) => { m.gameConfig.maxTurns = 0; }, /^model\.gameConfig\.maxTurns: expected a positive integer$/],
-    ["fractional turns", (m) => { m.gameConfig.maxTurns = 1.5; }, /^model\.gameConfig\.maxTurns: /],
-    ["a string recycle flag", (m) => { m.gameConfig.recycleDiscard = "yes"; }, /^model\.gameConfig\.recycleDiscard: /],
-    ["more sequences than a hand holds", (m) => { m.gameConfig.requiredSequences = 8; }, /^model\.gameConfig\.requiredSequences: /],
-    ["too few cards to deal", (m) => { Object.assign(m.gameConfig, { numDecks: 1, cardsInHand: 51 }); }, /^model\.gameConfig\.numDecks: /],
-    ["an unknown source kind", (m) => { m.source.kind = "trained"; }, /^model\.source\.kind: /],
-    ["bootstrap weights claiming training", (m) => { m.source.trained = true; }, /^model\.source\.trained: must be false for bootstrap weights$/],
-    ["bootstrap weights claiming the title", (m) => { m.source.champion = true; }, /^model\.source\.champion: must be false for bootstrap weights$/],
-    ["bootstrap weights without a seed", (m) => { m.source.seed = null; }, /^model\.source\.seed: /],
-    [
-      "a checkpoint claiming the title",
-      (m) => { Object.assign(m.source, { kind: "checkpoint", trained: true, champion: true, seed: null }); },
-      /^model\.source\.champion: must be false for checkpoint weights$/,
-    ],
-    [
-      "a registry export without its id",
-      (m) => { Object.assign(m.source, { kind: "registry", trained: true, champion: true, seed: null }); },
-      /^model\.source\.registryId: /,
-    ],
-    [
-      "a registry export with an empty id",
-      (m) => { Object.assign(m.source, { kind: "registry", trained: true, champion: true, seed: null, registryId: "" }); },
-      /^model\.source\.registryId: expected the champion's registry id$/,
-    ],
-    ["an uppercase digest", (m) => { m.source.sha256 = m.source.sha256.toUpperCase(); }, /^model\.source\.sha256: /],
-    ["a short digest", (m) => { m.source.tensorsSha256 = "abc"; }, /^model\.source\.tensorsSha256: expected 64 lowercase hex digits$/],
-    ["a missing tensor", (m) => { delete m.tensors["score.2.bias"]; }, /^model\.tensors\.score\.2\.bias: missing$/],
-    ["an extra tensor", (m) => { m.tensors["score.4.bias"] = m.tensors["score.2.bias"]; }, /^model\.tensors\.score\.4\.bias: unexpected field$/],
-    ["an extra tensor field", (m) => { m.tensors["score.2.bias"].dtype = "float32"; }, /^model\.tensors\["score\.2\.bias"\]\.dtype: unexpected field$/],
-    ["a transposed shape", (m) => { m.tensors["score.2.weight"].shape = [64, 1]; }, /^model\.tensors\["score\.2\.weight"\]\.shape: expected \[1, 64\]$/],
-    ["a string shape", (m) => { m.tensors["score.2.bias"].shape = "1"; }, /^model\.tensors\["score\.2\.bias"\]\.shape: /],
-    [
-      "truncated data",
-      (m) => { m.tensors["score.0.bias"].data = m.tensors["score.0.bias"].data.slice(0, -8); },
-      /^model\.tensors\["score\.0\.bias"\]\.data: expected 256 bytes, got 252$/,
-    ],
-    ["text that is not base64", (m) => { m.tensors["score.2.bias"].data = "not base64"; }, /^model\.tensors\["score\.2\.bias"\]\.data: expected base64 text$/],
-    ["unpadded base64", (m) => { m.tensors["score.2.bias"].data = "AAAAAA"; }, /^model\.tensors\["score\.2\.bias"\]\.data: expected base64 text$/],
-    ["numeric data", (m) => { m.tensors["score.2.bias"].data = 0; }, /^model\.tensors\["score\.2\.bias"\]\.data: expected base64 text$/],
-    [
-      "a NaN weight",
-      (m) => { m.tensors["score.2.bias"].data = Buffer.from(new Float32Array([NaN]).buffer).toString("base64"); },
-      /^model\.tensors\["score\.2\.bias"\]\.data: value 0 is not finite$/,
-    ],
+    ["a missing source", m => { delete m.source; }, /model\.source: missing/],
+    ["an extra field", m => { m.comment = "hi"; }, /model\.comment: unexpected/],
+    ["another format", m => { m.format = "onnx"; }, /model\.format:/],
+    ["a string format version", m => { m.formatVersion = "2"; }, /model\.formatVersion:/],
+    ["a v3 checkpoint", m => { m.checkpointVersion = 3; }, /model\.checkpointVersion:/],
+    ["an old encoding", m => { m.encodingVersion = 1; }, /model\.encodingVersion:/],
+    ["another architecture", m => { m.architecture = "dynamic_table"; }, /model\.architecture:/],
+    ["53 actions", m => { m.numActions = 53; }, /model\.numActions:/],
+    ["width four", m => { m.modelSpec.width = 4; }, /model\.modelSpec\.width:/],
+    ["an indivisible head count", m => { m.modelSpec.heads = 3; }, /model\.modelSpec\.heads:/],
+    ["zero heads", m => { m.modelSpec.heads = 0; }, /model\.modelSpec\.heads:/],
+    ["zero blocks", m => { m.modelSpec.blocks = 0; }, /model\.modelSpec\.blocks:/],
+    ["a missing blocks setting", m => { delete m.modelSpec.blocks; }, /model\.modelSpec\.blocks: missing/],
+    ["an extra spec field", m => { m.modelSpec.dropout = 0; }, /model\.modelSpec\.dropout: unexpected/],
+    ["zero decks", m => { m.gameConfig.numDecks = 0; }, /model\.gameConfig\.numDecks:/],
+    ["fractional turns", m => { m.gameConfig.maxTurns = 1.5; }, /model\.gameConfig\.maxTurns:/],
+    ["a string recycle flag", m => { m.gameConfig.recycleDiscard = "yes"; }, /model\.gameConfig\.recycleDiscard:/],
+    ["an impossible quota", m => { m.gameConfig.requiredSequences = 8; }, /model\.gameConfig\.requiredSequences:/],
+    ["too few cards", m => { Object.assign(m.gameConfig, { numDecks: 1, cardsInHand: 51 }); }, /model\.gameConfig\.numDecks:/],
+    ["an unknown source", m => { m.source.kind = "trained"; }, /model\.source\.kind:/],
+    ["bootstrap training claims", m => { m.source.trained = true; }, /model\.source\.trained:/],
+    ["bootstrap champion claims", m => { m.source.champion = true; }, /model\.source\.champion:/],
+    ["a missing bootstrap seed", m => { m.source.seed = null; }, /model\.source\.seed:/],
+    ["an uppercase digest", m => { m.source.sha256 = m.source.sha256.toUpperCase(); }, /model\.source\.sha256:/],
+    ["a short digest", m => { m.source.tensorsSha256 = "abc"; }, /model\.source\.tensorsSha256:/],
+    ["a missing tensor", m => { delete m.tensors["policy.face_out.bias"]; }, /model\.tensors\.policy\.face_out\.bias: missing/],
+    ["an auxiliary tensor", m => { m.tensors["aux.face_win.bias"] = m.tensors["policy.face_out.bias"]; }, /model\.tensors\.aux\.face_win\.bias: unexpected/],
+    ["an extra tensor field", m => { m.tensors["policy.face_out.bias"].dtype = "float32"; }, /model\.tensors\["policy.face_out.bias"\]\.dtype:/],
+    ["a transposed shape", m => { m.tensors["policy.face_out.weight"].shape = [64, 1]; }, /model\.tensors\["policy.face_out.weight"\]\.shape:/],
+    ["a string shape", m => { m.tensors["policy.face_out.bias"].shape = "1"; }, /model\.tensors\["policy.face_out.bias"\]\.shape:/],
+    ["truncated data", m => { m.tensors["policy.face_local.bias"].data = m.tensors["policy.face_local.bias"].data.slice(0, -8); }, /expected 256 bytes, got 252/],
+    ["invalid base64", m => { m.tensors["policy.face_out.bias"].data = "not base64"; }, /expected base64 text/],
+    ["unpadded base64", m => { m.tensors["policy.face_out.bias"].data = "AAAAAA"; }, /expected base64 text/],
+    ["numeric tensor data", m => { m.tensors["policy.face_out.bias"].data = 0; }, /expected base64 text/],
+    ["a NaN weight", m => {
+      m.tensors["policy.face_out.bias"].data = Buffer.from(new Float32Array([NaN]).buffer).toString("base64");
+    }, /value 0 is not finite/],
   ];
-
   for (const [label, mutate, message] of MALFORMED) {
     it(`rejects ${label}`, () => {
       const json = structuredClone(MODEL);
@@ -247,84 +205,149 @@ describe("parseQModel", () => {
   }
 });
 
-describe("encodeObservation and historyChannels", () => {
-  it("lays out cards, context, seats, and events as encoding.py does", () => {
-    const encoded = encodeObservation(threeSeatObservation());
-    const card = (face) => Array.from(encoded.cards.subarray(face * 5, face * 5 + 5));
-    assert.deepEqual(card(0), [1, 0, 0, 0, 0]);
-    assert.deepEqual(card(5), [0, 1, 1, 0, 0]);
-    assert.deepEqual(card(7), [0, 0.5, 0, 0, 0]);
-    assert.deepEqual(card(16), [0, 0, 0, 1, 1]);
-    assert.deepEqual([3, 29, 42].map((face) => card(face)[4]), [1, 1, 1]);
-    assert.equal(encoded.top, 5);
-    assertClose(Array.from(encoded.initialHand), faces({ 0: 0.5, 3: 0.5 }), 0, "initialHand");
-    assertClose(Array.from(encoded.context), [0, 1, 0, 20 / 30, 60 / 104, 2 / 6, 13 / 30, 0.4, 1, 0.5, 0.5], 1e-15, "context");
-    assertClose(Array.from(encoded.players.subarray(6, 12)), [0, 12 / 13, 20 / 30, 1, ...turn(1, 3)], 1e-15, "seat 1");
-    assert.equal(encoded.players[2 * 6 + 3], 0);
-    assert.deepEqual(Array.from(encoded.nextPlayer), [1, 2, 0]);
-    assert.deepEqual(Array.from(encoded.previousPlayer), [2, 0, 1]);
-    assert.deepEqual(Array.from(encoded.eventKind.subarray(0, 3)), [INITIAL, DISCARD, DRAW_STOCK]);
-    assert.deepEqual(Array.from(encoded.eventFace.subarray(0, 3)), [52, 3, 52]);
-    assert.deepEqual(Array.from(encoded.offeredTop.subarray(0, 3)), [52, 52, 3]);
-    assertClose(Array.from(encoded.events.subarray(16, 24)), [0, ...turn(1, 3), 1, 10 / 30, 0.5, ...turn(2, 3)], 1e-15, "event 2");
+describe("encodeObservation", () => {
+  it("marks Q-K-A and A-2-3 as natural and excludes K-A-2", () => {
+    for (const cards of [[0, 1, 2], [11, 12, 0]]) {
+      const features = encodeObservation(observation(cards));
+      for (const face of cards) {
+        assert.equal(cardChannel(features, face, "natural_run_member"), 1);
+        assert.equal(cardChannel(features, face, "pure_meld_member"), 1);
+      }
+    }
+    const bad = encodeObservation(observation([12, 0, 1]));
+    for (const face of [12, 0, 1]) assert.equal(cardChannel(bad, face, "any_meld_member"), 0);
+    assert.equal(context(bad, "pure_quota_deficit"), 1);
+    assertClose([context(bad, "unavoidable_deadwood")], [22 / 30], 1e-7, "deadwood");
   });
 
-  it("routes each event to its face and channel with recency weights", () => {
-    const length = 11;
-    const recency = (position) => (0.5 + 0.5 * (position / length)) / length;
-    const expected = new Array(52 * 5).fill(0);
-    const add = (face, channel, value) => { expected[face * 5 + channel] += value; };
-    add(0, 0, 0.5 - 1);
-    add(3, 0, 0.5);
-    add(14, 0, -0.5);
-    add(3, 0, recency(2));
-    add(3, 2, recency(3));
-    add(3, 3, recency(4));
-    add(9, 4, recency(5));
-    add(9, 1, recency(6));
-    add(11, 2, recency(7));
-    add(11, 4, recency(8));
-    add(14, 0, recency(11));
-    assertClose(Array.from(historyChannels(threeSeatObservation())), expected, 1e-15, "channels");
+  it("distinguishes exact-joker purity from same-rank wild substitution", () => {
+    const pure = encodeObservation(observation([16, 17, 7]));
+    const impure = encodeObservation(observation([16, 17, 33]));
+    for (const face of [16, 17, 7]) assert.equal(cardChannel(pure, face, "pure_meld_member"), 1);
+    for (const face of [16, 17, 33]) {
+      assert.equal(cardChannel(impure, face, "pure_meld_member"), 0);
+      assert.equal(cardChannel(impure, face, "any_meld_member"), 1);
+    }
+    assert.equal(cardChannel(pure, 16, "natural_run_member"), 0);
+    const triplet = encodeObservation(observation([5, 5, 5]));
+    assert.equal(cardChannel(triplet, 5, "pure_meld_member"), 1);
+    assert.equal(cardChannel(triplet, 5, "natural_run_member"), 0);
   });
 
-  it("rejects anything but an object", () => {
-    assert.throws(() => encodeObservation(null), { name: "TypeError", message: /^observation: expected an observation$/ });
+  it("counts the exact joker once in the pure-sequence upper bound", () => {
+    const obs = observation([0, 1, 2, 17, 30, 43], 2);
+    obs.config.cardsInHand = 6;
+    obs.config.requiredSequences = 2;
+    assert.equal(context(encodeObservation(obs), "pure_quota_deficit"), 0.5);
+  });
+
+  it("records per-kind recency for each relative seat without collapsing opposite seats", () => {
+    const obs = observation();
+    obs.players.push({ ...obs.players[0], nextPlayer: 0, previousPlayer: 0 });
+    obs.players[0].nextPlayer = obs.players[0].previousPlayer = 1;
+    obs.history[0].offeredTop = 5;
+    const event = (kind, face, offeredTop = null) => ({
+      ...obs.history[0], kind, actor: 1, face, offeredTop, initialHand: [],
+    });
+    obs.history.push(event(2, 5, 5), event(3, 16), event(1, null, 16), event(3, 28));
+    obs.history.push({ ...event(1, 14, 28), actor: 0 });
+    obs.hand[14] += 1;
+    obs.discardPile = [16, 28];
+    obs.phase = 1;
+    const features = encodeObservation(obs);
+    const history = (face, seat, channel) =>
+      features[OFFSETS.history + (face * 6 + seat) * 7 + CHANNELS.history.indexOf(channel)];
+    assertClose([history(5, 1, "took"), history(5, 1, "held")], [1 / 3, 1 / 3], 1e-7, "known take");
+    assertClose([history(16, 1, "discarded"), history(16, 1, "passed")], [1 / 3, 1 / 3], 1e-7, "safe card");
+    assertClose([history(5, 1, "last_take"), history(16, 1, "last_discard"), history(16, 1, "last_pass")],
+      [2 / 6, 3 / 6, 4 / 6], 1e-7, "recencies");
+    assert.equal(history(14, 1, "took"), 0);
+    assert.deepEqual(Array.from(features.slice(OFFSETS.seat + 2 * 11, OFFSETS.context)), new Array(44).fill(0));
+  });
+
+  it("zeros the legal mask for terminal states and afterstates awaiting another seat", () => {
+    const obs = observation();
+    assert.deepEqual(Array.from(encodeObservation(obs).slice(OFFSETS.legal, OFFSETS.top)), [1, 1, ...new Array(52).fill(0)]);
+    obs.phase = 2;
+    assert.equal(context(encodeObservation(obs), "to_act"), 0);
+    assert.deepEqual(Array.from(encodeObservation(obs).slice(OFFSETS.legal, OFFSETS.top)), new Array(54).fill(0));
+    obs.phase = 0;
+    obs.players.push({ ...obs.players[0] });
+    obs.history.push({ ...obs.history[0], kind: 3, face: 30, offeredTop: null, initialHand: [], nextPlayer: 1 });
+    const after = encodeObservation(obs);
+    assert.equal(context(after, "to_act"), 0);
+    assert.deepEqual(Array.from(after.slice(OFFSETS.legal, OFFSETS.top)), new Array(54).fill(0));
+  });
+
+  it("uses the empty-top sentinel and derives warm starts from the initial hand", () => {
+    const obs = observation([0, 1, 2, 30]);
+    obs.discardPile = [];
+    obs.history[0].offeredTop = null;
+    obs.phase = 1;
+    const features = encodeObservation(obs);
+    assert.equal(features[OFFSETS.top], 52);
+    assert.equal(context(features, "warm_start"), 1);
+    assert.equal(context(features, "to_act"), 1);
   });
 
   const MALFORMED = [
-    ["a short hand", (o) => { o.hand.pop(); }, /^observation\.hand: expected 52 face counts$/],
-    ["no config", (o) => { delete o.config; }, /^observation\.config: expected a game config$/],
-    ["no discard pile", (o) => { delete o.discardPile; }, /^observation\.discardPile: expected an array of faces$/],
-    ["a pile face out of range", (o) => { o.discardPile.push(52); }, /^observation\.discardPile\[3\]: expected an integer from 0 to 51$/],
-    ["a fractional joker", (o) => { o.joker = 1.5; }, /^observation\.joker: /],
-    ["phase 3", (o) => { o.phase = 3; }, /^observation\.phase: expected an integer from 0 to 2$/],
-    ["no players", (o) => { o.players = []; }, /^observation\.players: expected at least one player view$/],
-    ["no history", (o) => { o.history = []; }, /^observation\.history: expected at least one event$/],
-    ["no initial hand", (o) => { delete o.history[0].initialHand; }, /^observation\.history\[0\]\.initialHand: expected 52 face counts$/],
-    ["a next seat off the table", (o) => { o.players[1].nextPlayer = 3; }, /^observation\.players\[1\]\.nextPlayer: expected an integer from 0 to 2$/],
-    ["an actor off the table", (o) => { o.history[4].actor = 3; }, /^observation\.history\[4\]\.actor: /],
-    ["an unknown event kind", (o) => { o.history[4].kind = 6; }, /^observation\.history\[4\]\.kind: expected an integer from 0 to 5$/],
-    ["a missing event face", (o) => { delete o.history[4].face; }, /^observation\.history\[4\]\.face: /],
-    ["a missing turn count", (o) => { delete o.turnsRemaining; }, /^observation: context features are not finite/],
-    ["zero decks", (o) => { o.config.numDecks = 0; }, /^observation: cards features are not finite/],
+    ["a short hand", o => { o.hand.pop(); }, /observation\.hand:/],
+    ["no config", o => { delete o.config; }, /observation\.config:/],
+    ["no pile", o => { delete o.discardPile; }, /observation\.discardPile:/],
+    ["a bad pile face", o => { o.discardPile.push(52); }, /observation\.discardPile\[1\]:/],
+    ["a fractional joker", o => { o.joker = 1.5; }, /observation\.joker:/],
+    ["phase three", o => { o.phase = 3; }, /observation\.phase:/],
+    ["no players", o => { o.players = []; }, /observation\.players:/],
+    ["no history", o => { o.history = []; }, /observation\.history:/],
+    ["no initial hand", o => { delete o.history[0].initialHand; }, /observation\.history\[0\]\.initialHand:/],
+    ["an actor off the table", o => { o.history[0].actor = 1; }, /observation\.history\[0\]\.actor:/],
+    ["an unknown event kind", o => { o.history[0].kind = 6; }, /observation\.history\[0\]\.kind:/],
+    ["a missing face", o => { delete o.history[0].face; }, /observation\.history\[0\]\.face:/],
+    ["missing turns", o => { delete o.turnsRemaining; }, /observation\.turnsRemaining:/],
+    ["a hidden discard take", o => { o.history[0].kind = 2; }, /observation\.history\[0\]\.face:/],
+    ["a hidden discard", o => { o.history[0].kind = 3; }, /observation\.history\[0\]\.face:/],
+    ["zero decks", o => { o.config.numDecks = 0; }, /observation\.config\.numDecks:/],
   ];
-
   for (const [label, mutate, message] of MALFORMED) {
     it(`rejects ${label}`, () => {
-      const obs = threeSeatObservation();
+      const obs = observation();
       mutate(obs);
       assert.throws(() => encodeObservation(obs), { name: "TypeError", message });
-      assert.throws(() => historyChannels(obs), { name: "TypeError", message });
     });
   }
 
+  for (const [label, select, field] of [
+    ["observer turns", o => o, "turnsRemaining"],
+    ["stock", o => o, "stockRemaining"],
+    ["hand size", o => o.players[0], "handSize"],
+    ["player turns", o => o.players[0], "turnsRemaining"],
+  ]) {
+    it(`rejects invalid ${label} counts at the observation boundary`, () => {
+      for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, true, "3", null, undefined]) {
+        const obs = observation();
+        select(obs)[field] = value;
+        assert.throws(() => encodeObservation(obs), /expected a nonnegative safe integer/);
+      }
+    });
+  }
+
+  it("accepts zero remaining counts in a terminal observation", () => {
+    const obs = observation();
+    Object.assign(obs, { phase: 2, turnsRemaining: 0, stockRemaining: 0 });
+    Object.assign(obs.players[0], { handSize: 0, turnsRemaining: 0, active: false });
+    const features = encodeObservation(obs);
+    assert.equal(context(features, "terminal"), 1);
+    assert.equal(context(features, "turns"), 0);
+    assert.equal(context(features, "stock"), 0);
+    assert.deepEqual(Array.from(features.slice(OFFSETS.seat, OFFSETS.seat + 5)), [1, 1, 0, 0, 0]);
+  });
+
   it("names the bad observation in a qValues batch", () => {
     const model = parseQModel(MODEL);
-    const bad = threeSeatObservation();
+    const bad = observation();
     bad.hand.pop();
-    assert.throws(() => qValues(model, [threeSeatObservation(), bad]), { name: "TypeError", message: /^observations\[1\]\.hand: / });
-    assert.throws(() => qValues(model, threeSeatObservation()), { name: "TypeError", message: /^qValues: observations must be an array$/ });
-    assert.equal(qValues(model, [threeSeatObservation()])[0].length, 54);
+    assert.throws(() => qValues(model, [observation(), bad]), /observations\[1\]\.hand:/);
+    assert.throws(() => qValues(model, observation()), /observations must be an array/);
+    assert.throws(() => encodeObservation(null), /observation: expected an observation/);
   });
 });

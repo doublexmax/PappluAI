@@ -1,284 +1,248 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 import math
-from numbers import Real
 import random
-from typing import Any, Deque, Dict, List, Sequence, Tuple
+from typing import Any, Optional
 
-from src.evaluate import minimum_penalty
 from src.game.environment import (
-    ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, GameConfig, NUM_ACTIONS,
-    Observation, discard_action, legal_action_mask,
+    ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, GameConfig, Observation,
+    discard_action, legal_action_mask,
 )
 from src.game.information import EventKind, InformationHistory
-
-__all__ = (
-    "Episode",
-    "EpisodeReplay",
-    "TerminalShaping",
-    "Transition",
-    "discounted_returns",
-    "terminal_reward",
-)
-
-Transition = Tuple[Observation, int, float]
-Episode = Tuple[Transition, ...]
+from src.game.outcome import SeatOutcome
+from src.model.encoding import Features, encode, legal_actions
 
 
 @dataclass(frozen=True)
-class TerminalShaping:
-    speed: float = 0.0
-    margin: float = 0.0
-    points_cap: int = 100
+class Decision:
+    observation: Observation
+    features: Features
+    action: int
+    hidden_hands: tuple[tuple[int, ...], ...]
 
     def __post_init__(self) -> None:
-        for name in ("speed", "margin"):
-            value = getattr(self, name)
-            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-                raise ValueError("%s must be finite and nonnegative" % name)
-        if self.margin >= 1:
-            raise ValueError("margin must be less than 1")
-        if type(self.points_cap) is not int or self.points_cap < 1:
-            raise ValueError("points_cap must be a positive integer")
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "TerminalShaping":
-        if not isinstance(data, dict) or set(data) != set(cls.__dataclass_fields__):
-            raise ValueError("shaping must contain speed, margin, and points_cap")
-        return cls(**data)
-
-
-def terminal_reward(
-    shaping: TerminalShaping,
-    *,
-    won: bool,
-    turns_remaining: int,
-    max_turns: int,
-    hand: Sequence[int],
-    joker: int,
-    required_sequences: int,
-) -> float:
-    if won:
-        return 1.0 + shaping.speed * (turns_remaining / float(max_turns))
-    if shaping.margin == 0.0:
-        return 0.0
-    points = minimum_penalty(hand, joker, required_sequences).points
-    return shaping.margin * (1.0 - min(points, shaping.points_cap) / float(shaping.points_cap))
+        if type(self.action) is not int or self.action not in legal_actions(self.features):
+            raise ValueError("decision must choose a legal action")
+        if not legal_action_mask(self.observation)[self.action]:
+            raise ValueError("decision action does not match its observation")
+        hands, obs = self.hidden_hands, self.observation
+        if not isinstance(hands, tuple) or len(hands) != 6 or any(
+            not isinstance(hand, tuple) or len(hand) != 52
+            or any(type(value) is not int or not 0 <= value <= obs.config.num_decks for value in hand)
+            for hand in hands
+        ):
+            raise ValueError("hidden_hands must contain six tuples of 52 card counts")
+        if hands[0] != tuple(obs.hand):
+            raise ValueError("hidden_hands observer does not match observation")
+        if any(any(hand) for hand in hands[len(obs.players):]):
+            raise ValueError("hidden_hands absent seats must be empty")
+        if any(sum(hands[seat]) != player.hand_size for seat, player in enumerate(obs.players)):
+            raise ValueError("hidden_hands sizes do not match player views")
 
 
-class EpisodeReplay:
-    STATE_VERSION = 2
+@dataclass(frozen=True)
+class Trajectory:
+    players: int
+    decisions: tuple[Decision, ...]
+    outcome: SeatOutcome
+
+    def __post_init__(self) -> None:
+        if type(self.players) is not int or not 1 <= self.players <= 6:
+            raise ValueError("trajectory players must be in 1..6")
+        if not isinstance(self.decisions, tuple) or not self.decisions:
+            raise ValueError("trajectory decisions must be a nonempty tuple")
+        if any(len(decision.observation.players) != self.players for decision in self.decisions):
+            raise ValueError("trajectory changes player count")
+        outcome = self.outcome
+        if (
+            not isinstance(outcome, SeatOutcome)
+            or type(outcome.utility) not in (int, float)
+            or not math.isfinite(outcome.utility) or not -1 <= outcome.utility <= 1
+            or type(outcome.won) is not bool
+            or type(outcome.penalty) is not int or outcome.penalty < 0
+        ):
+            raise ValueError("trajectory outcome is invalid")
+
+
+@dataclass(frozen=True)
+class Sample:
+    decision: Decision
+    outcome: SeatOutcome
+    bootstrap: Optional[Decision]
+    scale: float
+
+
+class TrajectoryReplay:
+    STATE_VERSION = 4
 
     def __init__(self, capacity: int) -> None:
-        if (
-            isinstance(capacity, bool)
-            or not isinstance(capacity, int)
-            or capacity < 1
-        ):
+        if type(capacity) is not int or capacity < 1:
             raise ValueError("capacity must be a positive integer")
-        self._capacity = capacity
-        self._episodes: Deque[Episode] = deque()
+        self.capacity = capacity
+        self._trajectories: deque[Trajectory] = deque()
+        self._slots: dict[int, list[tuple[Trajectory, int]]] = {}
+        self._starts: dict[int, int] = {}
         self._size = 0
         self._sample_cursor = 0
 
     def __len__(self) -> int:
         return self._size
 
-    def append(self, episode: Episode) -> None:
-        stored = tuple(episode[-self._capacity:])
-        if not stored:
-            raise ValueError("cannot append an empty episode")
-        self._episodes.append(stored)
-        self._size += len(stored)
-
-        excess = self._size - self._capacity
-        while excess > 0:
-            oldest = self._episodes[0]
-            if len(oldest) <= excess:
-                self._episodes.popleft()
-                self._size -= len(oldest)
-                excess -= len(oldest)
+    def append(self, trajectory: Trajectory) -> None:
+        stored = replace(trajectory, decisions=trajectory.decisions[-self.capacity:])
+        self._trajectories.append(stored)
+        slots = self._slots.setdefault(stored.players, [])
+        self._starts.setdefault(stored.players, 0)
+        slots.extend((stored, index) for index in range(len(stored.decisions)))
+        self._size += len(stored.decisions)
+        while self._size > self.capacity:
+            oldest = self._trajectories[0]
+            removed = min(self._size - self.capacity, len(oldest.decisions))
+            self._starts[oldest.players] += removed
+            self._size -= removed
+            if removed == len(oldest.decisions):
+                self._trajectories.popleft()
             else:
-                self._episodes[0] = oldest[excess:]
-                self._size -= excess
-                excess = 0
+                self._trajectories[0] = replace(oldest, decisions=oldest.decisions[removed:])
+        for count in tuple(self._slots):
+            start = self._starts[count]
+            if start == len(self._slots[count]):
+                del self._slots[count]
+                del self._starts[count]
+            elif start > len(self._slots[count]) // 2:
+                self._slots[count] = self._slots[count][start:]
+                self._starts[count] = 0
 
-    def sample(self, rng: random.Random, batch_size: int) -> List[Transition]:
-        if (
-            isinstance(batch_size, bool)
-            or not isinstance(batch_size, int)
-            or batch_size < 1
-        ):
-            raise ValueError("batch_size must be a positive integer")
-        if not self._episodes:
+    def sample(
+        self, rng: random.Random, batch_size: int, *, n_step: int = 5, gamma: float = 1.0,
+    ) -> list[Sample]:
+        for name, value in (("batch_size", batch_size), ("n_step", n_step)):
+            if type(value) is not int or value < 1:
+                raise ValueError("%s must be a positive integer" % name)
+        if type(gamma) not in (int, float) or not math.isfinite(gamma) or not 0 < gamma <= 1:
+            raise ValueError("gamma must be in (0, 1]")
+        if not self._size:
             raise ValueError("cannot sample empty replay")
-        by_count: Dict[int, List[Episode]] = {}
-        for episode in self._episodes:
-            by_count.setdefault(len(episode[0][0].players), []).append(episode)
-        counts = sorted(by_count)
-        batch: List[Transition] = []
-        for index in range(batch_size):
-            episodes = by_count[counts[(self._sample_cursor + index) % len(counts)]]
-            episode = episodes[rng.randrange(len(episodes))]
-            batch.append(episode[rng.randrange(len(episode))])
+        counts = sorted(self._slots)
+        samples = []
+        for row in range(batch_size):
+            count = counts[(self._sample_cursor + row) % len(counts)]
+            slots, start = self._slots[count], self._starts[count]
+            trajectory, index = slots[rng.randrange(start, len(slots))]
+            decisions = trajectory.decisions
+            boot = index + n_step
+            samples.append(Sample(
+                decisions[index], trajectory.outcome,
+                decisions[boot] if boot < len(decisions) else None,
+                gamma ** (n_step if boot < len(decisions) else len(decisions) - 1 - index),
+            ))
         self._sample_cursor += batch_size
-        return batch
+        return samples
 
-    def state_dict(self) -> Dict[str, Any]:
-        episodes = []
-        for episode in self._episodes:
-            final = episode[-1][0]
+    def state_dict(self) -> dict[str, Any]:
+        trajectories = []
+        for trajectory in self._trajectories:
+            final = trajectory.decisions[-1].observation
             history = final.history
-            transitions = []
-            previous_prefix = 0
-            for obs, action, target in episode:
+            decisions = []
+            previous = 0
+            for decision in trajectory.decisions:
+                obs = decision.observation
                 prefix = len(obs.history)
                 if (
                     obs.config != final.config or obs.joker != final.joker
-                    or len(obs.players) != len(final.players)
-                    or obs.warm_start != final.warm_start
+                    or obs.warm_start != final.warm_start or len(obs.players) != trajectory.players
                 ):
-                    raise ValueError("replay episode changes journal configuration")
-                if prefix < previous_prefix or obs.history != history[:prefix]:
-                    raise ValueError("replay episode mixes seat or episode histories")
-                transitions.append((obs.to_snapshot(), prefix, action, target))
-                previous_prefix = prefix
-            episodes.append({
+                    raise ValueError("replay trajectory changes journal configuration")
+                if prefix < previous or obs.history != history[:prefix]:
+                    raise ValueError("replay trajectory mixes seat or deal histories")
+                decisions.append((
+                    obs.to_snapshot(), prefix, decision.action,
+                    tuple(value for hand in decision.hidden_hands for value in hand),
+                ))
+                previous = prefix
+            outcome = trajectory.outcome
+            trajectories.append({
                 "config": final.config.to_dict(),
                 "joker": final.joker,
-                "player_count": len(final.players),
+                "player_count": trajectory.players,
+                "warm_start": final.warm_start,
                 "history": tuple(event.to_dict() for event in history),
-                "transitions": tuple(transitions),
+                "decisions": tuple(decisions),
+                "outcome": (outcome.utility, outcome.won, outcome.penalty),
             })
         return {
             "version": self.STATE_VERSION,
-            "capacity": self._capacity,
+            "capacity": self.capacity,
             "sample_cursor": self._sample_cursor,
-            "episodes": tuple(episodes),
+            "trajectories": tuple(trajectories),
         }
 
-    def load_state_dict(self, state: Dict[str, Any]) -> None:
-        if not isinstance(state, dict):
-            raise TypeError("replay state must be a dict")
-        if set(state) != {"version", "capacity", "episodes", "sample_cursor"}:
-            raise ValueError("replay state has unexpected fields")
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict) or set(state) != {
+            "version", "capacity", "sample_cursor", "trajectories",
+        }:
+            raise ValueError("replay state fields do not match the journal schema")
         if type(state["version"]) is not int or state["version"] != self.STATE_VERSION:
-            raise ValueError(
-                "unsupported replay state version %r" % (state["version"],)
-            )
-        capacity = state["capacity"]
-        if (
-            isinstance(capacity, bool)
-            or not isinstance(capacity, int)
-            or capacity != self._capacity
-        ):
-            raise ValueError(
-                "replay capacity %r does not match expected %d"
-                % (capacity, self._capacity)
-            )
-        raw_episodes = state["episodes"]
-        if not isinstance(raw_episodes, tuple):
-            raise TypeError("replay episodes must be a tuple")
+            if type(state["version"]) is int and state["version"] == 3:
+                raise ValueError("replay v3 stores pre-v4.1 utilities; warm-start with --initial-model")
+            raise ValueError("unsupported replay state version %r" % state["version"])
+        if type(state["capacity"]) is not int or state["capacity"] != self.capacity:
+            raise ValueError("replay capacity does not match")
         cursor = state["sample_cursor"]
         if type(cursor) is not int or cursor < 0:
             raise ValueError("replay sample_cursor must be a nonnegative integer")
-
-        episodes: Deque[Episode] = deque()
-        size = 0
-        for episode_index, raw_episode in enumerate(raw_episodes):
-            if not isinstance(raw_episode, dict) or set(raw_episode) != {
-                "config", "joker", "player_count", "history", "transitions",
+        if not isinstance(state["trajectories"], tuple):
+            raise ValueError("replay trajectories must be a tuple")
+        candidate = TrajectoryReplay(self.capacity)
+        for journal in state["trajectories"]:
+            if not isinstance(journal, dict) or set(journal) != {
+                "config", "joker", "player_count", "warm_start", "history", "decisions", "outcome",
             }:
-                raise ValueError(
-                    "replay episode %d must use the journal schema" % episode_index
+                raise ValueError("replay trajectory fields do not match the journal schema")
+            config = GameConfig.from_dict(journal["config"])
+            history = InformationHistory.from_dict(journal["history"], config, journal["player_count"])
+            if type(journal["warm_start"]) is not bool:
+                raise ValueError("replay warm_start must be a boolean")
+            if not isinstance(journal["decisions"], tuple) or not journal["decisions"]:
+                raise ValueError("replay decisions must be a nonempty tuple")
+            decisions, previous = [], 0
+            for raw in journal["decisions"]:
+                if not isinstance(raw, tuple) or len(raw) != 4:
+                    raise ValueError("replay decision must be a four-item tuple")
+                snapshot, prefix, action, flat = raw
+                obs = Observation.from_snapshot(
+                    snapshot, history=history, prefix=prefix, joker=journal["joker"],
                 )
-            config = GameConfig.from_dict(raw_episode["config"])
-            history = InformationHistory.from_dict(
-                raw_episode["history"], config, raw_episode["player_count"],
-            )
-            raw_transitions = raw_episode["transitions"]
-            if not isinstance(raw_transitions, tuple) or not raw_transitions:
-                raise ValueError("replay journal transitions must be a nonempty tuple")
-            episode: List[Transition] = []
-            previous_prefix = 0
-            for transition_index, raw_transition in enumerate(raw_transitions):
-                if not isinstance(raw_transition, tuple) or len(raw_transition) != 4:
-                    raise ValueError(
-                        "replay transition %d:%d must be a four-item tuple"
-                        % (episode_index, transition_index)
-                    )
-                raw_observation, prefix, raw_action, raw_target = raw_transition
-                observation = Observation.from_snapshot(
-                    raw_observation, history=history, prefix=prefix,
-                    joker=raw_episode["joker"],
+                if prefix < previous or obs.warm_start != journal["warm_start"]:
+                    raise ValueError("replay history prefixes or warm_start are inconsistent")
+                previous = prefix
+                if not isinstance(flat, tuple) or len(flat) != 312:
+                    raise ValueError("replay hidden_hands must contain 312 counts")
+                decision = Decision(
+                    obs, encode(obs), action,
+                    tuple(flat[seat * 52:(seat + 1) * 52] for seat in range(6)),
                 )
-                if prefix < previous_prefix:
-                    raise ValueError("replay history prefix lengths must be nondecreasing")
-                if episode and observation.warm_start != episode[0][0].warm_start:
-                    raise ValueError("replay episode changes journal configuration")
-                previous_prefix = prefix
-                if (
-                    isinstance(raw_action, bool)
-                    or not isinstance(raw_action, int)
-                    or not 0 <= raw_action < NUM_ACTIONS
-                ):
-                    raise ValueError(
-                        "replay action %d:%d must be in 0..%d"
-                        % (
-                            episode_index,
-                            transition_index,
-                            NUM_ACTIONS - 1,
-                        )
-                    )
-                if not legal_action_mask(observation)[raw_action]:
-                    raise ValueError("replay contains an illegal action")
                 if prefix < len(history.events):
                     event = history.events[prefix]
-                    expected_action = (
+                    expected = (
                         ACTION_DRAW_STOCK if event.kind is EventKind.DRAW_STOCK
                         else ACTION_TAKE_DISCARD if event.kind is EventKind.TAKE_DISCARD
                         else discard_action(event.face) if event.kind is EventKind.DISCARD
                         else None
                     )
-                    if event.actor != 0 or raw_action != expected_action:
+                    if event.actor != 0 or action != expected:
                         raise ValueError("replay action does not match the next history event")
-                if (
-                    isinstance(raw_target, bool)
-                    or not isinstance(raw_target, Real)
-                    or not math.isfinite(float(raw_target))
-                ):
-                    raise ValueError(
-                        "replay target %d:%d must be finite"
-                        % (episode_index, transition_index)
-                    )
-                episode.append((observation, raw_action, float(raw_target)))
-            episodes.append(tuple(episode))
-            size += len(episode)
-        if size > self._capacity:
-            raise ValueError(
-                "replay contains %d transitions, capacity is %d"
-                % (size, self._capacity)
-            )
-
-        self._episodes = episodes
-        self._size = size
-        self._sample_cursor = cursor
-
-
-def discounted_returns(
-    rewards: Sequence[float],
-    gamma: float,
-) -> List[float]:
-    if not 0.0 <= gamma <= 1.0:
-        raise ValueError("gamma must be in [0, 1], got %r" % (gamma,))
-    returns: List[float] = [0.0] * len(rewards)
-    running = 0.0
-    for index in range(len(rewards) - 1, -1, -1):
-        running = float(rewards[index]) + gamma * running
-        returns[index] = running
-    return returns
+                decisions.append(decision)
+            raw_outcome = journal["outcome"]
+            if not isinstance(raw_outcome, tuple) or len(raw_outcome) != 3:
+                raise ValueError("replay outcome must contain utility, won, and penalty")
+            trajectory = Trajectory(journal["player_count"], tuple(decisions), SeatOutcome(*raw_outcome))
+            if len(candidate) + len(decisions) > self.capacity:
+                raise ValueError("replay contains more decisions than its capacity")
+            candidate.append(trajectory)
+        self._trajectories = candidate._trajectories
+        self._slots, self._starts = candidate._slots, candidate._starts
+        self._size, self._sample_cursor = len(candidate), cursor

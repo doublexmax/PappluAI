@@ -12,6 +12,7 @@ from pathlib import Path
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,14 +22,19 @@ import torch
 
 from src.checkpoints.io import atomic_write_json, file_sha256
 from src.evaluation.arena import CheckpointPolicy, play_match
+from src.evaluation.promotion import evaluate_gate
 from src.evaluation.ratings import RatingStore
 from src.game.environment import (
     ACTION_TAKE_DISCARD, GameConfig, Observation, discard_action, legal_action_mask,
 )
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.model.encoding import collate_observations
+from src.game.outcome import DealOutcome
+from src.model.encoding import encode
+from src.model.network import collate_observations
+from src.model.search import TeacherConfig
+from src.training.core import Decision, Trajectory
 from src.training.league import LeagueConfig, LeagueSession
-from src.training.optimization import train_batch
+from src.training.optimization import Learner, LearnerConfig
 
 
 def normalized(value):
@@ -112,11 +118,20 @@ def verify(output: Path) -> dict:
         for seed in (11, 22, 33):
             path = output / ("fresh-%d.pt" % seed)
             cli("solo", "--episodes", 0, "--seed", seed, "--max-turns", 60,
+                "--width", 16, "--heads", 2, "--blocks", 1,
                 "--log-every", 0, "--checkpoint", path)
             frozen = snapshots / ("model-" + file_sha256(path) + ".pt")
             frozen.write_bytes(path.read_bytes())
             paths.append(frozen)
         evidence["snapshot_sha256"] = [file_sha256(path) for path in paths]
+        checkpoint = torch.load(paths[0], weights_only=True)
+        assert checkpoint["checkpoint_version"] == 4
+        assert checkpoint["architecture"] == "axial_table"
+        assert checkpoint["model_spec"] == {"width": 16, "heads": 2, "blocks": 1}
+        evidence["model"] = {
+            "checkpoint_version": checkpoint["checkpoint_version"],
+            "architecture": checkpoint["architecture"], "model_spec": checkpoint["model_spec"],
+        }
         policy = CheckpointPolicy(str(paths[0]))
         before = digest(policy.network.state_dict())
         full_play = []
@@ -126,12 +141,15 @@ def verify(output: Path) -> dict:
                 seed=4000 + players, record_trajectories=True, record_terminal=True,
                 deadline=time.monotonic() + 120,
             )
-            observations = [step[0] for trajectory in result.trajectories for step in trajectory]
+            observations = [step.observation for trajectory in result.trajectories for step in trajectory]
             for trajectory in result.trajectories:
-                for obs, action, _ in trajectory:
+                for decision in trajectory:
+                    obs, action = decision.observation, decision.action
                     assert len(obs.players) == players
                     assert legal_action_mask(obs)[action]
-                    assert obs.history[0].initial_hand == trajectory[0][0].hand
+                    assert obs.history[0].initial_hand == trajectory[0].observation.hand
+                    assert decision.hidden_hands[0] == obs.hand
+                    assert decision.features == encode(obs)
             assert result.action_count == sum(map(len, result.trajectories))
             assert result.action_count == 2 * sum(result.seat_turns)
             assert result.terminal_reason in ("win", "turns_exhausted")
@@ -162,6 +180,8 @@ def verify(output: Path) -> dict:
             face = history_match.observe().discard_top
             history_match.step(ACTION_TAKE_DISCARD)
             representative = history_match.observe()
+            representative_seat = history_match.view().current_seat
+            representative_hands = history_match.private_hands(representative_seat)
             history_match.step(discard_action(face))
         assert history_match.view().terminal_reason == "turns_exhausted"
         assert len(representative.history) == 2 * completed_turns
@@ -174,74 +194,104 @@ def verify(output: Path) -> dict:
         started = time.perf_counter()
         with torch.no_grad():
             batch = collate_observations([representative], torch.device("cpu"))
-            assert batch.history_lengths.item() == len(representative.history)
+            assert torch.equal(
+                batch.history,
+                collate_observations([Observation.from_dict(representative.to_dict())], torch.device("cpu")).history,
+            )
+            assert len(encode(representative).data) == 12832
             values = policy.network(batch)
         forward_seconds = time.perf_counter() - started
         assert torch.isfinite(values).all()
-        learner = copy.deepcopy(policy.network)
-        learner_before = digest(learner.state_dict())
-        optimizer = torch.optim.Adam(learner.parameters(), lr=1e-4)
+        learner = Learner(copy.deepcopy(policy.network), LearnerConfig(
+            batch_size=1, learning_rate=1e-4, teacher=TeacherConfig(fraction=0),
+        ))
+        learner_before = digest(learner.online.state_dict())
         action = next(i for i, allowed in enumerate(legal_action_mask(representative)) if allowed)
-        started = time.perf_counter()
-        loss = train_batch(
-            learner, optimizer, torch.nn.MSELoss(), [(representative, action, 1.0)],
-            torch.device("cpu"), 1.0,
+        outcome = DealOutcome.score(
+            history_match.terminal_snapshot(), None, "turns_exhausted",
+            history_match.config.game.required_sequences,
         )
+        started = time.perf_counter()
+        stats = learner.learn([Trajectory(
+            len(representative.players),
+            (Decision(representative, encode(representative), action, representative_hands),),
+            outcome.seat(representative_seat),
+        )])
         update_seconds = time.perf_counter() - started
-        assert digest(learner.state_dict()) != learner_before
+        assert digest(learner.online.state_dict()) != learner_before
         evidence["bounded_cpu_cost"] = {
             "history_events": len(representative.history), "players": len(representative.players), "batch_size": 1,
-            "model_spec": learner.spec.to_dict(), "forward_seconds": [forward_seconds],
-            "update_seconds": update_seconds, "loss": loss,
+            "model_spec": learner.online.spec.to_dict(), "forward_seconds": [forward_seconds],
+            "update_seconds": update_seconds, "loss": stats.loss,
             "errors": 0, "completed_forwards": 1, "completed_updates": 1,
             "scope": "Single diagnostic samples with full collation and history reconstruction. No speedup or production throughput claim.",
         }
         curriculum = output / "curriculum"
         cli("curriculum", "--output-dir", curriculum, "--max-episodes", 1,
             "--max-seconds", 120, "--checkpoint-every", 1, "--validation-games", 1,
-            "--validate-every", 100, "--max-turns", 1, "--seed", 61)
+            "--validate-every", 100, "--max-turns", 1, "--seed", 61,
+            "--learning-rate", 0.0001, "--epsilon-start", 0.08, "--epsilon-end", 0.02,
+            "--epsilon-decay-episodes", 77,
+            "--width", 16, "--heads", 2, "--blocks", 1)
         cli("curriculum", "--resume", curriculum / "latest-state.pt", "--output-dir", curriculum,
             "--max-episodes", 2, "--max-seconds", 120, "--checkpoint-every", 1)
         solo_state = torch.load(curriculum / "latest-state.pt", weights_only=True)
         assert solo_state["counters"]["total_episodes"] == 2
+        assert solo_state["learner"]["replay"]["version"] == 4
+        assert tuple(solo_state["training_config"][name] for name in (
+            "learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_episodes",
+        )) == (0.0001, 0.08, 0.02, 77)
         cli("benchmark", "--checkpoint", curriculum / "latest-model.pt",
             "--output", output / "benchmark.json", "--games", 1, "--warm-games", 0)
 
         league = output / "league"
         cli("league", "--initial-model", paths[0], "--output-dir", league, "--matches", 6,
             "--players", 2, 3, 4, "--max-turns", 1, "--batch-size", 2,
-            "--updates-per-match", 1, "--max-seconds", 120, "--checkpoint-every", 1, "--seed", 62)
+            "--updates-per-match", 1, "--matches-per-round", 4,
+            "--learning-rate", 0.00015, "--epsilon-start", 0.12, "--epsilon-end", 0.03,
+            "--epsilon-decay-matches", 77,
+            "--max-seconds", 120, "--checkpoint-every", 3, "--seed", 62)
         state_path = league / "latest-state.pt"
         first = torch.load(state_path, weights_only=True)
+        assert first["last_exported_sha256"] == file_sha256(league / "latest-model.pt")
         league_summary = json.loads(evidence["commands"][-1]["stdout"].splitlines()[-1])
         assert league_summary["count_matches"] == {str(players): 2 for players in player_counts}
         control = LeagueSession(
             str(paths[0]),
             config=LeagueConfig(
-                game=GameConfig(max_turns=1), batch_size=2, updates_per_match=1,
+                game=GameConfig(max_turns=1), batch_size=2, updates_per_match=1, matches_per_round=4,
+                learning_rate=0.00015, epsilon_start=0.12, epsilon_end=0.03, epsilon_decay_matches=77,
             ),
             seed=62,
         )
-        for _ in range(6):
-            control.train_match()
+        for _ in range(2):
+            control.train_round(3)
+        control.export_model(output / "control-league" / "latest-model.pt")
         assert digest(control.state_dict()) == digest(first)
         resumed = LeagueSession.load(str(state_path), str(paths[0]))
         assert control.train_match() == resumed.train_match()
+        control.export_model(output / "control-league" / "latest-model.pt")
+        resumed.export_model(output / "resumed-league" / "latest-model.pt")
         assert digest(control.state_dict()) == digest(resumed.state_dict())
         exact_digest = digest(resumed.state_dict())
         cli("league", "--initial-model", paths[0], "--output-dir", league,
             "--resume", state_path, "--matches", 1, "--max-seconds", 120, "--checkpoint-every", 1)
         final = torch.load(state_path, weights_only=True)
+        assert final["last_exported_sha256"] == file_sha256(league / "latest-model.pt")
         assert digest(final) == exact_digest
         counts = Counter(
             episode["player_count"]
-            for episode in final["replay_state_dict"]["episodes"]
+            for episode in final["learner"]["replay"]["trajectories"]
         )
         assert set(counts) == {2, 3, 4}
+        assert final["learner"]["replay"]["version"] == 4
+        assert tuple(final["league_config"][name] for name in (
+            "learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_matches",
+        )) == (0.00015, 0.12, 0.03, 77)
         evidence["resume"] = {
             "exact_state_sha256": exact_digest,
             "matches": final["counters"]["completed_matches"],
-            "count_matches": resumed.count_matches, "replay_episodes_by_count": dict(counts),
+            "count_matches": resumed.count_matches, "replay_trajectories_by_count": dict(counts),
             "curriculum_episodes": solo_state["counters"]["total_episodes"],
             "uninterrupted_control_matches": control.completed_matches,
             "comparison": "Uninterrupted actual play and updates against restored CLI state.",
@@ -249,19 +299,73 @@ def verify(output: Path) -> dict:
         improve = output / "improve"
         cli("improve", "--initial-model", paths[0], "--output-dir", improve,
             "--max-seconds", 120, "--max-cycles", 1, "--max-turns", 1,
-            "--league-matches", 1, "--research-episodes", 1,
+            "--league-matches", 1,
             "--selection-blocks", 1, "--confirmation-blocks", 1, "--solo-games", 1,
-            "--checkpoint-every", 1)
+            "--learning-rate", 0.00015, "--epsilon-start", 0.12, "--epsilon-end", 0.03,
+            "--epsilon-decay-matches", 77,
+            "--checkpoint-every", 1, "--matches-per-round", 2, "--workers", 2)
         cli("improve", "--resume", improve / "latest-state.pt", "--output-dir", improve,
-            "--max-seconds", 0)
+            "--max-seconds", 0, "--workers", 1)
         assert json.loads((improve / "status.json").read_text())["promotions"] == 0
         improvement_status = json.loads((improve / "status.json").read_text())
         assert improvement_status["completed_cycles"] == 1
         assert improvement_status["last_gate"]["accepted"] is False
+        assert improvement_status["last_gate"]["gate_schema_version"] == 4
+        assert improvement_status["last_gate"]["phase"] == "selection"
+        assert "rules" in improvement_status["last_gate"]["gate_failures"]
+        assert improvement_status["last_gate"]["architecture"] == "axial_table"
+        assert [
+            (raw["blocks"], raw["games"])
+            for raw in improvement_status["last_gate"]["multiplayer"].values()
+        ] == [(4, 8), (2, 12), (1, 24)]
+        assert improvement_status["league_matches"] == 1
+        assert improvement_status["updates"] == 4
+        assert "research_episodes" not in improvement_status
+        improvement_state = torch.load(improve / "latest-state.pt", weights_only=True)
+        assert improvement_state["improvement_state_version"] == 4
+        assert tuple(improvement_state["league_state"]["league_config"][name] for name in (
+            "learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_matches",
+        )) == (0.00015, 0.12, 0.03, 77)
+        assert improvement_state["config"]["gate_workers"] == 1
+        assert improvement_state["cursors"] == {"league": 0}
+        assert "research_state" not in improvement_state
+        improvement_metrics = [
+            json.loads(line) for line in (improve / "metrics.jsonl").read_text().splitlines()
+        ]
+        assert [event["event"] for event in improvement_metrics] == ["league_match", "gate"]
+        assert improvement_metrics[-1]["phase"] == "selection"
+        assert improvement_metrics[-1]["candidate_origin"] == "league"
         evidence["improvement"] = {
             "cycles": improvement_status["completed_cycles"],
             "promotions": improvement_status["promotions"],
             "cap": improvement_status["rules"]["max_turns"],
+            "gate_schema_version": improvement_status["last_gate"]["gate_schema_version"],
+        }
+
+        gate_arguments = {
+            "candidate_path": str(paths[1]), "champion_path": str(paths[0]),
+            "opponent_paths": (str(paths[2]),), "seed": 70_000_000,
+            "seed_blocks": 1, "solo_games": 35, "max_turns": 1, "samples": 100,
+            "phase": "selection",
+        }
+        journal_dir = output / "gates"
+        serial_gate = evaluate_gate(**gate_arguments, workers=1, journal_dir=journal_dir)
+        parallel_gate = evaluate_gate(**gate_arguments, workers=2)
+        resumed_gate = evaluate_gate(**gate_arguments, workers=2, journal_dir=journal_dir)
+        assert json.dumps(serial_gate) == json.dumps(parallel_gate) == json.dumps(resumed_gate)
+        journal, = journal_dir.glob("*.jsonl")
+        completed_jobs = [json.loads(line) for line in journal.read_text().splitlines()]
+        assert len(completed_jobs) == 9
+        assert [record["job"] for record in completed_jobs[-2:]] == [["solo", 0, 32], ["solo", 32, 3]]
+        assert serial_gate["gate_schema_version"] == 4
+        assert serial_gate["phase"] == "selection"
+        assert "rules" in serial_gate["gate_failures"]
+        assert serial_gate["accepted"] is False
+        evidence["gate"] = {
+            "gate_schema_version": serial_gate["gate_schema_version"],
+            "result_sha256": digest(serial_gate), "completed_jobs": len(completed_jobs),
+            "workers_compared": [1, 2], "journal": str(journal),
+            "scope": "One-turn worker-count and journal-resume equality. Not promotion evidence.",
         }
 
         tournament = output / "tournament"
@@ -299,8 +403,8 @@ def verify(output: Path) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Verify the current dynamic model with bounded CPU play, training, resume, and ratings.")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser = argparse.ArgumentParser(description="Verify axial_table v4 play, finetune flags, gate v4 journals, resume, and ratings.")
+    parser.add_argument("--output-dir", type=Path, default=Path(tempfile.gettempdir()) / "papplu-dynamic-verification")
     args = parser.parse_args()
     verify(args.output_dir)
     return 0

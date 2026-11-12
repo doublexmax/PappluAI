@@ -58,10 +58,10 @@ class ModelRegistry:
             record.metadata.get("architecture") != ARCHITECTURE
             or record.metadata.get("encoding_version") != ENCODING_VERSION
             or record.metadata.get("checkpoint_version") != CHECKPOINT_VERSION
-            or set(record.metadata.get("model_spec", {})) != {"width", "heads"}
+            or set(record.metadata.get("model_spec", {})) != {"width", "heads", "blocks"}
             or "state_dim" in record.metadata
         ):
-            raise ValueError("Model record is not a current dynamic checkpoint; register fresh weights")
+            raise ValueError("Model record is not a current axial_table v4 checkpoint; register fresh weights")
         ModelSpec.from_dict(record.metadata["model_spec"])
         return record
 
@@ -81,7 +81,6 @@ class ModelRegistry:
         *,
         expected_sha256: Optional[str] = None,
     ) -> ModelRecord:
-        # Registry reads stay Torch-free; registration validates model files.
         from src.model.network import load_checkpoint
 
         source = Path(path)
@@ -173,7 +172,6 @@ class ModelRegistry:
             phase="confirmation",
             candidate_sha256=candidate.sha256,
             champion_sha256=current.sha256,
-            minimum_seed_blocks=gate_evidence.MIN_CONFIRMATION_SEED_BLOCKS,
             player_counts=player_counts,
         )
         selection = gate_evidence.validate_gate_evidence(
@@ -181,7 +179,6 @@ class ModelRegistry:
             phase="selection",
             candidate_sha256=candidate.sha256,
             champion_sha256=current.sha256,
-            minimum_seed_blocks=gate_evidence.MIN_SELECTION_SEED_BLOCKS,
             player_counts=player_counts,
         )
         if selection.player_counts != confirmation.player_counts:
@@ -192,9 +189,9 @@ class ModelRegistry:
             or abs(confirmation.seed - selection.seed)
             < 100_000
             + max(
-                confirmation.seed_blocks,
+                4 * confirmation.seed_blocks,
                 confirmation.solo_games,
-                selection.seed_blocks,
+                4 * selection.seed_blocks,
                 selection.solo_games,
             )
         ):
