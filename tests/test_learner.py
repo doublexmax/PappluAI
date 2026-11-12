@@ -209,7 +209,7 @@ class TestLearner(unittest.TestCase):
         self.assertAlmostEqual(stats.belief_loss, 1.28441553, places=6)
         self.assertAlmostEqual(stats.q_loss, 0.5, places=6)
 
-    def test_afterstate_training_runs_every_update_while_teacher_distillation_is_scheduled(self):
+    def test_afterstate_and_teacher_distillation_run_on_teacher_schedule(self):
         learner = Learner(QNetwork(ModelSpec(8, 1, 1)), self.config(
             teacher=TeacherConfig(fraction=1, every_updates=2, max_children=8),
         ))
@@ -219,11 +219,12 @@ class TestLearner(unittest.TestCase):
         action = discard_action(next(face for face, count in enumerate(obs.hand) if count))
         record = Decision(obs, encode(obs), action, (obs.hand,) + ((0,) * 52,) * 5)
         learner.append([Trajectory(1, (record,), SeatOutcome(-0.2, False, 20))])
-        first = learner.update()
         after_before = learner.online.aux.after_out.weight.detach().clone()
-        second = learner.update()
-        self.assertGreater(first.after_loss, 0)
+        first = learner.update()
+        self.assertEqual(first.after_loss, 0)
         self.assertEqual(first.teacher_loss, 0)
+        self.assertTrue(torch.equal(after_before, learner.online.aux.after_out.weight))
+        second = learner.update()
         self.assertGreater(second.after_loss, 0)
         self.assertGreater(second.teacher_loss, 0)
         self.assertFalse(torch.equal(after_before, learner.online.aux.after_out.weight))
@@ -231,7 +232,9 @@ class TestLearner(unittest.TestCase):
     def test_terminal_discards_do_not_train_the_afterstate_head(self):
         for warm_start, won, turns in ((True, False, 3), (False, True, 3), (False, False, 1)):
             with self.subTest(warm_start=warm_start, won=won, turns=turns):
-                learner = Learner(QNetwork(ModelSpec(8, 1, 1)), self.config())
+                learner = Learner(QNetwork(ModelSpec(8, 1, 1)), self.config(
+                    teacher=TeacherConfig(fraction=1, every_updates=1, max_children=8),
+                ))
                 env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1, max_turns=turns))
                 if warm_start:
                     obs = env.reset_warm_start(99)
