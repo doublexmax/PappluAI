@@ -5,8 +5,7 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
-from src.model.network import QNetwork
-from src.model.encoding import collate_observations
+from src.model.network import QNetwork, collate_observations
 from src.training.core import Transition
 
 

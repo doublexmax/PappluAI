@@ -25,6 +25,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--heads", type=int, default=None)
+    parser.add_argument("--blocks", type=int, default=None)
     parser.add_argument("--max-episodes", type=int, default=1_000_000)
     parser.add_argument("--max-seconds", type=float, default=82_800)
     parser.add_argument("--checkpoint-every", type=int, default=100)
@@ -162,6 +163,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 model_spec=runtime.ModelSpec(
                     width=default_spec.width if args.width is None else args.width,
                     heads=default_spec.heads if args.heads is None else args.heads,
+                    blocks=default_spec.blocks if args.blocks is None else args.blocks,
                 ),
             )
             _validate_model_arguments(session, args)
@@ -232,7 +234,7 @@ def _validate_resume_arguments(
 
 
 def _validate_model_arguments(session, args: argparse.Namespace) -> None:
-    for name in ("width", "heads"):
+    for name in ("width", "heads", "blocks"):
         requested = getattr(args, name)
         saved = getattr(session.network.spec, name)
         if requested is not None and requested != saved:

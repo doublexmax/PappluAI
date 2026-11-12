@@ -82,6 +82,7 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
             "--output-dir",
             "--width",
             "--heads",
+            "--blocks",
             "--max-episodes",
             "--max-seconds",
             "--checkpoint-every",
@@ -148,19 +149,19 @@ runpy.run_module("src.cli.curriculum", run_name="__main__")
                 "--max-episodes", "0", "--max-seconds", "0",
             ]
             fresh = subprocess.run(
-                command + ["--width", "128", "--heads", "8"],
+                command + ["--width", "128", "--heads", "8", "--blocks", "3"],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(fresh.returncode, 0, fresh.stderr)
             state_path = output / "latest-state.pt"
             state = torch.load(state_path, weights_only=True)
-            self.assertEqual(state["model_spec"], {"width": 128, "heads": 8})
+            self.assertEqual(state["model_spec"], {"width": 128, "heads": 8, "blocks": 3})
             resumed = subprocess.run(
-                command + ["--resume", str(state_path), "--width", "128", "--heads", "8"],
+                command + ["--resume", str(state_path), "--width", "128", "--heads", "8", "--blocks", "3"],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
-            for flag, value in (("--width", "192"), ("--heads", "4")):
+            for flag, value in (("--width", "192"), ("--heads", "4"), ("--blocks", "2")):
                 with self.subTest(flag=flag):
                     mismatch = subprocess.run(
                         command + ["--resume", str(state_path), flag, value],
@@ -444,7 +445,7 @@ class TestTrainingSession(unittest.TestCase):
                 )
                 == 1.0
             )
-            from src.model.encoding import collate_observations
+            from src.model.network import collate_observations
             state = observation
             with torch.no_grad():
                 value = network(
@@ -473,7 +474,7 @@ class TestTrainingSession(unittest.TestCase):
             result = session.run_episode()
 
         with torch.no_grad():
-            from src.model.encoding import collate_observations
+            from src.model.network import collate_observations
             after = session.network(
                 collate_observations([captured["state"]], torch.device("cpu"))
             )[0, captured["action"]]

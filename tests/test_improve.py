@@ -41,7 +41,7 @@ class TestMetricHistory(unittest.TestCase):
                 "max_turns": 60, "recycle_discard": True,
             }
             result = {
-                "encoding_version": 2, "checkpoint_version": 3, "architecture": "dynamic_table",
+                "encoding_version": 2, "checkpoint_version": 4, "architecture": "axial_table",
                 "checkpoint_sha256": sha256(model),
                 "game_config": rules,
                 "greedy": {"games": 2, "wins": 1, "outcomes": [1, 0]},
@@ -112,7 +112,7 @@ def gate_result(accepted):
         return {
             "gate_schema_version": 2,
             "encoding_version": 2,
-            "architecture": "dynamic_table",
+            "architecture": "axial_table",
             "candidate_sha256": sha256(kwargs["candidate_path"]),
             "champion_sha256": sha256(kwargs["champion_path"]),
             "accepted": accepted,
@@ -692,8 +692,8 @@ class TestImprovementController(unittest.TestCase):
                 json.dumps(
                     {
                         "encoding_version": 2,
-                        "checkpoint_version": 3,
-                        "architecture": "dynamic_table",
+                        "checkpoint_version": 4,
+                        "architecture": "axial_table",
                         "checkpoint_sha256": sha256(model),
                         "game_config": {
                             "num_decks": 3,

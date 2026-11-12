@@ -1,14 +1,3 @@
-"""Export dynamic_table Q-network weights for the browser engine in web/qnet.mjs.
-
-    python tools/weights_export.py                         seeded untrained weights, no torch
-    python tools/weights_export.py --checkpoint model.pt   needs torch
-    python tools/weights_export.py --registry DIR          exports the champion, needs torch
-
-Writes web/papplu-model.json and tests/fixtures/qnet-golden.json. Golden observations come
-from real src.game tables. Bootstrap Q values come from the pure-Python port of
-src/model/encoding.py and src/model/network.py below. A torch export stores torch's Q values
-and fails unless that port agrees with torch on every golden observation.
-"""
 from __future__ import annotations
 
 import argparse
@@ -33,37 +22,71 @@ from src.game.environment import (
 )
 from src.game.information import EventKind
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.model.encoding import (
+    CARD_CHANNELS, CONTEXT_CHANNELS, HISTORY_CHANNELS, LAYOUT, SEAT_CHANNELS,
+    Features, encode, feature_values,
+)
 from src.model.spec import ARCHITECTURE, CHECKPOINT_VERSION, ModelSpec
+
 
 FORMAT = "papplu-qnet"
 GOLDEN_FORMAT = "papplu-qnet-golden"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 BOOTSTRAP_SEED = 1729
-BOOTSTRAP_SENSITIVITY_GAINS = {"card_attention.in_proj_weight": 8.0, "event_summary.weight": 16.0}
+BOOTSTRAP_SENSITIVITY_GAINS = {
+    "card_embed.weight": 2.0, "table_embed.weight": 2.0,
+    "draw_top.weight": 2.0, "draw_set.weight": 2.0,
+    "face_out.weight": 2.0, "draw_out.weight": 2.0,
+}
 PRODUCTION = GameConfig(max_turns=60)
-SPEC = ModelSpec()
-NO_FACE = NUM_FACES
 TOLERANCE = 1e-4
 INPUT_TOLERANCE = 1e-6
 STEP_LIMIT = 1000
-SOURCES = ("src/model/encoding.py", "src/model/network.py", "tools/weights_export.py")
-TENSOR_SHAPES = (
-    ("suit_conv1.weight", (64, 5, 3)), ("suit_conv1.bias", (64,)),
-    ("suit_conv2.weight", (64, 64, 3)), ("suit_conv2.bias", (64,)),
-    ("card_attention.in_proj_weight", (192, 64)), ("card_attention.in_proj_bias", (192,)),
-    ("card_attention.out_proj.weight", (64, 64)), ("card_attention.out_proj.bias", (64,)),
-    ("card_norm.weight", (64,)), ("card_norm.bias", (64,)),
-    ("history_proj.weight", (1, 5)), ("history_proj.bias", (1,)),
-    ("context_features.weight", (64, 11)), ("context_features.bias", (64,)),
-    ("player_features.weight", (64, 6)), ("player_features.bias", (64,)),
-    ("event_summary.weight", (64, 8)), ("event_summary.bias", (64,)),
-    ("turn_relations.weight", (64, 192)), ("turn_relations.bias", (64,)),
-    ("context_gate.weight", (2, 64)), ("context_gate.bias", (2,)),
-    ("draw_head.0.weight", (64, 197)), ("draw_head.0.bias", (64,)),
-    ("draw_head.2.weight", (2, 64)), ("draw_head.2.bias", (2,)),
-    ("score.0.weight", (64, 210)), ("score.0.bias", (64,)),
-    ("score.2.weight", (1, 64)), ("score.2.bias", (1,)),
-)
+SOURCES = ("src/game/belief.py", "src/model/encoding.py", "src/model/network.py", "tools/weights_export.py")
+
+
+def tensor_shapes(spec=ModelSpec()):
+    width, shapes = spec.width, []
+
+    def layer(name, output, inputs=None, bias=True):
+        shape = (output,) if inputs is None else (output, inputs)
+        shapes.append(("policy." + name + ".weight", shape))
+        if bias:
+            shapes.append(("policy." + name + ".bias", (output,)))
+
+    layer("card_embed", width, 59)
+    layer("table_embed", width, 85)
+    for block in range(spec.blocks):
+        prefix = "blocks.%d." % block
+        layer(prefix + "rank_norm", width)
+        shapes.extend((
+            ("policy." + prefix + "rank_conv.weight", (width, 1, 3)),
+            ("policy." + prefix + "rank_conv.bias", (width,)),
+        ))
+        for name in ("rank_in", "rank_out"):
+            layer(prefix + name, width, width)
+        layer(prefix + "suit_norm", width)
+        for name in ("suit_in", "suit_out"):
+            layer(prefix + name, width, width)
+        layer(prefix + "card_norm", width)
+        layer(prefix + "table_norm", width)
+        layer(prefix + "table_query", width, width)
+        layer(prefix + "table_in", width, width * 2)
+        layer(prefix + "table_out", width, width)
+        layer(prefix + "film", width * 2, width)
+    layer("card_final", width)
+    layer("table_final", width)
+    layer("face_local", width, width)
+    layer("face_set", width, width, bias=False)
+    layer("face_table", width, width, bias=False)
+    layer("face_out", 1, width)
+    layer("draw_table", width, width)
+    layer("draw_top", width, width, bias=False)
+    layer("draw_set", width, width, bias=False)
+    layer("draw_out", 2, width)
+    layer("value_hidden", width, width)
+    layer("value_out", 1, width)
+    return tuple(shapes)
 
 
 def packed(values):
@@ -74,175 +97,67 @@ def float32(values):
     return list(struct.unpack("<%df" % len(values), packed(values)))
 
 
-def bootstrap_tensors(seed):
-    shapes = dict(TENSOR_SHAPES)
-    rng = random.Random(seed)
-    tensors = {}
-    for name, shape in TENSOR_SHAPES:
-        bound = BOOTSTRAP_SENSITIVITY_GAINS.get(name, 1.0) * bootstrap_weight_bound(name, shapes)
-        center = 1.0 if name == "card_norm.weight" else 0.0
+def bootstrap_tensors(seed, spec=ModelSpec()):
+    shapes, rng, tensors = dict(tensor_shapes(spec)), random.Random(seed), {}
+    for name, shape in shapes.items():
+        local = name.removeprefix("policy.")
+        is_norm = local.endswith(("_norm.weight", "_norm.bias", "_final.weight", "_final.bias"))
+        weight_shape = shapes[name.rsplit(".", 1)[0] + ".weight"]
+        bound = 0.1 if is_norm else 1.0 / math.sqrt(math.prod(weight_shape[1:]))
+        bound *= BOOTSTRAP_SENSITIVITY_GAINS.get(local, 1.0)
+        center = 1.0 if is_norm and name.endswith(".weight") else 0.0
         tensors[name] = float32([center + rng.uniform(-bound, bound) for _ in range(math.prod(shape))])
     return tensors
 
 
-def bootstrap_weight_bound(name, shapes):
-    if name == "card_attention.in_proj_weight":
-        return math.sqrt(6.0 / sum(shapes[name]))
-    if name.startswith("card_norm.") or name.endswith(("in_proj_bias", "out_proj.bias")):
-        return 0.1
-    weight = shapes[name.rsplit(".", 1)[0] + ".weight"]
-    return 1.0 / math.sqrt(math.prod(weight[1:]))
-
-
 def model_source(kind, tensors, sha256=None, seed=None, registry_id=None):
-    digest = hashlib.sha256(b"".join(packed(tensors[name]) for name, _ in TENSOR_SHAPES)).hexdigest()
+    digest = hashlib.sha256(b"".join(packed(values) for values in tensors.values())).hexdigest()
     return {
-        "kind": kind,
-        "trained": kind != "bootstrap",
-        "champion": kind == "registry",
-        "seed": seed,
-        "registryId": registry_id,
-        "sha256": digest if sha256 is None else sha256,
+        "kind": kind, "trained": kind != "bootstrap", "champion": kind == "registry",
+        "seed": seed, "registryId": registry_id, "sha256": digest if sha256 is None else sha256,
         "tensorsSha256": digest,
     }
 
 
 def game_config_json(config):
     return {
-        "numDecks": config.num_decks,
-        "cardsInHand": config.cards_in_hand,
-        "requiredSequences": config.required_sequences,
-        "maxTurns": config.max_turns,
+        "numDecks": config.num_decks, "cardsInHand": config.cards_in_hand,
+        "requiredSequences": config.required_sequences, "maxTurns": config.max_turns,
         "recycleDiscard": config.recycle_discard,
     }
 
 
-def model_document(tensors, config, source):
+def model_document(tensors, config, source, spec=ModelSpec()):
     return {
-        "format": FORMAT,
-        "formatVersion": FORMAT_VERSION,
-        "checkpointVersion": CHECKPOINT_VERSION,
-        "encodingVersion": ENCODING_VERSION,
-        "architecture": ARCHITECTURE,
-        "modelSpec": SPEC.to_dict(),
-        "numActions": NUM_ACTIONS,
-        "gameConfig": game_config_json(config),
-        "source": source,
+        "format": FORMAT, "formatVersion": FORMAT_VERSION, "checkpointVersion": CHECKPOINT_VERSION,
+        "encodingVersion": ENCODING_VERSION, "architecture": ARCHITECTURE,
+        "modelSpec": spec.to_dict(), "numActions": NUM_ACTIONS,
+        "gameConfig": game_config_json(config), "source": source,
         "tensors": {
             name: {"shape": list(shape), "data": base64.b64encode(packed(tensors[name])).decode("ascii")}
-            for name, shape in TENSOR_SHAPES
+            for name, shape in tensor_shapes(spec)
         },
     }
 
 
 def observation_json(obs):
     return {
-        "hand": list(obs.hand),
-        "discardPile": list(obs.discard_pile),
-        "joker": obs.joker,
-        "phase": obs.phase.value,
-        "turnsRemaining": obs.turns_remaining,
-        "stockRemaining": obs.stock_remaining,
-        "config": game_config_json(obs.config),
+        "hand": list(obs.hand), "discardPile": list(obs.discard_pile), "joker": obs.joker,
+        "phase": obs.phase.value, "turnsRemaining": obs.turns_remaining,
+        "stockRemaining": obs.stock_remaining, "config": game_config_json(obs.config),
         "players": [
-            {
-                "handSize": view.hand_size, "turnsRemaining": view.turns_remaining,
-                "nextPlayer": view.next_player, "previousPlayer": view.previous_player,
-                "active": view.active,
-            }
+            {"handSize": view.hand_size, "turnsRemaining": view.turns_remaining,
+             "nextPlayer": view.next_player, "previousPlayer": view.previous_player, "active": view.active}
             for view in obs.players
         ],
         "history": [
-            {
-                "kind": int(event.kind), "actor": event.actor, "handSize": event.hand_size,
-                "turnsRemaining": event.turns_remaining, "stockRemaining": event.stock_remaining,
-                "nextPlayer": event.next_player, "face": event.face,
-                "offeredTop": event.offered_top, "initialHand": list(event.initial_hand),
-            }
+            {"kind": int(event.kind), "actor": event.actor, "handSize": event.hand_size,
+             "turnsRemaining": event.turns_remaining, "stockRemaining": event.stock_remaining,
+             "nextPlayer": event.next_player, "face": event.face, "offeredTop": event.offered_top,
+             "initialHand": list(event.initial_hand)}
             for event in obs.history
         ],
     }
-
-
-def encode(obs):
-    config = obs["config"]
-    decks = config["numDecks"]
-    supply = decks * NUM_FACES
-    history = obs["history"]
-    count = len(obs["players"])
-    if not history or not count:
-        raise ValueError("model input needs complete history and player views")
-    sins = [math.sin(2.0 * math.pi * i / count) for i in range(count)]
-    coss = [math.cos(2.0 * math.pi * i / count) for i in range(count)]
-    cards = [[n / decks, 0.0, 0.0, 0.0, 0.0] for n in obs["hand"]]
-    for face in obs["discardPile"]:
-        cards[face][1] += 1.0 / decks
-    top = obs["discardPile"][-1] if obs["discardPile"] else NO_FACE
-    if top != NO_FACE:
-        cards[top][2] = 1.0
-    cards[obs["joker"]][3] = 1.0
-    for suit in range(4):
-        cards[suit * 13 + obs["joker"] % 13][4] = 1.0
-    players = []
-    for relative, player in enumerate(obs["players"]):
-        players.extend([
-            float(relative == 0), player["handSize"] / config["cardsInHand"],
-            player["turnsRemaining"] / config["maxTurns"], float(player["active"]),
-            sins[relative], coss[relative],
-        ])
-    events = []
-    for event in history:
-        events.extend([
-            float(event["actor"] == 0), sins[event["actor"]], coss[event["actor"]],
-            event["handSize"] / config["cardsInHand"], event["turnsRemaining"] / config["maxTurns"],
-            event["stockRemaining"] / supply, sins[event["nextPlayer"]], coss[event["nextPlayer"]],
-        ])
-    return {
-        "cards": [value for row in cards for value in row],
-        "initialHand": [n / decks for n in history[0]["initialHand"]],
-        "top": top,
-        "context": [float(obs["phase"] == phase) for phase in range(3)] + [
-            obs["turnsRemaining"] / config["maxTurns"], obs["stockRemaining"] / supply,
-            decks / 6.0, config["cardsInHand"] / 30.0, config["requiredSequences"] / 10.0,
-            float(config["recycleDiscard"]), count / 6.0, config["maxTurns"] / 60.0,
-        ],
-        "players": players,
-        "nextPlayer": [player["nextPlayer"] for player in obs["players"]],
-        "previousPlayer": [player["previousPlayer"] for player in obs["players"]],
-        "eventKind": [event["kind"] for event in history],
-        "eventFace": [NO_FACE if event["face"] is None else event["face"] for event in history],
-        "offeredTop": [
-            NO_FACE if event["offeredTop"] is None else event["offeredTop"] for event in history
-        ],
-        "eventActor": [event["actor"] for event in history],
-        "events": events,
-    }
-
-
-def history_channels(obs):
-    decks = obs["config"]["numDecks"]
-    initial = obs["history"][0]["initialHand"]
-    channels = [
-        [initial[face] / decks - obs["hand"][face] / decks, 0.0, 0.0, 0.0, 0.0]
-        for face in range(NUM_FACES)
-    ]
-    channels.append([0.0] * 5)
-    length = len(obs["history"])
-    for position, event in enumerate(obs["history"], start=1):
-        recency = (0.5 + 0.5 * (position / length)) / length
-        face = NO_FACE if event["face"] is None else event["face"]
-        offered = NO_FACE if event["offeredTop"] is None else event["offeredTop"]
-        if event["actor"] == 0:
-            channels[face][0] += recency
-            continue
-        base = 1 if event["actor"] == 1 else 3
-        if event["kind"] == EventKind.TAKE_DISCARD:
-            channels[face][base] += recency
-        elif event["kind"] == EventKind.DISCARD:
-            channels[face][base + 1] += recency
-        elif event["kind"] == EventKind.DRAW_STOCK:
-            channels[offered][base + 1] += recency
-    return [value for row in channels[:NUM_FACES] for value in row]
 
 
 def rows(values, width):
@@ -253,125 +168,106 @@ def dot(left, right):
     return math.fsum(map(operator.mul, left, right))
 
 
-def linear(layer, x):
-    weight, bias = layer
+def linear(layers, name, x):
+    weight = layers[name + ".weight"]
+    bias = layers.get(name + ".bias", (0.0,) * len(weight))
     return [b + dot(row, x) for row, b in zip(weight, bias)]
 
 
 def relu(values):
-    return [value if value > 0.0 else 0.0 for value in values]
+    return [max(value, 0.0) for value in values]
 
 
-def conv_relu(layer, steps):
-    zero = [0.0] * len(steps[0])
-    padded = [zero] + steps + [zero]
-    channels = range(len(zero))
-    return [
-        relu(linear(layer, [padded[t + k][c] for c in channels for k in range(3)]))
-        for t in range(len(steps))
-    ]
-
-
-def layer_norm(x, gamma, beta):
+def layer_norm(layers, name, x):
     mean = math.fsum(x) / len(x)
-    variance = math.fsum((value - mean) ** 2 for value in x) / len(x)
-    scale = 1.0 / math.sqrt(variance + 1e-5)
-    return [(value - mean) * scale * g + b for value, g, b in zip(x, gamma, beta)]
+    scale = 1.0 / math.sqrt(math.fsum((value - mean) ** 2 for value in x) / len(x) + 1e-5)
+    return [(value - mean) * scale * g + b
+            for value, g, b in zip(x, layers[name + ".weight"], layers[name + ".bias"])]
 
 
-def attention(layers, tokens):
-    width = SPEC.width
-    size = width // SPEC.heads
-    projected = [linear(layers["card_attention.in_proj"], token) for token in tokens]
-    mixed = [[0.0] * width for _ in tokens]
-    for start in range(0, width, size):
-        keys = [p[width + start:width + start + size] for p in projected]
-        values = [p[2 * width + start:2 * width + start + size] for p in projected]
-        columns = [list(column) for column in zip(*values)]
-        for row, p in zip(mixed, projected):
-            query = p[start:start + size]
-            scores = [dot(query, key) / math.sqrt(size) for key in keys]
+def add(*vectors):
+    return [math.fsum(column) for column in zip(*vectors)]
+
+
+def suit_means(cards):
+    return [[math.fsum(column) / 4 for column in zip(*cards[rank::13])] for rank in range(13)]
+
+
+def reference_layers(tensors, spec=ModelSpec()):
+    return {
+        name.removeprefix("policy."): rows(tensors[name], math.prod(shape[1:])) if len(shape) > 1 else tensors[name]
+        for name, shape in tensor_shapes(spec)
+    }
+
+
+def reference_q(layers, features, spec=ModelSpec()):
+    values = feature_values(features) if isinstance(features, Features) else features
+    fields = {field.name: list(values[field.offset:field.offset + field.size]) for field in LAYOUT}
+    width, head_size = spec.width, spec.width // spec.heads
+    cards = [linear(layers, "card_embed", card + history)
+             for card, history in zip(rows(fields["card"], 17), rows(fields["history"], 42))]
+    table = linear(layers, "table_embed", fields["context"] + fields["seat"])
+    for block in range(spec.blocks):
+        prefix = "blocks.%d." % block
+        normalized = [layer_norm(layers, prefix + "rank_norm", card) for card in cards]
+        rank_rows = []
+        kernel, bias = layers[prefix + "rank_conv.weight"], layers[prefix + "rank_conv.bias"]
+        for suit in range(4):
+            track = normalized[suit * 13:(suit + 1) * 13]
+            track = track + track[:1]
+            convolved = [[bias[c] + math.fsum(
+                kernel[c][k] * track[position + k - 1][c]
+                for k in range(3) if 0 <= position + k - 1 < 14
+            ) for c in range(width)] for position in range(14)]
+            rank_rows.extend([[0.5 * (a + b) for a, b in zip(convolved[0], convolved[13])], *convolved[1:13]])
+        cards = [add(card, linear(layers, prefix + "rank_out", relu(linear(layers, prefix + "rank_in", row))))
+                 for card, row in zip(cards, rank_rows)]
+        means = suit_means([layer_norm(layers, prefix + "suit_norm", card) for card in cards])
+        sets = [linear(layers, prefix + "suit_out", relu(linear(layers, prefix + "suit_in", row))) for row in means]
+        cards = [add(card, sets[face % 13]) for face, card in enumerate(cards)]
+        keys = [layer_norm(layers, prefix + "card_norm", card) for card in cards]
+        normalized_table = layer_norm(layers, prefix + "table_norm", table)
+        query = linear(layers, prefix + "table_query", normalized_table)
+        pooled = []
+        for start in range(0, width, head_size):
+            scores = [dot(query[start:start + head_size], key[start:start + head_size]) / math.sqrt(head_size) for key in keys]
             peak = max(scores)
             weights = [math.exp(score - peak) for score in scores]
             total = math.fsum(weights)
-            for offset, column in enumerate(columns):
-                row[start + offset] = dot(weights, column) / total
-    return [linear(layers["card_attention.out_proj"], row) for row in mixed]
+            pooled.extend(dot(weights, [key[c] for key in keys]) / total for c in range(start, start + head_size))
+        table = add(table, linear(layers, prefix + "table_out", relu(linear(layers, prefix + "table_in", normalized_table + pooled))))
+        film = linear(layers, prefix + "film", table)
+        cards = [[x + k * g + b for x, k, g, b in zip(card, key, film[:width], film[width:])]
+                 for card, key in zip(cards, keys)]
+    cards = [layer_norm(layers, "card_final", card) for card in cards]
+    table = layer_norm(layers, "table_final", table)
+    sets = suit_means(cards)
+    set_hidden = [linear(layers, "face_set", row) for row in sets]
+    table_hidden = linear(layers, "face_table", table)
+    faces = [relu(add(linear(layers, "face_local", card), set_hidden[face % 13], table_hidden))
+             for face, card in enumerate(cards)]
+    top = int(fields["top"][0])
+    top_card, top_set = (cards[top], sets[top % 13]) if top < NUM_FACES else ([0.0] * width, [0.0] * width)
+    draw = relu(add(linear(layers, "draw_table", table), linear(layers, "draw_top", top_card), linear(layers, "draw_set", top_set)))
+    advantage = linear(layers, "draw_out", draw) + [linear(layers, "face_out", face)[0] for face in faces]
+    center = dot(advantage, fields["legal"]) / max(math.fsum(fields["legal"]), 1.0)
+    value = linear(layers, "value_out", relu(linear(layers, "value_hidden", table)))[0]
+    return [value + action - center for action in advantage]
 
 
-def reference_layers(tensors):
-    shapes = dict(TENSOR_SHAPES)
-
-    def layer(weight, bias):
-        return rows(tensors[weight], math.prod(shapes[weight][1:])), tensors[bias]
-
-    names = (
-        "suit_conv1", "suit_conv2", "card_attention.out_proj", "history_proj", "context_features",
-        "player_features", "event_summary", "turn_relations", "context_gate",
-        "draw_head.0", "draw_head.2", "score.0", "score.2",
-    )
-    layers = {name: layer(name + ".weight", name + ".bias") for name in names}
-    layers["card_attention.in_proj"] = layer(
-        "card_attention.in_proj_weight", "card_attention.in_proj_bias",
-    )
-    layers["card_norm"] = (tensors["card_norm.weight"], tensors["card_norm.bias"])
-    return layers
-
-
-def reference_q(layers, encoded, channels):
-    cards = rows(encoded["cards"], 5)
-    tokens = [None] * NUM_FACES
-    for suit in range(4):
-        steps = [cards[suit * 13 + t % 13] for t in range(14)]
-        local = conv_relu(layers["suit_conv2"], conv_relu(layers["suit_conv1"], steps))
-        tokens[suit * 13] = [0.5 * (a + b) for a, b in zip(local[0], local[13])]
-        tokens[suit * 13 + 1:suit * 13 + 13] = local[1:13]
-    mixed = attention(layers, tokens)
-    local = [
-        layer_norm([a + b for a, b in zip(token, extra)], *layers["card_norm"])
-        for token, extra in zip(tokens, mixed)
-    ]
-    sets = [
-        [math.fsum(column) / 4.0 for column in zip(*local[rank::13])]
-        for rank in range(13)
-    ]
-    global_cards = [math.fsum(column) / NUM_FACES for column in zip(*local)]
-    bonus = [0.02 * math.tanh(linear(layers["history_proj"], row)[0]) for row in rows(channels, 5)]
-
-    players = rows(encoded["players"], 6)
-    own, after, before = (
-        linear(layers["player_features"], players[index])
-        for index in (0, encoded["nextPlayer"][0], encoded["previousPlayer"][0])
-    )
-    relation = relu(linear(layers["turn_relations"], own + after + before))
-    events = rows(encoded["events"], 8)
-    weights = [position / len(events) for position in range(1, len(events) + 1)]
-    total = max(math.fsum(weights), 1.0)
-    summary = linear(layers["event_summary"], [
-        math.fsum(w * event[k] for w, event in zip(weights, events)) / total for k in range(8)
-    ])
-    table = [
-        a + b + 0.1 * c
-        for a, b, c in zip(linear(layers["context_features"], encoded["context"]), relation, summary)
-    ]
-    gate = [0.02 * math.tanh(value) for value in linear(layers["context_gate"], table)]
-
-    top = encoded["top"]
-    if top < NUM_FACES:
-        top_features = local[top] + sets[top % 13] + cards[top]
-    else:
-        top_features = [0.0] * (2 * SPEC.width + 5)
-    raw = linear(layers["draw_head.2"], relu(linear(layers["draw_head.0"], global_cards + top_features)))
-    stock = raw[0] + gate[0]
-    q = [stock, stock + 0.25 * math.tanh(raw[1] + gate[1])]
-    for face in range(NUM_FACES):
-        rank = face % 13
-        features = local[face] + sets[rank] + global_cards + cards[face] + [
-            float(rank == other) for other in range(13)
-        ]
-        score = linear(layers["score.2"], relu(linear(layers["score.0"], features)))[0]
-        q.append(score + bonus[face] + gate[0])
-    return q
+def require_sensitive(tensors, features, golden, spec=ModelSpec()):
+    layers = reference_layers(tensors, spec)
+    for field in LAYOUT:
+        for feature, entry in zip(features, golden):
+            values = list(feature_values(feature))
+            if not any(values[field.offset:field.offset + field.size]):
+                continue
+            values[field.offset:field.offset + field.size] = [0.0] * field.size
+            changed = reference_q(layers, values, spec)
+            if max(abs(a - b) for a, b in zip(changed, entry["q"])) > 100 * TOLERANCE:
+                break
+        else:
+            raise SystemExit("bootstrap Q values are not sensitive to the %s feature field" % field.name)
 
 
 class GoldenCase(NamedTuple):
@@ -452,8 +348,7 @@ def golden_observation(case):
     else:
         env = MultiplayerEnv(MatchConfig(game=case.config, players=case.seats))
         env.reset(case.seed)
-    rng = random.Random(case.seed)
-    obs = env.observe()
+    rng, obs = random.Random(case.seed), env.observe()
     for _ in range(STEP_LIMIT):
         if case.until(obs):
             return obs
@@ -464,29 +359,15 @@ def golden_observation(case):
     raise RuntimeError("golden case %s never reached its position; pick another seed" % case.name)
 
 
-def golden_entry(case, obs):
-    observation = observation_json(obs)
-    return {
-        "name": case.name,
-        "seats": case.seats,
-        "observation": observation,
-        "encoded": encode(observation),
-        "historyChannels": history_channels(observation),
-    }
-
-
-def add_reference_q(tensors, golden):
-    layers = reference_layers(tensors)
-    for entry in golden:
-        entry["q"] = reference_q(layers, entry["encoded"], entry["historyChannels"])
-
-
 def require_close(label, actual, expected, tolerance):
-    if len(actual) != len(expected) or any(abs(a - b) > tolerance for a, b in zip(actual, expected)):
-        raise SystemExit("%s: the pure-Python port disagrees with torch" % label)
+    if len(actual) != len(expected) or any(
+        not math.isfinite(a) or not math.isfinite(b) or abs(a - b) > tolerance
+        for a, b in zip(actual, expected)
+    ):
+        raise SystemExit("%s: the pure-Python reference disagrees with torch" % label)
 
 
-def export_checkpoint(args, observations, golden):
+def export_checkpoint(args, observations, features, golden):
     try:
         import torch
     except ImportError:
@@ -496,9 +377,9 @@ def export_checkpoint(args, observations, golden):
         ) from None
     from src.checkpoints.io import file_sha256
     from src.checkpoints.registry import ModelRegistry
-    from src.model.encoding import collate_observations
-    from src.model.network import load_checkpoint
+    from src.model.network import collate, load_checkpoint
 
+    torch.set_num_threads(1)
     if args.checkpoint is not None:
         path, kind, registry_id = args.checkpoint, "checkpoint", None
         if not path.is_file():
@@ -511,52 +392,37 @@ def export_checkpoint(args, observations, golden):
         record = registry.champion()
         path, kind, sha256, registry_id = registry.model_path(record.id), "registry", record.sha256, record.id
     network, config, _ = load_checkpoint(str(path), device=torch.device("cpu"))
-    state = network.state_dict()
-    if network.spec != SPEC or [(name, tuple(value.shape)) for name, value in state.items()] != list(TENSOR_SHAPES):
-        raise SystemExit("web/qnet.mjs runs the width 64, 4 head dynamic_table network; %s differs" % path)
-    tensors = {name: value.detach().cpu().float().reshape(-1).tolist() for name, value in state.items()}
-    add_reference_q(tensors, golden)
-    with torch.no_grad():
-        for obs, entry in zip(observations, golden):
-            batch = collate_observations([obs], torch.device("cpu"))
+    spec = network.spec
+    tensors = {"policy." + name: value.detach().cpu().float().reshape(-1).tolist()
+               for name, value in network.policy.state_dict().items()}
+    if [("policy." + name, tuple(value.shape)) for name, value in network.policy.state_dict().items()] != list(tensor_shapes(spec)):
+        raise SystemExit("policy tensors do not match the axial_table v4 export schema")
+    layers = reference_layers(tensors, spec)
+    with torch.inference_mode():
+        batch = collate(features, torch.device("cpu"))
+        q = network(batch).tolist()
+        for row, (obs, feature, entry) in enumerate(zip(observations, features, golden)):
             label = "golden case " + entry["name"]
-            encoded = entry["encoded"]
-            for key, tensor in (
-                ("cards", batch.cards), ("initialHand", batch.initial_hand), ("context", batch.context),
-                ("players", batch.players), ("events", batch.event_features),
-            ):
-                require_close(label + " " + key, encoded[key], tensor[0].reshape(-1).tolist(), INPUT_TOLERANCE)
-            for key, tensor in (
-                ("top", batch.top), ("nextPlayer", batch.next_player),
-                ("previousPlayer", batch.previous_player), ("eventKind", batch.event_kind),
-                ("eventFace", batch.event_face), ("offeredTop", batch.offered_top),
-                ("eventActor", batch.event_actor),
-            ):
-                if encoded[key] != tensor[0].tolist():
-                    raise SystemExit("%s %s: the pure-Python port disagrees with torch" % (label, key))
-            channels = network._history_channels(batch)[0].reshape(-1).tolist()
-            require_close(label + " historyChannels", entry["historyChannels"], channels, INPUT_TOLERANCE)
-            q = network(batch)[0].tolist()
-            require_close(label + " q", entry["q"], q, TOLERANCE)
-            entry["q"] = q
-    return tensors, config, model_source(kind, tensors, sha256=sha256, registry_id=registry_id)
+            require_close(label + " encode", feature_values(encode(obs)), entry["features"], INPUT_TOLERANCE)
+            for field in LAYOUT:
+                actual = getattr(batch, field.name)[row].reshape(-1).tolist()
+                require_close(label + " " + field.name, actual, entry["features"][field.offset:field.offset + field.size], INPUT_TOLERANCE)
+            require_close(label + " q", reference_q(layers, feature, spec), q[row], TOLERANCE)
+            entry["q"] = q[row]
+    return tensors, config, model_source(kind, tensors, sha256=sha256, registry_id=registry_id), spec
 
 
 def write_json(path, document):
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    path.write_bytes((text + "\n").encode("utf-8"))
+    path.write_bytes((json.dumps(document, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8"))
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Export dynamic_table weights for web/qnet.mjs.")
+    parser = argparse.ArgumentParser(description="Export axial_table v4 policy weights for web/qnet.mjs.")
     weights = parser.add_mutually_exclusive_group()
     weights.add_argument("--checkpoint", type=Path, help="export this .pt checkpoint (needs torch)")
     weights.add_argument("--registry", type=Path, help="export this registry's champion (needs torch)")
-    weights.add_argument(
-        "--bootstrap", action="store_true",
-        help="seeded untrained weights without torch; the default when no checkpoint is given",
-    )
+    weights.add_argument("--bootstrap", action="store_true", help="seeded untrained weights without torch, the default")
     parser.add_argument("--seed", type=int, help="bootstrap seed (default %d)" % BOOTSTRAP_SEED)
     parser.add_argument("--output", type=Path, default=ROOT / "web" / "papplu-model.json")
     parser.add_argument("--golden", type=Path, default=ROOT / "tests" / "fixtures" / "qnet-golden.json")
@@ -564,34 +430,36 @@ def main(argv=None):
     from_torch = args.checkpoint is not None or args.registry is not None
     if from_torch and args.seed is not None:
         parser.error("--seed only applies to bootstrap weights")
-
     observations = [golden_observation(case) for case in GOLDEN_CASES]
-    golden = [golden_entry(case, obs) for case, obs in zip(GOLDEN_CASES, observations)]
+    features = [encode(obs) for obs in observations]
+    golden = [
+        {"name": case.name, "seats": case.seats, "observation": observation_json(obs),
+         "features": list(feature_values(feature))}
+        for case, obs, feature in zip(GOLDEN_CASES, observations, features)
+    ]
     if from_torch:
-        tensors, config, source = export_checkpoint(args, observations, golden)
+        tensors, config, source, spec = export_checkpoint(args, observations, features, golden)
     else:
-        seed = BOOTSTRAP_SEED if args.seed is None else args.seed
-        tensors, config = bootstrap_tensors(seed), PRODUCTION
+        seed, spec = BOOTSTRAP_SEED if args.seed is None else args.seed, ModelSpec()
+        tensors, config = bootstrap_tensors(seed, spec), PRODUCTION
         source = model_source("bootstrap", tensors, seed=seed)
-        add_reference_q(tensors, golden)
-    write_json(args.output, model_document(tensors, config, source))
+        layers = reference_layers(tensors, spec)
+        for entry, feature in zip(golden, features):
+            entry["q"] = reference_q(layers, feature, spec)
+        require_sensitive(tensors, features, golden, spec)
+    write_json(args.output, model_document(tensors, config, source, spec))
     write_json(args.golden, {
-        "format": GOLDEN_FORMAT,
-        "formatVersion": FORMAT_VERSION,
-        "modelSha256": source["sha256"],
-        "tensorsSha256": source["tensorsSha256"],
-        "oracle": "torch" if from_torch else "python-reference",
-        "sources": {
-            path: hashlib.sha256((ROOT / path).read_text(encoding="utf-8").encode("utf-8")).hexdigest()
-            for path in SOURCES
-        },
-        "tolerance": TOLERANCE,
+        "format": GOLDEN_FORMAT, "formatVersion": FORMAT_VERSION, "modelSha256": source["sha256"],
+        "tensorsSha256": source["tensorsSha256"], "oracle": "torch" if from_torch else "python-reference",
+        "sources": {path: hashlib.sha256((ROOT / path).read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+                    for path in SOURCES},
+        "tolerance": TOLERANCE, "featureLayout": [[field.name, list(field.shape)] for field in LAYOUT],
+        "channels": {"card": CARD_CHANNELS, "history": HISTORY_CHANNELS, "seat": SEAT_CHANNELS, "context": CONTEXT_CHANNELS},
         "cases": golden,
     })
     label = {
         "bootstrap": "UNTRAINED bootstrap weights, seed %s, not a champion" % source["seed"],
-        "checkpoint": "checkpoint weights",
-        "registry": "registry champion %s" % source["registryId"],
+        "checkpoint": "checkpoint weights", "registry": "registry champion %s" % source["registryId"],
     }[source["kind"]]
     print("wrote %s: %s, sha256 %s" % (args.output, label, source["sha256"]))
     print("wrote %s: %d golden observations" % (args.golden, len(golden)))

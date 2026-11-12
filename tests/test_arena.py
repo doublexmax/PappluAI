@@ -331,7 +331,7 @@ class TestArenaCheckpoints(unittest.TestCase):
             policy = CheckpointPolicy(path)
             self.assertIsNone(policy._network)
             self.assertEqual(policy.game_config, checkpoint_config)
-            self.assertEqual(policy.network.architecture, "dynamic_table")
+            self.assertEqual(policy.network.architecture, "axial_table")
             self.assertFalse(policy.network.training)
 
     def test_current_checkpoint_plays_all_supported_full21_tables(self):

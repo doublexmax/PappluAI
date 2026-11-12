@@ -262,7 +262,7 @@ class TestReplayJournals(unittest.TestCase):
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_weights_only_roundtrip_keeps_one_journal_and_shared_events(self):
-        from src.model.encoding import collate_observations
+        from src.model.network import collate_observations
 
         replay = self.replay()
         state = replay.state_dict()

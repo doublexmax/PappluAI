@@ -266,7 +266,7 @@ class TestTrainLearning(unittest.TestCase):
             payload = build_checkpoint(QNetwork(), cfg)
             payload["checkpoint_version"] = 2
             torch.save(payload, path)
-            with self.assertRaisesRegex(ValueError, "fresh dynamic weights"):
+            with self.assertRaisesRegex(ValueError, "fresh axial_table v4 weights"):
                 train(episodes=0, load_path=path)
             with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 code = train_main(
@@ -278,12 +278,12 @@ class TestTrainLearning(unittest.TestCase):
                     ]
                 )
             self.assertEqual(code, 2)
-            self.assertIn("fresh dynamic weights", err.getvalue())
+            self.assertIn("fresh axial_table v4 weights", err.getvalue())
 
     def test_controlled_discard_task_raises_chosen_q(self):
         """Repeated warm-start 3-card puzzle: correct discard value should rise."""
         from src.model.network import load_checkpoint, select_greedy_action
-        from src.model.encoding import collate_observations
+        from src.model.network import collate_observations
         from src.training.solo import train
 
         cfg = GameConfig(

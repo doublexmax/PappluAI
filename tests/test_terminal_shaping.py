@@ -179,7 +179,7 @@ class TestShapedTraining(unittest.TestCase):
                     transition = session.replay.state_dict()["episodes"][0]["transitions"][0]
                     self.assertAlmostEqual(transition[-1], expected)
 
-    def test_improvement_applies_shaping_to_both_learners(self):
+    def test_improvement_applies_shaping_to_the_single_learner(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             model = root / "initial.pt"
@@ -187,10 +187,9 @@ class TestShapedTraining(unittest.TestCase):
             controller = ImprovementController(
                 str(model), root / "run", config=ImproveConfig(max_cycles=1),
             )
-            for learner in (controller.league, controller.research):
-                self.assertEqual(
-                    learner.config.shaping, TerminalShaping(speed=0.35, margin=0.25),
-                )
+            self.assertEqual(
+                controller.league.config.shaping, TerminalShaping(speed=0.35, margin=0.25),
+            )
 
 
 if __name__ == "__main__":

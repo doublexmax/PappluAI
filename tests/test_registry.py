@@ -22,8 +22,8 @@ except ImportError:
 def install_record(registry, data, origin):
     digest = hashlib.sha256(data).hexdigest()
     metadata = {
-        "architecture": "dynamic_table", "checkpoint_version": 3, "encoding_version": 2,
-        "model_spec": {"width": 64, "heads": 4},
+        "architecture": "axial_table", "checkpoint_version": 4, "encoding_version": 2,
+        "model_spec": {"width": 64, "heads": 4, "blocks": 2},
     }
     record = ModelRecord(digest[:20], digest, "model-" + digest + ".pt", origin, metadata, {}, ())
     (registry.root / record.filename).write_bytes(data)
@@ -59,7 +59,7 @@ def gate_evidence(candidate, champion, blocks, seed, player_counts=(2, 3, 4)):
         "champion_sha256": champion.sha256,
         "gate_schema_version": GATE_SCHEMA_VERSION,
         "encoding_version": 2,
-        "architecture": "dynamic_table",
+        "architecture": "axial_table",
         "player_counts": list(player_counts),
         "seed_blocks": blocks,
         "seed": seed,
@@ -225,7 +225,7 @@ class TestChampionProtection(unittest.TestCase):
             database = json.loads(registry.path.read_text(encoding="utf-8"))
             database["models"][record.id]["metadata"] = {"architecture": "mlp", "encoding_version": 1}
             atomic_write_json(database, registry.path)
-            with self.assertRaisesRegex(ValueError, "current dynamic"):
+            with self.assertRaisesRegex(ValueError, "current axial_table v4"):
                 registry.get(record.id)
 
     def test_four_player_failure_cannot_be_hidden_by_other_counts(self):

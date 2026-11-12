@@ -492,6 +492,13 @@ def _card_points(face: int, joker: int) -> int:
     return 0 if rank == joker % NUM_RANKS else _RANK_POINTS[rank]
 
 
+def card_points(face: int, joker: int) -> int:
+    card = _require_integral(face, "face")
+    if not 0 <= card < NUM_FACES:
+        raise ValueError("face must be in 0..51, got %d" % card)
+    return _card_points(card, _parse_joker(joker))
+
+
 class _PenaltySearch:
     def __init__(
         self,

@@ -26,7 +26,8 @@ from src.game.environment import (
     ACTION_TAKE_DISCARD, GameConfig, Observation, discard_action, legal_action_mask,
 )
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.model.encoding import collate_observations
+from src.model.encoding import encode
+from src.model.network import collate_observations
 from src.training.league import LeagueConfig, LeagueSession
 from src.training.optimization import train_batch
 
@@ -174,7 +175,11 @@ def verify(output: Path) -> dict:
         started = time.perf_counter()
         with torch.no_grad():
             batch = collate_observations([representative], torch.device("cpu"))
-            assert batch.history_lengths.item() == len(representative.history)
+            assert torch.equal(
+                batch.history,
+                collate_observations([Observation.from_dict(representative.to_dict())], torch.device("cpu")).history,
+            )
+            assert len(encode(representative).data) == 12832
             values = policy.network(batch)
         forward_seconds = time.perf_counter() - started
         assert torch.isfinite(values).all()
