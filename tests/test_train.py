@@ -460,6 +460,13 @@ class TestLearnerAndTrainerLifecycle(unittest.TestCase):
             self.assertGreater(json.loads(stdout_timed.getvalue())["episodes"], 0)
             self.assertTrue(timed_ckpt.exists())
 
+            with mock.patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(cli_main([
+                    "--checkpoint", str(root / "bad-cycles.pt"),
+                    "--max-cycles", "1",
+                    "--width", "16", "--heads", "2", "--blocks", "1",
+                ]), 2)
+
             out_dir = root / "run"
             with mock.patch("sys.stdout", new_callable=io.StringIO):
                 self.assertEqual(cli_main([

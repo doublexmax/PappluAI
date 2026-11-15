@@ -1226,6 +1226,8 @@ class Trainer:
             _require_int(max_episodes, "max_episodes", minimum=0)
         if max_cycles is not None:
             _require_int(max_cycles, "max_cycles", minimum=0)
+            if not self.config.promote:
+                raise ValueError("max_cycles requires promote=True")
         deadline = None if max_seconds is None else time.monotonic() + float(max_seconds)
         reason: Optional[StopReason] = None
         while True:
