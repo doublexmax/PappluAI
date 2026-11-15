@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
-import random
-from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -18,17 +16,7 @@ from src.game.lookahead import (
     winning_discard,
 )
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.game.outcome import solo_outcome
 from src.model.encoding import CONTEXT_CHANNELS, LAYOUT, encode, feature_values
-
-try:
-    import torch
-except ImportError:
-    torch = None
-
-if torch is not None:
-    from src.model.search import TeacherConfig, state_values, teacher_targets
-    from src.training.core import Decision, Trajectory, TrajectoryReplay
 
 
 def draw_observation():
@@ -229,101 +217,6 @@ class TestBeliefLookahead(unittest.TestCase):
                      replace(discard.players[1], turns_remaining=0, active=False)),
         )
         self.assertEqual(expand(exhausted), {})
-
-
-@unittest.skipIf(torch is None, "PyTorch not installed")
-class TestBudgetedTeacher(unittest.TestCase):
-    def setUp(self):
-        self.device = torch.device("cpu")
-
-        class Values(torch.nn.Module):
-            def forward(self, batch):
-                return torch.full((len(batch.card), 54), 2.0, device=batch.card.device)
-
-            def outputs(self, batch):
-                return SimpleNamespace(after=torch.full((len(batch.card),), 0.4, device=batch.card.device))
-
-        self.target = Values()
-
-    def test_exact_wins_and_expected_stock_values_receive_the_draw_discount(self):
-        result = teacher_targets(self.target, [draw_observation()], TeacherConfig(fraction=1),
-                                 random.Random(1), 0.5, self.device)
-        self.assertEqual(result.rows.tolist(), [0])
-        self.assertEqual(result.mask[0].nonzero().flatten().tolist(), [0, 1])
-        self.assertAlmostEqual(result.values[0, 1].item(), 0.5)
-        self.assertAlmostEqual(result.values[0, 0].item(), 1 - 2 / 151, places=6)
-
-    def test_child_budget_never_truncates_or_renormalizes_a_chance_node(self):
-        result = teacher_targets(self.target, [draw_observation()], TeacherConfig(fraction=1, max_children=1),
-                                 random.Random(1), 0.5, self.device)
-        self.assertEqual(result.rows.tolist(), [])
-        self.assertEqual(result.values.shape, (0, 54))
-        complete = teacher_targets(
-            self.target, [draw_observation()], TeacherConfig(fraction=1, max_children=53),
-            random.Random(1), 0.5, self.device,
-        )
-        self.assertEqual(complete.mask[0].nonzero().flatten().tolist(), [0, 1])
-        self.assertAlmostEqual(complete.values[0, 0].item(), 1 - 2 / 151, places=6)
-        disabled = teacher_targets(self.target, [draw_observation()], TeacherConfig(fraction=0),
-                                   random.Random(1), 1.0, self.device)
-        self.assertEqual(disabled.values.shape, (0, 54))
-
-    def test_exhausted_budget_stops_expansion_and_estimates_skip_oversized_rows(self):
-        discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)
-        rng = mock.Mock()
-        rng.shuffle.side_effect = lambda rows: None
-        for budget, expected_rows in ((3, [0]), (8, [0, 2])):
-            with mock.patch("src.model.search.expand", wraps=expand) as expanded:
-                result = teacher_targets(
-                    self.target, [discard, draw_observation(), discard],
-                    TeacherConfig(fraction=1, max_children=budget), rng, 0.5, self.device,
-                )
-            self.assertEqual(result.rows.tolist(), expected_rows)
-            self.assertEqual([call.args[0] for call in expanded.call_args_list], [discard] * len(expected_rows))
-            for position in range(len(expected_rows)):
-                self.assertEqual(result.mask[position].nonzero().flatten().tolist(), [2, 3, 4, 32])
-                self.assertAlmostEqual(result.values[position, 2].item(), 0.4)
-                self.assertEqual(result.values[position, 32].item(), 1.0)
-
-    def test_terminal_discards_need_no_child_forward_even_when_only_one_child_is_budgeted(self):
-        discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)
-        solo = replace(discard, warm_start=True, players=(replace(
-            discard.players[0], next_player=0, previous_player=0,
-        ),))
-        with mock.patch.object(self.target, "forward", side_effect=AssertionError("terminal Q forward")), mock.patch.object(
-            self.target, "outputs", side_effect=AssertionError("terminal afterstate forward"),
-        ):
-            result = teacher_targets(
-                self.target, [solo], TeacherConfig(fraction=1, max_children=1),
-                random.Random(1), 0.5, self.device,
-            )
-        self.assertEqual(result.mask[0].nonzero().flatten().tolist(), [2, 3, 4, 32])
-        for action, expected, penalty in (
-            (2, -0.6, 10), (3, -0.6551724137931034, 18),
-            (4, -0.6491228070175439, 17), (32, 1.0, 0),
-        ):
-            remaining = list(solo.hand)
-            remaining[action - 2] -= 1
-            outcome = solo_outcome(remaining, solo.joker, action == 32, solo.config.required_sequences)
-            replay = TrajectoryReplay(8)
-            replay.append(Trajectory(1, (Decision(
-                solo, encode(solo), action, (solo.hand,) + ((0,) * 52,) * 5,
-            ),), outcome))
-            sample = replay.sample(random.Random(1), 1)[0]
-            self.assertEqual((sample.outcome.utility, sample.outcome.penalty), (expected, penalty))
-            self.assertAlmostEqual(result.values[0, action].item(), expected, places=6)
-            self.assertAlmostEqual(result.values[0, action].item(), sample.outcome.utility, places=6)
-
-    def test_discard_declarations_are_exact_and_afterstates_are_not_discounted(self):
-        discard = after_draw(draw_observation(), 2, EventKind.TAKE_DISCARD)
-        result = teacher_targets(self.target, [discard], TeacherConfig(fraction=1),
-                                 random.Random(1), 0.5, self.device)
-        self.assertEqual(result.values[0, discard_action(30)].item(), 1.0)
-        self.assertAlmostEqual(result.values[0, discard_action(0)].item(), 0.4)
-        after = after_discard(discard, 0)
-        values = state_values(self.target, [discard, after], self.device)
-        self.assertAlmostEqual(values[0].item(), 1.0)
-        self.assertAlmostEqual(values[1].item(), 0.4)
 
 
 if __name__ == "__main__":

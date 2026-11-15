@@ -15,102 +15,97 @@ python -m venv .venv
 ```
 
 Command-line entry points live in `src.cli`. They parse `--help` before loading
-PyTorch. Game rules are in `src.game`, the current network is in `src.model`, training
-implementations in `src.training`, evaluation in `src.evaluation`, and
-persistent state operations in `src.checkpoints`.
+PyTorch. Game rules are in `src.game`, the current network is in `src.model`, the unified training
+runtime lives in `src.training.train`, evaluation is in `src.evaluation`, and
+persistent state operations live in `src.checkpoints`.
 
 ## Run a short smoke test
 
-This uses a three-card warm-start puzzle. It verifies training, model
+This uses a three-card warm-start puzzle and exports a standalone model checkpoint. It verifies training, model
 checkpoint writing, loading, and evaluation without representing full Papplu
 performance.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.solo --episodes 20 --num-decks 2 --cards-in-hand 3 --required-sequences 1 --max-turns 5 --warm-start-fraction 1 --eval-episodes 10 --eval-seed 1000 --log-every 0 --checkpoint checkpoints\smoke.pt
+.\.venv\Scripts\python -m src.cli.train --checkpoint checkpoints\smoke.pt --max-episodes 20 --num-decks 2 --cards-in-hand 3 --required-sequences 1 --max-turns 5 --warm-start-fraction 1 --validation-games 0
 .\.venv\Scripts\python -m src.cli.benchmark --checkpoint checkpoints\smoke.pt --output runs\smoke-evaluation.json --games 20 --warm-games 20
 ```
 
 The first command writes `checkpoints\smoke.pt`. The second writes paired
 evaluation details to `runs\smoke-evaluation.json`.
 
-To fine-tune those weights, start with fresh optimizer and replay state.
+To fine-tune those weights with fresh optimizer and replay state, pass `--initial-model`.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.solo --load checkpoints\smoke.pt --episodes 5 --checkpoint checkpoints\smoke-finetuned.pt
+.\.venv\Scripts\python -m src.cli.train --initial-model checkpoints\smoke.pt --checkpoint checkpoints\smoke-finetuned.pt --max-episodes 5
 ```
 
 ## Train and resume full 21-card play
 
-The curriculum trainer defaults to three decks, 21 cards, five required pure
+`src.cli.train` defaults to one player, three decks, 21 cards, five required pure
 sequences, discard recycling, a 60-turn limit, and the `axial_table` network.
-This is a one-player curriculum for the same model that plays multiplayer.
+Passing `--curriculum-distances` enables staged solo curriculum deals for the same model that plays multiplayer.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --curriculum-distances 2 4 6 10
 ```
 
-For a larger model, set `--width`, `--heads`, and `--blocks` on the first run.
-Both `src.cli.solo` and `src.cli.curriculum` accept these flags.
+For a larger model, set `--width`, `--heads`, and `--blocks` when starting a fresh run without `--initial-model`.
 The default spec is `ModelSpec(width=64, heads=4, blocks=2)`.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.curriculum --output-dir runs\full21-wide --width 128 --heads 8 --blocks 3
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21-wide --curriculum-distances 2 4 6 10 --width 128 --heads 8 --blocks 3
 ```
 
 The output directory contains `latest-state.pt`, `latest-model.pt`,
-`best-model.pt`, `baseline-model.pt`, and `metrics.jsonl`. The full state
-checkpoint includes model and optimizer tensors, replay, curriculum and
+`best-model.pt`, `status.json`, and `metrics.jsonl`. The full state
+checkpoint includes model and optimizer tensors, compressed replay bytes, curriculum and
 learning counters, plus Python and PyTorch random-number-generator states.
 
-Resume the saved run, then benchmark its latest model.
+Repeat the same `--output-dir` to resume `latest-state.pt`, then benchmark `latest-model.pt`.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.curriculum --resume runs\full21\latest-state.pt --output-dir runs\full21
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --max-episodes 5000
 .\.venv\Scripts\python -m src.cli.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
 ```
 
 Model checkpoint version 4 and information encoding version 2 remain unchanged.
-Existing `axial_table` v4 weights can warm-start a new run.
-`TrajectoryReplay` v4 stores shaped terminal utilities.
-Resume rejects replay v3 with an instruction to warm-start through `--initial-model`.
+Existing `axial_table` v4 model weights can warm-start a new run through `--initial-model`.
+Trainer state uses version 5 and `Replay` v5.
+Incompatible older state files fail cleanly and require `--initial-model` in a fresh output directory.
 Old model architectures and old registry records remain unsupported.
 
-To finetune existing weights at curriculum stage 2, start fresh optimizer and replay state.
+To finetune existing weights at curriculum stage 2, start fresh optimizer and replay state in a new directory.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.curriculum --initial-model runs\full21\best-model.pt --initial-stage 2 --output-dir runs\full21-finetune --learning-rate 0.0001 --epsilon-start 0.08 --epsilon-end 0.02 --epsilon-decay-episodes 10000
+.\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\best-model.pt --output-dir runs\full21-finetune --curriculum-distances 2 4 6 10 --initial-stage 2 --learning-rate 0.0001 --epsilon-start 0.08 --epsilon-end 0.02 --epsilon-decay-episodes 10000
 ```
 
-Curriculum defaults remain learning rate 0.0003 and epsilon 0.3 to 0.1 over 10000 stage episodes.
-All four settings persist in `TrainingConfig`.
-Resume rejects changed values in both spaced and `=` argument forms.
+Default hyperparameters use learning rate 0.0003 and epsilon 0.30 to 0.05 over 10000 episodes.
+All settings persist in `TrainConfig`, and resume rejects hyperparameter changes while allowing `--checkpoint-every`, `--gate-workers`, `--torch-threads`, and `--device` overrides.
 
-`Learner` uses 5-step Double DQN with `gamma = 1.0`.
-The online network selects a legal bootstrap action, and the target network values that action.
+`Learner` uses 5-step Double DQN with `gamma = 0.99`.
+The online network selects a legal bootstrap action, and the target network values that action with contraction `gamma ** k` over `k` elapsed steps.
 Solo declaration earns +1.
-A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`, inside `(-1, -0.5]`.
+A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`, bounded between -1 and -0.5.
 Multiplayer utility averages pairwise margins weighted by 1 when either seat declared, and by 0.5 otherwise.
 The declarer earns +1. The best exhausted hand earns at most +0.5.
 An opponent's declaration never improves another seat's utility.
 Multiplayer utilities remain zero-sum.
 `DealOutcome.margin` stays unshaped for PFSP, ratings, and promotion.
-Solo, curriculum, and terminal lookahead targets all use `solo_outcome`.
-Curriculum episode metrics expose `utility` and `penalty`.
-Greedy validation and best-model selection still use binary declaration win rates.
-AdamW, a Polyak target network, and gradient clipping update the challenger.
-Win, penalty, opponent-card, afterstate, and budgeted lookahead losses provide additional training targets.
+Solo and curriculum deals score terminal outcomes through `solo_outcome`.
+Greedy validation and `best-model.pt` selection use binary declaration win rates.
+AdamW, a Polyak target network, and gradient clipping update the online network alongside win, penalty, and opponent-card auxiliary losses.
 
 `encode` converts each visible observation into a pure `Features` record of 3,208 float32 values.
 The encoder includes meld membership, public-card beliefs, per-kind history recencies, and six relative seat slots.
 `PolicyNet` combines rank convolutions, suit pooling, table attention, and FiLM on a four-suit, 13-rank grid.
 `collate` batches cached records without rescanning history.
-Hidden hands provide auxiliary training targets only.
+Opponent hand counts provide auxiliary training targets only.
 Browser exports omit `aux.*` weights and retain only `policy.*`.
 See the [current model contract](README.md#current-model-contract) for the model layout.
 
-`TrajectoryReplay` v4 samples decisions uniformly within each player count.
-Checkpoints store one visible-history journal per trajectory and a prefix for each decision.
-Resume validates each snapshot against its prefix and restores the replay sampling cursor.
+`Replay` v5 enforces strict step-level capacity, samples steps uniformly within each populated player count, and gives populated player counts equal shares.
+State checkpoints compress concatenated `Features` bytes with `zlib` so `torch.load(..., weights_only=True)` restores replay directly without retaining `Observation` instances.
 
 ## Run shared-deck arena matches
 
@@ -140,11 +135,11 @@ prefixes. The study compares cap-conditioned play, not one fixed trajectory
 truncated at different turns.
 
 Use a directory containing immutable `model-<sha256>.pt` snapshots, such as
-an improvement run's registry. The calibration adds a seeded random baseline.
+`runs\improve\registry`. The calibration adds a seeded random baseline.
 The pool must contain enough distinct competitors for the largest table.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.calibration --models-dir runs\improve --output-dir runs\calibration --caps 30 60 90 120 180 --players 2 3 4 --blocks 512 --workers 4
+.\.venv\Scripts\python -m src.cli.calibration --models-dir runs\improve\registry --output-dir runs\calibration --caps 30 60 90 120 180 --players 2 3 4 --blocks 512 --workers 4
 ```
 
 Each independent deal samples a lineup and seating independently of the deck,
@@ -175,74 +170,58 @@ Workers have coordinator-enforced deadlines. A timeout is an execution failure,
 not a game draw. The command stops on a worker failure and retains completed
 cases for recovery.
 
-## Train against a frozen league
+## Train across mixed tables and PFSP opponents
 
-Only the challenger is updated. The initial model, checkpoint opponents, and
-random policy remain frozen. Copy the generated full-hand model to make the
-opponent snapshot explicit.
-Training defaults to two, three, and four players.
+Only the online learner is updated. The initial model, `--opponent` checkpoints, and
+random policy remain frozen in the opponent pool. Copy the generated full-hand model to make an additional
+opponent snapshot explicit, and list every table size under `--players`.
 
 ```powershell
 New-Item -ItemType Directory -Force checkpoints
 Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
-.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --players 2 3 4 --matches 128 --matches-per-round 16 --max-seconds 3600 --checkpoint-every 16
-.\.venv\Scripts\python -m src.cli.league --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --resume runs\league\latest-state.pt --output-dir runs\league --matches 128 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --players 1 2 3 4 --max-episodes 128 --round-episodes 16 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\league --max-episodes 256 --max-seconds 3600 --checkpoint-every 16
 ```
 
-League options have these defaults.
+Key training options have these defaults.
 
 - `--max-turns 60` limits each seat's completed draw-discard turns.
 - `--batch-size 128` caps the replay samples in each optimizer update.
-- `--updates-per-match 4` sets the updates after a match with challenger actions.
-- `--matches-per-round 16` batches deals before updates.
-- `--learning-rate 0.0003` sets the optimizer rate.
-- `--epsilon-start 0.2` and `--epsilon-end 0.05` set exploration.
-- `--epsilon-decay-matches 10000` sets the exploration decay budget.
+- `--updates-per-episode 4` sets gradient updates per completed trajectory.
+- `--round-episodes 16` batches episodes before updates.
+- `--learning-rate 0.0003` sets the AdamW learning rate.
+- `--epsilon-start 0.30` and `--epsilon-end 0.05` set exploration bounds.
+- `--epsilon-decay-episodes 10000` sets the exploration decay budget.
 
-League checkpoints are published only at match boundaries and preserve the
-opponent-pool identity, replay, optimizer, counters, and random streams.
-Count and challenger-seat schedules are independent and deterministic.
-Replay gives each count equal sampling shares and samples its decisions uniformly.
-Resume restores the saved count selection and schedule cursors.
-`OpponentScheduler` uses PFSP weights `(1 - p)^2` from smoothed pairwise placement scores.
-The default schedule reserves 35% for the champion and 15% for available baseline and random opponents.
+Checkpoints are published at round and gate boundaries and preserve the
+opponent-pool order, compressed replay, optimizer, counters, and random streams.
+Player counts are sorted and distinct and cycle deterministically across episodes.
+Replay gives each populated count equal sampling shares and samples steps uniformly within each bucket.
+`pfsp_probabilities` weights non-anchor opponents by `(1 - p)^2` from Bayesian-smoothed pairwise placement scores.
+The default schedule reserves 35% for the champion and 15% for baseline and random anchors.
 Other frozen opponents share the remaining probability according to those weights.
 
-On resume, omit learning and exploration options to retain their saved values, or supply matching values.
-The same rule applies to `--max-turns`, `--batch-size`, `--updates-per-match`, and `--matches-per-round`.
-Changes to those options, `--players`, or `--seed` fail before checkpoint publication.
-Both spaced and `=` argument forms enforce this rule.
-Player counts must be sorted and distinct.
-Starting without `--resume` rejects a directory that already contains a league
-model or state checkpoint. Use a new output directory for a fresh run.
+On resume, omit training and exploration options to retain their saved values, or supply matching values.
+Changes to rules, learning hyperparameters, `--players`, or `--seed` fail before checkpoint publication.
+Only `--checkpoint-every`, `--gate-workers`, `--torch-threads`, and `--device` are tunable on resume.
 
 ## Run finite improvement cycles
 
-`ImprovementController` v4 trains one league challenger, selects it, and confirms it on fresh seeds.
-It registers one candidate per cycle and promotes only through `evaluate_gate` evidence.
+Passing `--promote` enables two-stage selection and confirmation gates inside `Trainer`.
+Each cycle trains for `--cycle-episodes` episodes, registers one candidate snapshot in `registry/`, and promotes only through `evaluate_gate` evidence.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.improve --initial-model runs\full21\latest-model.pt --output-dir runs\improve --max-seconds 3600 --max-cycles 1 --matches-per-round 16 --workers 4
-.\.venv\Scripts\python -m src.cli.improve --resume runs\improve\latest-state.pt --output-dir runs\improve --max-seconds 3600 --workers 2
+.\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\latest-model.pt --output-dir runs\improve --players 2 3 4 --promote --max-seconds 3600 --max-cycles 1 --round-episodes 16 --gate-workers 4
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\improve --max-seconds 3600 --gate-workers 2
 ```
 
-`champion.json` is the sole champion pointer. Registered model snapshots are
+`registry/champion.json` is the sole champion pointer, mirrored to `champion-model.pt`. Registered model snapshots are
 immutable. `status.json` describes the latest stable published state.
 
-The challenger follows the champion at each cycle boundary.
-Self-promotion keeps its weights, AdamW state, and replay.
-An external champion change reloads weights and resets the optimizer.
-`--rebase-after-rejections 8` applies the same rebase after eight rejected cycles.
-Replay and random streams survive both forms of rebase.
-
-`FinetuneSchedule` defaults to learning rate 0.0001 and epsilon 0.08 to 0.02.
-Verified ordinary full21 win rate of at least 0.95 selects learning rate 0.00002 and epsilon 0.04 to 0.01.
-The controller reads `final-best.json` beside the initial model.
-That file must bind ordinary outcomes to the model's SHA-256 and matching recycling rules.
-`--learning-rate`, `--epsilon-start`, and `--epsilon-end` override individual defaults.
-`--epsilon-decay-matches` defaults to 10000.
-`LeagueConfig` stores the resolved values and remains the source of truth on resume.
-An explicit changed finetune option fails even when written as `--epsilon-start=value`.
+Self-promotion keeps learner weights, AdamW state, and replay intact, and adds the promoted champion snapshot to the PFSP pool.
+`--rebase-after-rejections 8` reloads champion weights and resets AdamW moments after eight consecutive rejected cycles while preserving replay and random streams.
+Supply explicit `--learning-rate`, `--epsilon-start`, `--epsilon-end`, and `--epsilon-decay-episodes` flags when fine-tuning a strong warm-start checkpoint.
+`TrainConfig` stores the resolved values and remains the source of truth on resume.
 
 Keep the default `--selection-blocks 32`, `--confirmation-blocks 128`, and `--solo-games 256` for promotion.
 The gate uses 4x, 2x, and 1x the base block count for two, three, and four players.
@@ -262,17 +241,17 @@ Confirmation requires aggregate placement superiority and bounded per-count, dec
 Both phases retain the 256-game paired solo minimum.
 See [promotion evidence](RATINGS.md#promotion-evidence-stays-separate) for the complete gate contract.
 
-Use `--workers` to set the gate process count. The default is 1.
+Use `--gate-workers` to set the gate process count. The default is 1.
 Each worker verifies the source fingerprint and loads frozen policies once.
 Workers use one PyTorch thread each.
 Only the coordinator appends and flushes completed jobs to `gates/<gate_id>.jsonl`.
-Interrupted gates retain completed blocks and paired solo slices.
+Interrupted gates persist explicit `Selecting` or `Confirming` states and retain completed blocks and paired solo slices.
 Resume with the same model hashes, rules, seeds, and budgets to skip that work.
 Result assembly follows block index and solo-slice start, not worker completion order.
 
-On `--resume`, change `--workers`, `--checkpoint-every`, or `--max-cycles` as needed.
+On resume, change `--gate-workers`, `--checkpoint-every`, `--torch-threads`, `--device`, or `--max-cycles` as needed.
 Omit those options to retain their saved values.
-Learning settings, player counts, and the initial opponent pool cannot change on resume.
+Learning settings, player counts, and the seed cannot change on resume.
 
 Keep full 21-card, 60-turn recycling rules for promotion.
 Smaller `--selection-blocks`, `--confirmation-blocks`, and `--solo-games`
@@ -289,13 +268,13 @@ Use a temporary output directory for a bounded local check.
 ```
 
 The script verifies `axial_table` v4 checkpoints and runs full 60-turn games at each supported player count.
-Separate one-turn smoke games exercise mixed-count updates, exact full-state
-resume, a rejected improvement cycle, and persisted tournaments and reports.
-The resume check compares an uninterrupted learner's actual matches and updates
-with the checkpoint restored by the CLI.
+Separate one-turn smoke games exercise solo curriculum resume, mixed-count updates, exact full-state
+resume, a rejected promotion gate cycle, and persisted tournaments and reports.
+The resume check compares an uninterrupted `Trainer` run's actual matches and updates
+with the checkpoint restored by `src.cli.train`.
 Gate v4 checks compare in-process and two-worker results byte for byte and reuse a completed JSONL journal.
-The script checks persisted finetune flags in curriculum, league, and improvement states.
-Unit tests also interrupt a gate between jobs and verify that resume skips completed blocks and solo slices.
+The script checks persisted `TrainConfig` hyperparameters and tunable `--gate-workers` resume updates.
+Unit tests also interrupt a gate between phases and verify deterministic recovery.
 Each invocation creates a new timestamped directory, so repeated checks
 preserve earlier artifacts.
 Read `evidence.json` for the commands, exit codes, checkpoint identities, and

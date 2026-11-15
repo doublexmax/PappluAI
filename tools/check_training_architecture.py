@@ -246,14 +246,29 @@ def check_cycles(
         visit(module)
 
 
+def check_evaluation_boundaries(
+    trees: dict[Path, ast.Module],
+    errors: list[str],
+) -> None:
+    for path in sorted((SRC / "evaluation").glob("*.py")):
+        visitor = ModuleImportVisitor()
+        visitor.visit(trees[path])
+        for node in visitor.nodes:
+            for imported in imported_names(node):
+                if imported == "src.training" or imported.startswith("src.training."):
+                    errors.append(
+                        "evaluation module imports training at %s:%d"
+                        % (path.relative_to(ROOT), node.lineno)
+                    )
+
+
 def pure_modules(trees: dict[Path, ast.Module]) -> list[str]:
     modules = set()
     for path in trees:
         relative = path.relative_to(SRC)
-        if path.name == "__init__.py" or relative.parts[0] == "game":
+        if path.name == "__init__.py" or relative.parts[0] in ("game", "cli"):
             modules.add(module_name(path))
     for relative in (
-        "training/core.py",
         "checkpoints/evidence.py",
         "checkpoints/io.py",
         "checkpoints/registry.py",
@@ -299,6 +314,7 @@ def main() -> int:
     trees = source_trees()
     deferred_imports = check_import_placement(trees, errors)
     check_cli_boundaries(trees, errors)
+    check_evaluation_boundaries(trees, errors)
     check_cycles(trees, errors)
     check_pure_imports(trees, errors)
     if errors:

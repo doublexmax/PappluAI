@@ -39,6 +39,7 @@ jobs:
           tests.test_multiplayer
           tests.test_information
           tests.test_registry
+          tests.test_train
       - name: Check browser simulator
         run: >-
           node --test
@@ -51,12 +52,9 @@ jobs:
           tests/table.test.mjs
       - name: Check command help without training dependencies
         run: |
-          python -m src.cli.solo --help
-          python -m src.cli.curriculum --help
+          python -m src.cli.train --help
           python -m src.cli.benchmark --help
           python -m src.cli.arena --help
-          python -m src.cli.league --help
-          python -m src.cli.improve --help
           python -m src.cli.calibration --help
           python -m src.cli.tournament --help
           python -m src.cli.ratings --help

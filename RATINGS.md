@@ -175,9 +175,9 @@ one-sided results, and experimental cap discounts remain provisional.
 ## Promotion evidence stays separate
 
 The rating service does not modify model weights or promote a champion.
-`ImprovementController` v4 trains and gates one league challenger per cycle.
-Its `Learner` uses 5-step Double DQN with `gamma = 1.0` and `TrajectoryReplay` v4.
-League training uses PFSP opponent weights from pairwise placement scores.
+`Trainer` in `src.training.train` trains and gates one candidate per cycle when `--promote` is enabled.
+Its `Learner` uses 5-step Double DQN with `gamma = 0.99` and `Replay` v5.
+Multiplayer training uses PFSP opponent weights from pairwise placement scores.
 Tournament lineups use coverage, not PFSP or current rating estimates.
 The [training guide](TRAINING.md#run-finite-improvement-cycles) describes champion lineage and rebasing.
 
@@ -239,7 +239,7 @@ Gate schemas v2 and v3 require new v4 gates rather than conversion.
 
 `evaluate_gate` batches every block in one `run_matches` call.
 Solo retention uses deterministic slices of up to 32 games per policy.
-`src.cli.improve --workers` defaults to 1 and supports process-parallel evaluation.
+`src.cli.train --gate-workers` defaults to 1 and supports process-parallel evaluation.
 Only the coordinator appends and flushes completed jobs to `gates/<gate_id>.jsonl`.
 The gate identity includes model hashes, rules, versions, seeds, budgets, and player counts.
 Resume skips valid completed jobs and reconstructs results in deterministic order.
