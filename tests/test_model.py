@@ -13,8 +13,8 @@ from src.game.environment import GameConfig, PappluEnv, discard_action, legal_ac
 from src.game.information import EventKind
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
 from src.game.outcome import SeatOutcome
-from src.model.encoding import encode
-from src.model.spec import ModelSpec
+from src.model.encoding import _meld_membership, encode
+from src.model.spec import ModelSpec, ModelSpecError
 
 try:
     import torch
@@ -24,8 +24,9 @@ except ImportError:
 if torch is not None:
     from src.evaluation.arena import CheckpointPolicy
     from src.model.network import (
-        QNetwork, build_checkpoint, collate, collate_observations, load_checkpoint,
+        QNetwork, checkpoint_payload, collate, collate_observations, load_checkpoint,
         masked_q_values, save_checkpoint, select_action, select_greedy_action,
+        tensor_meld_channels,
     )
     from src.training.train import Learner, Replay, Step, TrainConfig, Trajectory
 
@@ -35,25 +36,29 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class TestModelSpec(unittest.TestCase):
     def test_roundtrip_requires_all_architecture_dimensions(self):
-        spec = ModelSpec(128, 8, 3)
-        self.assertEqual(ModelSpec.from_dict({"width": 128, "heads": 8, "blocks": 3}), spec)
-        self.assertEqual(spec.to_dict(), {"width": 128, "heads": 8, "blocks": 3})
-        for raw in ({"width": 64, "heads": 4}, {"width": 64, "heads": 4, "blocks": 2, "dropout": 0}):
-            with self.assertRaises(ValueError):
+        spec = ModelSpec(128, 3)
+        self.assertEqual(ModelSpec.from_dict({"width": 128, "blocks": 3}), spec)
+        self.assertEqual(spec.to_dict(), {"width": 128, "blocks": 3})
+        for raw in (
+            None, {"width": 64}, {"blocks": 2}, {"width": 64, "heads": 4, "blocks": 2},
+            {"width": 64, "blocks": 2, "dropout": 0}, {"width": True, "blocks": 2},
+            {"width": 64.0, "blocks": 2}, {"width": 64, "blocks": True},
+        ):
+            with self.subTest(raw=raw), self.assertRaises(ModelSpecError):
                 ModelSpec.from_dict(raw)
-        for arguments in ((4, 1, 1), (64, 3, 2), (64, 0, 2), (64, 4, 0), (True, 1, 1), (64, 4, True)):
-            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+        for arguments in ((4, 1), (64, 0), (True, 1), (64, True), (64.0, 2), (64, 2.0)):
+            with self.subTest(arguments=arguments), self.assertRaises(ModelSpecError):
                 ModelSpec(*arguments)
+        self.assertEqual(ModelSpec(9, 1).to_dict(), {"width": 9, "blocks": 1})
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
-class TestAxialNetwork(unittest.TestCase):
+class TestCardNetwork(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
         torch.manual_seed(41)
         self.network = QNetwork()
         self.device = torch.device("cpu")
-        self.private = {}
 
     def observation(self, players=4, turns=5, takes=False):
         env = MultiplayerEnv(MatchConfig(
@@ -64,26 +69,21 @@ class TestAxialNetwork(unittest.TestCase):
             for _ in range(turns):
                 env.step(int(takes))
                 env.step(discard_action(next(i for i, n in enumerate(env.observe().hand) if n)))
-        obs = env.observe()
-        self.private[obs] = env.private_hands(env.view().current_seat)
-        return obs
+        return env.observe()
 
     def values(self, *observations):
         return self.network(collate_observations(observations, self.device))
 
-    def test_one_network_scores_variable_tables_and_full_histories(self):
+    def test_one_network_scores_variable_tables_and_sparse_histories(self):
         observations = [PappluEnv().reset(17)] + [
             self.observation(players, turns=10) for players in (2, 3, 4, 5, 6)
         ]
         values = self.values(*observations)
         self.assertEqual(values.shape, (6, 54))
         self.assertTrue(torch.isfinite(values).all())
-        outputs = self.network.outputs(collate_observations(observations, self.device))
-        self.assertEqual(outputs.win_logit.shape, (6, 54))
-        self.assertEqual(outputs.penalty.shape, (6, 54))
-        self.assertEqual(outputs.belief.shape, (6, 6, 52))
-        self.assertEqual(outputs.after.shape, (6,))
-        torch.testing.assert_close(outputs.q, values, rtol=0, atol=0)
+        torch.testing.assert_close(
+            self.network.policy(collate_observations(observations, self.device)), values, rtol=0, atol=0,
+        )
 
     def test_cached_features_collate_without_a_non_cpu_default_device_leak(self):
         observations = [self.observation(2, 1), self.observation(3, 2)]
@@ -94,7 +94,9 @@ class TestAxialNetwork(unittest.TestCase):
             torch.set_default_device("meta")
             batch = collate(features, self.device)
             self.assertEqual(batch.card.device.type, "cpu")
-            self.assertEqual(batch.history.shape, (2, 52, 6, 7))
+            self.assertEqual(batch.card.shape, (2, 52, 13))
+            self.assertEqual(batch.seat.shape, (2, 6, 9))
+            self.assertEqual(batch.context.shape, (2, 17))
             torch.testing.assert_close(self.network(batch), expected, rtol=0, atol=0)
         finally:
             torch.set_default_device(previous)
@@ -104,19 +106,14 @@ class TestAxialNetwork(unittest.TestCase):
         targets = torch.tensor([1.0, 0.5, 0.0])
         trajectories = [Trajectory(
             len(obs.players),
-            (Step(encode(obs), 0, self.hidden_hands(obs)[1:]),),
+            (Step(encode(obs), 0),),
             SeatOutcome(float(target), bool(target == 1), 0),
         ) for obs, target in zip(observations, targets)]
         before = torch.nn.functional.mse_loss(self.values(*observations)[:, 0], targets).item()
-        learner = Learner(self.network, TrainConfig(
-            learning_rate=1e-4, gamma=1.0, win_weight=0.0, penalty_weight=0.0, belief_weight=0.0,
-        ))
+        learner = Learner(self.network, TrainConfig(learning_rate=1e-4, gamma=1.0))
         learner.learn(trajectories, updates=8)
         after = torch.nn.functional.mse_loss(self.values(*observations)[:, 0], targets).item()
         self.assertLess(after, before)
-
-    def hidden_hands(self, obs):
-        return self.private[obs]
 
     def test_warm_start_training_generalizes_to_unseen_deals(self):
         config = GameConfig(num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3)
@@ -169,7 +166,7 @@ class TestAxialNetwork(unittest.TestCase):
         initial[present] -= 1
         initial[(present + 1) % 52] += 1
         changed = replace(obs, history=(replace(obs.history[0], initial_hand=tuple(initial)), *obs.history[1:]))
-        self.assertGreater(float((baseline - self.values(changed)).abs().max()), 1e-7)
+        torch.testing.assert_close(baseline, self.values(changed), rtol=0, atol=0)
 
     def test_actual_next_player_relationship_changes_scores(self):
         obs = self.observation(4, 4)
@@ -179,7 +176,7 @@ class TestAxialNetwork(unittest.TestCase):
     def test_replay_and_inference_use_identical_information(self):
         obs = self.observation(4, 12)
         replay = Replay(3)
-        replay.append(Trajectory(4, (Step(encode(obs), 0, self.hidden_hands(obs)[1:]),), SeatOutcome(0.5, False, 50)))
+        replay.append(Trajectory(4, (Step(encode(obs), 0),), SeatOutcome(0.5, False, 50)))
         restored = Replay(3)
         restored.load_state_dict(replay.state_dict())
         replay_features = restored.sample(random.Random(4), 1)[0].step.features
@@ -262,18 +259,20 @@ class TestAxialNetwork(unittest.TestCase):
             selected.update(select_greedy_action(net, obs, device=self.device) for obs in observations)
         self.assertEqual(selected, {0, 1})
 
-    def test_auxiliary_weights_cannot_change_policy_forward(self):
+    def test_q_only_policy_returns_dueling_values_for_legal_and_terminal_rows(self):
         batch = collate_observations([self.observation(), PappluEnv().reset_warm_start(3)], self.device)
         with torch.no_grad():
-            expected = self.network(batch).clone()
-            for parameter in self.network.aux.parameters():
+            for parameter in self.network.parameters():
                 parameter.zero_()
-            torch.testing.assert_close(self.network(batch), expected, rtol=0, atol=0)
-            for parameter in self.network.aux.parameters():
-                parameter.normal_(mean=9, std=3)
-            torch.testing.assert_close(self.network(batch), expected, rtol=0, atol=0)
-        with mock.patch.object(self.network.aux, "forward", side_effect=AssertionError("play must not execute auxiliaries")):
-            torch.testing.assert_close(self.network(batch), expected, rtol=0, atol=0)
+            self.network.policy.value_out.bias.fill_(0.25)
+            self.network.policy.draw_out.bias.copy_(torch.tensor([1.0, 3.0]))
+            self.network.policy.face_out.bias.fill_(7.0)
+        expected = torch.tensor([[-0.75, 1.25] + [5.25] * 52, [-5.75, -3.75] + [0.25] * 52])
+        torch.testing.assert_close(self.network(batch), expected, rtol=0, atol=0)
+        terminal = replace(batch, legal=torch.zeros_like(batch.legal))
+        expected_terminal = torch.tensor([[1.25, 3.25] + [7.25] * 52] * 2)
+        torch.testing.assert_close(self.network(terminal), expected_terminal, rtol=0, atol=0)
+        self.assertEqual({name.split(".")[0] for name in self.network.state_dict()}, {"policy"})
 
     def test_legal_centering_ignores_illegal_advantages_and_terminal_mask_is_finite(self):
         batch = collate_observations([PappluEnv().reset(41)], self.device)
@@ -294,7 +293,7 @@ class TestAxialNetwork(unittest.TestCase):
         torch.testing.assert_close(first, self.values(obs), rtol=0, atol=0)
 
     def test_checkpoint_roundtrip_preserves_nondefault_spec_and_wire_format(self):
-        self.network = QNetwork(ModelSpec(32, 2, 3))
+        self.network = QNetwork(ModelSpec(32, 3))
         obs = self.observation()
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "nested" / "model.pt"
@@ -303,24 +302,27 @@ class TestAxialNetwork(unittest.TestCase):
             self.assertEqual((config, meta, loaded.spec), (obs.config, {"note": "fresh"}, self.network.spec))
             torch.testing.assert_close(self.values(obs), loaded(collate_observations([obs], self.device)), rtol=0, atol=0)
             payload = torch.load(path, weights_only=True)
-            self.assertEqual(payload["architecture"], "axial_table")
-            self.assertEqual(payload["checkpoint_version"], 4)
-            self.assertEqual(payload["encoding_version"], 2)
-            self.assertEqual(payload["model_spec"], {"width": 32, "heads": 2, "blocks": 3})
+            self.assertEqual(payload["architecture"], "card_mlp")
+            self.assertEqual(payload["checkpoint_version"], 5)
+            self.assertEqual(payload["encoding_version"], 3)
+            self.assertEqual(payload["model_spec"], {"width": 32, "blocks": 3})
             self.assertNotIn("state_dim", payload)
 
     def test_bad_or_old_checkpoints_do_not_mutate_supplied_network(self):
         baseline = copy.deepcopy(self.network.state_dict())
         changes = [
             {"checkpoint_version": 1}, {"checkpoint_version": 2}, {"checkpoint_version": 3},
-            {"encoding_version": 1}, {"architecture": "mlp"}, {"state_dim": 164},
-            {"model_spec": {"width": 32, "heads": 4, "blocks": 2}}, {"num_actions": 12},
-            {"model_spec": {"width": 64, "heads": 3, "blocks": 2}}, {"meta": []},
+            {"checkpoint_version": 4}, {"checkpoint_version": True}, {"checkpoint_version": 5.0},
+            {"encoding_version": 1}, {"encoding_version": 2}, {"encoding_version": 3.0},
+            {"architecture": "mlp"}, {"architecture": "axial_table"}, {"state_dim": 164},
+            {"model_spec": {"width": 32, "blocks": 2}}, {"num_actions": 12},
+            {"model_spec": {"width": 64, "heads": 4, "blocks": 2}},
+            {"model_spec": {"width": 64, "blocks": True}}, {"meta": []},
         ]
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "bad.pt"
             for change in changes:
-                payload = build_checkpoint(QNetwork(), GameConfig())
+                payload = checkpoint_payload(QNetwork(), GameConfig())
                 payload.update(change)
                 torch.save(payload, path)
                 with self.subTest(change=change), self.assertRaises(ValueError):
@@ -328,7 +330,7 @@ class TestAxialNetwork(unittest.TestCase):
                 for name, value in self.network.state_dict().items():
                     self.assertTrue(torch.equal(baseline[name], value), name)
             for defect in ("shape", "nan", "dtype"):
-                payload = build_checkpoint(QNetwork(), GameConfig())
+                payload = checkpoint_payload(QNetwork(), GameConfig())
                 last = next(reversed(payload["model_state_dict"]))
                 tensor = payload["model_state_dict"][last]
                 if defect == "shape":
@@ -355,34 +357,114 @@ const model = parseQModel(JSON.parse(readFileSync(process.argv[1], 'utf8')));
 const golden = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 const actual = qValues(model, golden.cases.map(c => c.observation));
 let maxError = 0;
-actual.forEach((q, i) => q.forEach((value, a) => {
-  maxError = Math.max(maxError, Math.abs(value - golden.cases[i].q[a]));
-}));
-assert.ok(maxError < 1e-4, String(maxError));
-console.log(JSON.stringify({cases: actual.length, maxError}));
+let minSpread = Infinity;
+actual.forEach((q, i) => {
+  minSpread = Math.min(minSpread, Math.max(...q) - Math.min(...q));
+  q.forEach((value, a) => {
+    maxError = Math.max(maxError, Math.abs(value - golden.cases[i].q[a]));
+  });
+});
+assert.ok(maxError < 1e-5, String(maxError));
+assert.ok(minSpread > 1e-3, String(minSpread));
+console.log(JSON.stringify({cases: actual.length, maxError, minSpread}));
 """
+        observations = [
+            PappluEnv().reset(17), PappluEnv().reset_warm_start(3),
+            *(self.observation(players, turns) for players in (2, 4, 6) for turns in (1, 3)),
+        ]
+        batch = collate_observations(observations, self.device)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for spec in (ModelSpec(), ModelSpec(128, 8, 3)):
+            for spec in (ModelSpec(), ModelSpec(128, 3)):
                 with self.subTest(spec=spec):
-                    network = QNetwork(spec)
+                    torch.manual_seed(901)
+                    network = QNetwork(spec).eval()
                     path, output, golden = root / "model.pt", root / "model.json", root / "golden.json"
-                    save_checkpoint(str(path), network, GameConfig())
+                    save_checkpoint(str(path), network, GameConfig(max_turns=60))
+                    loaded, _, _ = load_checkpoint(str(path))
+                    self.assertEqual(loaded.spec, spec)
+                    torch.testing.assert_close(loaded(batch), network(batch), rtol=0, atol=0)
                     exported = subprocess.run(
                         [sys.executable, "tools/weights_export.py", "--checkpoint", str(path),
                          "--output", str(output), "--golden", str(golden)],
                         cwd=ROOT, capture_output=True, text=True, timeout=180, check=False,
                     )
                     self.assertEqual(exported.returncode, 0, exported.stdout + exported.stderr)
-                    document = json.loads(output.read_text())
+                    document = json.loads(output.read_text(encoding="utf-8"))
                     self.assertEqual(document["modelSpec"], spec.to_dict())
-                    self.assertEqual(list(document["tensors"]), ["policy." + name for name in network.policy.state_dict()])
-                    evaluated = subprocess.run(
+                    browser = subprocess.run(
                         ["node", "--input-type=module", "-e", script, str(output), str(golden)],
-                        cwd=ROOT, capture_output=True, text=True, timeout=120, check=False,
+                        cwd=ROOT, capture_output=True, text=True, timeout=60, check=False,
                     )
-                    self.assertEqual(evaluated.returncode, 0, evaluated.stdout + evaluated.stderr)
-                    self.assertEqual(json.loads(evaluated.stdout)["cases"], 15)
+                    self.assertEqual(browser.returncode, 0, browser.stdout + browser.stderr)
+                    summary = json.loads(browser.stdout)
+                    self.assertEqual(summary["cases"], 15)
+                    self.assertLess(summary["maxError"], 1e-5)
+                    self.assertGreater(summary["minSpread"], 1e-3)
+
+    def assert_meld_parity(self, observations):
+        batch = collate_observations(observations, self.device)
+        cards, context = tensor_meld_channels(batch.card, batch.context)
+        self.assertEqual(cards.shape, (len(observations), 4, 13, 5))
+        self.assertEqual(context.shape, (len(observations), 1))
+        for idx, obs in enumerate(observations):
+            natural, pure, any_meld = _meld_membership(obs.hand, obs.joker)
+            expected, unavoidable = [], 0
+            for face, copies in enumerate(obs.hand):
+                suit, rank = divmod(face, 13)
+                neighbors = (1, 12) if rank == 0 else (11, 0) if rank == 12 else (rank - 1, rank + 1)
+                expected.append((
+                    sum(obs.hand[suit * 13 + neighbor] > 0 for neighbor in neighbors) / 2.0,
+                    sum(obs.hand[other * 13 + rank] > 0 for other in range(4) if other != suit) / 3.0,
+                    natural[face], pure[face], any_meld[face],
+                ))
+                pts = 0 if rank == obs.joker % 13 else (10 if rank == 0 or rank >= 10 else rank + 1)
+                unavoidable += copies * pts * (1 - any_meld[face])
+            torch.testing.assert_close(
+                cards[idx].reshape(52, 5), torch.tensor(expected, dtype=torch.float32),
+                rtol=0, atol=0,
+            )
+            self.assertAlmostEqual(
+                context[idx, 0].item(), unavoidable / (10.0 * obs.config.cards_in_hand), places=6,
+            )
+        return cards
+
+    def test_tensor_meld_channels_match_membership_across_random_deals(self):
+        observations = []
+        for decks, hand_size, sequences in ((1, 3, 1), (2, 7, 2), (3, 21, 5), (6, 30, 10)):
+            env = PappluEnv(GameConfig(
+                num_decks=decks, cards_in_hand=hand_size, required_sequences=sequences,
+            ))
+            for seed in range(64):
+                observations.append(env.reset(seed))
+                observations.append(env.step(seed % 2))
+        self.assert_meld_parity(observations)
+
+    def test_tensor_meld_channels_handle_aces_papplus_wilds_and_physical_sets(self):
+        cases = (
+            ((0, 1, 2), 7, (0, 1, 2), (0, 1, 2), (0, 1, 2)),
+            ((11, 12, 0), 7, (0, 11, 12), (0, 11, 12), (0, 11, 12)),
+            ((12, 0, 1), 7, (), (), ()),
+            ((16, 17, 7), 7, (), (7, 16, 17), (7, 16, 17)),
+            ((16, 17, 33), 7, (), (), (16, 17, 33)),
+            ((32, 33, 34), 7, (32, 33, 34), (32, 33, 34), (32, 33, 34)),
+            ((5, 5, 5), 7, (), (5,), (5,)),
+            ((5, 18, 31, 44), 7, (), (), (5, 18, 31, 44)),
+            ((5, 5, 7), 7, (), (), ()),
+            ((7, 20, 33), 7, (), (), (7, 20, 33)),
+            ((7, 7, 7), 7, (), (7,), (7,)),
+            ((), 7, (), (), ()),
+        )
+        obs = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1)).reset(17)
+        observations = [replace(
+            obs, hand=tuple(cards.count(face) for face in range(52)), joker=joker,
+        ) for cards, joker, *_ in cases]
+        extras = self.assert_meld_parity(observations).reshape(len(cases), 52, 5)
+        for idx, (_, _, natural, pure, any_meld) in enumerate(cases):
+            for channel, expected in zip((2, 3, 4), (natural, pure, any_meld)):
+                self.assertEqual(
+                    tuple(face for face in range(52) if extras[idx, face, channel].item()), expected,
+                )
 
 
 if __name__ == "__main__":

@@ -120,16 +120,16 @@ def verify(output: Path) -> dict:
         for seed in (11, 22, 33):
             path = output / ("fresh-%d.pt" % seed)
             cli("train", "--max-episodes", 0, "--seed", seed, "--max-turns", 60,
-                "--width", 16, "--heads", 2, "--blocks", 1,
+                "--width", 16, "--blocks", 1,
                 "--checkpoint", path)
             frozen = snapshots / ("model-" + file_sha256(path) + ".pt")
             frozen.write_bytes(path.read_bytes())
             paths.append(frozen)
         evidence["snapshot_sha256"] = [file_sha256(path) for path in paths]
         checkpoint = torch.load(paths[0], weights_only=True)
-        assert checkpoint["checkpoint_version"] == 4
-        assert checkpoint["architecture"] == "axial_table"
-        assert checkpoint["model_spec"] == {"width": 16, "heads": 2, "blocks": 1}
+        assert checkpoint["checkpoint_version"] == 5
+        assert checkpoint["architecture"] == "card_mlp"
+        assert checkpoint["model_spec"] == {"width": 16, "blocks": 1}
         evidence["model"] = {
             "checkpoint_version": checkpoint["checkpoint_version"],
             "architecture": checkpoint["architecture"], "model_spec": checkpoint["model_spec"],
@@ -183,7 +183,6 @@ def verify(output: Path) -> dict:
             history_match.step(ACTION_TAKE_DISCARD)
             representative = history_match.observe()
             representative_seat = history_match.view().current_seat
-            representative_hands = history_match.private_hands(representative_seat)
             history_match.step(discard_action(face))
         assert history_match.view().terminal_reason == "turns_exhausted"
         assert len(representative.history) == 2 * completed_turns
@@ -196,11 +195,10 @@ def verify(output: Path) -> dict:
         started = time.perf_counter()
         with torch.no_grad():
             batch = collate_observations([representative], torch.device("cpu"))
-            assert torch.equal(
-                batch.history,
-                collate_observations([Observation.from_dict(representative.to_dict())], torch.device("cpu")).history,
-            )
-            assert len(encode(representative).data) == 12832
+            reloaded = collate_observations([Observation.from_dict(representative.to_dict())], torch.device("cpu"))
+            for field_name in ("card", "seat", "context", "legal", "top"):
+                assert torch.equal(getattr(batch, field_name), getattr(reloaded, field_name))
+            assert len(encode(representative).data) == 3208
             values = policy.network(batch)
         forward_seconds = time.perf_counter() - started
         assert torch.isfinite(values).all()
@@ -217,7 +215,7 @@ def verify(output: Path) -> dict:
         started = time.perf_counter()
         stats = learner.learn([Trajectory(
             len(representative.players),
-            (Step(encode(representative), action, representative_hands[1:]),),
+            (Step(encode(representative), action),),
             outcome.seat(representative_seat),
         )])
         update_seconds = time.perf_counter() - started
@@ -236,7 +234,7 @@ def verify(output: Path) -> dict:
             "--validate-every", 100, "--max-turns", 1, "--seed", 61,
             "--learning-rate", 0.0001, "--epsilon-start", 0.08, "--epsilon-end", 0.02,
             "--epsilon-decay-episodes", 77,
-            "--width", 16, "--heads", 2, "--blocks", 1)
+            "--width", 16, "--blocks", 1)
         cli("train", "--output-dir", curriculum,
             "--max-episodes", 2, "--max-seconds", 120, "--checkpoint-every", 1)
         solo_state = torch.load(curriculum / "latest-state.pt", weights_only=True)
@@ -319,10 +317,10 @@ def verify(output: Path) -> dict:
         assert improvement_status["promotions"] == 0
         assert improvement_status["completed_cycles"] == 1
         assert improvement_status["last_gate"]["accepted"] is False
-        assert improvement_status["last_gate"]["gate_schema_version"] == 4
+        assert improvement_status["last_gate"]["gate_schema_version"] == 5
         assert improvement_status["last_gate"]["phase"] == "selection"
         assert "rules" in improvement_status["last_gate"]["gate_failures"]
-        assert improvement_status["last_gate"]["architecture"] == "axial_table"
+        assert improvement_status["last_gate"]["architecture"] == "card_mlp"
         assert [
             (raw["blocks"], raw["games"])
             for raw in improvement_status["last_gate"]["multiplayer"].values()
@@ -330,7 +328,7 @@ def verify(output: Path) -> dict:
         assert improvement_status["episodes"] == 1
         assert improvement_status["updates"] == 4
         improvement_state = torch.load(improve / "latest-state.pt", weights_only=True)
-        assert improvement_state["version"] == 5
+        assert improvement_state["version"] == 6
         assert tuple(improvement_state["config"][name] for name in (
             "learning_rate", "epsilon_start", "epsilon_end", "epsilon_decay_episodes",
         )) == (0.00015, 0.12, 0.03, 77)
@@ -362,7 +360,7 @@ def verify(output: Path) -> dict:
         completed_jobs = [json.loads(line) for line in journal.read_text().splitlines()]
         assert len(completed_jobs) == 9
         assert [record["job"] for record in completed_jobs[-2:]] == [["solo", 0, 32], ["solo", 32, 3]]
-        assert serial_gate["gate_schema_version"] == 4
+        assert serial_gate["gate_schema_version"] == 5
         assert serial_gate["phase"] == "selection"
         assert "rules" in serial_gate["gate_failures"]
         assert serial_gate["accepted"] is False
@@ -408,7 +406,7 @@ def verify(output: Path) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Verify axial_table v4 play, finetune flags, gate v4 journals, resume, and ratings.")
+    parser = argparse.ArgumentParser(description="Verify card_mlp v5 play, finetune flags, gate v5 journals, resume, and ratings.")
     parser.add_argument("--output-dir", type=Path, default=Path(tempfile.gettempdir()) / "papplu-dynamic-verification")
     args = parser.parse_args()
     verify(args.output_dir)

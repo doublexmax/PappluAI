@@ -24,8 +24,8 @@ except ImportError:
 def install_record(registry, data, origin):
     digest = hashlib.sha256(data).hexdigest()
     metadata = {
-        "architecture": "axial_table", "checkpoint_version": 4, "encoding_version": 2,
-        "model_spec": {"width": 64, "heads": 4, "blocks": 2},
+        "architecture": "card_mlp", "checkpoint_version": 5, "encoding_version": 3,
+        "model_spec": {"width": 64, "blocks": 2},
     }
     record = ModelRecord(digest[:20], digest, "model-" + digest + ".pt", origin, metadata, {}, ())
     (registry.root / record.filename).write_bytes(data)
@@ -61,8 +61,8 @@ def gate_evidence(candidate, champion, blocks, seed, player_counts=(2, 3, 4)):
         "candidate_sha256": candidate.sha256,
         "champion_sha256": champion.sha256,
         "gate_schema_version": GATE_SCHEMA_VERSION,
-        "encoding_version": 2,
-        "architecture": "axial_table",
+        "encoding_version": 3,
+        "architecture": "card_mlp",
         "player_counts": list(player_counts),
         "seed_blocks": blocks,
         "seed": seed,
@@ -168,16 +168,16 @@ class TestChampionProtection(unittest.TestCase):
             champion = install_record(registry, b"frozen", "initial")
             candidate = install_record(registry, b"new", "league")
             registry.initialize_champion(champion.id)
-            for version in (2, 3):
+            for version in (2, 3, 4):
                 for phase in ("selection", "confirmation"):
                     bad = evidence(candidate, champion)
                     target = bad if phase == "confirmation" else bad["selection"]
                     target["gate_schema_version"] = version
-                    with self.subTest(phase=phase, version=version), self.assertRaisesRegex(ValueError, "re-run gates under schema v4"):
+                    with self.subTest(phase=phase, version=version), self.assertRaisesRegex(ValueError, "re-run gates under schema v5"):
                         registry.promote(candidate.id, champion.id, bad)
                     self.assertEqual(registry.champion().id, champion.id)
 
-    def test_declared_architecture_must_match_axial_table(self):
+    def test_declared_architecture_must_match_card_mlp(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = ModelRegistry(Path(directory))
             champion = install_record(registry, b"frozen", "initial")
@@ -185,7 +185,7 @@ class TestChampionProtection(unittest.TestCase):
             registry.initialize_champion(champion.id)
             bad = evidence(candidate, champion)
             bad["architecture"] = "dynamic_table"
-            with self.assertRaisesRegex(ValueError, "axial_table gate schema v4"):
+            with self.assertRaisesRegex(ValueError, "card_mlp gate schema v5"):
                 registry.promote(candidate.id, champion.id, bad)
             self.assertEqual(registry.champion().id, champion.id)
 
@@ -309,7 +309,7 @@ class TestChampionProtection(unittest.TestCase):
             database = json.loads(registry.path.read_text(encoding="utf-8"))
             database["models"][record.id]["metadata"] = {"architecture": "mlp", "encoding_version": 1}
             atomic_write_json(database, registry.path)
-            with self.assertRaisesRegex(ValueError, "current axial_table v4"):
+            with self.assertRaisesRegex(ValueError, "current card_mlp v5"):
                 registry.get(record.id)
 
     def test_four_player_failure_cannot_be_hidden_by_other_counts(self):

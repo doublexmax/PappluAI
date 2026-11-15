@@ -23,12 +23,7 @@ CONFIG_FLAGS: tuple[tuple[str, type], ...] = (
     ("--learning-rate", float),
     ("--weight-decay", float),
     ("--gamma", float),
-    ("--n-step", int),
-    ("--target-tau", float),
     ("--grad-clip", float),
-    ("--win-weight", float),
-    ("--penalty-weight", float),
-    ("--belief-weight", float),
     ("--epsilon-start", float),
     ("--epsilon-end", float),
     ("--epsilon-decay-episodes", int),
@@ -61,7 +56,7 @@ CONFIG_FLAGS: tuple[tuple[str, type], ...] = (
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.cli.train",
-        description="Train axial_table v4 across solo, curriculum, PFSP league, and promotion gates.",
+        description="Train card_mlp v5 with Q-only DMC across solo, curriculum, PFSP league, and promotion gates.",
     )
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
@@ -82,9 +77,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--promote", dest="promote", action="store_true", default=None)
-    parser.add_argument("--width", type=int, default=None)
-    parser.add_argument("--heads", type=int, default=None)
-    parser.add_argument("--blocks", type=int, default=None)
+    parser.add_argument("--width", type=int, default=None, help="Model width for a fresh run (default: 64).")
+    parser.add_argument("--blocks", type=int, default=None, help="Card blocks for a fresh run (default: 2).")
     parser.add_argument("--max-seconds", type=float, default=None)
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--max-cycles", type=int, default=None)
@@ -96,18 +90,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _resolve_initial(args: argparse.Namespace, runtime: Any) -> Any:
     spec_fields = {
         name: getattr(args, name)
-        for name in ("width", "heads", "blocks")
+        for name in ("width", "blocks")
         if getattr(args, name) is not None
     }
     if args.initial_model is not None and spec_fields:
-        raise ValueError("cannot combine --initial-model with --width, --heads, or --blocks")
+        raise ValueError("cannot combine --initial-model with --width or --blocks")
     if args.initial_model is not None:
         return Path(args.initial_model)
     if spec_fields:
         defaults = runtime.ModelSpec()
         return runtime.ModelSpec(
             width=spec_fields.get("width", defaults.width),
-            heads=spec_fields.get("heads", defaults.heads),
             blocks=spec_fields.get("blocks", defaults.blocks),
         )
     return None

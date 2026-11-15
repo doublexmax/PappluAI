@@ -6,9 +6,8 @@ import math
 import struct
 from typing import Sequence
 
-from src.evaluate import NUM_FACES, card_points, pure_sequence_upper_bound
-from src.game.belief import BeliefState
-from src.game.environment import NUM_ACTIONS, Observation, Phase, legal_action_mask
+from src.evaluate import NUM_FACES
+from src.game.environment import ENCODING_VERSION, NUM_ACTIONS, Observation, Phase, legal_action_mask
 from src.game.information import EventKind
 from src.game.lookahead import LEGAL_RUNS
 
@@ -16,22 +15,24 @@ from src.game.lookahead import LEGAL_RUNS
 NUM_SEAT_SLOTS = 6
 NO_TOP = NUM_FACES
 CARD_CHANNELS = (
-    "own", "own_ge1", "own_ge2", "own_ge3", "initial", "pile", "unseen", "top",
-    "stock", "indicator", "wild", "points", "adjacent", "set_mates",
-    "natural_run_member", "pure_meld_member", "any_meld_member",
-)
-HISTORY_CHANNELS = (
-    "took", "held", "discarded", "passed", "last_take", "last_discard", "last_pass",
+    "own", "own_ge1", "own_ge2", "own_ge3", "pile", "top", "indicator", "wild",
+    "points", "opp_discarded", "next_held", "other_held", "next_passed",
 )
 SEAT_CHANNELS = (
-    "present", "observer", "active", "hand_size", "turns", "next", "previous",
-    "take_rate", "takes", "passes", "held_total",
+    "present", "observer", "active", "hand_size", "turns", "next", "takes",
+    "passes", "held_total",
 )
 CONTEXT_CHANNELS = (
     "draw", "discard", "terminal", "to_act", "turns", "stock", "pile", "refills",
     "decks", "hand", "sequences", "recycle", "players", "max_turns", "warm_start",
-    "wilds", "deadwood", "pure_quota_deficit", "unavoidable_deadwood",
+    "wilds", "deadwood",
 )
+CARD_OFFSET = 0
+SEAT_OFFSET = CARD_OFFSET + NUM_FACES * len(CARD_CHANNELS)
+CONTEXT_OFFSET = SEAT_OFFSET + NUM_SEAT_SLOTS * len(SEAT_CHANNELS)
+LEGAL_OFFSET = CONTEXT_OFFSET + len(CONTEXT_CHANNELS)
+TOP_OFFSET = LEGAL_OFFSET + NUM_ACTIONS
+FEATURE_SIZE = TOP_OFFSET + 1
 _RUN_FACES = tuple(tuple(suit * 13 + rank for rank in run)
                    for suit in range(4) for run in LEGAL_RUNS)
 _SET_FACES = tuple(tuple(suit * 13 + rank for suit in suits)
@@ -59,15 +60,12 @@ def _layout(fields: Sequence[tuple[str, tuple[int, ...]]]) -> tuple[FeatureField
 
 LAYOUT = _layout((
     ("card", (NUM_FACES, len(CARD_CHANNELS))),
-    ("history", (NUM_FACES, NUM_SEAT_SLOTS, len(HISTORY_CHANNELS))),
     ("seat", (NUM_SEAT_SLOTS, len(SEAT_CHANNELS))),
     ("context", (len(CONTEXT_CHANNELS),)),
     ("legal", (NUM_ACTIONS,)),
     ("top", (1,)),
 ))
-FEATURE_SIZE = LAYOUT[-1].offset + LAYOUT[-1].size
 _RECORD = struct.Struct("<%df" % FEATURE_SIZE)
-_LEGAL_OFFSET = next(field.offset for field in LAYOUT if field.name == "legal") * 4
 
 
 @dataclass(frozen=True)
@@ -112,53 +110,62 @@ def _meld_membership(hand: Sequence[int], joker: int) -> tuple[list[int], list[i
 
 def encode(obs: Observation) -> Features:
     cfg, hand, count = obs.config, obs.hand, len(obs.players)
-    belief = BeliefState.from_observation(obs)
-    ledger = belief.ledger
     decks, supply = cfg.num_decks, cfg.num_decks * NUM_FACES
-    stock_total, history_length = sum(belief.stock_weights), len(obs.history)
     pile = [0] * NUM_FACES
     for face in obs.discard_pile:
         pile[face] += 1
-    natural, pure, any_meld = _meld_membership(hand, obs.joker)
-    points = [card_points(face, obs.joker) for face in range(NUM_FACES)]
+    seat_held = [[0] * NUM_FACES for _ in range(count)]
+    seat_held_total, seat_takes, seat_passes = [0] * count, [0] * count, [0] * count
+    opp_disc, next_passed = [0] * NUM_FACES, [0] * NUM_FACES
+    next_opp = obs.players[0].next_player if count > 1 and obs.players[0].next_player > 0 else -1
+    refills = 0
+    for event in obs.history:
+        actor, face = event.actor, event.face
+        if event.kind is EventKind.TAKE_DISCARD:
+            seat_held[actor][face] += 1
+            seat_held_total[actor] += 1
+            seat_takes[actor] += 1
+        elif event.kind is EventKind.DISCARD:
+            if seat_held[actor][face] > 0:
+                seat_held[actor][face] -= 1
+                seat_held_total[actor] -= 1
+            if actor > 0:
+                opp_disc[face] += 1
+        elif event.kind is EventKind.DRAW_STOCK:
+            if event.offered_top is not None:
+                seat_passes[actor] += 1
+                if actor == next_opp:
+                    next_passed[event.offered_top] += 1
+        elif event.kind is EventKind.REFILL:
+            refills += 1
+    top_face, wild_rank = obs.discard_top, obs.joker % 13
+    raw_pts_sum, wild_cnt = 0, 0
     values = []
     for face, copies in enumerate(hand):
-        suit, rank = divmod(face, 13)
-        neighbors = (1, 12) if rank == 0 else (11, 0) if rank == 12 else (rank - 1, rank + 1)
+        rank = face % 13
+        is_wild = rank == wild_rank
+        pts = 0 if is_wild else (10 if rank == 0 or rank >= 10 else rank + 1)
+        raw_pts_sum += copies * pts
+        wild_cnt += copies if is_wild else 0
+        opp_held_face = sum(seat_held[seat][face] for seat in range(1, count))
+        next_held_face = seat_held[next_opp][face] if next_opp > 0 else 0
         values.extend((
             copies / decks, float(copies >= 1), float(copies >= 2), float(copies >= 3),
-            obs.history[0].initial_hand[face] / decks, pile[face] / decks, belief.unseen[face] / decks,
-            float(face == obs.discard_top),
-            belief.stock_weights[face] / stock_total if stock_total else 0.0,
-            float(face == obs.joker), float(rank == obs.joker % 13), points[face] / 10.0,
-            sum(hand[suit * 13 + neighbor] > 0 for neighbor in neighbors) / 2.0,
-            sum(hand[other * 13 + rank] > 0 for other in range(4) if other != suit) / 3.0,
-            natural[face], pure[face], any_meld[face],
+            pile[face] / decks, float(face == top_face), float(face == obs.joker),
+            float(is_wild), pts / 10.0, opp_disc[face] / decks, next_held_face / decks,
+            (opp_held_face - next_held_face) / decks, next_passed[face] / decks,
         ))
-    for face in range(NUM_FACES):
-        for seat in range(NUM_SEAT_SLOTS):
-            if seat >= count:
-                values.extend((0.0,) * len(HISTORY_CHANNELS))
-                continue
-            row = ledger.seats[seat]
-            values.extend((
-                row.took[face] / decks, row.held[face] / decks,
-                row.discarded[face] / decks, row.passed[face] / decks,
-                row.last_take[face] / history_length, row.last_discard[face] / history_length,
-                row.last_pass[face] / history_length,
-            ))
     for seat in range(NUM_SEAT_SLOTS):
         if seat >= count:
             values.extend((0.0,) * len(SEAT_CHANNELS))
             continue
-        player, row = obs.players[seat], ledger.seats[seat]
+        player = obs.players[seat]
         values.extend((
             1.0, float(seat == 0), float(player.active), player.hand_size / cfg.cards_in_hand,
             player.turns_remaining / cfg.max_turns,
             float(seat > 0 and seat == obs.players[0].next_player),
-            float(seat > 0 and seat == obs.players[0].previous_player),
-            belief.take_rate(seat), row.takes / cfg.max_turns, row.passes / cfg.max_turns,
-            sum(row.held) / cfg.cards_in_hand,
+            seat_takes[seat] / cfg.max_turns, seat_passes[seat] / cfg.max_turns,
+            seat_held_total[seat] / cfg.cards_in_hand,
         ))
     last = obs.history[-1]
     to_act = not obs.done and obs.players[0].active and (
@@ -168,29 +175,46 @@ def encode(obs: Observation) -> Features:
         or obs.phase is Phase.DRAW and last.kind in (EventKind.DISCARD, EventKind.REFILL)
         and last.next_player == 0
     )
-    pure_upper = pure_sequence_upper_bound(hand, obs.joker)
     values.extend((
         float(obs.phase is Phase.DRAW), float(obs.phase is Phase.DISCARD), float(obs.done), float(to_act),
         obs.turns_remaining / cfg.max_turns, obs.stock_remaining / supply, len(obs.discard_pile) / supply,
-        min(ledger.refills, 3) / 3.0, decks / 6.0, cfg.cards_in_hand / 30.0,
+        min(refills, 3) / 3.0, decks / 6.0, cfg.cards_in_hand / 30.0,
         cfg.required_sequences / 10.0, float(cfg.recycle_discard), count / 6.0, cfg.max_turns / 60.0,
         float(count == 1 and sum(obs.history[0].initial_hand) == cfg.cards_in_hand + 1),
-        sum(hand[suit * 13 + obs.joker % 13] for suit in range(4)) / (4 * decks),
-        sum(copies * points[face] for face, copies in enumerate(hand)) / 100.0,
-        max(0, cfg.required_sequences - pure_upper) / max(1, cfg.required_sequences),
-        sum(copies * points[face] for face, copies in enumerate(hand) if not any_meld[face])
-        / (10 * cfg.cards_in_hand),
+        wild_cnt / (4 * decks), raw_pts_sum / 100.0,
     ))
     values.extend(float(allowed and to_act) for allowed in legal_action_mask(obs))
-    values.append(float(NO_TOP if obs.discard_top is None else obs.discard_top))
+    values.append(float(NO_TOP if top_face is None else top_face))
     return Features(_RECORD.pack(*values))
 
 
 def legal_actions(features: Features) -> tuple[int, ...]:
     return tuple(action for action, allowed in enumerate(
-        struct.unpack_from("<%df" % NUM_ACTIONS, features.data, _LEGAL_OFFSET),
+        struct.unpack_from("<%df" % NUM_ACTIONS, features.data, LEGAL_OFFSET * 4),
     ) if allowed)
 
 
 def feature_values(features: Features) -> tuple[float, ...]:
     return _RECORD.unpack(features.data)
+
+
+def unpack(features: Features) -> dict[str, tuple[float, ...]]:
+    values = feature_values(features)
+    return {field.name: values[field.offset:field.offset + field.size] for field in LAYOUT}
+
+
+def encoding_layout() -> tuple[FeatureField, ...]:
+    return LAYOUT
+
+
+def encoding_metadata() -> dict:
+    return {
+        "encoding_version": ENCODING_VERSION,
+        "feature_size": FEATURE_SIZE,
+        "feature_bytes": _RECORD.size,
+        "layout": [
+            {"name": field.name, "shape": list(field.shape), "offset": field.offset}
+            for field in LAYOUT
+        ],
+        "channels": {"card": CARD_CHANNELS, "seat": SEAT_CHANNELS, "context": CONTEXT_CHANNELS},
+    }

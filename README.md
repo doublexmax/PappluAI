@@ -80,7 +80,7 @@ If both piles are empty, deal again.
 
 ### AI tiers
 
-- **Neural + Search** runs the `axial_table` `PolicyNet` in JavaScript.
+- **Neural + Search** runs the `card_mlp` `PolicyNet` in JavaScript.
   It uses public-card beliefs, feed risk, exact winning checks, draw lookahead,
   and a four-candidate one-ply outs search.
 - **Tactical** minimizes exact deadwood penalty and uses feed risk and a
@@ -316,13 +316,13 @@ responsibility.
 | Package | Responsibility |
 |---|---|
 | `src.game` | Rules, immutable information observations, stock handling, and multiplayer state |
-| `src.model` | Pure `Features`, axial inference, training-only auxiliary heads, and model checkpoints |
-| `src.training` | Unified replay, n-step learner, curriculum, PFSP league, and gated promotion in `src.training.train` |
+| `src.model` | Pure `Features`, `card_mlp` Q-only inference, and model checkpoints |
+| `src.training` | Unified replay, Q-only Deep Monte-Carlo learner, curriculum, PFSP league, and gated promotion in `src.training.train` |
 | `src.evaluation` | Benchmarks, arena matches, ratings, and promotion gates |
 | `src.checkpoints` | Atomic files, tensor validation, evidence, and registries |
 
 `src.cli.train` is the unified training command across one through six players.
-`Learner` runs 5-step Double DQN with `gamma = 0.99`, Polyak target updates, and win, penalty, and opponent-card auxiliary losses.
+`Learner` runs Q-only Deep Monte-Carlo with `gamma = 0.99` and fits legal-centered Q-values to discounted terminal utilities.
 Solo play uses shaped deadwood utility, and multiplayer play uses declaration-weighted pairwise utility.
 See [TRAINING.md](TRAINING.md) for a
 fresh-clone walkthrough of every training workflow.
@@ -331,37 +331,42 @@ point-based placements, uncertainty, and capped-game evidence.
 
 ### Current model contract
 
-`axial_table` is the only supported architecture. `Observation` contains the
+`card_mlp` is the only supported architecture. `Observation` contains the
 observer's current hand, public player views, and complete visible event history.
 Seats are relative to the observer. Public stock draws reveal the source and
 hand count, not the face. The observer retains their initial hand and own drawn
 faces after those cards leave their hand.
 
 `src.model.encoding.encode` is pure Python and returns a fixed `Features` record.
-Each record contains 3,208 little-endian float32 values, or 12,832 bytes.
-Card channels include meld membership, public-card beliefs, and deadwood context.
-History channels retain public take, discard, and pass counts and separate recencies.
-Six relative seat slots include the observer and zero-padded absent seats.
+Each record contains 802 little-endian float32 values, or 3,208 bytes.
+A single scan of visible history populates 13 channels across all 52 card faces:
+own copy counts, discard-pile counts, wild and indicator flags, point values,
+opponent discards, known copies held by the next opponent and other opponents,
+and cards passed by the next opponent. It also populates nine channels across
+six relative seat slots, 17 table-context features, 54 legal-action flags, and
+the discard-top index.
 The encoder never reads an opponent's private hand or the stock order.
 
 `src.model.network.collate` batches cached `Features` without rescanning history.
-`PolicyNet` uses rank convolutions, suit pooling, table attention, and FiLM on
-the four-suit, 13-rank grid. Its dueling Q values center advantages over legal actions.
+`PolicyNet` computes five vectorized meld-participation channels and unavoidable
+deadwood on the four-suit, 13-rank grid, then runs `CardBlock` blocks over a
+14-slot `[A, 2, ..., K, A]` rank strip with rank-set, suit-run, and table
+context plus shared `card_norm` mean and max table pooling.
+Its dueling Q-values center advantages over legal actions across all 54 actions.
 The stock action has no hidden drawn-card input.
-`AuxHeads` retain win, penalty, opponent-card, and afterstate tensors on `QNetwork`, while `Learner` optimizes the win, penalty, and opponent-card heads.
-Browser exports use `formatVersion == 2` and contain only `policy.*` tensors.
+`QNetwork` is pure Q-only with no auxiliary heads or target network.
+Browser exports use `formatVersion == 2` and contain `policy.*` tensors.
 
-`ModelSpec(width=64, heads=4, blocks=2)` is the default.
-`src.cli.train` accepts `--width`, `--heads`, and `--blocks` when creating a fresh model without `--initial-model`.
+`ModelSpec(width=64, blocks=2)` is the default with 126,660 parameters.
+`src.cli.train` accepts `--width` and `--blocks` when creating a fresh model without `--initial-model`.
 Warm-started runs inherit the initial checkpoint's spec.
-The browser accepts any valid spec, including width 128, eight heads, and three blocks.
+The browser accepts any valid spec, including width 128 and three blocks.
 
-`Replay` v5 stores encoded `Features` and opponent hand counts per step, enforces strict step capacity across trajectories, and gives populated player counts equal sampling shares.
+`Replay` v6 stores encoded `Features` and chosen action per step, enforces strict step capacity across trajectories, and gives populated player counts equal sampling shares.
 State checkpoints compress encoded feature bytes with `zlib` so `torch.load(..., weights_only=True)` restores replay without pickled `Observation` objects or history journals.
-Opponent hand counts provide auxiliary training targets only and never enter `Features`.
-Model checkpoints use `checkpoint_version == 4` and `encoding_version == 2`.
-Existing `axial_table` v4 model weights remain valid warm starts via `--initial-model`.
-Trainer state uses `version == 5` and rejects incompatible earlier state files with an instruction to warm-start through `--initial-model` in a fresh output directory.
+Model checkpoints use `checkpoint_version == 5` and `encoding_version == 3`.
+Current `card_mlp` v5 model weights remain valid warm starts via `--initial-model`.
+Trainer state uses `version == 6` and rejects incompatible earlier checkpoints and state files.
 There is no checkpoint conversion or old architecture selector.
 Old model architectures remain unsupported.
 Fresh weights and tiny updates establish working software, not competitive play.
@@ -387,7 +392,7 @@ To continue from those weights with fresh optimizer and replay state, pass `--in
 
 `src.cli.train` creates a new run when `--output-dir` has no `latest-state.pt` and resumes automatically when `latest-state.pt` already exists.
 The default configuration uses one player, three decks, 21 cards, five pure
-sequences, a 60-turn limit, and the same `axial_table` network used in multiplayer.
+sequences, a 60-turn limit, and the same `card_mlp` network used in multiplayer.
 
 ```powershell
 .\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --curriculum-distances 2 4 6 10
@@ -396,10 +401,10 @@ sequences, a 60-turn limit, and the same `axial_table` network used in multiplay
 For a larger model, set its spec when the run starts.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21-wide --curriculum-distances 2 4 6 10 --width 128 --heads 8 --blocks 3
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21-wide --curriculum-distances 2 4 6 10 --width 128 --blocks 3
 ```
 
-To warm-start existing v4 weights with fresh optimizer and replay state, point `--initial-model` at the checkpoint and choose a fresh output directory.
+To warm-start existing v5 weights with fresh optimizer and replay state, point `--initial-model` at the checkpoint and choose a fresh output directory.
 
 ```powershell
 .\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\best-model.pt --output-dir runs\full21-finetune --curriculum-distances 2 4 6 10 --initial-stage 2 --learning-rate 0.0001 --epsilon-start 0.08 --epsilon-end 0.02 --epsilon-decay-episodes 10000
@@ -486,7 +491,7 @@ Each cycle trains for `--cycle-episodes` episodes, runs selection against the pi
 Self-promotion preserves weights, AdamW moments, and replay.
 `--rebase-after-rejections 8` reloads champion weights and resets AdamW moments after eight consecutive rejected cycles while preserving replay and random streams.
 
-`evaluate_gate` writes `gate_schema_version == 4` evidence.
+`evaluate_gate` writes `gate_schema_version == 5` evidence.
 `--selection-blocks 32` produces 128 two-player, 64 three-player, and 32 four-player blocks.
 `--confirmation-blocks 128` produces 512, 256, and 128 blocks respectively.
 Each block batches all 2, 6, or 24 seat orders in one `run_matches` call.
@@ -513,7 +518,7 @@ Training updates are stochastic and are
 not an atomic group, so published metrics need not improve monotonically.
 `status.json` is written last and describes the stable published snapshot.
 
-Existing v4 model weights can start a fresh run.
+Existing v5 model weights can start a fresh run.
 Old champion conversion and rule migration commands remain removed.
 Use a new output directory rather than resume an incompatible replay or controller state.
 

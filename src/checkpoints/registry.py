@@ -24,8 +24,6 @@ class ModelRecord:
 
 
 class ModelRegistry:
-    """One writer owns registration and compare-and-swap promotion."""
-
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -58,10 +56,10 @@ class ModelRegistry:
             record.metadata.get("architecture") != ARCHITECTURE
             or record.metadata.get("encoding_version") != ENCODING_VERSION
             or record.metadata.get("checkpoint_version") != CHECKPOINT_VERSION
-            or set(record.metadata.get("model_spec", {})) != {"width", "heads", "blocks"}
+            or set(record.metadata.get("model_spec", {})) != {"width", "blocks"}
             or "state_dim" in record.metadata
         ):
-            raise ValueError("Model record is not a current axial_table v4 checkpoint; register fresh weights")
+            raise ValueError("Model record is not a current card_mlp v5 checkpoint; register fresh weights")
         ModelSpec.from_dict(record.metadata["model_spec"])
         return record
 

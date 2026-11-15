@@ -23,8 +23,8 @@ from src.game.environment import (
 from src.game.information import EventKind
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
 from src.model.encoding import (
-    CARD_CHANNELS, CONTEXT_CHANNELS, HISTORY_CHANNELS, LAYOUT, SEAT_CHANNELS,
-    Features, encode, feature_values,
+    CARD_CHANNELS, CONTEXT_CHANNELS, LAYOUT, NUM_SEAT_SLOTS, SEAT_CHANNELS,
+    Features, _meld_membership, encode, feature_values,
 )
 from src.model.spec import ARCHITECTURE, CHECKPOINT_VERSION, ModelSpec
 
@@ -43,8 +43,8 @@ TOLERANCE = 1e-4
 INPUT_TOLERANCE = 1e-6
 STEP_LIMIT = 1000
 SOURCES = (
-    "src/evaluate.py", "src/game/belief.py", "src/game/environment.py", "src/game/lookahead.py",
-    "src/model/encoding.py", "src/model/network.py", "tools/weights_export.py",
+    "src/evaluate.py", "src/game/environment.py", "src/game/information.py", "src/game/lookahead.py",
+    "src/model/encoding.py", "src/model/network.py", "src/model/spec.py", "tools/weights_export.py",
 )
 
 
@@ -57,26 +57,18 @@ def tensor_shapes(spec=ModelSpec()):
         if bias:
             shapes.append(("policy." + name + ".bias", (output,)))
 
-    layer("card_embed", width, 59)
-    layer("table_embed", width, 85)
+    layer("card_embed", width, len(CARD_CHANNELS) + 5)
+    layer("table_embed", width, NUM_SEAT_SLOTS * len(SEAT_CHANNELS) + len(CONTEXT_CHANNELS) + 1)
     for block in range(spec.blocks):
         prefix = "blocks.%d." % block
-        layer(prefix + "rank_norm", width)
-        shapes.extend((
-            ("policy." + prefix + "rank_conv.weight", (width, 1, 3)),
-            ("policy." + prefix + "rank_conv.bias", (width,)),
-        ))
-        for name in ("rank_in", "rank_out"):
-            layer(prefix + name, width, width)
-        layer(prefix + "suit_norm", width)
-        for name in ("suit_in", "suit_out"):
-            layer(prefix + name, width, width)
         layer(prefix + "card_norm", width)
         layer(prefix + "table_norm", width)
-        layer(prefix + "table_query", width, width)
-        layer(prefix + "table_in", width, width * 2)
-        layer(prefix + "table_out", width, width)
-        layer(prefix + "film", width * 2, width)
+        layer(prefix + "w_seq", width * 3, width)
+        for name in ("w_rank_set", "w_suit_run", "w_table"):
+            layer(prefix + name, width, width, bias=False)
+        layer(prefix + "card_out", width, width)
+        layer(prefix + "table_fc1", width, width * 3)
+        layer(prefix + "table_fc2", width, width)
     layer("card_final", width)
     layer("table_final", width)
     layer("face_local", width, width)
@@ -177,8 +169,9 @@ def linear(layers, name, x):
     return [b + dot(row, x) for row, b in zip(weight, bias)]
 
 
-def relu(values):
-    return [max(value, 0.0) for value in values]
+def silu(values):
+    return [value / (1.0 + math.exp(-value)) if value >= 0.0
+            else value * math.exp(value) / (1.0 + math.exp(value)) for value in values]
 
 
 def layer_norm(layers, name, x):
@@ -203,58 +196,76 @@ def reference_layers(tensors, spec=ModelSpec()):
     }
 
 
+def meld_channels(card, context):
+    decks = max(round(context[8] * 6.0), 1)
+    hand_size = max(round(context[9] * 30.0), 1)
+    hand = [round(row[0] * decks) for row in card]
+    joker = next((face for face, row in enumerate(card) if row[6]), 0)
+    natural, pure, any_meld = _meld_membership(hand, joker)
+    extra = []
+    for face in range(NUM_FACES):
+        suit, rank = divmod(face, 13)
+        extra.append(float32([
+            (int(hand[suit * 13 + (rank - 1) % 13] > 0)
+             + int(hand[suit * 13 + (rank + 1) % 13] > 0)) / 2.0,
+            sum(hand[other * 13 + rank] > 0 for other in range(4) if other != suit) / 3.0,
+            natural[face], pure[face], any_meld[face],
+        ]))
+    unavoidable = math.fsum(copies * row[8] * 10.0 * (1 - member)
+                            for copies, row, member in zip(hand, card, any_meld)) / (10.0 * hand_size)
+    return extra, float32([unavoidable])[0]
+
+
 def reference_q(layers, features, spec=ModelSpec()):
     values = feature_values(features) if isinstance(features, Features) else features
     fields = {field.name: list(values[field.offset:field.offset + field.size]) for field in LAYOUT}
-    width, head_size = spec.width, spec.width // spec.heads
-    cards = [linear(layers, "card_embed", card + history)
-             for card, history in zip(rows(fields["card"], 17), rows(fields["history"], 42))]
-    table = linear(layers, "table_embed", fields["context"] + fields["seat"])
+    width = spec.width
+    card_rows = rows(fields["card"], len(CARD_CHANNELS))
+    extra, unavoidable = meld_channels(card_rows, fields["context"])
+    cards = [linear(layers, "card_embed", card + channels) for card, channels in zip(card_rows, extra)]
+    table = linear(layers, "table_embed", fields["seat"] + fields["context"] + [unavoidable])
+    zeros = [0.0] * width
     for block in range(spec.blocks):
         prefix = "blocks.%d." % block
-        normalized = [layer_norm(layers, prefix + "rank_norm", card) for card in cards]
-        rank_rows = []
-        kernel, bias = layers[prefix + "rank_conv.weight"], layers[prefix + "rank_conv.bias"]
+        normalized = [layer_norm(layers, prefix + "card_norm", card) for card in cards]
+        normalized_table = layer_norm(layers, prefix + "table_norm", table)
+        sequence = []
+        suit_context = []
         for suit in range(4):
             track = normalized[suit * 13:(suit + 1) * 13]
-            track = track + track[:1]
-            convolved = [[bias[c] + math.fsum(
-                kernel[c][k] * track[position + k - 1][c]
-                for k in range(3) if 0 <= position + k - 1 < 14
-            ) for c in range(width)] for position in range(14)]
-            rank_rows.extend([[0.5 * (a + b) for a, b in zip(convolved[0], convolved[13])], *convolved[1:13]])
-        cards = [add(card, linear(layers, prefix + "rank_out", relu(linear(layers, prefix + "rank_in", row))))
-                 for card, row in zip(cards, rank_rows)]
-        means = suit_means([layer_norm(layers, prefix + "suit_norm", card) for card in cards])
-        sets = [linear(layers, prefix + "suit_out", relu(linear(layers, prefix + "suit_in", row))) for row in means]
-        cards = [add(card, sets[face % 13]) for face, card in enumerate(cards)]
-        keys = [layer_norm(layers, prefix + "card_norm", card) for card in cards]
-        normalized_table = layer_norm(layers, prefix + "table_norm", table)
-        query = linear(layers, prefix + "table_query", normalized_table)
-        pooled = []
-        for start in range(0, width, head_size):
-            scores = [dot(query[start:start + head_size], key[start:start + head_size]) / math.sqrt(head_size) for key in keys]
-            peak = max(scores)
-            weights = [math.exp(score - peak) for score in scores]
-            total = math.fsum(weights)
-            pooled.extend(dot(weights, [key[c] for key in keys]) / total for c in range(start, start + head_size))
-        table = add(table, linear(layers, prefix + "table_out", relu(linear(layers, prefix + "table_in", normalized_table + pooled))))
-        film = linear(layers, prefix + "film", table)
-        cards = [[x + k * g + b for x, k, g, b in zip(card, key, film[:width], film[width:])]
-                 for card, key in zip(cards, keys)]
+            projected = [linear(layers, prefix + "w_seq", row) for row in track + track[:1]]
+            seq14 = [add(
+                row[:width],
+                projected[position - 1][width:width * 2] if position > 0 else zeros,
+                projected[position + 1][width * 2:] if position < 13 else zeros,
+            ) for position, row in enumerate(projected)]
+            sequence.extend([[0.5 * (a + b) for a, b in zip(seq14[0], seq14[13])], *seq14[1:13]])
+            suit_context.append(linear(layers, prefix + "w_suit_run",
+                                       [math.fsum(column) / 13.0 for column in zip(*track)]))
+        rank_context = [linear(layers, prefix + "w_rank_set", row) for row in suit_means(normalized)]
+        table_context = linear(layers, prefix + "w_table", normalized_table)
+        cards = [add(card, linear(layers, prefix + "card_out", silu(add(
+            sequence[face], rank_context[face % 13], suit_context[face // 13], table_context,
+        )))) for face, card in enumerate(cards)]
+        pooled = list(zip(*[layer_norm(layers, prefix + "card_norm", card) for card in cards]))
+        table_input = normalized_table + [math.fsum(column) / NUM_FACES for column in pooled] + [
+            max(column) for column in pooled
+        ]
+        table = add(table, linear(layers, prefix + "table_fc2",
+                                 silu(linear(layers, prefix + "table_fc1", table_input))))
     cards = [layer_norm(layers, "card_final", card) for card in cards]
     table = layer_norm(layers, "table_final", table)
     sets = suit_means(cards)
     set_hidden = [linear(layers, "face_set", row) for row in sets]
     table_hidden = linear(layers, "face_table", table)
-    faces = [relu(add(linear(layers, "face_local", card), set_hidden[face % 13], table_hidden))
+    faces = [silu(add(linear(layers, "face_local", card), set_hidden[face % 13], table_hidden))
              for face, card in enumerate(cards)]
     top = int(fields["top"][0])
-    top_card, top_set = (cards[top], sets[top % 13]) if top < NUM_FACES else ([0.0] * width, [0.0] * width)
-    draw = relu(add(linear(layers, "draw_table", table), linear(layers, "draw_top", top_card), linear(layers, "draw_set", top_set)))
+    top_card, top_set = (cards[top], sets[top % 13]) if 0 <= top < NUM_FACES else (zeros, zeros)
+    draw = silu(add(linear(layers, "draw_table", table), linear(layers, "draw_top", top_card), linear(layers, "draw_set", top_set)))
     advantage = linear(layers, "draw_out", draw) + [linear(layers, "face_out", face)[0] for face in faces]
     center = dot(advantage, fields["legal"]) / max(math.fsum(fields["legal"]), 1.0)
-    value = linear(layers, "value_out", relu(linear(layers, "value_hidden", table)))[0]
+    value = linear(layers, "value_out", silu(linear(layers, "value_hidden", table)))[0]
     return [value + action - center for action in advantage]
 
 
@@ -399,7 +410,7 @@ def export_checkpoint(args, observations, features, golden):
     tensors = {"policy." + name: value.detach().cpu().float().reshape(-1).tolist()
                for name, value in network.policy.state_dict().items()}
     if [("policy." + name, tuple(value.shape)) for name, value in network.policy.state_dict().items()] != list(tensor_shapes(spec)):
-        raise SystemExit("policy tensors do not match the axial_table v4 export schema")
+        raise SystemExit("policy tensors do not match the card_mlp v5 export schema")
     layers = reference_layers(tensors, spec)
     with torch.inference_mode():
         batch = collate(features, torch.device("cpu"))
@@ -421,7 +432,7 @@ def write_json(path, document):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Export axial_table v4 policy weights for web/qnet.mjs.")
+    parser = argparse.ArgumentParser(description="Export card_mlp v5 policy weights for web/qnet.mjs.")
     weights = parser.add_mutually_exclusive_group()
     weights.add_argument("--checkpoint", type=Path, help="export this .pt checkpoint (needs torch)")
     weights.add_argument("--registry", type=Path, help="export this registry's champion (needs torch)")
@@ -457,7 +468,7 @@ def main(argv=None):
         "sources": {path: hashlib.sha256((ROOT / path).read_text(encoding="utf-8").encode("utf-8")).hexdigest()
                     for path in SOURCES},
         "tolerance": TOLERANCE, "featureLayout": [[field.name, list(field.shape)] for field in LAYOUT],
-        "channels": {"card": CARD_CHANNELS, "history": HISTORY_CHANNELS, "seat": SEAT_CHANNELS, "context": CONTEXT_CHANNELS},
+        "channels": {"card": CARD_CHANNELS, "seat": SEAT_CHANNELS, "context": CONTEXT_CHANNELS},
         "cases": golden,
     })
     label = {

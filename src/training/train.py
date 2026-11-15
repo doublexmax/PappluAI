@@ -39,21 +39,20 @@ from src.evaluation.promotion import GateInterrupted, evaluate_gate
 from src.game.environment import GameConfig, PappluEnv
 from src.game.multiplayer import MatchConfig
 from src.game.outcome import SeatOutcome, solo_outcome
-from src.model.encoding import FEATURE_SIZE, Features, NUM_FACES, encode, legal_actions
-from src.model.network import QNetwork, build_checkpoint, collate, greedy_actions, load_checkpoint
+from src.model.encoding import FEATURE_SIZE, Features, encode, legal_actions
+from src.model.network import QNetwork, checkpoint_payload, collate, load_checkpoint
 from src.model.spec import ModelSpec
 
 
-STATE_VERSION = 5
+STATE_VERSION = 6
 STATUS_SCHEMA_VERSION = 1
-ALGORITHM = "unified_nstep_ddqn"
+ALGORITHM = "dmc"
 RANDOM_OPPONENT = "random"
 ORDINARY_VALIDATION_SEED = 30_000_000
 CURRICULUM_VALIDATION_SEED = 20_000_000
 SELECTION_SEED_BASE = 60_000_000
 SOLO_EXPLORATION_SALT = 0x9E3779B97F4A7C15
 FEATURE_BYTES = FEATURE_SIZE * 4
-EMPTY_OPPONENT_HANDS = ((0,) * NUM_FACES,) * 5
 MAX_OPPONENT_POOL = 8
 TUNABLE_ON_RESUME = frozenset({
     "checkpoint_every",
@@ -93,30 +92,18 @@ def _require_float(
 
 @dataclass(frozen=True)
 class Step:
-    """One recorded learner decision without Observation retention."""
-
     features: Features
     action: int
-    opponent_hands: tuple[tuple[int, ...], ...] = EMPTY_OPPONENT_HANDS
 
     def __post_init__(self) -> None:
         if not isinstance(self.features, Features):
             raise ValueError("step features must be a Features record")
         if type(self.action) is not int or self.action not in legal_actions(self.features):
             raise ValueError("step action must be a legal action index")
-        hands = self.opponent_hands
-        if not isinstance(hands, tuple) or len(hands) != 5 or any(
-            not isinstance(hand, tuple) or len(hand) != NUM_FACES
-            or any(type(count) is not int or count < 0 for count in hand)
-            for hand in hands
-        ):
-            raise ValueError("opponent_hands must hold five 52-count tuples")
 
 
 @dataclass(frozen=True)
 class Trajectory:
-    """Learner decision sequence and terminal outcome for one completed deal."""
-
     players: int
     steps: tuple[Step, ...]
     outcome: SeatOutcome
@@ -144,15 +131,11 @@ class Trajectory:
 @dataclass(frozen=True)
 class Sample:
     step: Step
-    outcome: SeatOutcome
-    bootstrap: Optional[Features]
-    scale: float
+    target: float
 
 
 class Replay:
-    """Player-count-stratified trajectory replay with strict step capacity."""
-
-    STATE_VERSION = 5
+    STATE_VERSION = 6
 
     def __init__(self, capacity: int) -> None:
         _require_int(capacity, "capacity", minimum=1)
@@ -204,11 +187,9 @@ class Replay:
         rng: random.Random,
         batch_size: int,
         *,
-        n_step: int = 5,
         gamma: float = 0.99,
     ) -> list[Sample]:
         _require_int(batch_size, "batch_size", minimum=1)
-        _require_int(n_step, "n_step", minimum=1)
         _require_float(gamma, "gamma", minimum=0.0, maximum=1.0, strict_min=True)
         active = sorted(p for p, count in self._counts.items() if count > 0)
         if not active:
@@ -221,14 +202,8 @@ class Replay:
                 length = len(trajectory.steps)
                 if target < length:
                     step = trajectory.steps[target]
-                    next_index = target + n_step
-                    if next_index < length:
-                        bootstrap = trajectory.steps[next_index].features
-                        scale = gamma ** n_step
-                    else:
-                        bootstrap = None
-                        scale = gamma ** (length - 1 - target)
-                    samples.append(Sample(step, trajectory.outcome, bootstrap, scale))
+                    value = trajectory.outcome.utility * gamma ** (length - 1 - target)
+                    samples.append(Sample(step, value))
                     break
                 target -= length
         self._sample_cursor = (self._sample_cursor + batch_size) % len(active)
@@ -244,7 +219,6 @@ class Replay:
                 records.append((
                     trajectory.players,
                     tuple(step.action for step in trajectory.steps),
-                    tuple(step.opponent_hands for step in trajectory.steps),
                     (
                         float(trajectory.outcome.utility),
                         trajectory.outcome.won,
@@ -260,7 +234,11 @@ class Replay:
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        if not isinstance(state, Mapping) or state.get("version") != self.STATE_VERSION:
+        if (
+            not isinstance(state, Mapping)
+            or type(state.get("version")) is not int
+            or state["version"] != self.STATE_VERSION
+        ):
             raise ValueError("unsupported replay state version")
         cursor = _require_int(state.get("sample_cursor"), "sample_cursor", minimum=0)
         compressed = state.get("features_zlib")
@@ -274,7 +252,7 @@ class Replay:
         total_steps = sum(
             len(entry[1])
             for entry in records
-            if isinstance(entry, (tuple, list)) and len(entry) == 4 and isinstance(entry[1], (tuple, list))
+            if isinstance(entry, (tuple, list)) and len(entry) == 3 and isinstance(entry[1], (tuple, list))
         )
         if len(raw) != total_steps * FEATURE_BYTES:
             raise ValueError("replay feature byte length mismatch")
@@ -284,23 +262,20 @@ class Replay:
         counts: dict[int, int] = {}
         offset = 0
         for entry in records:
-            if not isinstance(entry, (tuple, list)) or len(entry) != 4:
+            if not isinstance(entry, (tuple, list)) or len(entry) != 3:
                 raise ValueError("invalid replay trajectory record")
-            players, actions, hands_seq, outcome_raw = entry
+            players, actions, outcome_raw = entry
             if (
                 not isinstance(actions, (tuple, list))
-                or not isinstance(hands_seq, (tuple, list))
-                or len(actions) != len(hands_seq)
                 or not isinstance(outcome_raw, (tuple, list))
                 or len(outcome_raw) != 3
             ):
                 raise ValueError("invalid replay step sequence")
             steps = []
-            for action, opp_hands in zip(actions, hands_seq):
+            for action in actions:
                 chunk = raw[offset:offset + FEATURE_BYTES]
                 offset += FEATURE_BYTES
-                normalized_hands = tuple(tuple(hand) for hand in opp_hands)
-                steps.append(Step(Features(chunk), action, normalized_hands))
+                steps.append(Step(Features(chunk), action))
             outcome = SeatOutcome(outcome_raw[0], outcome_raw[1], outcome_raw[2])
             trajectory = Trajectory(players, tuple(steps), outcome)
             buckets.setdefault(players, deque()).append(trajectory)
@@ -326,12 +301,7 @@ class TrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     gamma: float = 0.99
-    n_step: int = 5
-    target_tau: float = 0.005
     grad_clip: float = 1.0
-    win_weight: float = 0.25
-    penalty_weight: float = 0.25
-    belief_weight: float = 0.10
     epsilon_start: float = 0.30
     epsilon_end: float = 0.05
     epsilon_decay_episodes: int = 10_000
@@ -380,7 +350,7 @@ class TrainConfig:
                 MatchConfig(game=game, players=count)
         for int_name, low in (
             ("round_episodes", 1), ("updates_per_episode", 0), ("batch_size", 1),
-            ("replay_capacity", 1), ("n_step", 1), ("epsilon_decay_episodes", 0),
+            ("replay_capacity", 1), ("epsilon_decay_episodes", 0),
             ("initial_stage", 0), ("stage_passes", 1), ("validate_every", 1),
             ("validation_games", 0), ("cycle_episodes", 1), ("selection_blocks", 1),
             ("confirmation_blocks", 1), ("solo_games", 1), ("gate_samples", 100),
@@ -391,9 +361,7 @@ class TrainConfig:
         _require_int(self.seed, "seed")
         for float_name, low, high, strict in (
             ("learning_rate", 0.0, None, True), ("weight_decay", 0.0, None, False),
-            ("gamma", 0.0, 1.0, True), ("target_tau", 0.0, 1.0, True),
-            ("grad_clip", 0.0, None, True), ("win_weight", 0.0, None, False),
-            ("penalty_weight", 0.0, None, False), ("belief_weight", 0.0, None, False),
+            ("gamma", 0.0, 1.0, True), ("grad_clip", 0.0, None, True),
             ("epsilon_start", 0.0, 1.0, False), ("epsilon_end", 0.0, 1.0, False),
             ("warm_start_fraction", 0.0, 1.0, False), ("curriculum_fraction", 0.0, 1.0, False),
             ("stage_margin", 0.0, 1.0, False), ("stage_floor", 0.0, 1.0, False),
@@ -513,15 +481,9 @@ class TrainConfig:
 
 @dataclass(frozen=True)
 class LearnStats:
-    """Mean loss components across a batch of gradient updates."""
-
     updates: int = 0
     samples: int = 0
     loss: float = 0.0
-    q_loss: float = 0.0
-    win_loss: float = 0.0
-    penalty_loss: float = 0.0
-    belief_loss: float = 0.0
 
 
 class Learner:
@@ -540,7 +502,6 @@ class Learner:
         self.config = config
         self.device = resolved_device
         self.online = online.to(self.device)
-        self.target = deepcopy(self.online).to(self.device).eval().requires_grad_(False)
         self.optimizer = self._make_optimizer()
         self.replay = Replay(config.replay_capacity)
         self.rng = random.Random(seed)
@@ -570,15 +531,13 @@ class Learner:
         if updates == 0 or len(self.replay) == 0:
             return LearnStats()
         self.online.train()
-        self.target.eval()
-        totals = [0.0, 0.0, 0.0, 0.0, 0.0]
+        total_loss = 0.0
         total_samples = 0
         cfg = self.config
         for _ in range(updates):
             batch = self.replay.sample(
                 self.rng,
                 min(cfg.batch_size, len(self.replay)),
-                n_step=cfg.n_step,
                 gamma=cfg.gamma,
             )
             now = collate([item.step.features for item in batch], self.device)
@@ -588,95 +547,29 @@ class Learner:
                 dtype=torch.long,
             )
             targets = torch.tensor(
-                [item.outcome.utility for item in batch],
+                [item.target for item in batch],
                 device=self.device,
                 dtype=torch.float32,
             )
-            boot_rows = [idx for idx, item in enumerate(batch) if item.bootstrap is not None]
-            with torch.no_grad():
-                if boot_rows:
-                    next_batch = collate(
-                        [batch[idx].bootstrap for idx in boot_rows if batch[idx].bootstrap is not None],
-                        self.device,
-                    )
-                    best_next = greedy_actions(self.online, next_batch)
-                    targets[boot_rows] = self.target(next_batch).gather(1, best_next[:, None]).squeeze(1)
-                scales = torch.tensor(
-                    [item.scale for item in batch],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-                targets = targets * scales
-            won = torch.tensor(
-                [1.0 if item.outcome.won else 0.0 for item in batch],
-                device=self.device,
-                dtype=torch.float32,
-            )
-            penalties = torch.tensor(
-                [item.outcome.penalty / 100.0 for item in batch],
-                device=self.device,
-                dtype=torch.float32,
-            )
-            outputs = self.online.outputs(now)
-            q_pred = outputs.q.gather(1, actions[:, None]).squeeze(1)
-            win_pred = outputs.win_logit.gather(1, actions[:, None]).squeeze(1)
-            pen_pred = outputs.penalty.gather(1, actions[:, None]).squeeze(1)
-            q_loss = F.smooth_l1_loss(q_pred, targets)
-            win_loss = F.binary_cross_entropy_with_logits(win_pred, won)
-            penalty_loss = F.smooth_l1_loss(pen_pred, penalties)
-            present = now.seat[:, 1:, 0] > 0.5
-            belief_loss = outputs.q.new_zeros(())
-            if bool(present.any()):
-                opp_hands = torch.tensor(
-                    [item.step.opponent_hands for item in batch],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-                decks = (now.context[:, 8] * 6.0).round().clamp_min(1.0)
-                belief_targets = (opp_hands / decks[:, None, None]).clamp(0.0, 1.0)
-                belief_loss = F.binary_cross_entropy_with_logits(
-                    outputs.belief[:, 1:][present],
-                    belief_targets[present],
-                )
-            loss = (
-                q_loss
-                + cfg.win_weight * win_loss
-                + cfg.penalty_weight * penalty_loss
-                + cfg.belief_weight * belief_loss
-            )
+            q = self.online(now).gather(1, actions[:, None]).squeeze(1)
+            loss = F.smooth_l1_loss(q, targets)
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.online.parameters(), cfg.grad_clip)
             self.optimizer.step()
-            with torch.no_grad():
-                for target_param, online_param in zip(
-                    self.target.parameters(),
-                    self.online.parameters(),
-                ):
-                    target_param.lerp_(online_param, cfg.target_tau)
-            totals[0] += float(loss.detach().item())
-            totals[1] += float(q_loss.detach().item())
-            totals[2] += float(win_loss.detach().item())
-            totals[3] += float(penalty_loss.detach().item())
-            totals[4] += float(belief_loss.detach().item())
+            total_loss += float(loss.detach().item())
             total_samples += len(batch)
             self.update_count += 1
         return LearnStats(
             updates=updates,
             samples=total_samples,
-            loss=totals[0] / updates,
-            q_loss=totals[1] / updates,
-            win_loss=totals[2] / updates,
-            penalty_loss=totals[3] / updates,
-            belief_loss=totals[4] / updates,
+            loss=total_loss / updates,
         )
 
     def adopt(self, model_state: Mapping[str, Tensor]) -> None:
         validated = validate_model_state(model_state, self.online.state_dict(), "adopted_model")
         self.online.load_state_dict(validated, strict=True)
         self.online.to(self.device)
-        self.target.load_state_dict(validated, strict=True)
-        self.target.to(self.device).eval().requires_grad_(False)
         self.optimizer = self._make_optimizer()
 
     def state_dict(self) -> dict[str, Any]:
@@ -688,7 +581,6 @@ class Learner:
         return {
             "spec": self.online.spec.to_dict(),
             "online": clone_model_state(self.online.state_dict()),
-            "target": clone_model_state(self.target.state_dict()),
             "optimizer": opt_state,
             "replay": self.replay.state_dict(),
             "rng": self.rng.getstate(),
@@ -699,11 +591,12 @@ class Learner:
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         if not isinstance(state, Mapping):
             raise ValueError("learner state must be a mapping")
+        if set(state) != {"spec", "online", "optimizer", "replay", "rng", "step_count", "update_count"}:
+            raise ValueError("learner state fields do not match the Q-only DMC schema")
         validate_checkpoint_tree(state, "learner_state")
         if ModelSpec.from_dict(state.get("spec")) != self.online.spec:
             raise ValueError("learner spec mismatch")
         online_state = validate_model_state(state.get("online"), self.online.state_dict(), "online")
-        target_state = validate_model_state(state.get("target"), self.target.state_dict(), "target")
         step_count = _require_int(state.get("step_count"), "step_count", minimum=0)
         update_count = _require_int(state.get("update_count"), "update_count", minimum=0)
         replay = Replay(self.config.replay_capacity)
@@ -712,8 +605,6 @@ class Learner:
         rng.setstate(state["rng"])
         self.online.load_state_dict(online_state, strict=True)
         self.online.to(self.device)
-        self.target.load_state_dict(target_state, strict=True)
-        self.target.to(self.device).eval().requires_grad_(False)
         optimizer = self._make_optimizer()
         optimizer.load_state_dict(state["optimizer"])
         self.optimizer = optimizer
@@ -1089,7 +980,11 @@ class Trainer:
         opponents: Sequence[Union[str, Path]],
     ) -> Trainer:
         payload = torch.load(state_path, map_location="cpu", weights_only=True)
-        if not isinstance(payload, Mapping) or payload.get("version") != STATE_VERSION:
+        if (
+            not isinstance(payload, Mapping)
+            or type(payload.get("version")) is not int
+            or payload["version"] != STATE_VERSION
+        ):
             raise ValueError("unsupported trainer state version; warm-start with --initial-model")
         validate_checkpoint_tree(payload, "trainer_state")
         saved_config = TrainConfig.from_dict(payload["config"])
@@ -1199,7 +1094,7 @@ class Trainer:
         self.pool_order = [sha for sha in self.pool_order if sha in keep]
 
     def export_model(self, path: Union[str, Path], role: str = "latest") -> None:
-        payload = build_checkpoint(
+        payload = checkpoint_payload(
             self.learner.online,
             self.config.game,
             meta={
@@ -1323,7 +1218,6 @@ class Trainer:
             "updates": self.progress.updates,
             "epsilon": round(epsilon, 6),
             "loss": round(stats.loss, 6),
-            "q_loss": round(stats.q_loss, 6),
             "stage": self.progress.stage,
         })
         now_solo = self.progress.solo_episodes
@@ -1414,7 +1308,7 @@ class Trainer:
             raw_steps = result.trajectories[learner_seat]
             if raw_steps:
                 steps = tuple(
-                    Step(item.features, item.action, item.hidden_hands[1:])
+                    Step(item.features, item.action)
                     for item in raw_steps
                 )
                 trajectories.append(Trajectory(players, steps, seat_outcome))

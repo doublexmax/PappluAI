@@ -42,18 +42,18 @@ To fine-tune those weights with fresh optimizer and replay state, pass `--initia
 ## Train and resume full 21-card play
 
 `src.cli.train` defaults to one player, three decks, 21 cards, five required pure
-sequences, discard recycling, a 60-turn limit, and the `axial_table` network.
+sequences, discard recycling, a 60-turn limit, and the `card_mlp` network.
 Passing `--curriculum-distances` enables staged solo curriculum deals for the same model that plays multiplayer.
 
 ```powershell
 .\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --curriculum-distances 2 4 6 10
 ```
 
-For a larger model, set `--width`, `--heads`, and `--blocks` when starting a fresh run without `--initial-model`.
-The default spec is `ModelSpec(width=64, heads=4, blocks=2)`.
+For a larger model, set `--width` and `--blocks` when starting a fresh run without `--initial-model`.
+The default spec is `ModelSpec(width=64, blocks=2)`.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21-wide --curriculum-distances 2 4 6 10 --width 128 --heads 8 --blocks 3
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21-wide --curriculum-distances 2 4 6 10 --width 128 --blocks 3
 ```
 
 The output directory contains `latest-state.pt`, `latest-model.pt`,
@@ -68,10 +68,10 @@ Repeat the same `--output-dir` to resume `latest-state.pt`, then benchmark `late
 .\.venv\Scripts\python -m src.cli.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
 ```
 
-Model checkpoint version 4 and information encoding version 2 remain unchanged.
-Existing `axial_table` v4 model weights can warm-start a new run through `--initial-model`.
-Trainer state uses version 5 and `Replay` v5.
-Incompatible older state files fail cleanly and require `--initial-model` in a fresh output directory.
+Model checkpoints use version 5 and information encoding version 3.
+Current `card_mlp` v5 model weights can warm-start a new run through `--initial-model`.
+Trainer state uses version 6 and `Replay` v6.
+Incompatible older checkpoints and state files fail cleanly.
 Old model architectures and old registry records remain unsupported.
 
 To finetune existing weights at curriculum stage 2, start fresh optimizer and replay state in a new directory.
@@ -83,8 +83,8 @@ To finetune existing weights at curriculum stage 2, start fresh optimizer and re
 Default hyperparameters use learning rate 0.0003 and epsilon 0.30 to 0.05 over 10000 episodes.
 All settings persist in `TrainConfig`, and resume rejects hyperparameter changes while allowing `--checkpoint-every`, `--gate-workers`, `--torch-threads`, and `--device` overrides.
 
-`Learner` uses 5-step Double DQN with `gamma = 0.99`.
-The online network selects a legal bootstrap action, and the target network values that action with contraction `gamma ** k` over `k` elapsed steps.
+`Learner` uses Q-only Deep Monte-Carlo with `gamma = 0.99`.
+Each trajectory step fits `Q(s, a)` via smooth L1 loss to discounted terminal utility `u * gamma ** (T - 1 - t)`, with no target network or auxiliary heads.
 Solo declaration earns +1.
 A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`, bounded between -1 and -0.5.
 Multiplayer utility averages pairwise margins weighted by 1 when either seat declared, and by 0.5 otherwise.
@@ -94,17 +94,16 @@ Multiplayer utilities remain zero-sum.
 `DealOutcome.margin` stays unshaped for PFSP, ratings, and promotion.
 Solo and curriculum deals score terminal outcomes through `solo_outcome`.
 Greedy validation and `best-model.pt` selection use binary declaration win rates.
-AdamW, a Polyak target network, and gradient clipping update the online network alongside win, penalty, and opponent-card auxiliary losses.
+AdamW and gradient clipping update the online network on Q-value returns.
 
-`encode` converts each visible observation into a pure `Features` record of 3,208 float32 values.
-The encoder includes meld membership, public-card beliefs, per-kind history recencies, and six relative seat slots.
-`PolicyNet` combines rank convolutions, suit pooling, table attention, and FiLM on a four-suit, 13-rank grid.
+`encode` converts each visible observation into a pure `Features` record of 802 float32 values, or 3,208 bytes.
+A single pass over visible history populates 13 per-card channels, including opponent discards, known copies held by the next opponent and other opponents, and cards passed by the next opponent. It also writes nine channels across six relative seat slots and 17 context features.
+`PolicyNet` computes vectorized meld-participation channels and runs `CardBlock` blocks over a 14-slot `[A, 2, ..., K, A]` rank strip with shared `card_norm` table pooling on the four-suit, 13-rank grid.
 `collate` batches cached records without rescanning history.
-Opponent hand counts provide auxiliary training targets only.
-Browser exports omit `aux.*` weights and retain only `policy.*`.
+Browser exports retain `policy.*` tensors and match Python Q-values.
 See the [current model contract](README.md#current-model-contract) for the model layout.
 
-`Replay` v5 enforces strict step-level capacity, samples steps uniformly within each populated player count, and gives populated player counts equal shares.
+`Replay` v6 enforces strict step-level capacity, samples steps uniformly within each populated player count, and gives populated player counts equal shares.
 State checkpoints compress concatenated `Features` bytes with `zlib` so `torch.load(..., weights_only=True)` restores replay directly without retaining `Observation` instances.
 
 ## Run shared-deck arena matches
@@ -230,7 +229,7 @@ Confirmation plays 1,024, 1,536, and 3,072 games.
 Each block batches all 2, 6, or 24 seat orders.
 The registry requires disjoint selection and confirmation seeds.
 
-`gate_schema_version == 4` records placement margins, declaration margins, `phase`, and `gate_failures`.
+`gate_schema_version == 5` records placement margins, declaration margins, `phase`, and `gate_failures`.
 Better loser placements count even when neither contender declares.
 Within base block `b`, each count's replica `r` uses deal seed `seed + 4 * b + r`.
 The gate averages replicas within each count, then averages counts equally.
@@ -267,12 +266,12 @@ Use a temporary output directory for a bounded local check.
 .\.venv\Scripts\python tools\verify_dynamic_model.py --output-dir "$env:TEMP\papplu-dynamic-verification"
 ```
 
-The script verifies `axial_table` v4 checkpoints and runs full 60-turn games at each supported player count.
+The script verifies `card_mlp` v5 checkpoints and runs full 60-turn games at each supported player count.
 Separate one-turn smoke games exercise solo curriculum resume, mixed-count updates, exact full-state
 resume, a rejected promotion gate cycle, and persisted tournaments and reports.
 The resume check compares an uninterrupted `Trainer` run's actual matches and updates
 with the checkpoint restored by `src.cli.train`.
-Gate v4 checks compare in-process and two-worker results byte for byte and reuse a completed JSONL journal.
+Gate v5 checks compare in-process and two-worker results byte for byte and reuse a completed JSONL journal.
 The script checks persisted `TrainConfig` hyperparameters and tunable `--gate-workers` resume updates.
 Unit tests also interrupt a gate between phases and verify deterministic recovery.
 Each invocation creates a new timestamped directory, so repeated checks

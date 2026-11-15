@@ -22,7 +22,7 @@ def protocol(players=2):
     return {
         "players": players,
         "game": GameConfig(num_decks=3, cards_in_hand=3, required_sequences=1, max_turns=2).to_dict(),
-        "encoding_version": 2, "scoring_version": 1,
+        "encoding_version": 3, "scoring_version": 1,
         "policy": "greedy-v1", "seating_design": "all-permutations-v1", "seed": 41,
     }
 
@@ -420,7 +420,7 @@ class TestRatingStore(unittest.TestCase):
         ):
             with self.subTest(command=module.__name__), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
                 self.assertEqual(module.main(bad_args), 2)
-                self.assertTrue(error.getvalue().startswith("error: "))
+                self.assertTrue(error.getvalue().splitlines()[-1].startswith("error: "))
             with self.subTest(command=module.__name__, missing_dep=True), mock.patch.object(
                 module, "load_runtime", side_effect=MissingTrainingDependency("training dependency missing"),
             ), mock.patch("sys.stderr", new_callable=io.StringIO) as error:

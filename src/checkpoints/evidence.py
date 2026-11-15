@@ -14,7 +14,7 @@ from src.model.spec import ARCHITECTURE
 MIN_SELECTION_SEED_BLOCKS = 32
 MIN_CONFIRMATION_SEED_BLOCKS = 128
 MIN_SOLO_GAMES = 256
-GATE_SCHEMA_VERSION = 4
+GATE_SCHEMA_VERSION = 5
 PLAYER_COUNTS = (2, 3, 4)
 GATE_PHASES = ("selection", "confirmation")
 
@@ -222,7 +222,7 @@ def validate_gate_evidence(
         raise ValueError("%s evidence must accept these exact models" % phase)
     version = evidence.get("gate_schema_version")
     if type(version) is not int or version != GATE_SCHEMA_VERSION:
-        raise ValueError("%s evidence uses unsupported gate schema v%r; re-run gates under schema v4" % (phase, version))
+        raise ValueError("%s evidence uses unsupported gate schema v%r; re-run gates under schema v5" % (phase, version))
     if (
         type(evidence.get("accepted")) is not bool
         or evidence.get("phase") != phase
@@ -236,7 +236,7 @@ def validate_gate_evidence(
         evidence.get("encoding_version") != ENCODING_VERSION
         or evidence.get("architecture") != ARCHITECTURE
     ):
-        raise ValueError("%s evidence requires axial_table gate schema v4" % phase)
+        raise ValueError("%s evidence requires card_mlp gate schema v5" % phase)
     raw_counts = evidence.get("player_counts")
     if not isinstance(raw_counts, (list, tuple)):
         raise ValueError("%s evidence requires player_counts as a list or tuple" % phase)

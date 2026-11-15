@@ -83,8 +83,8 @@ cap-conditioned play rather than a shared trajectory with different cutoffs.
 The calibration command and its evidence rules are described in
 [TRAINING.md](TRAINING.md#calibrate-multiplayer-draw-limits).
 
-Earlier frozen-pool cap studies do not establish limits for `axial_table`.
-Current checkpoints use `checkpoint_version == 4` and `encoding_version == 2`.
+Earlier frozen-pool cap studies do not establish limits for `card_mlp`.
+Current checkpoints use `checkpoint_version == 5` and `encoding_version == 3`.
 Current tournament registration rejects old model schemas and old registry
 records. Keep historical evidence separate and use a new root for current models.
 
@@ -176,7 +176,7 @@ one-sided results, and experimental cap discounts remain provisional.
 
 The rating service does not modify model weights or promote a champion.
 `Trainer` in `src.training.train` trains and gates one candidate per cycle when `--promote` is enabled.
-Its `Learner` uses 5-step Double DQN with `gamma = 0.99` and `Replay` v5.
+Its `Learner` uses Q-only Deep Monte-Carlo with `gamma = 0.99` and `Replay` v6.
 Multiplayer training uses PFSP opponent weights from pairwise placement scores.
 Tournament lineups use coverage, not PFSP or current rating estimates.
 The [training guide](TRAINING.md#run-finite-improvement-cycles) describes champion lineage and rebasing.
@@ -184,7 +184,7 @@ The [training guide](TRAINING.md#run-finite-improvement-cycles) describes champi
 `DealOutcome.margin(candidate_seat, champion_seat)` is +1 for a better placement, -1 for a worse placement, and 0 for a tie.
 If another seat declares, a candidate with 40 points beats a champion with 80 points.
 That game contributes placement margin +1 and declaration margin 0.
-Gate v4 averages these unshaped margins over every seating in a replica.
+Gate v5 averages these unshaped margins over every seating in a replica.
 Declaration margin is +1 if the candidate declares, -1 if the champion declares, and 0 otherwise.
 Training's declaration-weighted utility does not change these evaluation scores or OpenSkill updates.
 
@@ -214,7 +214,7 @@ The interval fields are `multiplayer_ci95`, `multiplayer_ci95_by_count`, `declar
 
 Both phases require:
 
-- `gate_schema_version == 4`, `architecture == "axial_table"`, and the exact candidate and champion hashes.
+- `gate_schema_version == 5`, `architecture == "card_mlp"`, and the exact candidate and champion hashes.
 - Selection has at least 32 base blocks. Confirmation has at least 128 base blocks.
 - Both phases use full21, 60-turn discard-recycling rules and matching player counts.
 - At least 256 paired solo games per phase. `--solo-games` remains configurable.
@@ -235,7 +235,7 @@ Failure names are `rules`, `seed_blocks`, `solo_games`, `placement`, `placement_
 The absolute seed distance is at least `100_000 + max(4 * confirmation.seed_blocks, confirmation.solo_games, 4 * selection.seed_blocks, selection.solo_games)`.
 `ModelRegistry.promote` recomputes summaries, intervals, and the phase verdict from raw margins and paired solo outcomes.
 It checks the stored failure list exactly.
-Gate schemas v2 and v3 require new v4 gates rather than conversion.
+Gate schemas v2 through v4 require new v5 gates rather than conversion.
 
 `evaluate_gate` batches every block in one `run_matches` call.
 Solo retention uses deterministic slices of up to 32 games per policy.

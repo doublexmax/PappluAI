@@ -246,7 +246,7 @@ class TestSeatClusterBootstrap(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 path = Path(temporary) / "model.pt"
-                save_checkpoint(str(path), QNetwork(ModelSpec(8, 1, 1)), GameConfig())
+                save_checkpoint(str(path), QNetwork(ModelSpec(8, 1)), GameConfig())
                 with mock.patch(
                     "src.evaluation.promotion.CheckpointPolicy",
                     side_effect=RuntimeError("bad checkpoint"),
@@ -384,7 +384,7 @@ class TestGateExecution(unittest.TestCase):
         with torch.random.fork_rng(devices=[]):
             for path, seed in ((self.candidate, 17), (self.champion, 31)):
                 torch.manual_seed(seed)
-                save_checkpoint(str(path), QNetwork(ModelSpec(8, 1, 1)), GameConfig())
+                save_checkpoint(str(path), QNetwork(ModelSpec(8, 1)), GameConfig())
 
     def gate(self, **overrides):
         arguments = {

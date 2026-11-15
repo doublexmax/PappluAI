@@ -16,7 +16,6 @@ from src.game.lookahead import (
     winning_discard,
 )
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.model.encoding import CONTEXT_CHANNELS, LAYOUT, encode, feature_values
 
 
 def draw_observation():
@@ -31,13 +30,7 @@ class TestLongSequenceDeclarations(unittest.TestCase):
     def test_exact_joker_is_not_also_counted_as_a_natural_sequence(self):
         counts = tuple(int(face in (0, 1, 2, 17, 30, 43)) for face in range(52))
         self.assertEqual(pure_sequence_upper_bound(counts, 2), 1)
-        obs = replace(
-            draw_observation(), hand=counts, joker=2,
-            config=GameConfig(cards_in_hand=6, required_sequences=2),
-        )
-        values = feature_values(encode(obs))
-        context_offset = next(field.offset for field in LAYOUT if field.name == "context")
-        self.assertEqual(values[context_offset + CONTEXT_CHANNELS.index("pure_quota_deficit")], 0.5)
+        self.assertFalse(can_declare_ub(counts, joker=2, required_sequences=2))
 
     def test_two_exact_wildcards_can_fill_one_sequence_piece(self):
         counts = [0] * 52
