@@ -229,7 +229,7 @@ def load_checkpoint(
         raise ValueError("unsupported checkpoint_version %r; train fresh card_mlp v5 weights"
                          % payload.get("checkpoint_version"))
     if type(payload.get("encoding_version")) is not int or payload["encoding_version"] != ENCODING_VERSION:
-        raise ValueError("incompatible encoding_version; card_mlp v5 requires encoding_version 4")
+        raise ValueError("incompatible encoding_version; card_mlp v5 requires encoding_version 5")
     if payload.get("architecture") != ARCHITECTURE:
         raise ValueError("unsupported architecture; expected card_mlp v5")
     required = {

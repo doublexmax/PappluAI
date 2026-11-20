@@ -18,6 +18,7 @@ CARD_CHANNELS = (
     "own", "own_ge1", "own_ge2", "own_ge3", "pile", "top", "indicator", "wild",
     "points", "opp_discarded", "next_held", "other_held", "next_passed",
     "adjacent", "set_mates", "natural", "pure", "any_meld",
+    "spare_frac", "disc_pseq_delta", "disc_pts_saved", "disc_pairs_delta",
 )
 SEAT_CHANNELS = (
     "present", "observer", "active", "hand_size", "turns", "next", "takes",
@@ -27,6 +28,7 @@ CONTEXT_CHANNELS = (
     "draw", "discard", "terminal", "to_act", "turns", "stock", "pile", "refills",
     "decks", "hand", "sequences", "recycle", "players", "max_turns", "warm_start",
     "wilds", "deadwood", "unavoidable_dw",
+    "disjoint_pseq_frac", "disjoint_gated_pts", "top_gain_pseq", "top_gain_pts",
 )
 CARD_OFFSET = 0
 SEAT_OFFSET = CARD_OFFSET + NUM_FACES * len(CARD_CHANNELS)
@@ -38,6 +40,24 @@ _RUN_FACES = tuple(tuple(suit * 13 + rank for rank in run)
                    for suit in range(4) for run in LEGAL_RUNS)
 _SET_FACES = tuple(tuple(suit * 13 + rank for suit in suits)
                    for rank in range(13) for suits in combinations(range(4), 3))
+_RANK_POINTS = (10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10)
+_ORDERED_RUNS = tuple(sorted(_RUN_FACES, key=lambda run: (
+    run[0] // 13, -sum(_RANK_POINTS[f % 13] for f in run), run[0] % 13,
+)))
+_RUN_PAIRS = tuple(sorted(
+    {tuple(sorted(pair)) for run in _RUN_FACES for pair in combinations(run, 2)},
+    key=lambda pair: (-sum(_RANK_POINTS[f % 13] for f in pair), pair),
+))
+_PURE_PAIRS = tuple(tuple(pair for pair in _RUN_PAIRS if joker not in pair) for joker in range(NUM_FACES))
+_WILD_PAIRS = tuple(tuple(sorted(
+    {pair for pair in _RUN_PAIRS if all(f % 13 != rank for f in pair)}
+    | {(a * 13 + r, b * 13 + r) for r in range(13) if r != rank
+       for a, b in combinations(range(4), 2)},
+    key=lambda pair: (-sum(_RANK_POINTS[f % 13] for f in pair), pair),
+)) for rank in range(13))
+_SET_RANKS = tuple(sorted(range(13), key=lambda rank: (-_RANK_POINTS[rank], rank)))
+_POINT_ORDER = tuple(sorted(range(NUM_FACES), key=lambda face: (-_RANK_POINTS[face % 13], face)))
+_RUN_STARTS = {run[0]: run for run in _RUN_FACES}
 
 
 @dataclass(frozen=True)
@@ -76,6 +96,85 @@ class Features:
     def __post_init__(self) -> None:
         if not isinstance(self.data, bytes) or len(self.data) != _RECORD.size:
             raise ValueError("features must contain %d bytes of little-endian float32 data" % _RECORD.size)
+
+
+def disjoint_pack(hand: Sequence[int], joker: int, required_sequences: int) -> tuple[int, int, int, int, list[int]]:
+    rem = list(hand)
+    pure_seqs = 0
+    for a, b, c in _ORDERED_RUNS:
+        if joker in (a, b, c):
+            continue
+        while rem[a] and rem[b] and rem[c]:
+            rem[a] -= 1
+            rem[b] -= 1
+            rem[c] -= 1
+            pure_seqs += 1
+            if c % 13 < 12 and c == b + 1:
+                nxt = c + 1
+                run = _RUN_STARTS.get(nxt)
+                starts = run is not None and rem[run[0]] and rem[run[1]] and rem[run[2]]
+                if nxt != joker and rem[nxt] and not starts:
+                    rem[nxt] -= 1
+    for face in range(NUM_FACES):
+        if face != joker:
+            while rem[face] >= 3:
+                rem[face] -= 3
+                pure_seqs += 1
+    for a, b, c in _ORDERED_RUNS:
+        if joker not in (a, b, c):
+            continue
+        while rem[a] and rem[b] and rem[c]:
+            rem[a] -= 1
+            rem[b] -= 1
+            rem[c] -= 1
+            pure_seqs += 1
+    while rem[joker]:
+        pair = next((pair for pair in _PURE_PAIRS[joker] if rem[pair[0]] and rem[pair[1]]), None)
+        if pair is not None:
+            rem[pair[0]] -= 1
+            rem[pair[1]] -= 1
+            rem[joker] -= 1
+            pure_seqs += 1
+        elif rem[joker] >= 2:
+            face = next((face for face in _POINT_ORDER if face != joker and rem[face]), None)
+            if face is None:
+                break
+            rem[face] -= 1
+            rem[joker] -= 2
+            pure_seqs += 1
+        else:
+            break
+    after_pure = list(rem)
+    pairs = sum(
+        ((a != joker and rem[a] > 0) + (b != joker and rem[b] > 0) + (c != joker and rem[c] > 0)) >= 2
+        for a, b, c in _RUN_FACES
+    )
+    rank, wilds = joker % 13, 0
+    for suit in range(4):
+        face = suit * 13 + rank
+        wilds += rem[face]
+        rem[face] = 0
+    for r in _SET_RANKS:
+        if r == rank:
+            continue
+        while True:
+            faces = [suit * 13 + r for suit in range(4) if rem[suit * 13 + r]]
+            if len(faces) < 3:
+                break
+            for face in faces:
+                rem[face] -= 1
+    while wilds:
+        pair = next((pair for pair in _WILD_PAIRS[rank] if rem[pair[0]] and rem[pair[1]]), None)
+        if pair is None:
+            break
+        rem[pair[0]] -= 1
+        rem[pair[1]] -= 1
+        wilds -= 1
+    points = sum(n * _RANK_POINTS[f % 13] for f, n in enumerate(rem) if n)
+    gated = points if pure_seqs >= required_sequences else sum(
+        n * _RANK_POINTS[f % 13] for f, n in enumerate(after_pure) if n and f % 13 != rank
+    )
+    return pure_seqs, gated, points, pairs, rem
 
 
 def _meld_membership(hand: Sequence[int], joker: int) -> tuple[list[int], list[int], list[int]]:
@@ -140,6 +239,8 @@ def encode(obs: Observation) -> Features:
         elif event.kind is EventKind.REFILL:
             refills += 1
     top_face, wild_rank = obs.discard_top, obs.joker % 13
+    required = cfg.required_sequences
+    base = disjoint_pack(hand, obs.joker, required)
     natural, pure, any_meld = _meld_membership(hand, obs.joker)
     raw_pts_sum, wild_cnt, unavoidable_dw = 0, 0, 0
     values = []
@@ -161,6 +262,7 @@ def encode(obs: Observation) -> Features:
              + int(hand[suit * 13 + (rank + 1) % 13] > 0)) / 2.0,
             sum(hand[other * 13 + rank] > 0 for other in range(4) if other != suit) / 3.0,
             natural[face], pure[face], any_meld[face],
+            base[4][face] / copies if copies else 0.0, 0.0, 0.0, 0.0,
         ))
     for seat in range(NUM_SEAT_SLOTS):
         if seat >= count:
@@ -189,6 +291,7 @@ def encode(obs: Observation) -> Features:
         cfg.required_sequences / 10.0, float(cfg.recycle_discard), count / 6.0, cfg.max_turns / 60.0,
         float(count == 1 and sum(obs.history[0].initial_hand) == cfg.cards_in_hand + 1),
         wild_cnt / (4 * decks), raw_pts_sum / 100.0, unavoidable_dw / (10.0 * cfg.cards_in_hand),
+        min(base[0], required) / max(1, required), base[1] / 100.0, 0.0, 0.0,
     ))
     legal = list(legal_action_mask(obs))
     if (
@@ -196,6 +299,35 @@ def encode(obs: Observation) -> Features:
         and last.actor == 0 and last.face is not None and sum(c > 0 for c in hand) > 1
     ):
         legal[2 + last.face] = False
+    if to_act and obs.phase is Phase.DISCARD:
+        for face, copies in enumerate(hand):
+            if not copies or not legal[2 + face]:
+                continue
+            after = list(hand)
+            after[face] -= 1
+            packed = disjoint_pack(after, obs.joker, required)
+            offset = face * len(CARD_CHANNELS)
+            values[offset + 19:offset + 22] = (
+                min(packed[0], required) - min(base[0], required),
+                (base[2] - packed[2]) / 10.0, (packed[3] - base[3]) / 3.0,
+            )
+    if to_act and obs.phase is Phase.DRAW and legal[1]:
+        plus = list(hand)
+        plus[top_face] += 1
+        best, best_key = None, None
+        for face, copies in enumerate(plus):
+            if not copies or face == top_face:
+                continue
+            plus[face] -= 1
+            packed = disjoint_pack(plus, obs.joker, required)
+            plus[face] += 1
+            key = (min(packed[0], required), -packed[2], packed[3], -packed[1])
+            if best_key is None or key > best_key:
+                best, best_key = packed, key
+        if best is not None:
+            values[CONTEXT_OFFSET + 20:CONTEXT_OFFSET + 22] = (
+                min(best[0], required) - min(base[0], required), (base[2] - best[2]) / 20.0,
+            )
     values.extend(float(allowed and to_act) for allowed in legal)
     values.append(float(NO_TOP if top_face is None else top_face))
     return Features(_RECORD.pack(*values))

@@ -25,7 +25,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--model",
         action="append",
         required=True,
-        help="checkpoint path or the sentinel 'random'; repeat once per seat",
+        help="checkpoint path, 'random', or 'heuristic'; repeat once per seat",
     )
     parser.add_argument("--games", type=_positive_int, required=True)
     parser.add_argument("--seed", type=int, default=0)
@@ -50,16 +50,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
-    policies: Tuple[runtime.Policy, ...] = tuple(
-        runtime.RandomPolicy()
-        if value == "random"
-        else runtime.CheckpointPolicy(value)
-        for value in args.model
-    )
-    labels = [
-        "random" if value == "random" else Path(value).stem
-        for value in args.model
-    ]
+    policies: Tuple[runtime.Policy, ...] = tuple(runtime.resolve_policy(value) for value in args.model)
+    labels = [Path(value).stem for value in args.model]
     config = runtime.MatchConfig(
         game=runtime.GameConfig(max_turns=args.max_turns),
         players=players,

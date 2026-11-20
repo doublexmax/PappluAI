@@ -54,7 +54,7 @@ runpy.run_path('tools/weights_export.py', run_name='__main__')
             document = json.loads(model.read_text())
             fixture = json.loads(golden.read_text())
             self.assertEqual(document["checkpointVersion"], 5)
-            self.assertEqual(document["encodingVersion"], 4)
+            self.assertEqual(document["encodingVersion"], 5)
             self.assertEqual(document["architecture"], "card_mlp")
             self.assertEqual(document["modelSpec"], {"width": 64, "blocks": 2})
             self.assertEqual(document["source"]["kind"], "bootstrap")
@@ -62,12 +62,12 @@ runpy.run_path('tools/weights_export.py', run_name='__main__')
             self.assertEqual(len(fixture["cases"]), 15)
             self.assertTrue(all(name.startswith("policy.") for name in document["tensors"]))
             self.assertEqual(document["source"]["tensorsSha256"], fixture["tensorsSha256"])
-            self.assertEqual(len(fixture["cases"][0]["features"]), 1063)
+            self.assertEqual(len(fixture["cases"][0]["features"]), 1275)
             self.assertEqual(fixture["featureLayout"], [
-                ["card", [52, 18]], ["seat", [6, 9]], ["context", [18]], ["legal", [54]], ["top", [1]],
+                ["card", [52, 22]], ["seat", [6, 9]], ["context", [22]], ["legal", [54]], ["top", [1]],
             ])
             self.assertEqual(
-                sum(len(base64.b64decode(entry["data"])) // 4 for entry in document["tensors"].values()), 126660,
+                sum(len(base64.b64decode(entry["data"])) // 4 for entry in document["tensors"].values()), 127172,
             )
 
     def test_legacy_heads_flag_is_rejected(self):
@@ -117,8 +117,8 @@ class TestReferenceExport(unittest.TestCase):
                 features = unpack(encode(replace(
                     obs, hand=tuple(cards.count(face) for face in range(52)), joker=7,
                 )))
-                extra = [row[13:] for row in rows(features["card"], 18)]
-                deadwood = features["context"][-1]
+                extra = [row[13:18] for row in rows(features["card"], 22)]
+                deadwood = features["context"][17]
                 for channel, expected in zip((2, 3, 4), (natural, pure, any_meld)):
                     self.assertEqual(tuple(face for face, row in enumerate(extra) if row[channel]), expected)
                 self.assertAlmostEqual(deadwood, expected_deadwood, places=7)

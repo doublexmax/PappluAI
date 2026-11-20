@@ -11,7 +11,7 @@ import torch
 from src.game.environment import GameConfig, Observation, legal_action_mask
 from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv, TerminalSnapshot
 from src.game.outcome import DealOutcome
-from src.model.encoding import Features, encode, legal_actions
+from src.model.encoding import CARD_CHANNELS, CONTEXT_OFFSET, Features, encode, feature_values, legal_actions
 from src.model.network import collate, greedy_actions, load_checkpoint
 
 
@@ -50,6 +50,53 @@ class RandomPolicy:
         if len(features) != len(rngs):
             raise ValueError("each feature row needs its own RNG")
         return [rng.choice(legal_actions(row)) for row, rng in zip(features, rngs)]
+
+
+_CARD_WIDTH = len(CARD_CHANNELS)
+
+
+def _next_wanted(values: Sequence[float], face: int, held: Sequence[int]) -> float:
+    if values[face * _CARD_WIDTH + 12]:
+        return 0.0
+    rank, suit, wanted = face % 13, face // 13, 0.0
+    for known in held:
+        other_rank = known % 13
+        if face == known or values[face * _CARD_WIDTH + 7] or values[known * _CARD_WIDTH + 7]:
+            weight = 1.0
+        elif suit == known // 13:
+            distance = abs(rank - other_rank)
+            if rank == 0 or other_rank == 0:
+                distance = min(distance, 13 - distance)
+            weight = 0.6 if distance == 1 else 0.3 if distance == 2 else 0.0
+        else:
+            weight = 0.5 if rank == other_rank else 0.0
+        wanted = max(wanted, weight)
+    return wanted
+
+
+class HeuristicPolicy:
+    def act(self, observation: Observation, rng: random.Random) -> int:
+        return self.act_features([encode(observation)], [rng])[0]
+
+    def act_features(self, features: Sequence[Features], rngs: Sequence[random.Random]) -> list[int]:
+        if len(features) != len(rngs):
+            raise ValueError("each feature row needs its own RNG")
+        result = []
+        for row in features:
+            values, legal = feature_values(row), legal_actions(row)
+            if values[CONTEXT_OFFSET]:
+                gain, points = values[CONTEXT_OFFSET + 20:CONTEXT_OFFSET + 22]
+                take = gain >= 1.0 or gain >= 0.0 and points >= 0.30
+                result.append(1 if take and 1 in legal else 0 if 0 in legal else 1)
+            else:
+                held = [face for face in range(52) if values[face * _CARD_WIDTH + 10] > 0]
+                result.append(max(legal, key=lambda action: (
+                    values[(action - 2) * _CARD_WIDTH + 19],
+                    values[(action - 2) * _CARD_WIDTH + 20]
+                    + 0.35 * values[(action - 2) * _CARD_WIDTH + 21]
+                    - 0.4 * _next_wanted(values, action - 2, held),
+                )))
+        return result
 
 
 class GreedyPolicy:
@@ -98,6 +145,11 @@ class CheckpointPolicy(GreedyPolicy):
         network.eval()
         self._network = network
         self._game_config = game_config
+
+
+def resolve_policy(model: str) -> Policy:
+    builtins = {"random": RandomPolicy, "heuristic": HeuristicPolicy}
+    return builtins[model]() if model in builtins else CheckpointPolicy(model)
 
 
 class EpsilonPolicy(GreedyPolicy):

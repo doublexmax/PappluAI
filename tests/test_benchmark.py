@@ -57,10 +57,14 @@ class TestEvaluation(unittest.TestCase):
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(17)
                 network = QNetwork(ModelSpec(8, 1))
+            with torch.no_grad():
+                for parameter in network.parameters():
+                    parameter.zero_()
+                network.policy.draw_out.bias[0] = 1.0
             config = GameConfig(max_turns=1)
             with mock.patch.object(network, "forward", wraps=network.forward) as forward:
                 greedy = evaluate_games(network, config, 35, 600000)
-            self.assertEqual(greedy, PolicyResults((0,) * 35, 34, 1))
+            self.assertEqual(greedy, PolicyResults((0,) * 35, 35, 0))
             self.assertEqual([call.args[0].card.shape[0] for call in forward.call_args_list], [32, 32, 3, 3])
             self.assertEqual(
                 evaluate_games(network, config, 35, 600000, policy="random"),
@@ -80,11 +84,15 @@ class TestEvaluation(unittest.TestCase):
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(17)
                 network = QNetwork(ModelSpec(8, 1))
+            with torch.no_grad():
+                for parameter in network.parameters():
+                    parameter.zero_()
+                network.policy.draw_out.bias[0] = 1.0
             config = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=3)
             greedy = evaluate_games(network, config, 35, 600000, warm_start=True)
             self.assertEqual(greedy, PolicyResults((
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0,
+                0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1,
             ), 0, 0))
             random_policy = evaluate_games(network, config, 35, 600000, "random", True)
             self.assertEqual(random_policy, PolicyResults((
@@ -92,7 +100,7 @@ class TestEvaluation(unittest.TestCase):
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0,
             ), 0, 0))
             ordinary = evaluate_games(network, config, 35, 600000)
-            self.assertEqual(ordinary, PolicyResults((0,) * 35, 105, 0))
+            self.assertEqual(ordinary, PolicyResults(tuple(int(index in (9, 26)) for index in range(35)), 103, 0))
         finally:
             torch.set_num_threads(previous_threads)
 

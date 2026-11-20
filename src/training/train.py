@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from src.checkpoints.io import atomic_copy, atomic_write_json
 from src.checkpoints.tensor import atomic_torch_save, clone_model_state, validate_model_state
-from src.evaluation.arena import CheckpointPolicy, Deal, EpsilonPolicy, GreedyPolicy, RandomPolicy, run_matches
+from src.evaluation.arena import CheckpointPolicy, Deal, EpsilonPolicy, GreedyPolicy, HeuristicPolicy, RandomPolicy, run_matches
 from src.evaluation.benchmark import evaluate_games
 from src.game.environment import GameConfig, PappluEnv
 from src.game.multiplayer import MatchConfig
@@ -26,7 +26,7 @@ from src.model.network import ObservationBatch, QNetwork, checkpoint_payload, lo
 from src.model.spec import ModelSpec
 
 
-STATE_VERSION = 7
+STATE_VERSION = 8
 VALIDATION_SEED = 30_000_001
 
 
@@ -51,16 +51,17 @@ class TrainConfig:
     round_episodes: int = 16
     updates_per_episode: int = 4
     batch_size: int = 128
-    replay_capacity: int = 50_000
+    replay_capacity: int = 40_000
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
-    gamma: float = 0.99
+    gamma: float = 0.98
+    margin_weight: float = 0.50
     grad_clip: float = 1.0
     epsilon_start: float = 0.30
     epsilon_end: float = 0.05
     epsilon_decay_episodes: int = 10_000
     actors: int = 1
-    self_play_share: float = 0.75
+    self_play_share: float = 0.50
     max_pool: int = 8
     validate_every: int = 1_000
     validation_games: int = 64
@@ -86,7 +87,7 @@ class TrainConfig:
         ):
             if type(getattr(self, name)) is not int or getattr(self, name) < low:
                 raise ValueError("%s must be an integer >= %d" % (name, low))
-        for name in ("learning_rate", "weight_decay", "gamma", "grad_clip", "epsilon_start", "epsilon_end", "self_play_share"):
+        for name in ("learning_rate", "weight_decay", "gamma", "margin_weight", "grad_clip", "epsilon_start", "epsilon_end", "self_play_share"):
             value = getattr(self, name)
             high = 1.0 if name in ("gamma", "epsilon_start", "epsilon_end", "self_play_share") else math.inf
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= high:
@@ -200,8 +201,17 @@ class Learner:
             fields["top"] = fields["top"].squeeze(-1).long()
             actions = self.replay.actions[idx].to(self.device)
             targets = self.replay.returns[idx].to(self.device)
-            q = self.online(ObservationBatch(**fields)).gather(1, actions[:, None]).squeeze(1)
-            loss = F.smooth_l1_loss(q, targets)
+            q_all = self.online(ObservationBatch(**fields))
+            q_taken = q_all.gather(1, actions[:, None]).squeeze(1)
+            mc_loss = F.smooth_l1_loss(q_taken, targets)
+            if self.config.margin_weight > 0:
+                margin = torch.where(fields["legal"] > 0, 0.10, -1e9)
+                margin.scatter_(1, actions[:, None], 0.0)
+                win_mask = (targets > 0).to(q_all.dtype)
+                margin_loss = (((q_all + margin).amax(dim=1) - q_taken) * win_mask).sum() / win_mask.sum().clamp_min(1.0)
+                loss = mc_loss + self.config.margin_weight * margin_loss
+            else:
+                loss = mc_loss
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.online.parameters(), self.config.grad_clip, error_if_nonfinite=True)
@@ -227,7 +237,7 @@ class Learner:
 
 def collect_round(config: TrainConfig, online: QNetwork, pool: Sequence[str], start: int, count: int, epsilon: float) -> list[Trajectory]:
     learner = EpsilonPolicy(online, epsilon)
-    policies = [learner, RandomPolicy(), *(CheckpointPolicy(path) for path in pool[-config.max_pool:])]
+    policies = [learner, HeuristicPolicy(), RandomPolicy(), *(CheckpointPolicy(path) for path in pool[-config.max_pool:])]
     solos, deals, trajectories = [], [], []
     for episode in range(start, start + count):
         players = config.player_counts[episode % len(config.player_counts)]
@@ -240,8 +250,8 @@ def collect_round(config: TrainConfig, online: QNetwork, pool: Sequence[str], st
             deals.append(Deal(seed, (0,) * players, players, frozenset(range(players))))
         else:
             seat = rng.randrange(players)
-            seats = tuple(0 if s == seat else rng.randrange(1, len(policies)) for s in range(players))
-            deals.append(Deal(seed, seats, players, frozenset((seat,))))
+            seats = tuple(0 if s == seat else 1 if rng.random() < 0.5 else rng.randrange(1, len(policies)) for s in range(players))
+            deals.append(Deal(seed, seats, players, frozenset(range(players))))
     while any(not row[1].done for row in solos):
         active = [row for row in solos if not row[1].done]
         features = [encode(row[1]) for row in active]
@@ -279,7 +289,7 @@ def _validation_job(job: tuple) -> tuple[str, float]:
     players = deals[0].players
     if players == 1:
         return key, sum(evaluate_games(online, cfg.game, len(deals), deals[0].seed, seed_stride=2).outcomes)
-    results = run_matches(deals, [GreedyPolicy(online), CheckpointPolicy(opponent) if opponent else RandomPolicy()], cfg.game)
+    results = run_matches(deals, [GreedyPolicy(online), opponent], cfg.game)
     return key, sum(
         (1 + result.outcome.margin(deal.seats.index(0), other)) / 2
         for deal, result in zip(deals, results) for other in range(players) if deal.seats[other] != 0
@@ -353,10 +363,10 @@ class Trainer:
         cfg, online = self.config, self.learner.online.eval()
         if cfg.actors > 1 and self._executor is None:
             self._executor = ProcessPoolExecutor(max_workers=cfg.actors, initializer=_actor_init)
-        opponents = {"random": None, "initial": str(self.root / "initial-model.pt"), "best": str(self.root / "best-model.pt")}
+        opponents = (("heuristic", HeuristicPolicy()), ("best", CheckpointPolicy(str(self.root / "best-model.pt"))))
         cases = [("solo", 1, None)] if 1 in cfg.player_counts else []
         cases += [("%dp_%s" % (players, name), players, path)
-                  for players in cfg.player_counts if players > 1 for name, path in opponents.items()]
+                  for players in cfg.player_counts if players > 1 for name, path in opponents]
         jobs, state = [], clone_model_state(online.state_dict())
         for key, players, opponent in cases:
             seed = VALIDATION_SEED + (2 * players * cfg.validation_games if players > 1 else 0)
@@ -370,10 +380,11 @@ class Trainer:
         anchors = [value for key, value in metrics.items() if not key.endswith("_best")]
         score = sum(anchors) / len(anchors)
         best = [value for key, value in metrics.items() if key.endswith("_best")]
-        promoted = score >= self.best_score
         if best:
             metrics["vs_best"] = sum(best) / len(best)
-            promoted = self.best_score < 0 or (metrics["vs_best"] > 0.51 and score >= self.best_score - 0.03)
+        promoted = self.best_score < 0 or (
+            metrics.get("vs_best", 0) > 0.50 and score >= self.best_score - 0.02
+        ) or score > self.best_score + 0.02
         if promoted:
             self.best_score = max(self.best_score, score) if best else score
             self.export_model(self.root / "best-model.pt")

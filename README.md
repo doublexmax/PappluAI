@@ -181,21 +181,25 @@ The [training guide](TRAINING.md) covers setup, self-play, resume, evaluation, a
 
 ### Observation encoding
 
-`encode` returns 1,063 little-endian float32 values, or 4,252 bytes.
-Encoding version 4 uses the following layout.
+`encode` returns 1,275 little-endian float32 values, or 5,100 bytes.
+Encoding version 5 uses the following layout.
 
 | Field | Shape | Float offset |
 | --- | --- | --- |
-| `card` | 52 by 18 | 0 |
-| `seat` | 6 by 9 | 936 |
-| `context` | 18 | 990 |
-| `legal` | 54 | 1008 |
-| `top` | 1 | 1062 |
+| `card` | 52 by 22 | 0 |
+| `seat` | 6 by 9 | 1144 |
+| `context` | 22 | 1198 |
+| `legal` | 54 | 1220 |
+| `top` | 1 | 1274 |
 
 The card channels contain own copies, pile copies, top and indicator flags, wild flags, points, and visible opponent activity.
 Five further channels describe `adjacent`, `set_mates`, `natural`, `pure`, and `any_meld`.
-The context includes `unavoidable_dw`.
-The encoder computes meld membership once, without an exact hand search.
+Four disjoint-packing channels add `spare_frac`, `disc_pseq_delta`, `disc_pts_saved`, and `disc_pairs_delta`.
+The context adds `disjoint_pseq_frac`, `disjoint_gated_pts`, `top_gain_pseq`, and `top_gain_pts` alongside `unavoidable_dw`.
+The deterministic pack spends each card and joker at most once.
+It preserves the 2 after Q-K-A and splits six-card runs when possible.
+Packing is a greedy feature estimate, not the exact declaration or penalty search.
+Legal discard and top-card exchange candidates use the same pack.
 Seats are relative to the observer. Unused seat slots are zero.
 No feature contains hidden opponent hands or stock order.
 
@@ -206,7 +210,7 @@ Training, solo evaluation, arena policies, and browser inference use this encodi
 
 ### Neural network
 
-`PolicyNet` embeds the 18 card channels and 72 table inputs.
+`PolicyNet` embeds the 22 card channels and 76 table inputs.
 Residual `CardBlock` modules mix neighboring ranks, matching ranks, suits, and table context.
 The rank strip is `[A, 2, ..., K, A]`.
 Shared normalization and mean and max pooling update the table representation.
@@ -214,31 +218,39 @@ The draw and face heads produce 54 advantages.
 A value head and legal-action centering produce Q-values.
 There are no auxiliary heads, target network, or meld computations inside the network.
 
-`ModelSpec(64, 2)` has 126,660 parameters.
-`ModelSpec(128, 3)` has 672,388 parameters.
+`ModelSpec(64, 2)` has 127,172 parameters.
+`ModelSpec(128, 3)` has 673,412 parameters.
 Python and Node tests compare nonzero exported weights at both sizes within `1e-5` for all 54 actions.
 Browser forward computation uses flat Float32 buffers.
 
 ### DMC learning
 
 The trainer cycles cold deals across one, two, three, and four players by default.
-On 75% of multiplayer deals, every seat uses the current epsilon-greedy network and contributes a trajectory.
-The remaining deals record one learner seat against uniform random and frozen snapshot opponents.
+On 50% of multiplayer deals, every seat uses the current epsilon-greedy network.
+The remaining deals place one learner seat against a feature-only `HeuristicPolicy`, uniform random, and frozen snapshot opponents.
+The heuristic receives at least half the opponent probability.
+Every seat contributes its own outcome and trajectory, including opponent wins and losses.
+Solo deals always use the learner.
 The active snapshot pool holds at most eight checkpoints.
 
 Replay stores contiguous float32 features, int64 actions, and float32 discounted returns.
-For terminal utility `u`, step `t` of a length-`T` trajectory targets `u * 0.99 ** (T - 1 - t)`.
+Replay retains the most recent 40,000 steps.
+For terminal utility `u`, step `t` of a length-`T` trajectory targets `u * 0.98 ** (T - 1 - t)`.
 AdamW fits selected-action Q-values with Smooth-L1 loss and gradient clipping.
-There is no warm-start curriculum, opponent prioritization, registry, or promotion gate.
+Winning trajectories also rank their taken action above other legal actions with a DQfD margin of 0.10 and default weight 0.50.
+`--margin-weight 0` disables the margin term.
+There is no warm-start curriculum, target network, or registry.
 
-A solo declaration earns +1.
-A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`.
-Multiplayer utility averages pairwise placement margins.
-A pair involving a declarer has weight 1. Other pairs have weight 0.5.
-The declarer earns +1. The best exhausted hand earns at most +0.5.
+Solo and multiplayer use the same declaration-first utility.
+A valid declaration earns +1.
+Losing to a declaration earns `-0.5 - 0.5 * min(p, 100) / 100`, where `p` is the seat's penalty.
+Without a declaration, utility is `-0.5 + 0.4 * seq_frac - 0.3 * min(p, 100) / 100`.
+`seq_frac` caps qualifying sequences at the required quota and equals 1 when no sequences are required.
+Exhaustion always earns negative utility, even for zero penalty.
+Validation compares against the fixed heuristic and reigning best checkpoint.
 
-Model checkpoints use version 5 and encoding version 4.
-Trainer state uses version 7.
+Model checkpoints use version 5 and encoding version 5.
+Trainer state uses version 8.
 Older encodings and trainer states require a fresh run.
 Bootstrap weights and short smoke runs do not establish competitive strength.
 

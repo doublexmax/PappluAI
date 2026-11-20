@@ -1,4 +1,5 @@
 import copy
+from dataclasses import replace
 import unittest
 
 from src.game.environment import GameConfig, PappluEnv
@@ -91,6 +92,31 @@ class TestDMCLearner(unittest.TestCase):
         self.assertEqual((stats.updates, stats.samples, learner.step_count, learner.update_count), (32, 256, 8, 32))
         self.assertGreaterEqual(stats.loss, 0)
         self.assertEqual(learner.replay.features[:8].tolist(), [list(feature_values(f)) for f in self.features])
+
+    def test_winning_margin_ranks_taken_actions_above_only_legal_alternatives(self):
+        class ActionValues(torch.nn.Module):
+            def __init__(self, target):
+                super().__init__()
+                self.q = torch.nn.Parameter(torch.tensor([target, target - 0.05] + [100.0] * 52))
+
+            def forward(self, batch):
+                return self.q.expand(batch.legal.shape[0], -1)
+
+        for utility in (1.0, -1.0, 0.0):
+            for weight in (0.0, 0.5):
+                with self.subTest(utility=utility, weight=weight):
+                    network = ActionValues(utility)
+                    before = network.q.detach().clone()
+                    learner = Learner(network, replace(self.config, margin_weight=weight))
+                    stats = learner.learn([Trajectory((Step(self.features[0], 0),), utility)])
+                    expected = 0.05 * weight if utility > 0 else 0.0
+                    self.assertAlmostEqual(stats.loss, expected, places=7)
+                    if expected:
+                        self.assertGreater(network.q[0].item(), utility)
+                        self.assertLess(network.q[1].item(), before[1].item())
+                        torch.testing.assert_close(network.q[2:], before[2:], rtol=0, atol=0)
+                    else:
+                        torch.testing.assert_close(network.q, before, rtol=0, atol=0)
 
     def test_state_restores_optimizer_replay_and_sampling_for_exact_continuation(self):
         learner = Learner(self.network, self.config, seed=19)

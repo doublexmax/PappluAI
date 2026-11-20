@@ -36,7 +36,7 @@ The directory contains these outputs.
 | `latest-model.pt` | Current network weights and game settings. |
 | `best-model.pt` | Selected validation checkpoint, or the initial model before the first validation. |
 | `latest-state.pt` | Network, AdamW state, compressed replay, sampling RNG, counters, configuration, and snapshot paths. |
-| `initial-model.pt` | Frozen starting weights used by validation. |
+| `initial-model.pt` | Frozen starting weights in the initial opponent pool. |
 | `opponents/` | Imported opponents, selected best snapshots, and periodic strong-policy snapshots. |
 | `status.json` | Saved counters, validation results, active snapshots, and stop reason. |
 | `metrics.jsonl` | One record per completed training round. |
@@ -74,16 +74,27 @@ Use a new directory so the smoke cap does not carry into training.
 
 The defaults use three decks, 21 cards, five required pure sequences, and 60 turns per seat.
 The trainer cycles `--players 1 2 3 4`.
-It uses `ModelSpec(64, 2)`, `gamma=0.99`, a 50,000-step replay, and batches of at most 128 steps.
+It uses `ModelSpec(64, 2)`, `gamma=0.98`, a 40,000-step replay, and batches of at most 128 steps.
 Each completed deal schedules four learner updates by default. Use `--updates-per-episode` to change that count.
+Positive-return declaration trajectories add a 0.10 legal-action margin to the Smooth-L1 objective.
+`--margin-weight` defaults to 0.50. Set it to zero to train without the margin.
 Epsilon decreases from 0.30 to 0.05 over 10,000 deals. Use `--epsilon-decay-episodes` to change the decay length.
 The trainer holds epsilon fixed within each 16-deal round.
 
 Every deal starts cold.
-There are no solved-hand warm starts, curriculum stages, priority opponent weights, or promotion state machines.
-On each multiplayer deal, self-play has probability 0.75.
-Every self-play seat contributes its own terminal utility and trajectory.
-Other deals place the learner in a random seat against uniform choices from RandomPolicy and the active snapshot pool.
+There are no solved-hand warm starts or curriculum stages.
+On each multiplayer deal, self-play has probability 0.50.
+Other deals place the learner in a random seat against `HeuristicPolicy`, `RandomPolicy`, and the active snapshot pool.
+Each opponent seat chooses the heuristic with probability 0.50, then otherwise samples uniformly from all opponents, including the heuristic.
+Every seat contributes its own terminal utility and trajectory in both modes.
+Solo deals always use the learner.
+The heuristic reads cached disjoint-packing features without exact penalty backtracking.
+It is a sparring policy, not part of `PolicyNet` or the browser's greedy neural ranking.
+
+Declaring earns +1.
+Losing to another declaration earns between -1 and -0.5 according to capped penalty points.
+Exhaustion earns between -0.8 and -0.1 according to qualifying sequences and capped penalty points.
+The same objective applies to solo and multiplayer. See the [utility formulas](README.md#dmc-learning).
 
 Continue the run with a larger absolute episode limit.
 
@@ -124,7 +135,7 @@ If the host has a CUDA-capable Torch installation, select the learner device.
 ```
 
 Rollout workers remain on CPU. Replay stays on CPU.
-The default replay allocates about 203 MiB before Python and optimizer overhead.
+The default replay allocates about 195 MiB before Python and optimizer overhead.
 Checkpoint compression reduces saved bytes, not the live replay allocation.
 Use `--replay-capacity` to set the memory budget when starting a run.
 
@@ -141,8 +152,8 @@ Start a larger network in a fresh directory.
 .\.venv\Scripts\python -m src.cli.train --output-dir runs\wide --width 128 --blocks 3 --max-episodes 10000
 ```
 
-The default 64-by-2 model has 126,660 parameters.
-The 128-by-3 model has 672,388.
+The default 64-by-2 model has 127,172 parameters.
+The 128-by-3 model has 673,412.
 Both use the same encoding and browser inference implementation.
 
 To keep weights but start new replay and AdamW state, supply an initial checkpoint.
@@ -161,7 +172,7 @@ Resume restores the recipe rather than changing it.
 The CLI allows `--actors`, `--device`, and `--torch-threads` changes on resume.
 The Python API also allows `checkpoint_every` changes.
 Other changed settings fail before training.
-Encoding versions before 4 and trainer state versions before 7 require a fresh run.
+Encoding versions before 5 and trainer state versions before 8 require a fresh run.
 
 ## Inspect validation
 
@@ -171,34 +182,35 @@ Set it to zero only to disable validation for a bounded diagnostic run.
 
 Solo validation measures cold greedy declarations when solo is in `--players`.
 For every configured multiplayer count, validation rotates the learner through every seat on every seed.
-It compares against RandomPolicy, the frozen initial checkpoint, and the reigning `best-model.pt`.
+It compares against `HeuristicPolicy` and the reigning `best-model.pt`.
 A pairwise placement win earns 1, a tie earns 0.5, and a loss earns 0.
 Other losing seats still compare their final deadwood penalties after a declaration.
 
 The validation `score` is the unweighted mean of the solo rate and each fixed multiplayer opponent rate.
-For the default counts, those are seven rates.
+For the default counts, those are four rates, solo and `2p_heuristic`, `3p_heuristic`, and `4p_heuristic`.
 The score lies in `[0, 1]`.
 Training seeds are even and validation seeds are odd, so those deal seeds do not overlap.
-Validation reuses fixed seeds and the same initial opponent across the run.
+Validation reuses fixed seeds and the same heuristic across the run.
 
 Each `Xp_best` rate measures head-to-head placement credit against the reigning best for that player count.
 `vs_best` is their unweighted mean and does not enter the fixed-anchor `score`.
 With multiplayer enabled, the first validation selects the current network.
-Later validations replace `best-model.pt` only when `vs_best > 0.51` and `score >= best_score - 0.03`.
+Later validations replace `best-model.pt` when `vs_best > 0.50` and `score >= best_score - 0.02`.
+An anchor score above `best_score + 0.02` also promotes, regardless of `vs_best`.
 `best_score` retains the highest fixed-anchor score among promoted models.
-For solo-only runs, a score at least as high as `best_score` replaces the best checkpoint.
+Solo-only runs use the anchor-improvement rule after their first validation.
 Every validation records `promoted` as a boolean.
 
 On promotion, the trainer copies the best checkpoint to `opponents/best-<episode>.pt`.
 Without promotion, `vs_best >= 0.45` saves the current network as `opponents/snap-<episode>.pt`.
 Snapshot names pad the episode count to 12 digits.
 The active pool retains the latest eight snapshots by default.
-Older snapshot files remain on disk but no longer enter the active pool. `initial-model.pt` remains available for validation.
+Older snapshot files remain on disk but no longer enter the active pool.
 The current network can regress between validations.
 The selected validation score is not a rating or proof of strength against unseen opponents.
 
 Read `status.json` for the latest saved selection.
-Read `metrics.jsonl` for each round's episode count, epsilon, trajectory count, Smooth-L1 loss, updates, samples, and optional validation.
+Read `metrics.jsonl` for each round's episode count, epsilon, trajectory count, combined learning loss, updates, samples, and optional validation.
 `latest-state.pt` compresses tensor bytes with zlib and restores them without NumPy.
 With one actor, splitting at the same round boundary preserves model, optimizer, replay, and sampling exactly.
 Changing the actor count can change batch composition and learning order.
@@ -213,7 +225,7 @@ Use additional evaluation seeds rather than selecting against the same validatio
 ```
 
 Repeat `--model` for each additional arena seat.
-Use another checkpoint instead of `random` to compare against a frozen policy.
+Use `--model heuristic` for the fixed sparring policy, or supply another checkpoint for a frozen neural opponent.
 Keep the game rules and turn cap the same across comparisons.
 Optional `--warm-games` and `--sensitivity` test discard puzzles only.
 Puzzle results do not replace cold-game evidence and never enter training.
@@ -255,6 +267,7 @@ Fresh runs use the defaults described above. Resume restores saved settings unle
 | `--replay-capacity` | Maximum replay steps in memory. |
 | `--learning-rate` | AdamW learning rate. |
 | `--gamma` | Terminal-return discount factor. |
+| `--margin-weight` | Nonnegative winning-trajectory margin weight. Zero disables it. |
 | `--epsilon-decay-episodes` | Deals over which epsilon decreases. Zero selects the final epsilon immediately. |
 | `--self-play-share` | Probability that every seat uses the learner. |
 | `--validate-every` | Completed-deal interval between validations. |

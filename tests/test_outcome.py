@@ -1,27 +1,29 @@
 from __future__ import annotations
 
-import random
 from itertools import product
 import unittest
 
-from src.evaluate import HandPenalty, card_points
+from src.evaluate import HandPenalty, Meld, card_points
 from src.game.multiplayer import MatchConfig, MultiplayerEnv, TerminalSnapshot
 from src.game.outcome import DealOutcome, placements, solo_outcome
 
 
 class TestDealOutcome(unittest.TestCase):
     @staticmethod
-    def outcome(points, winner=None):
+    def outcome(points, winner=None, sequences=None, required_sequences=5):
+        sequences = sequences if sequences is not None else (0,) * len(points)
+        sequence = Meld("sequence", (0, 1, 2), (0, 1, 2), True)
         return DealOutcome(winner, "win" if winner is not None else "turns_exhausted", tuple(
-            HandPenalty(point, (), (0,) * 52) for point in points
-        ))
+            HandPenalty(point, (sequence,) * count, (0,) * 52)
+            for point, count in zip(points, sequences)
+        ), required_sequences)
 
-    def test_declarer_wins_and_tied_losers_split_pairwise_utility(self):
+    def test_declarer_wins_without_changing_ranks_or_margins(self):
         outcome = self.outcome((0, 20, 20, 130), 0)
         self.assertEqual(outcome.ranks(), (1, 2, 2, 4))
         self.assertEqual(
             tuple(outcome.seat(seat).utility for seat in range(4)),
-            (1.0, -1 / 6, -1 / 6, -2 / 3),
+            (1.0, -0.6, -0.6, -1.0),
         )
         self.assertEqual(outcome.margin(0, 3), 1)
         self.assertEqual(outcome.margin(3, 0), -1)
@@ -30,39 +32,68 @@ class TestDealOutcome(unittest.TestCase):
         self.assertEqual(outcome.seat(3).penalty, 130)
         self.assertEqual(placements((0, 0, 20), 0, "win", "points"), (1, 2, 3))
 
-    def test_multiplayer_utility_is_zero_sum_for_every_tie_pattern(self):
-        rng = random.Random(13)
-        for players in range(2, 7):
-            for _ in range(50):
-                points = [rng.choice((0, 20, 20, 80, 130)) for _ in range(players)]
-                for winner in (None, rng.randrange(players)):
-                    if winner is not None:
-                        points[winner] = 0
-                    outcome = self.outcome(points, winner)
-                    self.assertAlmostEqual(sum(outcome.seat(seat).utility for seat in range(players)), 0.0, places=12)
+    def test_opponent_declaration_penalties_are_monotonic_and_capped(self):
+        for players in (2, 3, 4):
+            for winner in range(players):
+                utilities = []
+                for points, expected in ((0, -0.5), (3, -0.515), (40, -0.7), (100, -1.0), (140, -1.0)):
+                    penalties = [points] * players
+                    penalties[winner] = 0
+                    outcome = self.outcome(penalties, winner, (5,) * players)
+                    self.assertEqual(outcome.seat(winner).utility, 1.0)
+                    for seat in range(players):
+                        if seat == winner:
+                            continue
+                        with self.subTest(players=players, winner=winner, seat=seat, points=points):
+                            result = outcome.seat(seat)
+                            self.assertAlmostEqual(result.utility, expected, places=12)
+                            self.assertLessEqual(result.utility, -0.5)
+                            self.assertFalse(result.won)
+                            self.assertEqual(result.penalty, points)
+                    utilities.append(outcome.seat((winner + 1) % players).utility)
+                self.assertEqual(utilities, sorted(utilities, reverse=True))
+                self.assertEqual(utilities[-2:], [-1.0, -1.0])
 
-    def test_solo_losses_order_deadwood_below_every_declaration(self):
-        self.assertEqual(self.outcome((0,), 0).seat(0).utility, 1.0)
-        self.assertEqual(self.outcome((0,)).seat(0).utility, -0.5)
+    def test_exhausted_utilities_are_strictly_negative_and_capped(self):
+        for players in (1, 2, 3, 4):
+            for sequences, expected in (
+                (0, (-0.5, -0.62, -0.8, -0.8)),
+                (1, (-0.42, -0.54, -0.72, -0.72)),
+                (5, (-0.1, -0.22, -0.4, -0.4)),
+                (6, (-0.1, -0.22, -0.4, -0.4)),
+            ):
+                for points, utility in zip((0, 40, 100, 140), expected):
+                    outcome = self.outcome((points,) * players, sequences=(sequences,) * players)
+                    for seat in range(players):
+                        with self.subTest(players=players, sequences=sequences, points=points, seat=seat):
+                            result = outcome.seat(seat)
+                            self.assertAlmostEqual(result.utility, utility, places=12)
+                            self.assertTrue(-0.8 <= round(result.utility, 12) <= -0.1)
+                            self.assertLess(result.utility, 0.0)
+                            self.assertFalse(result.won)
+                            self.assertEqual(result.penalty, points)
         self.assertEqual(self.outcome((0,)).ranks(), (1,))
-        losses = [self.outcome((points,)).seat(0) for points in (3, 40, 140)]
-        for result, expected in zip(losses, (-23 / 43, -0.75, -8 / 9)):
-            self.assertAlmostEqual(result.utility, expected, places=12)
-            self.assertFalse(result.won)
-        self.assertEqual([result.penalty for result in losses], [3, 40, 140])
-        self.assertGreater(losses[0].utility, losses[1].utility)
-        self.assertGreater(losses[1].utility, losses[2].utility)
-        self.assertTrue(all(-1.0 < result.utility <= -0.5 for result in losses))
 
-    def test_deadwood_winner_gets_half_credit_without_changing_margins(self):
-        outcome = self.outcome((3, 21, 42, 63))
-        self.assertEqual(outcome.ranks(), (1, 2, 3, 4))
-        self.assertEqual(
-            tuple(outcome.seat(seat).utility for seat in range(4)),
-            (0.5, 1 / 6, -1 / 6, -0.5),
-        )
-        self.assertEqual(tuple(outcome.margin(0, other) for other in (1, 2, 3)), (1, 1, 1))
+    def test_sequences_beat_low_point_hoarding_on_exhaustion(self):
+        outcome = self.outcome((0, 100), sequences=(0, 5))
+        self.assertAlmostEqual(outcome.seat(0).utility, -0.5, places=12)
+        self.assertAlmostEqual(outcome.seat(1).utility, -0.4, places=12)
+        self.assertGreater(outcome.seat(1).utility, outcome.seat(0).utility)
+        self.assertEqual(outcome.ranks(), (1, 2))
+        self.assertEqual(outcome.margin(0, 1), 1)
         self.assertFalse(outcome.seat(0).won)
+
+    def test_exhausted_utility_uses_required_sequences(self):
+        outcome = self.outcome((0, 0, 0, 0), sequences=(0, 1, 2, 3), required_sequences=2)
+        for seat, expected in enumerate((-0.5, -0.3, -0.1, -0.1)):
+            self.assertAlmostEqual(outcome.seat(seat).utility, expected, places=12)
+        default = DealOutcome(None, "turns_exhausted", outcome.penalties)
+        self.assertAlmostEqual(default.seat(1).utility, -0.42, places=12)
+
+    def test_zero_required_sequences_gives_full_sequence_credit(self):
+        outcome = self.outcome((0, 40, 100, 140), sequences=(0, 1, 5, 6), required_sequences=0)
+        for seat, expected in enumerate((-0.1, -0.22, -0.4, -0.4)):
+            self.assertAlmostEqual(outcome.seat(seat).utility, expected, places=12)
 
     def test_an_opponent_declaration_never_improves_a_non_declarers_utility(self):
         for count in (2, 3, 4):
@@ -77,24 +108,50 @@ class TestDealOutcome(unittest.TestCase):
                         result = declared.seat(seat)
                         self.assertTrue(-1.0 <= result.utility <= 1.0)
                         if seat != winner:
-                            self.assertLess(result.utility, exhausted.seat(seat).utility)
+                            self.assertLessEqual(result.utility, exhausted.seat(seat).utility)
 
     def test_score_uses_minimum_penalty_for_each_final_hand(self):
         hands = (
             tuple(int(face in (0, 1, 2)) for face in range(52)),
             tuple(int(face in (0, 1, 12)) for face in range(52)),
         )
-        outcome = DealOutcome.score(TerminalSnapshot(hands, 7), 0, "win", 1)
+        snapshot = TerminalSnapshot(hands, 7)
+        outcome = DealOutcome.score(snapshot, 0, "win", 1)
         self.assertEqual(tuple(penalty.points for penalty in outcome.penalties), (0, 22))
-        self.assertEqual(tuple(outcome.seat(seat).utility for seat in range(2)), (1.0, -1.0))
+        self.assertEqual(outcome.required_sequences, 1)
+        self.assertEqual(tuple(outcome.seat(seat).utility for seat in range(2)), (1.0, -0.61))
+        exhausted = DealOutcome.score(snapshot, None, "turns_exhausted", 1)
+        self.assertAlmostEqual(exhausted.seat(0).utility, -0.1, places=12)
+        self.assertAlmostEqual(exhausted.seat(1).utility, -0.566, places=12)
 
-    def test_solo_helper_keeps_zero_penalty_losses_distinct_from_declarations(self):
+    def test_solo_helper_matches_the_deal_objective(self):
         natural = tuple(int(face in (0, 1, 2)) for face in range(52))
-        wildcards = tuple(3 if face == 7 else 0 for face in range(52))
-        declared = solo_outcome(natural, 7, True, 1)
-        incomplete = solo_outcome(wildcards, 7, False, 1)
-        self.assertEqual((declared.utility, declared.won, declared.penalty), (1.0, True, 0))
-        self.assertEqual((incomplete.utility, incomplete.won, incomplete.penalty), (-0.5, False, 0))
+        wildcard = tuple(int(face == 7) for face in range(52))
+        deadwood = tuple(int(face in (0, 1, 12)) for face in range(52))
+        for hand, declared, required, utility, points in (
+            (natural, True, 1, 1.0, 0),
+            (natural, False, 1, -0.1, 0),
+            (natural, False, 2, -0.3, 0),
+            (natural, False, 5, -0.42, 0),
+            (wildcard, False, 1, -0.5, 0),
+            (wildcard, False, 0, -0.1, 0),
+            (deadwood, False, 1, -0.566, 22),
+            (deadwood, False, 0, -0.166, 22),
+        ):
+            with self.subTest(declared=declared, required=required, utility=utility):
+                solo = solo_outcome(hand, 7, declared, required)
+                self.assertAlmostEqual(solo.utility, utility, places=12)
+                self.assertEqual((solo.won, solo.penalty), (declared, points))
+                outcome = DealOutcome.score(
+                    TerminalSnapshot((hand,), 7), 0 if declared else None,
+                    "win" if declared else "turns_exhausted", required,
+                )
+                self.assertEqual(solo, outcome.seat(0))
+                for players in (2, 3, 4):
+                    multiplayer = DealOutcome(
+                        outcome.winner, outcome.ending, outcome.penalties * players, outcome.required_sequences,
+                    )
+                    self.assertEqual(solo, multiplayer.seat(0))
 
     def test_card_points_validate_both_faces(self):
         self.assertEqual(tuple(card_points(face, 20) for face in range(13)), (10, 2, 3, 4, 5, 6, 7, 0, 9, 10, 10, 10, 10))

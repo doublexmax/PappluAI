@@ -10,7 +10,7 @@ from src.game.information import EventKind, InformationEvent
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
 from src.model.encoding import (
     CARD_CHANNELS, CONTEXT_CHANNELS, FEATURE_SIZE, Features,
-    _meld_membership, encode, encoding_layout, encoding_metadata, feature_values,
+    _meld_membership, disjoint_pack, encode, encoding_layout, encoding_metadata, feature_values,
     legal_actions, unpack,
 )
 
@@ -56,6 +56,41 @@ class TestFeatures(unittest.TestCase):
         self.assertEqual(sum(duplicate["pure"]), 0.0)
         self.assertEqual(sum(duplicate["any_meld"]), 0.0)
 
+    def test_disjoint_pack_spends_a_shared_joker_once_and_gates_sets(self):
+        cards = (0, 1, 13, 14, 26, 27, 39, 40, 9, 10, 22, 23, 7)
+        hand = tuple(cards.count(face) for face in range(52))
+        packed = disjoint_pack(hand, 7, 5)
+        self.assertEqual(packed[:3], (1, 68, 20))
+        self.assertEqual(packed[4][7], 0)
+        self.assertTrue(all(0 <= remaining <= copies for remaining, copies in zip(packed[4], hand)))
+        obs = replace(PappluEnv().reset(17), hand=hand, joker=7)
+        context = unpack(encode(obs))["context"]
+        self.assertAlmostEqual(context[CONTEXT_CHANNELS.index("disjoint_pseq_frac")], 0.2, places=7)
+        self.assertAlmostEqual(context[CONTEXT_CHANNELS.index("disjoint_gated_pts")], 0.68, places=7)
+
+    def test_disjoint_pack_preserves_two_after_high_ace_and_splits_six_card_runs(self):
+        hand = tuple(int(face in (11, 12, 0, 1)) for face in range(52))
+        packed = disjoint_pack(hand, 7, 1)
+        self.assertEqual(packed[:3], (1, 2, 2))
+        self.assertEqual(packed[4][1], 1)
+        hand = tuple(int(face < 6) for face in range(52))
+        self.assertEqual(disjoint_pack(hand, 7, 2)[:3], (2, 0, 0))
+        hand = tuple(int(face in (12, 0, 1)) for face in range(52))
+        self.assertEqual(disjoint_pack(hand, 7, 1)[:3], (0, 22, 22))
+
+    def test_disjoint_discard_and_top_gains_describe_the_legal_exchange(self):
+        env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1))
+        obs = env.reset_warm_start(17)
+        hand = tuple(int(face in (0, 1, 2, 9)) for face in range(52))
+        values = unpack(encode(replace(obs, hand=hand, joker=7)))["card"]
+        self.assertEqual(values[9 * 22 + 18:9 * 22 + 22], (1.0, 0.0, 1.0, 0.0))
+        self.assertEqual(values[19], -1.0)
+        obs = env.reset(17)
+        hand = tuple(int(face in (0, 1, 30)) for face in range(52))
+        context = unpack(encode(replace(obs, hand=hand, joker=7, discard_pile=(2,))))["context"]
+        self.assertEqual(context[20], 1.0)
+        self.assertAlmostEqual(context[21], 0.85, places=7)
+
     def test_fixed_record_is_finite_for_solo_hexa_and_terminal(self):
         observations = [PappluEnv().reset(1), PappluEnv().reset_warm_start(3)]
         env = MultiplayerEnv(MatchConfig(GameConfig(max_turns=1), 6))
@@ -68,8 +103,8 @@ class TestFeatures(unittest.TestCase):
         observations.append(env.observe())
         for obs in observations:
             features = encode(obs)
-            self.assertEqual(len(feature_values(features)), 1063)
-            self.assertEqual(len(features.data), 4252)
+            self.assertEqual(len(feature_values(features)), 1275)
+            self.assertEqual(len(features.data), 5100)
             self.assertTrue(all(math.isfinite(value) for value in feature_values(features)))
         self.assertEqual(legal_actions(encode(observations[-1])), ())
         solo = encode(observations[0])
@@ -109,8 +144,8 @@ class TestFeatures(unittest.TestCase):
         self.assertEqual(FEATURE_SIZE * 4, len(features.data))
         cards = field_values(features, "card")
         self.assertEqual(cards[CARD_CHANNELS.index("own_ge1")], 1.0)
-        self.assertEqual(cards[7 * 18 + CARD_CHANNELS.index("points")], 0.0)
-        self.assertEqual(cards[20 * 18 + CARD_CHANNELS.index("wild")], 1.0)
+        self.assertEqual(cards[7 * 22 + CARD_CHANNELS.index("points")], 0.0)
+        self.assertEqual(cards[20 * 22 + CARD_CHANNELS.index("wild")], 1.0)
 
     def test_layout_and_metadata_describe_the_encoded_segments(self):
         features = encode(PappluEnv().reset(17))
@@ -118,8 +153,8 @@ class TestFeatures(unittest.TestCase):
         layout = encoding_layout()
         self.assertEqual(
             [(field.name, field.offset, len(segments[field.name])) for field in layout],
-            [("card", 0, 936), ("seat", 936, 54), ("context", 990, 18),
-             ("legal", 1008, 54), ("top", 1062, 1)],
+            [("card", 0, 1144), ("seat", 1144, 54), ("context", 1198, 22),
+             ("legal", 1220, 54), ("top", 1274, 1)],
         )
         self.assertEqual(tuple(value for field in layout for value in segments[field.name]), feature_values(features))
         metadata = encoding_metadata()
@@ -148,7 +183,7 @@ class TestFeatures(unittest.TestCase):
                 action = next(a for a in legal_actions(encode(obs)) if a != discard_action(taken[seat]))
                 env.step(action)
         values = unpack(encode(env.observe()))
-        card = lambda face, channel: values["card"][face * 18 + CARD_CHANNELS.index(channel)]
+        card = lambda face, channel: values["card"][face * 22 + CARD_CHANNELS.index(channel)]
         self.assertEqual(card(taken[1], "next_held"), 1.0)
         self.assertEqual(card(discarded[1], "opp_discarded"), 1.0)
         self.assertEqual(card(taken[1], "other_held"), 0.0)

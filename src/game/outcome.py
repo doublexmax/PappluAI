@@ -8,9 +8,6 @@ from src.game.multiplayer import TerminalSnapshot
 
 
 CAP_POLICIES = ("undecided", "points", "weighted-points", "tie", "exclude")
-DECLARATION_UTILITY = 1.0
-DEADWOOD_WEIGHT = 0.5
-SOLO_HALF_CREDIT_POINTS = 40
 
 
 def placements(points: Sequence[int], winner: Optional[int], ending: str, cap_policy: str) -> Optional[tuple[int, ...]]:
@@ -49,6 +46,7 @@ class DealOutcome:
     winner: Optional[int]
     ending: str
     penalties: tuple[HandPenalty, ...]
+    required_sequences: int = 5
 
     @classmethod
     def score(
@@ -58,7 +56,7 @@ class DealOutcome:
         return cls(winner, ending, tuple(
             minimum_penalty(hand, snapshot.joker, required_sequences)
             for hand in snapshot.hands
-        ))
+        ), required_sequences)
 
     def ranks(self) -> tuple[int, ...]:
         if len(self.penalties) == 1:
@@ -73,18 +71,20 @@ class DealOutcome:
         return int(ranks[seat] < ranks[other]) - int(ranks[seat] > ranks[other])
 
     def seat(self, seat: int) -> SeatOutcome:
-        count = len(self.penalties)
-        points = self.penalties[seat].points
-        utility = (
-            sum(
-                (DECLARATION_UTILITY if self.winner in (seat, other) else DEADWOOD_WEIGHT)
-                * self.margin(seat, other)
-                for other in range(count) if other != seat
-            ) / (count - 1)
-            if count > 1 else DECLARATION_UTILITY if self.winner == 0
-            else -1.0 + DEADWOOD_WEIGHT * SOLO_HALF_CREDIT_POINTS / (SOLO_HALF_CREDIT_POINTS + points)
-        )
-        return SeatOutcome(utility, self.winner == seat, points)
+        penalty = self.penalties[seat]
+        points = min(penalty.points, 100)
+        if self.winner == seat:
+            utility = 1.0
+        elif self.winner is not None:
+            utility = -0.5 - 0.5 * points / 100.0
+        else:
+            required = max(1, self.required_sequences)
+            seq_frac = (
+                min(penalty.qualifying_sequences, required) / required
+                if self.required_sequences > 0 else 1.0
+            )
+            utility = -0.5 + 0.4 * seq_frac - 0.3 * points / 100.0
+        return SeatOutcome(utility, self.winner == seat, penalty.points)
 
 
 def solo_outcome(
