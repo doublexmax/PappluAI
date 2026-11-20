@@ -9,11 +9,12 @@ import sys
 import tempfile
 import unittest
 
-from src.game.environment import GameConfig, PappluEnv, Phase
+from src.game.environment import GameConfig, PappluEnv, Phase, discard_action
+from src.game.information import EventKind
 from src.model.encoding import encode, feature_values, unpack
 from src.model.spec import ModelSpec
 from tools.weights_export import (
-    GOLDEN_CASES, golden_observation, main, meld_channels, reference_layers, reference_q,
+    GOLDEN_CASES, golden_observation, main, observation_json, reference_layers, reference_q,
     require_sensitive, rows, tensor_shapes,
 )
 
@@ -53,7 +54,7 @@ runpy.run_path('tools/weights_export.py', run_name='__main__')
             document = json.loads(model.read_text())
             fixture = json.loads(golden.read_text())
             self.assertEqual(document["checkpointVersion"], 5)
-            self.assertEqual(document["encodingVersion"], 3)
+            self.assertEqual(document["encodingVersion"], 4)
             self.assertEqual(document["architecture"], "card_mlp")
             self.assertEqual(document["modelSpec"], {"width": 64, "blocks": 2})
             self.assertEqual(document["source"]["kind"], "bootstrap")
@@ -61,9 +62,9 @@ runpy.run_path('tools/weights_export.py', run_name='__main__')
             self.assertEqual(len(fixture["cases"]), 15)
             self.assertTrue(all(name.startswith("policy.") for name in document["tensors"]))
             self.assertEqual(document["source"]["tensorsSha256"], fixture["tensorsSha256"])
-            self.assertEqual(len(fixture["cases"][0]["features"]), 802)
+            self.assertEqual(len(fixture["cases"][0]["features"]), 1063)
             self.assertEqual(fixture["featureLayout"], [
-                ["card", [52, 13]], ["seat", [6, 9]], ["context", [17]], ["legal", [54]], ["top", [1]],
+                ["card", [52, 18]], ["seat", [6, 9]], ["context", [18]], ["legal", [54]], ["top", [1]],
             ])
             self.assertEqual(
                 sum(len(base64.b64decode(entry["data"])) // 4 for entry in document["tensors"].values()), 126660,
@@ -116,10 +117,19 @@ class TestReferenceExport(unittest.TestCase):
                 features = unpack(encode(replace(
                     obs, hand=tuple(cards.count(face) for face in range(52)), joker=7,
                 )))
-                extra, deadwood = meld_channels(rows(features["card"], 13), features["context"])
+                extra = [row[13:] for row in rows(features["card"], 18)]
+                deadwood = features["context"][-1]
                 for channel, expected in zip((2, 3, 4), (natural, pure, any_meld)):
                     self.assertEqual(tuple(face for face, row in enumerate(extra) if row[channel]), expected)
                 self.assertAlmostEqual(deadwood, expected_deadwood, places=7)
+
+    def test_removed_registry_source_is_rejected(self):
+        result = subprocess.run(
+            [sys.executable, "-B", "tools/weights_export.py", "--registry", "retired"],
+            cwd=ROOT, capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unrecognized arguments: --registry retired", result.stderr)
 
 
 @unittest.skipIf(torch is None, "torch is not installed")
@@ -127,6 +137,16 @@ class TestCheckpointExport(unittest.TestCase):
     def test_real_checkpoint_export_matches_torch_and_portable_reference(self):
         from src.model.network import QNetwork, collate, save_checkpoint
 
+        script = """
+import {readFileSync} from 'node:fs';
+import {encodeObservation, parseQModel, qValues} from './web/qnet.mjs';
+const model = parseQModel(JSON.parse(readFileSync(process.argv[1], 'utf8')));
+const observations = JSON.parse(readFileSync(0, 'utf8'));
+console.log(JSON.stringify({
+  q: qValues(model, observations).map(row => Array.from(row)),
+  features: observations.map(obs => Array.from(encodeObservation(obs))),
+}));
+"""
         torch.set_num_threads(1)
         config = GameConfig(max_turns=60)
         for spec in (ModelSpec(64, 2), ModelSpec(128, 3), ModelSpec(9, 1)):
@@ -146,13 +166,38 @@ class TestCheckpointExport(unittest.TestCase):
                     data = base64.b64decode(entry["data"])
                     tensors[name] = list(struct.unpack("<%df" % (len(data) // 4), data))
                 layers = reference_layers(tensors, spec)
-                features = [encode(golden_observation(case)) for case in GOLDEN_CASES]
+                observations = [golden_observation(case) for case in GOLDEN_CASES]
+                env = PappluEnv(config)
+                observations.append(env.reset(917))
+                observations.append(env.step(0))
+                env.reset(918)
+                taken = env.step(1)
+                observations.append(taken)
+                features = [encode(obs) for obs in observations]
+                self.assertEqual([obs.phase for obs in observations[-3:]], [
+                    Phase.DRAW, Phase.DISCARD, Phase.DISCARD,
+                ])
+                self.assertIs(taken.history[-1].kind, EventKind.TAKE_DISCARD)
+                self.assertEqual(unpack(features[-1])["legal"][discard_action(taken.history[-1].face)], 0.0)
                 with torch.inference_mode():
                     expected = network(collate(features, torch.device("cpu"))).tolist()
-                for feature, entry, torch_q in zip(features, fixture["cases"], expected):
+                for feature, entry, torch_q in zip(features[:15], fixture["cases"], expected):
                     self.assertEqual(list(feature_values(feature)), entry["features"])
-                    self.assertEqual(entry["q"], torch_q)
+                    self.assertLessEqual(max(abs(a - b) for a, b in zip(entry["q"], torch_q)), 1e-6)
                     self.assertLess(max(abs(a - b) for a, b in zip(reference_q(layers, feature, spec), torch_q)), 1e-5)
+                browser = subprocess.run(
+                    ["node", "--input-type=module", "-e", script, str(output)],
+                    input=json.dumps([observation_json(obs) for obs in observations]),
+                    cwd=ROOT, capture_output=True, text=True, timeout=60, check=False,
+                )
+                self.assertEqual(browser.returncode, 0, browser.stdout + browser.stderr)
+                actual = json.loads(browser.stdout)
+                self.assertEqual(len(actual["q"]), 18)
+                self.assertGreater(min(max(q) - min(q) for q in expected), 1e-3)
+                for index, (feature, torch_q, node_q) in enumerate(zip(features, expected, actual["q"])):
+                    self.assertEqual(len(node_q), 54)
+                    self.assertEqual(actual["features"][index], list(feature_values(feature)))
+                    self.assertLessEqual(max(abs(a - b) for a, b in zip(torch_q, node_q)), 1e-5)
 
 
 if __name__ == "__main__":

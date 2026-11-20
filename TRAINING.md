@@ -1,299 +1,266 @@
-# Training walkthrough
+# Train a Papplu model
 
-All commands in this guide run from a fresh repository clone on Windows
-PowerShell with Python 3.10 or newer. Training is CPU-compatible but requires
-the optional training dependencies.
+Use this guide to create a resumable self-play run and export its selected checkpoint to the browser.
+The [model contract](README.md#model-and-training-contract) describes the network, encoding, and terminal utility.
+No command here provisions Azure resources or spends cloud credit.
 
-## Set up a fresh clone
+## Install PyTorch
+
+Use Python 3.11, as CI does.
+Create the environment from the repository root.
 
 ```powershell
-git clone https://github.com/doublexmax/PappluAI.git
-Set-Location PappluAI
 python -m venv .venv
-.\.venv\Scripts\python -m pip install --upgrade pip
 .\.venv\Scripts\python -m pip install -r requirements-training.txt
 ```
 
-Command-line entry points live in `src.cli`. They parse `--help` before loading
-PyTorch. Game rules are in `src.game`, the current network is in `src.model`, the unified training
-runtime lives in `src.training.train`, evaluation is in `src.evaluation`, and
-persistent state operations live in `src.checkpoints`.
+The only direct training dependency is `torch>=2.6`.
+The trainer and exporter do not use NumPy.
+Torch can emit its own NumPy initialization warning when NumPy is absent.
+The evaluator, encoders, bootstrap exporter, and command help need neither package.
 
-## Run a short smoke test
+## Check the lifecycle before a long run
 
-This uses a three-card warm-start puzzle and exports a standalone model checkpoint. It verifies training, model
-checkpoint writing, loading, and evaluation without representing full Papplu
-performance.
-
-```powershell
-.\.venv\Scripts\python -m src.cli.train --checkpoint checkpoints\smoke.pt --max-episodes 20 --num-decks 2 --cards-in-hand 3 --required-sequences 1 --max-turns 5 --warm-start-fraction 1 --validation-games 0
-.\.venv\Scripts\python -m src.cli.benchmark --checkpoint checkpoints\smoke.pt --output runs\smoke-evaluation.json --games 20 --warm-games 20
-```
-
-The first command writes `checkpoints\smoke.pt`. The second writes paired
-evaluation details to `runs\smoke-evaluation.json`.
-
-To fine-tune those weights with fresh optimizer and replay state, pass `--initial-model`.
+Start four cold deals with a two-turn cap.
+This tests software behavior, not playing strength.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.train --initial-model checkpoints\smoke.pt --checkpoint checkpoints\smoke-finetuned.pt --max-episodes 5
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\smoke --players 1 2 3 4 --max-turns 2 --round-episodes 4 --batch-size 8 --replay-capacity 128 --validate-every 4 --validation-games 1 --max-episodes 4
 ```
 
-## Train and resume full 21-card play
+The JSON response reports `episodes` as 4 and `status` as `max_episodes`.
+The directory contains these outputs.
 
-`src.cli.train` defaults to one player, three decks, 21 cards, five required pure
-sequences, discard recycling, a 60-turn limit, and the `card_mlp` network.
-Passing `--curriculum-distances` enables staged solo curriculum deals for the same model that plays multiplayer.
+| File | Contents |
+| --- | --- |
+| `latest-model.pt` | Current network weights and game settings. |
+| `best-model.pt` | Selected validation checkpoint, or the initial model before the first validation. |
+| `latest-state.pt` | Network, AdamW state, compressed replay, sampling RNG, counters, configuration, and snapshot paths. |
+| `initial-model.pt` | Frozen starting weights used by validation. |
+| `opponents/` | Imported opponents, selected best snapshots, and periodic strong-policy snapshots. |
+| `status.json` | Saved counters, validation results, active snapshots, and stop reason. |
+| `metrics.jsonl` | One record per completed training round. |
+
+Resume the same run to eight total deals.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --curriculum-distances 2 4 6 10
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\smoke --max-episodes 8
 ```
 
-For a larger model, set `--width` and `--blocks` when starting a fresh run without `--initial-model`.
-The default spec is `ModelSpec(width=64, blocks=2)`.
+`--max-episodes` is an absolute deal count, not an additional count.
+Self-play can produce several seat trajectories per deal.
+The resumed response reports eight episodes.
+Omit the original recipe flags to restore their saved values.
+
+Evaluate and export the selected checkpoint.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21-wide --curriculum-distances 2 4 6 10 --width 128 --blocks 3
+.\.venv\Scripts\python -m src.cli.evaluate --checkpoint runs\smoke\best-model.pt --games 4 --warm-games 0 --output runs\smoke\evaluation.json
+.\.venv\Scripts\python -m src.cli.arena --model runs\smoke\best-model.pt --model random --games 4 --max-turns 2 --output runs\smoke\arena.json
+.\.venv\Scripts\python tools\weights_export.py --checkpoint runs\smoke\best-model.pt --output runs\smoke\model.json --golden runs\smoke\golden.json
 ```
 
-The output directory contains `latest-state.pt`, `latest-model.pt`,
-`best-model.pt`, `status.json`, and `metrics.jsonl`. The full state
-checkpoint includes model and optimizer tensors, compressed replay bytes, curriculum and
-learning counters, plus Python and PyTorch random-number-generator states.
+The solo report separates greedy and random results.
+The arena report records seat order, winner, terminal reason, draw sources, and refill turns.
+Neither report assigns a rating.
 
-Repeat the same `--output-dir` to resume `latest-state.pt`, then benchmark `latest-model.pt`.
+## Start a full 21-card run
+
+Use a new directory so the smoke cap does not carry into training.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --max-episodes 5000
-.\.venv\Scripts\python -m src.cli.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --max-episodes 10000 --max-seconds 3600
 ```
 
-Model checkpoints use version 5 and information encoding version 3.
-Current `card_mlp` v5 model weights can warm-start a new run through `--initial-model`.
-Trainer state uses version 6 and `Replay` v6.
-Incompatible older checkpoints and state files fail cleanly.
-Old model architectures and old registry records remain unsupported.
+The defaults use three decks, 21 cards, five required pure sequences, and 60 turns per seat.
+The trainer cycles `--players 1 2 3 4`.
+It uses `ModelSpec(64, 2)`, `gamma=0.99`, a 50,000-step replay, and batches of at most 128 steps.
+Each completed deal schedules four learner updates by default. Use `--updates-per-episode` to change that count.
+Epsilon decreases from 0.30 to 0.05 over 10,000 deals. Use `--epsilon-decay-episodes` to change the decay length.
+The trainer holds epsilon fixed within each 16-deal round.
 
-To finetune existing weights at curriculum stage 2, start fresh optimizer and replay state in a new directory.
+Every deal starts cold.
+There are no solved-hand warm starts, curriculum stages, priority opponent weights, or promotion state machines.
+On each multiplayer deal, self-play has probability 0.75.
+Every self-play seat contributes its own terminal utility and trajectory.
+Other deals place the learner in a random seat against uniform choices from RandomPolicy and the active snapshot pool.
+
+Continue the run with a larger absolute episode limit.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\best-model.pt --output-dir runs\full21-finetune --curriculum-distances 2 4 6 10 --initial-stage 2 --learning-rate 0.0001 --epsilon-start 0.08 --epsilon-end 0.02 --epsilon-decay-episodes 10000
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --max-episodes 20000 --max-seconds 3600
 ```
 
-Default hyperparameters use learning rate 0.0003 and epsilon 0.30 to 0.05 over 10000 episodes.
-All settings persist in `TrainConfig`, and resume rejects hyperparameter changes while allowing `--checkpoint-every`, `--gate-workers`, `--torch-threads`, and `--device` overrides.
+Without either limit, the command runs one more training round.
+Ctrl+C requests a stop.
+Time limits and stop requests are checked between completed rounds.
+A rollout round or validation can overrun the requested time limit.
+Use a smaller `--round-episodes` when starting a run that needs shorter stop intervals.
+The trainer saves completed work and closes actor processes before returning.
 
-`Learner` uses Q-only Deep Monte-Carlo with `gamma = 0.99`.
-Each trajectory step fits `Q(s, a)` via smooth L1 loss to discounted terminal utility `u * gamma ** (T - 1 - t)`, with no target network or auxiliary heads.
-Solo declaration earns +1.
-A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`, bounded between -1 and -0.5.
-Multiplayer utility averages pairwise margins weighted by 1 when either seat declared, and by 0.5 otherwise.
-The declarer earns +1. The best exhausted hand earns at most +0.5.
-An opponent's declaration never improves another seat's utility.
-Multiplayer utilities remain zero-sum.
-`DealOutcome.margin` stays unshaped for PFSP, ratings, and promotion.
-Solo and curriculum deals score terminal outcomes through `solo_outcome`.
-Greedy validation and `best-model.pt` selection use binary declaration win rates.
-AdamW and gradient clipping update the online network on Q-value returns.
+## Use more CPU actors or a GPU learner
 
-`encode` converts each visible observation into a pure `Features` record of 802 float32 values, or 3,208 bytes.
-A single pass over visible history populates 13 per-card channels, including opponent discards, known copies held by the next opponent and other opponents, and cards passed by the next opponent. It also writes nine channels across six relative seat slots and 17 context features.
-`PolicyNet` computes vectorized meld-participation channels and runs `CardBlock` blocks over a 14-slot `[A, 2, ..., K, A]` rank strip with shared `card_norm` table pooling on the four-suit, 13-rank grid.
-`collate` batches cached records without rescanning history.
-Browser exports retain `policy.*` tensors and match Python Q-values.
-See the [current model contract](README.md#current-model-contract) for the model layout.
-
-`Replay` v6 enforces strict step-level capacity, samples steps uniformly within each populated player count, and gives populated player counts equal shares.
-State checkpoints compress concatenated `Features` bytes with `zlib` so `torch.load(..., weights_only=True)` restores replay directly without retaining `Observation` instances.
-
-## Run shared-deck arena matches
-
-Repeat `--model` once per seat, using either a checkpoint or `random`.
+Set the actor count when starting a run, or change it on resume.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.arena --model runs\full21\latest-model.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\parallel --actors 4 --round-episodes 32 --validation-games 16 --max-episodes 10000
 ```
 
-`runs\arena.json` records seating, winners, terminal reasons, action counts,
-turn counts, and remaining stock. Its `telemetry` field records stock draws
-and discard draws per seat, plus the completed-turn number of each stock
-refill. A refill does not reset the turn budget.
-`run_matches` encodes each active state once and batches inference by policy.
-`evaluate_games` advances up to 32 solo deals in lockstep while preserving `seed + index` order.
+One actor runs inline.
+More than one actor uses a persistent process pool.
+Each worker uses one Torch thread and simulates its chunk with the current frozen round weights.
+Validation uses the same pool for solo games and multiplayer seat rotations.
+Its chunk boundaries and seeds do not depend on the actor count.
+Set `--torch-threads` to change the learner's Torch thread count. The default is one.
+Only the learner updates weights, appends replay, and writes checkpoints.
+Rollout workers return features, actions, and terminal utility, not private observations.
+Validation workers return metric totals.
+The pool stays alive across rounds and closes when `run` returns.
 
-## Calibrate multiplayer draw limits
-
-This study measures extra completion probability only. It does not validate
-winners, loser placements, rating rankings, or the provisional capped-game
-weight of 0.25. A supported cap is not evidence that those outcomes agree
-with the guard.
-
-The cap and remaining turn budgets are part of policy observations before
-the cutoff. Matching seeds therefore do not guarantee identical action
-prefixes. The study compares cap-conditioned play, not one fixed trajectory
-truncated at different turns.
-
-Use a directory containing immutable `model-<sha256>.pt` snapshots, such as
-`runs\improve\registry`. The calibration adds a seeded random baseline.
-The pool must contain enough distinct competitors for the largest table.
+If the host has a CUDA-capable Torch installation, select the learner device.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.calibration --models-dir runs\improve\registry --output-dir runs\calibration --caps 30 60 90 120 180 --players 2 3 4 --blocks 512 --workers 4
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\gpu --device cuda --actors 4 --round-episodes 32 --batch-size 256 --validation-games 16 --max-seconds 3600
 ```
 
-Each independent deal samples a lineup and seating independently of the deck,
-then plays that same assignment under every candidate cap. This command runs
-7,680 games. It uses independent deals rather than counting correlated seat
-permutations as additional trials.
+Rollout workers remain on CPU. Replay stays on CPU.
+The default replay allocates about 203 MiB before Python and optimizer overhead.
+Checkpoint compression reduces saved bytes, not the live replay allocation.
+Use `--replay-capacity` to set the memory budget when starting a run.
 
-`protocol.json` fixes the models, source, caps, seeds, and sample budget.
-Completed cases are persisted individually. Repeating the same command resumes
-unfinished work. Use a new output directory and fresh seeds for a new study.
-`status.json` reports progress. `summary.json` contains outcomes, refill counts,
-and the cap comparison.
+More actors or a larger network do not guarantee better throughput.
+Compare completed deals and updates over the same time budget before renting more compute.
+Keep validation settings fixed when comparing runs.
+The fixed validation workload can cost more than a short training round.
 
-The default selection bound allows at most a 5% probability that the larger
-guard obtains a declaration where the candidate cap does not. One-sided exact
-binomial bounds account for the compared caps and table sizes. An incomplete
-or underpowered study does not select a cap, and the largest guard is never
-chosen as a fallback. This is evidence about the frozen model pool, not a
-universal human-game limit.
+## Choose a model size or initial checkpoint
 
-The default budget is 128 independent blocks per table size. The default
-caps and table sizes make six comparisons. Even with zero extra completions,
-at least 94 complete blocks are needed to bring the upper bound below 5%.
-Explicit smaller budgets remain available for smoke tests and can return
-`insufficient_evidence`.
-
-Workers have coordinator-enforced deadlines. A timeout is an execution failure,
-not a game draw. The command stops on a worker failure and retains completed
-cases for recovery.
-
-## Train across mixed tables and PFSP opponents
-
-Only the online learner is updated. The initial model, `--opponent` checkpoints, and
-random policy remain frozen in the opponent pool. Copy the generated full-hand model to make an additional
-opponent snapshot explicit, and list every table size under `--players`.
+Start a larger network in a fresh directory.
 
 ```powershell
-New-Item -ItemType Directory -Force checkpoints
-Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
-.\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --players 1 2 3 4 --max-episodes 128 --round-episodes 16 --max-seconds 3600 --checkpoint-every 16
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\league --max-episodes 256 --max-seconds 3600 --checkpoint-every 16
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\wide --width 128 --blocks 3 --max-episodes 10000
 ```
 
-Key training options have these defaults.
+The default 64-by-2 model has 126,660 parameters.
+The 128-by-3 model has 672,388.
+Both use the same encoding and browser inference implementation.
 
-- `--max-turns 60` limits each seat's completed draw-discard turns.
-- `--batch-size 128` caps the replay samples in each optimizer update.
-- `--updates-per-episode 4` sets gradient updates per completed trajectory.
-- `--round-episodes 16` batches episodes before updates.
-- `--learning-rate 0.0003` sets the AdamW learning rate.
-- `--epsilon-start 0.30` and `--epsilon-end 0.05` set exploration bounds.
-- `--epsilon-decay-episodes 10000` sets the exploration decay budget.
-
-Checkpoints are published at round and gate boundaries and preserve the
-opponent-pool order, compressed replay, optimizer, counters, and random streams.
-Player counts are sorted and distinct and cycle deterministically across episodes.
-Replay gives each populated count equal sampling shares and samples steps uniformly within each bucket.
-`pfsp_probabilities` weights non-anchor opponents by `(1 - p)^2` from Bayesian-smoothed pairwise placement scores.
-The default schedule reserves 35% for the champion and 15% for baseline and random anchors.
-Other frozen opponents share the remaining probability according to those weights.
-
-On resume, omit training and exploration options to retain their saved values, or supply matching values.
-Changes to rules, learning hyperparameters, `--players`, or `--seed` fail before checkpoint publication.
-Only `--checkpoint-every`, `--gate-workers`, `--torch-threads`, and `--device` are tunable on resume.
-
-## Run finite improvement cycles
-
-Passing `--promote` enables two-stage selection and confirmation gates inside `Trainer`.
-Each cycle trains for `--cycle-episodes` episodes, registers one candidate snapshot in `registry/`, and promotes only through `evaluate_gate` evidence.
+To keep weights but start new replay and AdamW state, supply an initial checkpoint.
 
 ```powershell
-.\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\latest-model.pt --output-dir runs\improve --players 2 3 4 --promote --max-seconds 3600 --max-cycles 1 --round-episodes 16 --gate-workers 4
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\improve --max-seconds 3600 --gate-workers 2
+.\.venv\Scripts\python -m src.cli.train --output-dir runs\continued --initial-model runs\full21\best-model.pt --opponent runs\full21\latest-model.pt --max-episodes 10000
 ```
 
-`registry/champion.json` is the sole champion pointer, mirrored to `champion-model.pt`. Registered model snapshots are
-immutable. `status.json` describes the latest stable published state.
+The initial checkpoint determines the network spec and game settings.
+Do not combine `--initial-model` with `--width` or `--blocks`.
+Optional `--opponent` checkpoints must match those game settings.
+The trainer copies them into the new run.
+Initial models and imported opponents apply only to fresh runs.
 
-Self-promotion keeps learner weights, AdamW state, and replay intact, and adds the promoted champion snapshot to the PFSP pool.
-`--rebase-after-rejections 8` reloads champion weights and resets AdamW moments after eight consecutive rejected cycles while preserving replay and random streams.
-Supply explicit `--learning-rate`, `--epsilon-start`, `--epsilon-end`, and `--epsilon-decay-episodes` flags when fine-tuning a strong warm-start checkpoint.
-`TrainConfig` stores the resolved values and remains the source of truth on resume.
+Resume restores the recipe rather than changing it.
+The CLI allows `--actors`, `--device`, and `--torch-threads` changes on resume.
+The Python API also allows `checkpoint_every` changes.
+Other changed settings fail before training.
+Encoding versions before 4 and trainer state versions before 7 require a fresh run.
 
-Keep the default `--selection-blocks 32`, `--confirmation-blocks 128`, and `--solo-games 256` for promotion.
-The gate uses 4x, 2x, and 1x the base block count for two, three, and four players.
-Selection therefore plays 256, 384, and 768 games.
-Confirmation plays 1,024, 1,536, and 3,072 games.
-Each block batches all 2, 6, or 24 seat orders.
-The registry requires disjoint selection and confirmation seeds.
+## Inspect validation
 
-`gate_schema_version == 5` records placement margins, declaration margins, `phase`, and `gate_failures`.
-Better loser placements count even when neither contender declares.
-Within base block `b`, each count's replica `r` uses deal seed `seed + 4 * b + r`.
-The gate averages replicas within each count, then averages counts equally.
-The 95% bootstrap resamples whole base blocks and preserves cross-count seed covariance.
-Evidence includes `multiplayer_ci95`, `multiplayer_ci95_by_count`, `declaration_ci95`, and paired binary `solo_ci95`.
-Selection requires positive aggregate mean placement gain and screens count, declaration, and solo means.
-Confirmation requires aggregate placement superiority and bounded per-count, declaration, and solo noninferiority.
-Both phases retain the 256-game paired solo minimum.
-See [promotion evidence](RATINGS.md#promotion-evidence-stays-separate) for the complete gate contract.
+By default, validation runs after each 1,000 completed deals.
+`--validation-games 64` controls held-out solo games and multiplayer seed blocks.
+Set it to zero only to disable validation for a bounded diagnostic run.
 
-Use `--gate-workers` to set the gate process count. The default is 1.
-Each worker verifies the source fingerprint and loads frozen policies once.
-Workers use one PyTorch thread each.
-Only the coordinator appends and flushes completed jobs to `gates/<gate_id>.jsonl`.
-Interrupted gates persist explicit `Selecting` or `Confirming` states and retain completed blocks and paired solo slices.
-Resume with the same model hashes, rules, seeds, and budgets to skip that work.
-Result assembly follows block index and solo-slice start, not worker completion order.
+Solo validation measures cold greedy declarations when solo is in `--players`.
+For every configured multiplayer count, validation rotates the learner through every seat on every seed.
+It compares against RandomPolicy, the frozen initial checkpoint, and the reigning `best-model.pt`.
+A pairwise placement win earns 1, a tie earns 0.5, and a loss earns 0.
+Other losing seats still compare their final deadwood penalties after a declaration.
 
-On resume, change `--gate-workers`, `--checkpoint-every`, `--torch-threads`, `--device`, or `--max-cycles` as needed.
-Omit those options to retain their saved values.
-Learning settings, player counts, and the seed cannot change on resume.
+The validation `score` is the unweighted mean of the solo rate and each fixed multiplayer opponent rate.
+For the default counts, those are seven rates.
+The score lies in `[0, 1]`.
+Training seeds are even and validation seeds are odd, so those deal seeds do not overlap.
+Validation reuses fixed seeds and the same initial opponent across the run.
 
-Keep full 21-card, 60-turn recycling rules for promotion.
-Smaller `--selection-blocks`, `--confirmation-blocks`, and `--solo-games`
-values exercise the workflow but cannot authorize promotion.
-An explicit reduced `--max-turns` cap also cannot promote.
-Fresh random weights or a few updates do not establish trained strength.
+Each `Xp_best` rate measures head-to-head placement credit against the reigning best for that player count.
+`vs_best` is their unweighted mean and does not enter the fixed-anchor `score`.
+With multiplayer enabled, the first validation selects the current network.
+Later validations replace `best-model.pt` only when `vs_best > 0.51` and `score >= best_score - 0.03`.
+`best_score` retains the highest fixed-anchor score among promoted models.
+For solo-only runs, a score at least as high as `best_score` replaces the best checkpoint.
+Every validation records `promoted` as a boolean.
 
-## Verify the complete current lifecycle
+On promotion, the trainer copies the best checkpoint to `opponents/best-<episode>.pt`.
+Without promotion, `vs_best >= 0.45` saves the current network as `opponents/snap-<episode>.pt`.
+Snapshot names pad the episode count to 12 digits.
+The active pool retains the latest eight snapshots by default.
+Older snapshot files remain on disk but no longer enter the active pool. `initial-model.pt` remains available for validation.
+The current network can regress between validations.
+The selected validation score is not a rating or proof of strength against unseen opponents.
 
-Use a temporary output directory for a bounded local check.
+Read `status.json` for the latest saved selection.
+Read `metrics.jsonl` for each round's episode count, epsilon, trajectory count, Smooth-L1 loss, updates, samples, and optional validation.
+`latest-state.pt` compresses tensor bytes with zlib and restores them without NumPy.
+With one actor, splitting at the same round boundary preserves model, optimizer, replay, and sampling exactly.
+Changing the actor count can change batch composition and learning order.
+
+## Evaluate on separate deals and publish browser weights
+
+Use additional evaluation seeds rather than selecting against the same validation deals again.
 
 ```powershell
-.\.venv\Scripts\python tools\verify_dynamic_model.py --output-dir "$env:TEMP\papplu-dynamic-verification"
+.\.venv\Scripts\python -m src.cli.evaluate --checkpoint runs\full21\best-model.pt --games 300 --seed 9000001 --warm-games 0 --output runs\full21\evaluation.json
+.\.venv\Scripts\python -m src.cli.arena --model runs\full21\best-model.pt --model random --games 100 --seed 9100001 --max-turns 60 --output runs\full21\arena.json
 ```
 
-The script verifies `card_mlp` v5 checkpoints and runs full 60-turn games at each supported player count.
-Separate one-turn smoke games exercise solo curriculum resume, mixed-count updates, exact full-state
-resume, a rejected promotion gate cycle, and persisted tournaments and reports.
-The resume check compares an uninterrupted `Trainer` run's actual matches and updates
-with the checkpoint restored by `src.cli.train`.
-Gate v5 checks compare in-process and two-worker results byte for byte and reuse a completed JSONL journal.
-The script checks persisted `TrainConfig` hyperparameters and tunable `--gate-workers` resume updates.
-Unit tests also interrupt a gate between phases and verify deterministic recovery.
-Each invocation creates a new timestamped directory, so repeated checks
-preserve earlier artifacts.
-Read `evidence.json` for the commands, exit codes, checkpoint identities, and
-actual output paths. Inspect the provisional rating report without treating
-one deal block as strength evidence.
+Repeat `--model` for each additional arena seat.
+Use another checkpoint instead of `random` to compare against a frozen policy.
+Keep the game rules and turn cap the same across comparisons.
+Optional `--warm-games` and `--sensitivity` test discard puzzles only.
+Puzzle results do not replace cold-game evidence and never enter training.
 
-## What training CI checks
+Export weights into the browser's default paths.
 
-`.github\workflows\training-ci.yml` is a CPU regression gate, not deployment
-automation or a long-running training job. It keeps evaluator and browser
-simulator checks free of PyTorch, verifies CLI help at the optional-dependency
-boundary, and runs `python -m unittest discover -s tests -v` across the complete
-Python suite.
-The training job then runs `tools/verify_dynamic_model.py` for play, checkpoint
-publication, exact resume, improvement, and persisted ratings verification.
+```powershell
+.\.venv\Scripts\python tools\weights_export.py --checkpoint runs\full21\best-model.pt
+node --test tests/qnet.test.mjs tests/ai.test.mjs tests/table.test.mjs
+```
 
-Every pull request runs the `portable` and `training` jobs before merge. Push
-path filters do not affect pull requests and apply only to direct pushes.
-`workflow_dispatch` remains available for a manual run.
-CI uses the current-only verification script instead of old-format
-compatibility comparisons.
-Artifact upload runs even when verification fails.
-It includes `evidence.json`, `rating-report.json`, and `benchmark.json`.
+The exporter writes the model and its matching golden cases together.
+It checks the portable forward pass against Torch.
+The full Python suite also exports nonzero 128-by-3 weights and checks all 54 Node Q-values within `1e-5`.
+Keep `web/papplu-model.json` and `tests/fixtures/qnet-golden.json` together.
+Use `--bootstrap --seed 1729` to restore the deterministic untrained model.
+
+Run the [verification commands](README.md#verification) before accepting a training-code change.
+
+## Training CLI options
+
+Run `python -m src.cli.train --help` for argument syntax.
+Fresh runs use the defaults described above. Resume restores saved settings unless an allowed override is supplied.
+
+| Option | Meaning |
+| --- | --- |
+| `-h`, `--help` | Show help without loading Torch. |
+| `--output-dir` | Required run directory. Reuse it to resume. |
+| `--initial-model` | Starting checkpoint for a fresh run. |
+| `--opponent` | Imported opponent checkpoint. Repeat for multiple opponents. |
+| `--players` | Player counts, supplied as one or more integers. |
+| `--actors` | Number of rollout and validation actors. |
+| `--width` | Network width for a fresh model. |
+| `--blocks` | Network block count for a fresh model. |
+| `--max-turns` | Turn limit per seat. |
+| `--round-episodes` | Deals per training round. |
+| `--updates-per-episode` | Learner updates per completed deal. |
+| `--batch-size` | Maximum replay samples per update. |
+| `--replay-capacity` | Maximum replay steps in memory. |
+| `--learning-rate` | AdamW learning rate. |
+| `--gamma` | Terminal-return discount factor. |
+| `--epsilon-decay-episodes` | Deals over which epsilon decreases. Zero selects the final epsilon immediately. |
+| `--self-play-share` | Probability that every seat uses the learner. |
+| `--validate-every` | Completed-deal interval between validations. |
+| `--validation-games` | Solo games and multiplayer seed blocks per validation. Zero disables validation. |
+| `--seed` | Training seed. |
+| `--device` | Learner Torch device. |
+| `--torch-threads` | Learner Torch thread count. Workers always use one. |
+| `--max-episodes` | Absolute completed-deal limit. |
+| `--max-seconds` | Wall-clock budget, checked between rounds. |

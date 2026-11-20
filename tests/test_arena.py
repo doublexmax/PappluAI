@@ -24,6 +24,7 @@ from src.game.environment import (
     legal_action_mask,
 )
 from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv
+from src.model.encoding import encode, legal_actions
 
 try:
     import torch
@@ -41,18 +42,12 @@ class FirstLegalPolicy:
         del rng
         self.calls += 1
         self.observations.append(observation)
-        mask = legal_action_mask(observation)
-        return next(action for action, legal in enumerate(mask) if legal)
+        return legal_actions(encode(observation))[0]
 
 
 class RandomLegalPolicy:
     def act(self, observation, rng):
-        legal = [
-            action
-            for action, allowed in enumerate(legal_action_mask(observation))
-            if allowed
-        ]
-        return rng.choice(legal)
+        return rng.choice(legal_actions(encode(observation)))
 
 
 class TestArenaMatches(unittest.TestCase):
@@ -88,7 +83,8 @@ class TestArenaMatches(unittest.TestCase):
                 self.assertEqual(len(state.players), 3)
                 self.assertEqual(state.history[0].initial_hand, trajectory[0].observation.hand)
                 self.assertTrue(legal_action_mask(state)[action])
-                self.assertEqual(decision.hidden_hands[0], state.hand)
+                self.assertEqual(decision.features, encode(state))
+                self.assertFalse(hasattr(decision, "hidden_hands"))
         for policy, trajectory in zip(policies, result.trajectories):
             self.assertEqual(policy.observations, [step.observation for step in trajectory])
 

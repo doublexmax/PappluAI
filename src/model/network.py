@@ -49,66 +49,6 @@ def collate_observations(
     return collate([encode(obs) for obs in observations], device)
 
 
-def tensor_meld_channels(card: Tensor, context: Tensor) -> tuple[Tensor, Tensor]:
-    size = card.shape[0]
-    c = card.reshape(size, 4, 13, len(CARD_CHANNELS))
-    decks = (context[:, 8] * 6.0).round().clamp_min(1.0)[:, None, None]
-    hand_sz = (context[:, 9] * 30.0).round().clamp_min(1.0)
-    copies = (c[:, :, :, 0] * decks).round()
-    present = (copies >= 1.0).to(card.dtype)
-    triple = (copies >= 3.0).to(card.dtype)
-    is_joker, is_wild, pts = c[:, :, :, 6], c[:, :, :, 7], c[:, :, :, 8]
-    joker_avail = (copies * is_joker).sum(dim=(1, 2), keepdim=True)
-    wild_avail = (copies * is_wild).sum(dim=(1, 2), keepdim=True)
-    pres14 = torch.cat((present, present[:, :, :1]), dim=2)
-    jok14 = torch.cat((is_joker, is_joker[:, :, :1]), dim=2)
-    wild14 = torch.cat((is_wild, is_wild[:, :, :1]), dim=2)
-    nat_win = pres14[:, :, :12] * pres14[:, :, 1:13] * pres14[:, :, 2:14]
-    non_jok14 = pres14 * (1.0 - jok14)
-    miss_pure = 3.0 - (non_jok14[:, :, :12] + non_jok14[:, :, 1:13] + non_jok14[:, :, 2:14])
-    pure_win = (miss_pure <= joker_avail).to(card.dtype)
-    non_wild14 = pres14 * (1.0 - wild14)
-    miss_any = 3.0 - (non_wild14[:, :, :12] + non_wild14[:, :, 1:13] + non_wild14[:, :, 2:14])
-    any_run_win = (miss_any <= wild_avail).to(card.dtype)
-
-    def scatter_runs(
-        win: Tensor, mask14: Tensor,
-        flex_avail: Optional[Tensor] = None, flex14: Optional[Tensor] = None,
-    ) -> Tensor:
-        active = torch.zeros((size, 4, 14), dtype=card.dtype, device=card.device)
-        active[:, :, :12] += win
-        active[:, :, 1:13] += win
-        active[:, :, 2:14] += win
-        out14 = ((active > 0.0) & (mask14 > 0.0)).to(card.dtype)
-        if flex_avail is not None and flex14 is not None:
-            any_win = (win.sum(dim=(1, 2), keepdim=True) > 0.0) & (flex_avail > 0.0)
-            flex_hit = (any_win & (pres14 > 0.0) & (flex14 > 0.0)).to(card.dtype)
-            out14 = torch.maximum(out14, flex_hit)
-        ace = torch.maximum(out14[:, :, :1], out14[:, :, 13:])
-        return torch.cat((ace, out14[:, :, 1:13]), dim=2)
-
-    natural = scatter_runs(nat_win, pres14)
-    pure = torch.maximum(scatter_runs(pure_win, non_jok14, joker_avail, jok14), triple)
-    any_runs = scatter_runs(any_run_win, non_wild14, wild_avail, wild14)
-    non_wild = present * (1.0 - is_wild)
-    set_non_wild_suits = non_wild.sum(dim=1, keepdim=True)
-    miss_set = 3.0 - set_non_wild_suits.clamp_max(3.0)
-    valid_set_rank = (miss_set <= wild_avail).to(card.dtype)
-    other_non_wild = (set_non_wild_suits - non_wild).clamp_min(0.0)
-    miss_set_with_s = 2.0 - other_non_wild.clamp_max(2.0)
-    set_member_non_wild = non_wild * (miss_set_with_s <= wild_avail).to(card.dtype)
-    any_valid_set = (valid_set_rank.sum(dim=2, keepdim=True) > 0.0) & (wild_avail > 0.0)
-    set_member_wild = (any_valid_set & (present > 0.0) & (is_wild > 0.0)).to(card.dtype)
-    set_member = torch.maximum(set_member_non_wild, set_member_wild)
-    any_meld = torch.maximum(torch.maximum(any_runs, pure), set_member)
-    left_adj = torch.cat((present[:, :, 12:13], present[:, :, :12]), dim=2)
-    right_adj = torch.cat((present[:, :, 1:13], present[:, :, :1]), dim=2)
-    adjacent = (left_adj + right_adj) * 0.5
-    set_mates = (present.sum(dim=1, keepdim=True) - present) / 3.0
-    unavoidable_dw = (copies * pts * 10.0 * (1.0 - any_meld)).sum(dim=(1, 2)) / (10.0 * hand_sz)
-    return torch.stack((adjacent, set_mates, natural, pure, any_meld), dim=-1), unavoidable_dw[:, None]
-
-
 class CardBlock(nn.Module):
     def __init__(self, width: int) -> None:
         super().__init__()
@@ -148,8 +88,8 @@ class PolicyNet(nn.Module):
     def __init__(self, spec: ModelSpec) -> None:
         super().__init__()
         width = spec.width
-        self.card_embed = nn.Linear(len(CARD_CHANNELS) + 5, width)
-        self.table_embed = nn.Linear(NUM_SEAT_SLOTS * len(SEAT_CHANNELS) + len(CONTEXT_CHANNELS) + 1, width)
+        self.card_embed = nn.Linear(len(CARD_CHANNELS), width)
+        self.table_embed = nn.Linear(NUM_SEAT_SLOTS * len(SEAT_CHANNELS) + len(CONTEXT_CHANNELS), width)
         self.blocks = nn.ModuleList(CardBlock(width) for _ in range(spec.blocks))
         self.card_final = nn.LayerNorm(width)
         self.table_final = nn.LayerNorm(width)
@@ -166,12 +106,9 @@ class PolicyNet(nn.Module):
 
     def forward(self, batch: ObservationBatch) -> Tensor:
         size = batch.card.shape[0]
-        extra_cards, extra_ctx = tensor_meld_channels(batch.card, batch.context)
-        cards = self.card_embed(torch.cat((
-            batch.card.reshape(size, 4, 13, len(CARD_CHANNELS)), extra_cards,
-        ), dim=-1))
+        cards = self.card_embed(batch.card.reshape(size, 4, 13, len(CARD_CHANNELS)))
         width = cards.shape[-1]
-        table = self.table_embed(torch.cat((batch.seat.flatten(1), batch.context, extra_ctx), dim=-1))
+        table = self.table_embed(torch.cat((batch.seat.flatten(1), batch.context), dim=-1))
         for block in self.blocks:
             cards, table = block(cards, table)
         cards, table = self.card_final(cards), self.table_final(table)
@@ -292,7 +229,7 @@ def load_checkpoint(
         raise ValueError("unsupported checkpoint_version %r; train fresh card_mlp v5 weights"
                          % payload.get("checkpoint_version"))
     if type(payload.get("encoding_version")) is not int or payload["encoding_version"] != ENCODING_VERSION:
-        raise ValueError("incompatible encoding_version; card_mlp v5 requires encoding_version 3")
+        raise ValueError("incompatible encoding_version; card_mlp v5 requires encoding_version 4")
     if payload.get("architecture") != ARCHITECTURE:
         raise ValueError("unsupported architecture; expected card_mlp v5")
     required = {

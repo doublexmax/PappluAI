@@ -7,7 +7,7 @@ import { createTable } from "./table.mjs";
 const SUITS = ["♠", "♥", "♦", "♣"];
 const SUIT_NAMES = ["Spades", "Hearts", "Diamonds", "Clubs"];
 const RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
-const TIER_NAMES = { neural: "Neural + Search", tactical: "Tactical", casual: "Casual" };
+const TIER_NAMES = { neural: "Neural", tactical: "Tactical", casual: "Casual" };
 const $ = (id) => document.getElementById(id);
 const builder = { hand: [], nextId: 1, selectedId: null, draggedId: null, revision: 0, timer: null };
 const pointer = { selectedId: null, draggedId: null, stamp: null };

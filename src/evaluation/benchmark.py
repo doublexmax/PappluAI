@@ -12,12 +12,11 @@ import torch
 
 from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv, Phase, discard_action
 from src.evaluate import hand_reward
-from src.model.encoding import encode
+from src.model.encoding import encode, legal_actions
 from src.model.network import (
     collate,
     greedy_actions,
     load_checkpoint,
-    select_random_legal,
 )
 from src.model.spec import CHECKPOINT_VERSION
 from src.checkpoints.io import file_sha256
@@ -46,8 +45,9 @@ def evaluate_games(
     policy: str = "greedy",
     warm_start: bool = False,
     deadline: Optional[float] = None,
-    curriculum_distance: Optional[int] = None,
     stop_requested: Callable[[], bool] = lambda: False,
+    *,
+    seed_stride: int = 1,
 ) -> PolicyResults:
     if isinstance(games, bool) or not isinstance(games, int) or games <= 0:
         raise ValueError("games must be a positive integer")
@@ -55,11 +55,8 @@ def evaluate_games(
         raise ValueError("policy must be greedy, random, or oracle")
     if policy == "oracle" and not warm_start:
         raise ValueError("oracle is only a discard-puzzle sensitivity check")
-    if curriculum_distance is not None:
-        if type(curriculum_distance) is not int or curriculum_distance <= 0:
-            raise ValueError("curriculum_distance must be a positive integer")
-        if warm_start:
-            raise ValueError("curriculum and warm starts are separate evaluation sources")
+    if type(seed_stride) is not int or seed_stride < 1:
+        raise ValueError("seed_stride must be a positive integer")
     outcomes = []
     draws = [0, 0]
     was_training = network.training
@@ -73,25 +70,25 @@ def evaluate_games(
             indices = range(start, min(start + 32, games))
             envs = [PappluEnv(config) for _ in indices]
             observations = [
-                env.reset_warm_start(seed=seed + index)
-                if warm_start else env.reset_curriculum(curriculum_distance, seed=seed + index)
-                if curriculum_distance is not None else env.reset(seed=seed + index)
+                env.reset_warm_start(seed=seed + index * seed_stride)
+                if warm_start else env.reset(seed=seed + index * seed_stride)
                 for env, index in zip(envs, indices)
             ]
-            rngs = [random.Random(seed + index + 10_000_000) for index in indices]
+            rngs = [random.Random(seed + index * seed_stride + 10_000_000) for index in indices]
             while any(not obs.done for obs in observations):
                 if stop_requested():
                     raise InterruptedError("Game evaluation stopped")
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("Game evaluation reached its time limit")
                 active = [index for index, obs in enumerate(observations) if not obs.done]
+                features = [encode(observations[index]) for index in active]
                 if policy == "greedy":
                     device = next(network.parameters()).device
                     actions = greedy_actions(
-                        network, collate([encode(observations[index]) for index in active], device),
+                        network, collate(features, device),
                     ).tolist()
                 elif policy == "random":
-                    actions = [select_random_legal(observations[index], rngs[index]) for index in active]
+                    actions = [rngs[index].choice(legal_actions(row)) for index, row in zip(active, features)]
                 else:
                     actions = []
                     for index in active:

@@ -316,55 +316,9 @@ function casualPolicy(obs, random) {
   return { action: tied[Math.floor(random() * tied.length)] + 2, reason: "greedy" };
 }
 
-function afterDraw(obs, face, kind) {
-  const hand = [...obs.hand];
-  hand[face] += 1;
-  const take = kind === TAKE_DISCARD;
-  const stockRemaining = obs.stockRemaining - Number(!take);
-  const player = { ...obs.players[0], handSize: obs.players[0].handSize + 1 };
-  return {
-    ...obs, hand, phase: 1, stockRemaining,
-    discardPile: take ? obs.discardPile.slice(0, -1) : obs.discardPile,
-    players: [player, ...obs.players.slice(1)],
-    history: [...obs.history, {
-      kind, actor: 0, handSize: player.handSize, turnsRemaining: obs.turnsRemaining,
-      stockRemaining, nextPlayer: player.nextPlayer, face,
-      offeredTop: obs.discardPile.at(-1) ?? null, initialHand: [],
-    }],
-  };
-}
-
 function neuralPolicy(obs, model) {
-  const belief = new BeliefState(obs);
-  if (obs.phase === 1) {
-    const values = Array.from(qValues(model, [obs])[0].slice(2));
-    const faces = candidateFaces(obs, true);
-    for (const face of faces) values[face] -= 0.03 * belief.feedRisk(face);
-    const candidates = [...faces].sort((a, b) => values[b] - values[a] || a - b).slice(0, BEAM);
-    const hand = [...obs.hand];
-    for (const face of candidates) {
-      hand[face] -= 1;
-      values[face] += 0.15 * outs1ply(hand, belief, obs.config);
-      hand[face] += 1;
-    }
-    return { action: bestFace(faces, values) + 2, reason: "discard-search" };
-  }
-  const top = obs.discardPile.at(-1);
-  const hand = [...obs.hand];
-  hand[top] += 1;
-  if (winningDiscard(hand, obs.joker, obs.config)) return { action: 1, reason: "exact-win" };
-  const probabilities = belief.stockProbabilities();
-  if (probabilities.length) {
-    const children = [afterDraw(obs, top, TAKE_DISCARD),
-      ...probabilities.map(([face]) => afterDraw(obs, face, DRAW_STOCK))];
-    const rows = qValues(model, children);
-    const best = rows.map((row, index) => {
-      const faces = candidateFaces(children[index], index === 0);
-      return Math.max(...faces.map((face) => row[face + 2] - 0.03 * belief.feedRisk(face)));
-    });
-    const stock = probabilities.reduce((total, [, chance], index) => total + chance * best[index + 1], 0);
-    return { action: best[0] > stock ? 1 : 0, reason: "draw-lookahead" };
-  }
   const values = qValues(model, [obs])[0];
-  return { action: values[1] > values[0] ? 1 : 0, reason: "greedy" };
+  const actions = obs.phase === 0 ? legalActions(obs) : candidateFaces(obs, true).map(face => face + 2);
+  const action = actions.reduce((best, candidate) => values[candidate] > values[best] ? candidate : best, actions[0]);
+  return { action, reason: "greedy" };
 }

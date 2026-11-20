@@ -47,7 +47,7 @@ class TestPairedComparison(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "Training dependencies not installed")
 class TestEvaluation(unittest.TestCase):
-    def test_curriculum_games_batch_without_changing_deal_order_or_random_policy_streams(self):
+    def test_cold_games_batch_without_changing_deal_order_or_random_policy_streams(self):
         from src.model.network import QNetwork
         from src.model.spec import ModelSpec
 
@@ -59,11 +59,11 @@ class TestEvaluation(unittest.TestCase):
                 network = QNetwork(ModelSpec(8, 1))
             config = GameConfig(max_turns=1)
             with mock.patch.object(network, "forward", wraps=network.forward) as forward:
-                greedy = evaluate_games(network, config, 35, 600000, curriculum_distance=1)
+                greedy = evaluate_games(network, config, 35, 600000)
             self.assertEqual(greedy, PolicyResults((0,) * 35, 34, 1))
             self.assertEqual([call.args[0].card.shape[0] for call in forward.call_args_list], [32, 32, 3, 3])
             self.assertEqual(
-                evaluate_games(network, config, 35, 600000, policy="random", curriculum_distance=1),
+                evaluate_games(network, config, 35, 600000, policy="random"),
                 PolicyResults((0,) * 35, 14, 21),
             )
             self.assertTrue(network.training)
@@ -113,6 +113,23 @@ class TestEvaluation(unittest.TestCase):
                     evaluate_checkpoint(str(path), games=1, warm_games=0)
             self.assertEqual(torch.get_num_threads(), before)
 
+    def test_seed_stride_matches_separate_games_for_both_policy_rngs(self):
+        from src.model.network import QNetwork
+        from src.model.spec import ModelSpec
+
+        torch.set_num_threads(1)
+        torch.manual_seed(17)
+        network = QNetwork(ModelSpec(8, 1))
+        config = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=3)
+        for policy in ("greedy", "random"):
+            with self.subTest(policy=policy):
+                actual = evaluate_games(network, config, 7, 30000001, policy, seed_stride=2)
+                scalar = [evaluate_games(network, config, 1, seed, policy) for seed in range(30000001, 30000015, 2)]
+                self.assertEqual(actual, PolicyResults(
+                    tuple(row.outcomes[0] for row in scalar),
+                    sum(row.stock_draws for row in scalar), sum(row.discard_draws for row in scalar),
+                ))
+
     def test_puzzle_oracle_proves_sensitivity(self):
         from src.model.network import QNetwork
 
@@ -143,11 +160,11 @@ class TestEvaluation(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             evaluate_games(QNetwork(), GameConfig(), 0, 0)
-        for distance in (0, -1, True, 1.5, "1"):
-            with self.subTest(distance=distance), self.assertRaisesRegex(ValueError, "curriculum_distance"):
-                evaluate_games(QNetwork(), GameConfig(), 1, 0, curriculum_distance=distance)
-        with self.assertRaisesRegex(ValueError, "separate evaluation sources"):
-            evaluate_games(QNetwork(), GameConfig(), 1, 0, warm_start=True, curriculum_distance=1)
+        with self.assertRaisesRegex(ValueError, "only a discard-puzzle"):
+            evaluate_games(QNetwork(), GameConfig(), 1, 0, policy="oracle")
+        for stride in (0, -1, True):
+            with self.subTest(stride=stride), self.assertRaisesRegex(ValueError, "seed_stride"):
+                evaluate_games(QNetwork(), GameConfig(), 1, 0, seed_stride=stride)
 
 
 if __name__ == "__main__":

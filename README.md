@@ -1,555 +1,270 @@
 # PappluAI
 
-Papplu hand evaluation, shared-deck play, and placement-based model training.
-The evaluator uses this project's house rules, not a universal rummy ruleset.
-The browser play area provides a hand builder and a card table with Human and AI seats.
-The optional training tools use PyTorch.
-
-The Social club layout uses a warm background, player seats, a green hand mat,
-and a separate draw tray. Cards use clear sans-serif indices and a softer
-palette while keeping recognizable playing-card artwork.
-
-Card faces use original SVG artwork with red hearts and diamonds, black spades
-and clubs, mirrored corner indices, number-card pips, and colored court cards.
-Face-down cards use a generic patterned back. No external images or fonts are
-downloaded.
+Papplu hand evaluation, shared-deck play, and a Q-network trained by self-play.
+The evaluator implements this project's house rules, not a universal rummy ruleset.
+The browser runs without a build or a remote API. Training needs PyTorch.
 
 ## Run the simulator
 
-From the repository root, start the local server with Python 3.9 or later.
-No package installation or JavaScript build is needed.
+Start the local server from the repository root with Python 3.9 or later.
 
 ```powershell
 python -m src.simulator
 ```
 
-Open `http://127.0.0.1:8765` in your browser. To use another port, run
-`python -m src.simulator --port 8766`. Stop the server with Ctrl+C.
-The server accepts only local requests and is not a production web server.
+Open `http://127.0.0.1:8765`. Use `--port 8766` to change the port.
+Stop the server with Ctrl+C. The server accepts local requests only.
 
 ### Hand builder
 
-Expand the settings panel to change the hand rules or selected joker.
-Samples and the card picker remain available alongside the hand.
-Click a card under **Add cards** to add a copy. Select a card in your hand and
-choose **Remove** to remove only that copy.
-Load a sample to inspect a complete hand without entering all 21 cards.
+The settings panel controls the hand size, sequence requirement, and selected joker.
+Add cards with the picker, remove a selected copy, or load a sample.
+The evaluator reports complete meld witnesses for winning hands.
+It also reports minimum deadwood points for partial and complete hands.
+A losing declaration has binary reward zero, not zero useful sequences.
 
-The result updates after each edit. A winning hand shows its complete grouping
-and what each substituted joker represents. A losing hand has reward zero, but
-the display does not claim that it contains zero useful sequences.
-Partial and complete hands also show `minimumPenalty` deadwood points,
-exempt melds, and counted deadwood cards.
+Card faces use original SVG artwork. No external images or fonts are downloaded.
+Face-down cards use a generic back that reveals no face information.
 
 ### Game table
 
-Choose a preset or edit one through six seats. Each seat has a custom name
-and is either Human or AI. The default is **vs AI**, with You and a Neural AI.
-**Solo Practice** has one human. **Pass & Play** has two humans.
-**AI Watch** seats Neural, Tactical, and Casual opponents.
-Custom tables can mix any of these seats.
+Tables support one through six Human or AI seats.
+The presets are vs AI, Solo Practice, Pass & Play, and AI Watch.
+Seat names, AI tiers, and rules apply at the next deal.
+The current round keeps its original settings.
 
-The default rules use three decks, 21 cards per player, and five required pure sequences.
-Deal a new game to shuffle and deal each player's hand.
-The game then removes one card as the joker indicator and places another on
-the discard pile. The indicator cannot be drawn during the round.
-Seat and rule changes apply at the next deal. The current round keeps its
-original seats and rules. AI speed can be Instant, Normal, or Slow.
-**Pause** stops AI play. **Resume** continues it.
-AI Watch pauses after 200 completed turns and can be resumed.
+Draw from the stock or the top discard, then discard from the enlarged hand.
+Humans can return either drawn card immediately.
+Neural policies keep a discard-pile pickup when another face can be discarded.
+That policy restriction prevents repeated pickup-and-return cycles.
+The underlying game still allows the move.
 
-Draw from the stock or the top of the discard pile. Choose a card to discard
-from your enlarged hand, or discard the drawn card immediately.
-Both choices finish the turn with the original hand size.
-Returning a card drawn from the discard pile is allowed in this simulator.
-The game does not decide whether that choice improved your hand.
+Pass & Play covers hands between turns.
+With one human, that hand stays visible during AI turns.
+AI Watch reveals hands to spectators, but each AI receives only its own hand and public events.
+Opponent stock faces and face-down declarations stay hidden.
 
-With multiple human seats, pass the screen and reveal the next human's hand.
-With one human seat, that human's hand stays visible during AI turns.
-AI-only tables show all hands to spectators, but each AI receives only its own
-hand and public history. Opponent stock draws and face-down declarations stay hidden.
-**Check hand** is off initially. Enable it to see validity and grouping for the
-visible human hand.
-Having a valid hand does not automatically end the round.
-The hand-check panel appears only when requested. Declaration results appear
-when a declaration is made, rather than occupying an empty panel during play.
-**Reshuffle discard pile when stock is empty** is on by default.
-After a continuing discard or invalid declaration, the game shuffles all but
-the top discard into the empty stock. Turn the rule off to leave the stock empty.
-If both piles are empty, deal again.
+The speed settings are Instant, Normal, and Slow.
+Pause and Resume control AI play. AI Watch pauses after 200 completed turns.
+The optional Check hand panel does not declare a win or end a round.
+
+When stock empties, the default rule shuffles all but the top discard into stock.
+Turn off recycling to leave stock empty. Deal again if both piles are empty.
+The selected joker indicator stays outside the playable piles.
 
 ### AI tiers
 
-- **Neural + Search** runs the `card_mlp` `PolicyNet` in JavaScript.
-  It uses public-card beliefs, feed risk, exact winning checks, draw lookahead,
-  and a four-candidate one-ply outs search.
-- **Tactical** minimizes exact deadwood penalty and uses feed risk and a
-  four-candidate one-ply outs search.
-- **Casual** keeps wild cards and builds groups with nearby ranks and matching cards.
+- **Neural** chooses the legal action with the highest Q-value. Its reported reason is `greedy`.
+- **Tactical** minimizes exact deadwood penalty and uses public-card beliefs, feed risk, and one-ply outs.
+- **Casual** keeps wild cards and favors nearby ranks and matching cards.
 
-Every tier declares when it finds a discard that leaves a valid hand.
-Neural falls back to Tactical when the model is unavailable, the rules differ,
-or the table has only one seat. The scoreboard reports the effective tier.
-The shipped weights are deterministic, untrained bootstrap weights, not a
-promoted champion. They prove inference compatibility and do not establish playing strength.
-There is no promotion evidence for these weights at any seat count.
-Training examples evaluate two, three, and four seats.
+Every tier first declares an exact winning discard when one exists.
+Neural has no draw lookahead, belief search, or feed-risk adjustment.
+It falls back to Tactical for unavailable weights, incompatible rules, or solo browser play.
+The scoreboard reports the effective tier and any downgrade.
 
-### Declare a win
+The bundled model contains seeded, untrained bootstrap weights.
+Those weights establish inference compatibility, not playing strength or a rating.
 
-After drawing, select the card you want to put down and choose **Declare win**.
-That card goes face down into a separate declaration area, not the playable
-discard pile. The browser evaluator checks the remaining hand against the
-round's rules, even when **Check hand** is off.
+### Declarations and scoring
+
+After drawing, select a card and choose Declare win.
+The card goes face down into a separate declaration area.
+The evaluator checks the remaining hand.
 
 | Result | Outcome |
 | --- | --- |
-| Valid hand | The declaring player wins and the round ends. |
-| Invalid hand | The player loses, is eliminated from the round, and receives 80 penalty points. |
-| Evaluation error or timeout | No win, loss, or penalty is assigned. Retry the same pending declaration. |
+| Valid declaration | The declaring player wins. |
+| Invalid declaration | The player receives 80 penalty points and leaves the round. |
+| Evaluation error or timeout | The declaration stays pending and retryable. No penalty is assigned. |
 
-Other active players continue after an invalid declaration. Eliminated players
-are skipped, and their cards remain out of play. When only one player remains,
-that player wins automatically. An invalid solo declaration ends in a loss.
-Cards and turns cannot be changed while a declaration is awaiting a verdict.
+Other active players continue after an invalid declaration.
+The last remaining player wins. An invalid solo declaration loses.
+Cards cannot change while the verdict is pending.
+Penalty totals carry across deals with the same player count.
+The final summary reveals hands, declaration cards, deadwood, and exempt melds.
+Deadwood points remain separate from false-declaration penalties and binary reward.
 
-Penalty totals accumulate across deals with the same player count.
-Changing the player count resets those totals. These are false-declaration
-penalties only. The end-of-round summary reveals every final hand, the
-declared card, minimum deadwood points, exempt melds, and counted cards.
-Deadwood scores do not change the false-declaration scoreboard.
-The evaluator's binary reward remains separate from both scores.
+The declaration penalty follows [RummyCircle's points-rummy rules](https://www.rummycircle.com/rummy-variations/points-rummy.html).
+That source describes 13-card play. This project adopts the penalty as a house rule for 21 cards.
+[Pagat describes differences between 21-card variants](https://www.pagat.com/rummy/indian.html).
 
-The 80-point penalty and continued multiplayer play follow
-[RummyCircle's points-rummy declaration rules](https://www.rummycircle.com/rummy-variations/points-rummy.html).
-Those rules describe a 13-card game. This simulator adopts the penalty as a
-house rule for its 21-card game, not as a universal Papplu rule.
-[Pagat notes that 21-card variants have differing penalties](https://www.pagat.com/rummy/indian.html).
+### Card order and persistence
 
-### Arrange your cards
+Drag cards or use the move controls to arrange a hand.
+Sort restores suit, rank, and physical-copy order.
+Manual order survives draws, discards, and checks within the round.
+Drawing appends the new card.
 
-Hands start sorted by suit and rank. Drag cards into your preferred order, or
-select a card and use the move controls. **Sort** restores the default
-order. Individual copies move separately, including identical-looking cards.
-Your order persists across draws, discards, checks, and turns.
-Drawing appends the new card instead of rearranging your hand.
-
-Builder and table hands are separate. Table settings apply when a new game is
-dealt, not halfway through a round. Reloading resets the hands and scores.
-Seat and rule preferences persist under `papplu:settings:v1` in local storage.
+Builder and table hands are separate.
+Reloading resets hands and scores.
+Seat and rule preferences use `papplu:settings:v1` in local storage.
 There are no network players or saved rounds.
 
-### Simulator limits
-
-The UI supports one through six decks, hand sizes from 3 through 30, and
-required sequence counts from 0 through 10.
-The deal must leave enough cards for all players, the indicator, and the first
-discard. Individual copies retain their identities during draw and discard.
-
-The browser runs `web/evaluate.mjs`, an exact port of `src/evaluate.py`.
-Parity fixtures compare validity, meld witnesses, penalties, and validation errors.
-Module workers run evaluation and AI search without a production API.
-Any HTTP static server can serve `web/`. The Python server still provides
-`POST /api/evaluate` for existing scripts.
-Older results cannot overwrite an edited hand.
-A worker evaluation that exceeds ten seconds stops and reports an error,
-not a losing-hand verdict. Preview errors leave the hand editable.
-A pending declaration remains committed and retryable without a false penalty.
-Browsers without workers use the same engine in the main thread.
-That fallback can block the UI during a long search and cannot interrupt it.
-
-### Regenerate browser fixtures and weights
-
-The parity exporter and bootstrap exporter need only Python's standard library.
-
-```powershell
-python tools\export_parity_fixtures.py
-python tools\weights_export.py --bootstrap
-```
-
-The second command writes `web/papplu-model.json` and
-`tests/fixtures/qnet-golden.json`. A pure-Python forward pass produces the
-golden Q values. Node tests compare all 54 actions within `1e-4`.
-With PyTorch installed, replace the bootstrap with a current checkpoint or registry champion.
-
-```powershell
-python tools\weights_export.py --checkpoint path\to\model.pt
-python tools\weights_export.py --registry path\to\registry
-```
+Module workers run evaluation and AI decisions.
+Browsers without workers use the same local engine on the main thread.
+That fallback can block during an exact evaluation and cannot interrupt it.
+A worker timeout reports an error, never a losing-hand verdict.
+Any static HTTP server can serve `web/`.
+The Python server also supports `POST /api/evaluate`.
 
 ## House rules
 
-The default declaration contains **21 cards and at least 5 pure sequences**.
-Both values are configurable. Every card must belong to exactly one legal group.
+The default winning hand has 21 cards and at least five pure sequences.
+Every card belongs to exactly one legal group.
 
 | Group | Rule |
 | --- | --- |
-| Sequence | At least three consecutive ranks of one suit, or three identical natural copies of the exact same card. Ace can be low in A-2-3 or high in Q-K-A, but K-A-2 is invalid. |
-| Required pure sequence | A sequence with no substitutions except by the exact selected joker card, or three identical natural copies of the exact same card. |
-| Set | Three or four cards of one rank with distinct represented suits. Sets do not count toward the pure-sequence requirement. |
+| Sequence | At least three consecutive ranks in one suit, or three identical natural copies of one face. |
+| Required pure sequence | No substitution except by the exact selected joker face. Identical natural triplets also qualify. |
+| Set | Three or four cards of one rank with distinct represented suits. Sets do not meet the pure-sequence requirement. |
 
-A long sequence counts as one group. It can count as multiple sequences only if
-it can be split into disjoint sequences of at least three cards each.
-Additional sequences and sets may use wildcards once the required sequences
-are accounted for. The input order does not matter.
+Ace is low in A-2-3 or high in Q-K-A. K-A-2 is invalid.
+A long sequence counts once unless it splits into disjoint legal sequences.
+Additional sequences and sets can use joker-rank wild cards.
+Multiple physical copies can belong to separate groups.
 
-### Jokers
+When `8s` is selected, all eights are wild.
+The exact `8s` can substitute in a required pure sequence such as `4h 5h 8s`.
+An `8d` can appear naturally in `7d 8d 9d`.
+It cannot substitute for `6h` in a required pure sequence.
+Three copies of the exact selected joker form a qualifying triplet.
+`7s 7s 8d` is not a set, but `7s 7h 8d` can be.
 
-The card drawn at the start identifies the selected joker, such as `8s`.
-Every eight is then wild, with different permissions for required sequences.
+The browser supports one through six decks, hand sizes of 3 through 30, and sequence requirements of 0 through 10.
+The deal must leave enough cards for every hand, the indicator, and the first discard.
 
-| Cards when `8s` is selected | Counts as a required pure sequence? |
-| --- | --- |
-| `4h 5h 8s`, with `8s` representing `6h` | Yes. The exact selected card can substitute anywhere. |
-| `7d 8d 9d` | Yes. The off-suit eight acts as its natural card. |
-| `4h 5h 8d`, with `8d` representing `6h` | No. It is an additional impure sequence only. |
+## Python evaluator
 
-Jokers may fill every position in a group. An all-joker sequence counts toward
-the required minimum only if it satisfies the same substitution rule.
-For example, three copies of `8s` qualify when `8s` is selected.
-
-Jokers do not remove duplicate natural cards. `7s 7s 8d` is not a legal set
-when eights are wild, but `7s 7h 8d` is legal because `8d` can represent `7c`.
-Multiple copies of a face may belong to separate groups.
-
-## Python API
-
-`src\evaluate.py` requires Python 3.9 or later and has no third-party dependencies.
+`src.evaluate` has no third-party dependencies.
+Card indices are `suit * 13 + rank`.
+Suits are spades, hearts, diamonds, and clubs.
+Ranks are Ace through King, with Ace at zero.
+Hands are 52 nonnegative integer counts, not physical card IDs.
 
 ```python
-from src.evaluate import evaluate_hand, hand_reward, is_valid_hand
+from src.evaluate import evaluate_hand, hand_reward, minimum_penalty
 
-ranks = ("A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K")
-suits = ("s", "h", "d", "c")
-
-def card_index(card):
-	return suits.index(card[-1]) * 13 + ranks.index(card[:-1])
-
-cards = (
-	"3s 4s 5s "
-	"6h 7h 8h "
-	"9d 10d Jd "
-	"Ac 2c 3c "
-	"Js Qs Ks "
-	"2s 2h 2d "
-	"5h 5d 5c"
-).split()
 hand = [0] * 52
-for card in cards:
-	hand[card_index(card)] += 1
-
-joker = card_index("8s")
-result = evaluate_hand(hand, joker)
+hand[0] = hand[1] = hand[2] = 1
+result = evaluate_hand(hand, joker=7, required_sequences=1, cards_in_hand=3)
 assert result.is_valid
-assert is_valid_hand(hand, joker)
-assert hand_reward(hand, joker) == 1.0
-
-for meld in result.melds:
-	print(meld.kind, meld.cards, meld.represented_cards, meld.is_pure)
+assert hand_reward(hand, joker=7, required_sequences=1, cards_in_hand=3) == 1.0
+assert minimum_penalty(hand, joker=7, required_sequences=1).points == 0
 ```
 
-All three functions accept the same arguments.
+`evaluate_hand` returns an immutable `HandEvaluation` with exact meld witnesses.
+`is_valid_hand` returns the declaration verdict.
+`hand_reward` returns 1.0 for a valid complete declaration and 0.0 otherwise.
+`minimum_penalty` accepts any hand size and returns an exact `HandPenalty`.
+A zero penalty alone does not establish a valid declaration.
 
-| Argument | Meaning |
-| --- | --- |
-| `hand` | A sequence of 52 nonnegative integer counts, not a list of card IDs or a one-hot encoding. |
-| `joker` | The exact selected card's index from 0 through 51. It need not be present in the hand. |
-| `required_sequences=5` | Minimum number of disjoint qualifying sequences. May be zero. |
-| `cards_in_hand=21` | Exact number of cards in a winning declaration. Must be positive. |
+Numbered cards score face value. A/J/Q/K score 10. Joker-rank cards score zero.
+Qualifying pure sequences are exempt.
+Other melds become exempt only when that grouping meets the sequence requirement.
+The search considers alternative groupings and can be costly on joker-heavy hands.
+Malformed counts and settings raise `TypeError` or `ValueError`.
+The evaluator does not mutate its inputs.
 
-Card indices are `suit_index * 13 + rank_index`. Suits are spades, hearts,
-diamonds, and clubs. Ranks are Ace through King, with Ace at index zero.
-Counts support multiple decks. The evaluator does not validate the deck supply
-or limit the number of copies of a face. Printed jokers are not represented.
+## Model and training contract
 
-`evaluate_hand` returns an immutable `HandEvaluation`. For a valid hand,
-`melds` contains a complete grouping. Each `Meld` records its `kind`, consumed
-`cards`, aligned `represented_cards`, and whether it `is_pure`.
-For an invalid declaration, `is_valid` is false and `melds` is empty.
-
-`is_valid_hand` returns a boolean. `hand_reward` returns **1.0 for a valid
-declaration and 0.0 otherwise**, with no partial credit or deadwood score.
-Use the reward on the final hand after discarding, not on the extra-card draw
-state. A hand whose total differs from `cards_in_hand` is invalid.
-
-Malformed inputs, including negative counts, nonintegral counts, invalid joker
-indices, and invalid configuration values, raise `TypeError` or `ValueError`.
-Booleans are not accepted as integers. The evaluator does not mutate its inputs.
-
-The old `matched_rate` prototype and its matching helpers have been removed.
-Use `hand_reward` for a declaration verdict and `evaluate_hand` for a grouping.
-The binary reward is not the old prototype's unmatched-card count.
-`Learner` trains on shaped terminal utility, not this binary reward.
-Solo declaration earns +1. A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`.
-Zero deadwood without a declaration still earns only -0.5.
-Multiplayer utility weights each pairwise margin by 1 when either seat declared, and by 0.5 otherwise.
-The declarer earns +1, while the best exhausted hand earns at most +0.5.
-Ratings and promotion still use unshaped `DealOutcome.margin` values.
-
-`minimum_penalty(hand, joker, required_sequences=5)` returns an exact
-`HandPenalty` for a hand of any size. Its `points`, `exempt_melds`, and
-`counted_cards` describe one minimum-penalty grouping. Numbered cards use face
-value, A/J/Q/K score 10, and joker-rank cards score zero. Qualifying sequences
-are exempt, but sets and other melds become exempt only when the required
-sequences exist in that same grouping. A zero penalty does not prove a valid
-declaration. The binary reward remains unchanged.
-
-The evaluator searches alternative groupings instead of greedily removing the
-first sequence it finds. It caches remaining card counts and the unmet sequence
-quota within each call. The search is exact, but its worst-case cost grows
-combinatorially. Joker-heavy hands can be slower than ordinary deals.
-The exact evaluator can remain the limiting cost for joker-heavy hands.
-
-## Train a model
-
-Install the optional training dependency from the repository root.
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements-training.txt
-```
-
-The executable commands live under `src.cli`. They parse arguments before
-loading the optional PyTorch runtime. Implementation modules are grouped by
-responsibility.
+The only architecture is `card_mlp` v5.
+The [training guide](TRAINING.md) covers setup, self-play, resume, evaluation, and browser export.
 
 | Package | Responsibility |
-|---|---|
-| `src.game` | Rules, immutable information observations, stock handling, and multiplayer state |
-| `src.model` | Pure `Features`, `card_mlp` Q-only inference, and model checkpoints |
-| `src.training` | Unified replay, Q-only Deep Monte-Carlo learner, curriculum, PFSP league, and gated promotion in `src.training.train` |
-| `src.evaluation` | Benchmarks, arena matches, ratings, and promotion gates |
-| `src.checkpoints` | Atomic files, tensor validation, evidence, and registries |
+| --- | --- |
+| `src.game` | Environments, public observations, terminal outcomes, and stock handling. |
+| `src.model` | Pure observation encoding, the Q-network, and model checkpoint loading. |
+| `src.training.train` | Tensor replay, DMC updates, self-play actors, snapshots, and fixed validation. |
+| `src.evaluation` | Solo evaluation and shared-deck arena matches. |
+| `src.checkpoints` | Atomic files and tensor validation. |
 
-`src.cli.train` is the unified training command across one through six players.
-`Learner` runs Q-only Deep Monte-Carlo with `gamma = 0.99` and fits legal-centered Q-values to discounted terminal utilities.
-Solo play uses shaped deadwood utility, and multiplayer play uses declaration-weighted pairwise utility.
-See [TRAINING.md](TRAINING.md) for a
-fresh-clone walkthrough of every training workflow.
-See [RATINGS.md](RATINGS.md) for persistent multiplayer tournaments,
-point-based placements, uncertainty, and capped-game evidence.
+### Observation encoding
 
-### Current model contract
+`encode` returns 1,063 little-endian float32 values, or 4,252 bytes.
+Encoding version 4 uses the following layout.
 
-`card_mlp` is the only supported architecture. `Observation` contains the
-observer's current hand, public player views, and complete visible event history.
-Seats are relative to the observer. Public stock draws reveal the source and
-hand count, not the face. The observer retains their initial hand and own drawn
-faces after those cards leave their hand.
+| Field | Shape | Float offset |
+| --- | --- | --- |
+| `card` | 52 by 18 | 0 |
+| `seat` | 6 by 9 | 936 |
+| `context` | 18 | 990 |
+| `legal` | 54 | 1008 |
+| `top` | 1 | 1062 |
 
-`src.model.encoding.encode` is pure Python and returns a fixed `Features` record.
-Each record contains 802 little-endian float32 values, or 3,208 bytes.
-A single scan of visible history populates 13 channels across all 52 card faces:
-own copy counts, discard-pile counts, wild and indicator flags, point values,
-opponent discards, known copies held by the next opponent and other opponents,
-and cards passed by the next opponent. It also populates nine channels across
-six relative seat slots, 17 table-context features, 54 legal-action flags, and
-the discard-top index.
-The encoder never reads an opponent's private hand or the stock order.
+The card channels contain own copies, pile copies, top and indicator flags, wild flags, points, and visible opponent activity.
+Five further channels describe `adjacent`, `set_mates`, `natural`, `pure`, and `any_meld`.
+The context includes `unavoidable_dw`.
+The encoder computes meld membership once, without an exact hand search.
+Seats are relative to the observer. Unused seat slots are zero.
+No feature contains hidden opponent hands or stock order.
 
-`src.model.network.collate` batches cached `Features` without rescanning history.
-`PolicyNet` computes five vectorized meld-participation channels and unavoidable
-deadwood on the four-suit, 13-rank grid, then runs `CardBlock` blocks over a
-14-slot `[A, 2, ..., K, A]` rank strip with rank-set, suit-run, and table
-context plus shared `card_norm` mean and max table pooling.
-Its dueling Q-values center advantages over legal actions across all 54 actions.
-The stock action has no hidden drawn-card input.
-`QNetwork` is pure Q-only with no auxiliary heads or target network.
-Browser exports use `formatVersion == 2` and contain `policy.*` tensors.
+The legal mask excludes returning a just-taken discard when another face is held.
+It retains the action for a single-face hand.
+Terminal observations and afterstates awaiting another seat have no legal actions.
+Training, solo evaluation, arena policies, and browser inference use this encoding.
 
-`ModelSpec(width=64, blocks=2)` is the default with 126,660 parameters.
-`src.cli.train` accepts `--width` and `--blocks` when creating a fresh model without `--initial-model`.
-Warm-started runs inherit the initial checkpoint's spec.
-The browser accepts any valid spec, including width 128 and three blocks.
+### Neural network
 
-`Replay` v6 stores encoded `Features` and chosen action per step, enforces strict step capacity across trajectories, and gives populated player counts equal sampling shares.
-State checkpoints compress encoded feature bytes with `zlib` so `torch.load(..., weights_only=True)` restores replay without pickled `Observation` objects or history journals.
-Model checkpoints use `checkpoint_version == 5` and `encoding_version == 3`.
-Current `card_mlp` v5 model weights remain valid warm starts via `--initial-model`.
-Trainer state uses `version == 6` and rejects incompatible earlier checkpoints and state files.
-There is no checkpoint conversion or old architecture selector.
-Old model architectures remain unsupported.
-Fresh weights and tiny updates establish working software, not competitive play.
+`PolicyNet` embeds the 18 card channels and 72 table inputs.
+Residual `CardBlock` modules mix neighboring ranks, matching ranks, suits, and table context.
+The rank strip is `[A, 2, ..., K, A]`.
+Shared normalization and mean and max pooling update the table representation.
+The draw and face heads produce 54 advantages.
+A value head and legal-action centering produce Q-values.
+There are no auxiliary heads, target network, or meld computations inside the network.
 
-### Run a short discard-puzzle smoke test
+`ModelSpec(64, 2)` has 126,660 parameters.
+`ModelSpec(128, 3)` has 672,388 parameters.
+Python and Node tests compare nonzero exported weights at both sizes within `1e-5` for all 54 actions.
+Browser forward computation uses flat Float32 buffers.
 
-This command runs 20 three-card warm-start episodes on CPU and exports a standalone model checkpoint. It checks the
-training, checkpoint, load, and evaluation paths. It does not measure full
-21-card play.
+### DMC learning
 
-```powershell
-.\.venv\Scripts\python -m src.cli.train --checkpoint checkpoints\smoke.pt --max-episodes 20 --num-decks 2 --cards-in-hand 3 --required-sequences 1 --max-turns 5 --warm-start-fraction 1 --validation-games 0
-.\.venv\Scripts\python -m src.cli.benchmark --checkpoint checkpoints\smoke.pt --output runs\smoke-evaluation.json --games 20 --warm-games 20
-```
+The trainer cycles cold deals across one, two, three, and four players by default.
+On 75% of multiplayer deals, every seat uses the current epsilon-greedy network and contributes a trajectory.
+The remaining deals record one learner seat against uniform random and frozen snapshot opponents.
+The active snapshot pool holds at most eight checkpoints.
 
-To continue from those weights with fresh optimizer and replay state, pass `--initial-model`.
+Replay stores contiguous float32 features, int64 actions, and float32 discounted returns.
+For terminal utility `u`, step `t` of a length-`T` trajectory targets `u * 0.99 ** (T - 1 - t)`.
+AdamW fits selected-action Q-values with Smooth-L1 loss and gradient clipping.
+There is no warm-start curriculum, opponent prioritization, registry, or promotion gate.
 
-```powershell
-.\.venv\Scripts\python -m src.cli.train --initial-model checkpoints\smoke.pt --checkpoint checkpoints\smoke-finetuned.pt --max-episodes 5
-```
+A solo declaration earns +1.
+A solo loss with `p` deadwood points earns `-1 + 20 / (40 + p)`.
+Multiplayer utility averages pairwise placement margins.
+A pair involving a declarer has weight 1. Other pairs have weight 0.5.
+The declarer earns +1. The best exhausted hand earns at most +0.5.
 
-### Train the default 21-card solo and curriculum model
-
-`src.cli.train` creates a new run when `--output-dir` has no `latest-state.pt` and resumes automatically when `latest-state.pt` already exists.
-The default configuration uses one player, three decks, 21 cards, five pure
-sequences, a 60-turn limit, and the same `card_mlp` network used in multiplayer.
-
-```powershell
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --curriculum-distances 2 4 6 10
-```
-
-For a larger model, set its spec when the run starts.
-
-```powershell
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21-wide --curriculum-distances 2 4 6 10 --width 128 --blocks 3
-```
-
-To warm-start existing v5 weights with fresh optimizer and replay state, point `--initial-model` at the checkpoint and choose a fresh output directory.
-
-```powershell
-.\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\best-model.pt --output-dir runs\full21-finetune --curriculum-distances 2 4 6 10 --initial-stage 2 --learning-rate 0.0001 --epsilon-start 0.08 --epsilon-end 0.02 --epsilon-decay-episodes 10000
-```
-
-`--epsilon-start`, `--epsilon-end`, and `--epsilon-decay-episodes` persist in `TrainConfig`.
-Validation and `best-model.pt` selection use binary greedy declaration rates.
-
-The trainer writes `latest-model.pt`, `best-model.pt`, `status.json`, `metrics.jsonl`, and `latest-state.pt`.
-The state checkpoint includes the model, optimizer, compressed replay buffer, counters,
-curriculum stage, PFSP history, gate state, and random-number-generator states. Repeat `--output-dir` to
-continue the same run deterministically.
-
-```powershell
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\full21 --max-episodes 5000
-.\.venv\Scripts\python -m src.cli.benchmark --checkpoint runs\full21\latest-model.pt --output runs\full21-evaluation.json --games 300 --warm-games 0
-```
-
-`src.model.network.load_checkpoint` accepts only current model checkpoints.
-It validates the model spec, tensor keys, shapes, types, and finite values before
-changing a supplied network. Saved game settings must contain all five fields.
-Curriculum is a one-player scenario of the same architecture.
-Its history starts at the actual constructed deal, without the construction target.
-
-### Compare policies in shared-deck matches
-
-`src.cli.arena` runs headless matches with two through six seats. Repeat `--model`
-once per seat. Use `random` for a random legal policy.
-
-```powershell
-.\.venv\Scripts\python -m src.cli.arena --model runs\full21\latest-model.pt --model random --games 20 --seed 1000 --max-turns 60 --output runs\arena.json
-```
-
-`run_matches` advances multiple deals in lockstep and batches inference by policy.
-The report records each seat order, winner label, terminal reason, action
-count, and remaining stock. Checkpoint policies load lazily and must match the
-saved deck, hand, and sequence rules.
-Each game's `telemetry` records per-seat stock draws, discard pickups, and
-refill turns.
-
-### Train across mixed tables and PFSP opponents
-
-`src.cli.train` trains one unified policy across any distinct subset of `--players 1` through `6`.
-The initial model, `--opponent` checkpoints, and random policy stay frozen in the opponent pool while the online learner updates.
-
-```powershell
-New-Item -ItemType Directory -Force checkpoints
-Copy-Item runs\full21\latest-model.pt checkpoints\frozen-full21.pt
-.\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\latest-model.pt --opponent checkpoints\frozen-full21.pt --output-dir runs\league --players 1 2 3 4 --max-episodes 128 --round-episodes 16 --max-seconds 3600 --checkpoint-every 16
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\league --max-episodes 256 --max-seconds 3600 --checkpoint-every 16
-```
-
-The state checkpoint is written at round and gate boundaries. It contains the
-network, AdamW state, replay, counters, opponent-pool order, and random
-number generator states. Supplying additional `--opponent` files on resume copies and registers them without discarding replay.
-
-Player counts are sorted and distinct and cycle deterministically across episodes.
-`Replay` samples steps uniformly within each populated player count and balances counts equally.
-`--max-turns` sets the per-seat turn budget and defaults to 60.
-`--batch-size` caps replay samples per optimizer update and defaults to 128.
-`--updates-per-episode` sets gradient updates per completed trajectory and defaults to 4.
-`--round-episodes` batches up to 16 episodes per round by default.
-`--learning-rate` defaults to 0.0003.
-`--epsilon-start`, `--epsilon-end`, and `--epsilon-decay-episodes` default to 0.30, 0.05, and 10000.
-On resume, omit training hyperparameters to restore their saved values, or supply matching values.
-Only `--checkpoint-every`, `--gate-workers`, `--torch-threads`, and `--device` can change on resume.
-
-`pfsp_probabilities` implements prioritized fictitious self-play.
-It weights other frozen opponents by `(1 - p)^2`, where `p` is the Bayesian-smoothed pairwise placement score.
-The default schedule reserves 35% for the current champion and 15% for baseline and random anchors.
-The remaining share favors opponents the learner places below.
-
-### Run gated promotion cycles
-
-Adding `--promote` activates cycle gating and `ModelRegistry` lineage inside `Trainer`.
-Each cycle trains for `--cycle-episodes` episodes, runs selection against the pinned champion, and confirms passing candidates on fresh disjoint seeds.
-
-```powershell
-.\.venv\Scripts\python -m src.cli.train --initial-model runs\full21\latest-model.pt --output-dir runs\improve --players 2 3 4 --promote --max-seconds 3600 --max-cycles 1 --round-episodes 16 --gate-workers 4
-.\.venv\Scripts\python -m src.cli.train --output-dir runs\improve --max-seconds 3600 --gate-workers 2
-```
-
-`registry/champion.json` is the only champion authority, mirrored to `champion-model.pt` for convenience. Model snapshots are immutable.
-Self-promotion preserves weights, AdamW moments, and replay.
-`--rebase-after-rejections 8` reloads champion weights and resets AdamW moments after eight consecutive rejected cycles while preserving replay and random streams.
-
-`evaluate_gate` writes `gate_schema_version == 5` evidence.
-`--selection-blocks 32` produces 128 two-player, 64 three-player, and 32 four-player blocks.
-`--confirmation-blocks 128` produces 512, 256, and 128 blocks respectively.
-Each block batches all 2, 6, or 24 seat orders in one `run_matches` call.
-Placement margins count better loser placements even when another seat declares.
-Declaration margins remain a separate retention check.
-Each base block shares seeds `seed + 4 * base_block + replica` across active counts.
-The gate averages replicas within each count, gives counts equal weight, and bootstraps whole joint base blocks.
-
-Selection screens mean gains at 32 base blocks.
-Confirmation requires a positive aggregate placement gain and lower 95% bound at 128 base blocks.
-Per-count placement, declaration, and paired solo checks allow bounded noninferiority.
-Both phases still require at least 256 paired solo games through `--solo-games`.
-Evidence includes `phase`, `gate_failures`, and `declaration_ci95`.
-See the [complete promotion limits](RATINGS.md#promotion-evidence-stays-separate).
-Reduced-cap or undersized smoke evidence cannot promote.
-The registry recomputes these metrics from raw margins and requires disjoint selection and confirmation seeds.
-
-`--gate-workers` defaults to 1 and controls gate processes, not the training algorithm.
-Workers load their own frozen policies once and use one PyTorch thread.
-Only the coordinator appends completed jobs to `gates/<gate_id>.jsonl`.
-`Progress.gate` persists explicit `Selecting` and `Confirming` states across interruptions, and resume skips valid completed jobs in deterministic block and solo-slice order.
-Changing `--gate-workers`, `--checkpoint-every`, or `--max-cycles` on resume does not change gate results.
-Training updates are stochastic and are
-not an atomic group, so published metrics need not improve monotonically.
-`status.json` is written last and describes the stable published snapshot.
-
-Existing v5 model weights can start a fresh run.
-Old champion conversion and rule migration commands remain removed.
-Use a new output directory rather than resume an incompatible replay or controller state.
+Model checkpoints use version 5 and encoding version 4.
+Trainer state uses version 7.
+Older encodings and trainer states require a fresh run.
+Bootstrap weights and short smoke runs do not establish competitive strength.
 
 ## Verification
 
-Run these checks from the repository root.
+Run the complete checks from the repository root.
 
 ```powershell
-python -m unittest discover -s tests -v
-node --test tests\*.test.mjs
 .\.venv\Scripts\python tools\check_training_architecture.py
-.\.venv\Scripts\python tools\verify_dynamic_model.py --output-dir "$env:TEMP\papplu-dynamic-verification"
+.\.venv\Scripts\python -m unittest discover -s tests -v
+node --test tests/*.test.mjs
 ```
 
-`tools/verify_dynamic_model.py` creates a timestamped output directory.
-It runs legal full 21-card, 60-turn games for two, three, and four players.
-It also checks bounded training, exact resume, current snapshots, and a
-persisted tournament with restart and reporting.
-It compares gate evidence across worker counts and reuses the gate journal.
-`evidence.json` records the
-commands, exit codes, output paths, and strength limitations.
-The shorter lifecycle games use explicit one-turn caps, not promotion evidence.
+The architecture checker rejects import cycles and function-local imports.
+It also checks optional-dependency boundaries with Torch and NumPy blocked.
+The tests cover exact evaluator witnesses, game conservation, masks, DMC replay, spawned actors, deterministic resume, and browser parity.
+CI also runs a bounded train, resume, export, solo evaluation, and arena lifecycle.
 
-The tests cover the house rules and compare the evaluator with an independent
-brute-force partition oracle on small hands. Valid results are also checked
-for card conservation and legal joker assignments.
-API tests cover request validation and bounded evaluation. Game-state tests
-cover card conservation, physical copies, card order, draw/discard transitions,
-declaration outcomes, and elimination penalties.
-Card-art tests cover all 52 faces, pip counts, and generic face-down backs.
-Browser-engine tests cover evaluator parity, inference parity, private observations,
-AI declarations, discard recycling, table scheduling, retryable declarations,
-and end-of-round deadwood summaries.
-Node.js is needed only for the JavaScript tests, not to run the simulator.
+Regenerate the portable fixtures and seeded browser model with these commands.
+
+```powershell
+python tools\export_parity_fixtures.py
+python tools\weights_export.py --bootstrap --seed 1729
+```
+
+`tools/verify_browser.mjs` exercises the real browser through Playwright.
+It checks worker decisions, the Neural label and greedy reason, declarations, privacy, and the main-thread fallback.
+`node tools/benchmark_qnet.mjs` times five passes over 1,000 real draw and discard observations.
+It reports median and p95 latency for validation, encoding, and one forward pass.

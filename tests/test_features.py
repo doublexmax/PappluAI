@@ -5,13 +5,11 @@ import math
 import unittest
 from unittest import mock
 
-from src.game.belief import BeliefState
 from src.game.environment import GameConfig, PappluEnv, Phase, discard_action
-from src.game.information import EventKind
-from src.game.lookahead import after_discard, after_draw
+from src.game.information import EventKind, InformationEvent
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
 from src.model.encoding import (
-    CARD_CHANNELS, CONTEXT_CHANNELS, FEATURE_SIZE, SEAT_CHANNELS, Features,
+    CARD_CHANNELS, CONTEXT_CHANNELS, FEATURE_SIZE, Features,
     _meld_membership, encode, encoding_layout, encoding_metadata, feature_values,
     legal_actions, unpack,
 )
@@ -70,8 +68,8 @@ class TestFeatures(unittest.TestCase):
         observations.append(env.observe())
         for obs in observations:
             features = encode(obs)
-            self.assertEqual(len(feature_values(features)), 802)
-            self.assertEqual(len(features.data), 3208)
+            self.assertEqual(len(feature_values(features)), 1063)
+            self.assertEqual(len(features.data), 4252)
             self.assertTrue(all(math.isfinite(value) for value in feature_values(features)))
         self.assertEqual(legal_actions(encode(observations[-1])), ())
         solo = encode(observations[0])
@@ -87,8 +85,10 @@ class TestFeatures(unittest.TestCase):
     def test_afterstate_has_no_legal_actions_when_another_seat_acts(self):
         env = MultiplayerEnv(MatchConfig(GameConfig(cards_in_hand=3, required_sequences=1), 4))
         env.reset(2)
-        drawn = after_draw(env.observe(), env.observe().discard_top, EventKind.TAKE_DISCARD)
-        after = after_discard(drawn, next(face for face, copies in enumerate(drawn.hand) if copies))
+        obs = env.observe()
+        after = replace(obs, history=(*obs.history, InformationEvent(
+            EventKind.DISCARD, 0, 3, 59, obs.stock_remaining, 1, face=0,
+        )))
         self.assertEqual(after.phase, Phase.DRAW)
         self.assertEqual(after.players[0].next_player, 1)
         features = encode(after)
@@ -98,18 +98,19 @@ class TestFeatures(unittest.TestCase):
     def test_raw_points_and_wild_counts_do_not_require_meld_search(self):
         obs = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1)).reset(17)
         hand = tuple(int(face in (0, 1, 7, 12, 20)) for face in range(52))
-        with mock.patch("src.model.encoding._meld_membership", side_effect=AssertionError("meld search")), mock.patch(
-            "src.game.belief.BeliefState.from_observation", side_effect=AssertionError("belief construction"),
-        ), mock.patch("src.evaluate.pure_sequence_upper_bound", side_effect=AssertionError("sequence search")):
+        with mock.patch("src.model.encoding._meld_membership", wraps=_meld_membership) as membership, mock.patch(
+            "src.evaluate.pure_sequence_upper_bound", side_effect=AssertionError("sequence search"),
+        ):
             features = encode(replace(obs, hand=hand, joker=7))
+        self.assertEqual(membership.call_count, 1)
         context = field_values(features, "context")
         self.assertAlmostEqual(context[CONTEXT_CHANNELS.index("deadwood")], 0.22, places=7)
         self.assertAlmostEqual(context[CONTEXT_CHANNELS.index("wilds")], 2 / 12, places=7)
         self.assertEqual(FEATURE_SIZE * 4, len(features.data))
         cards = field_values(features, "card")
         self.assertEqual(cards[CARD_CHANNELS.index("own_ge1")], 1.0)
-        self.assertEqual(cards[7 * 13 + CARD_CHANNELS.index("points")], 0.0)
-        self.assertEqual(cards[20 * 13 + CARD_CHANNELS.index("wild")], 1.0)
+        self.assertEqual(cards[7 * 18 + CARD_CHANNELS.index("points")], 0.0)
+        self.assertEqual(cards[20 * 18 + CARD_CHANNELS.index("wild")], 1.0)
 
     def test_layout_and_metadata_describe_the_encoded_segments(self):
         features = encode(PappluEnv().reset(17))
@@ -117,8 +118,8 @@ class TestFeatures(unittest.TestCase):
         layout = encoding_layout()
         self.assertEqual(
             [(field.name, field.offset, len(segments[field.name])) for field in layout],
-            [("card", 0, 676), ("seat", 676, 54), ("context", 730, 17),
-             ("legal", 747, 54), ("top", 801, 1)],
+            [("card", 0, 936), ("seat", 936, 54), ("context", 990, 18),
+             ("legal", 1008, 54), ("top", 1062, 1)],
         )
         self.assertEqual(tuple(value for field in layout for value in segments[field.name]), feature_values(features))
         metadata = encoding_metadata()
@@ -127,64 +128,53 @@ class TestFeatures(unittest.TestCase):
         self.assertEqual([row["name"] for row in metadata["layout"]], list(segments))
         self.assertEqual(set(metadata["channels"]), {"card", "seat", "context"})
 
-    def assert_ledger_channels(self, obs):
-        ledger = BeliefState.from_observation(obs).ledger
-        values = unpack(encode(obs))
-        count, cfg = len(obs.players), obs.config
-        next_opp = obs.players[0].next_player if count > 1 and obs.players[0].next_player > 0 else -1
-        for face in range(52):
-            held = ledger.seats[next_opp].held[face] if next_opp > 0 else 0
-            passed = ledger.seats[next_opp].passed[face] if next_opp > 0 else 0
-            expected = {
-                "opp_discarded": sum(row.discarded[face] for row in ledger.seats[1:]),
-                "next_held": held,
-                "other_held": sum(row.held[face] for row in ledger.seats[1:]) - held,
-                "next_passed": passed,
-            }
-            for channel, value in expected.items():
-                self.assertAlmostEqual(
-                    values["card"][face * len(CARD_CHANNELS) + CARD_CHANNELS.index(channel)],
-                    value / cfg.num_decks, places=6,
-                )
-        for seat, row in enumerate(ledger.seats):
-            for channel, value, denominator in (
-                ("takes", row.takes, cfg.max_turns),
-                ("passes", row.passes, cfg.max_turns),
-                ("held_total", sum(row.held), cfg.cards_in_hand),
-            ):
-                self.assertAlmostEqual(
-                    values["seat"][seat * len(SEAT_CHANNELS) + SEAT_CHANNELS.index(channel)],
-                    value / denominator, places=6,
-                )
-        self.assertAlmostEqual(values["context"][7], min(ledger.refills, 3) / 3.0, places=6)
-        return ledger
-
-    def test_sparse_history_channels_match_the_full_ledger_for_multiseat_deals(self):
+    def test_public_takes_passes_and_discards_are_encoded_without_beliefs(self):
         cfg = GameConfig(num_decks=1, cards_in_hand=3, required_sequences=1, max_turns=60)
-        for players in (2, 4, 6):
-            for seed in (19, 47):
-                with self.subTest(players=players, seed=seed), mock.patch(
-                    "src.game.multiplayer.hand_reward", return_value=0.0,
-                ):
-                    env = MultiplayerEnv(MatchConfig(cfg, players))
-                    env.reset(seed)
-                    turn = 0
-                    while not env.view().done:
-                        obs = env.observe()
-                        self.assert_ledger_channels(obs)
-                        take = turn % 3 == 0 or not obs.stock_remaining
-                        env.step(int(take))
-                        obs = env.observe()
-                        self.assert_ledger_channels(obs)
-                        held = [face for face, copies in enumerate(obs.hand) if copies]
-                        taken = obs.history[-1].face
-                        choices = [face for face in held if face != taken] if take and turn % 2 else held
-                        env.step(discard_action((choices or held)[-1]))
-                        turn += 1
-                    ledger = self.assert_ledger_channels(env.observe())
-                    self.assertGreater(ledger.refills, 0)
-                    self.assertGreater(sum(row.takes for row in ledger.seats), 0)
-                    self.assertGreater(sum(row.passes for row in ledger.seats), 0)
+        env = MultiplayerEnv(MatchConfig(cfg, 2))
+        env.reset(19)
+        initial = unpack(encode(env.observe()))
+        self.assertEqual(initial["seat"][6:9], (0.0, 0.0, 0.0))
+        taken, discarded = [], []
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
+            for _ in range(2):
+                taken.append(env.observe().discard_top)
+                env.step(1)
+                action = legal_actions(encode(env.observe()))[0]
+                discarded.append(action - 2)
+                env.step(action)
+            for seat in range(2):
+                env.step(0)
+                obs = env.observe()
+                action = next(a for a in legal_actions(encode(obs)) if a != discard_action(taken[seat]))
+                env.step(action)
+        values = unpack(encode(env.observe()))
+        card = lambda face, channel: values["card"][face * 18 + CARD_CHANNELS.index(channel)]
+        self.assertEqual(card(taken[1], "next_held"), 1.0)
+        self.assertEqual(card(discarded[1], "opp_discarded"), 1.0)
+        self.assertEqual(card(taken[1], "other_held"), 0.0)
+        for seat in range(2):
+            row = values["seat"][seat * 9:(seat + 1) * 9]
+            self.assertAlmostEqual(row[6], 1 / 60, places=7)
+            self.assertAlmostEqual(row[7], 1 / 60, places=7)
+            self.assertAlmostEqual(row[8], 1 / 3, places=7)
+
+    def test_taken_face_cannot_be_repeated_unless_it_is_the_only_face(self):
+        for players in (1, 2, 4):
+            game = GameConfig(cards_in_hand=3, required_sequences=1)
+            env = PappluEnv(game) if players == 1 else MultiplayerEnv(MatchConfig(game, players))
+            env.reset(17)
+            env.step(1)
+            obs = env.observe()
+            taken = obs.history[-1].face
+            legal = legal_actions(encode(obs))
+            self.assertNotIn(discard_action(taken), legal)
+            self.assertTrue(legal)
+            one_face = replace(obs, hand=tuple(4 if face == taken else 0 for face in range(52)))
+            self.assertEqual(legal_actions(encode(one_face)), (discard_action(taken),))
+            from_stock = replace(obs, history=(*obs.history[:-1], replace(
+                obs.history[-1], kind=EventKind.DRAW_STOCK,
+            )))
+            self.assertIn(discard_action(taken), legal_actions(encode(from_stock)))
 
 
 if __name__ == "__main__":

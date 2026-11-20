@@ -40,7 +40,6 @@ class LocalImportVisitor(ast.NodeVisitor):
         self.errors = errors
         self.classes: list[str] = []
         self.functions: list[str] = []
-        self.allowed = 0
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.classes.append(node.name)
@@ -64,13 +63,6 @@ class LocalImportVisitor(ast.NodeVisitor):
         if not self.functions:
             return
         relative = self.path.relative_to(ROOT).as_posix()
-        if (
-            relative == "src/checkpoints/registry.py"
-            and self.classes[-1:] == ["ModelRegistry"]
-            and self.functions[-1:] == ["register"]
-        ):
-            self.allowed += 1
-            return
         scope = ".".join((*self.classes, *self.functions))
         self.errors.append(
             "function-local import at %s:%d in %s"
@@ -82,12 +74,10 @@ def check_import_placement(
     trees: dict[Path, ast.Module],
     errors: list[str],
 ) -> int:
-    allowed = 0
     for path, tree in trees.items():
         visitor = LocalImportVisitor(path, errors)
         visitor.visit(tree)
-        allowed += visitor.allowed
-    return allowed
+    return 0
 
 
 def check_cli_boundaries(
@@ -269,9 +259,7 @@ def pure_modules(trees: dict[Path, ast.Module]) -> list[str]:
         if path.name == "__init__.py" or relative.parts[0] in ("game", "cli"):
             modules.add(module_name(path))
     for relative in (
-        "checkpoints/evidence.py",
         "checkpoints/io.py",
-        "checkpoints/registry.py",
         "model/spec.py",
         "model/encoding.py",
     ):
@@ -323,7 +311,7 @@ def main() -> int:
         return 1
     print(
         "training architecture: %d modules, no cycles, "
-        "%d documented deferred import"
+        "%d function-local imports"
         % (len(trees), deferred_imports)
     )
     return 0

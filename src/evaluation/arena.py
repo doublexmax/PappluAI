@@ -20,26 +20,12 @@ class Decision:
     observation: Observation
     features: Features
     action: int
-    hidden_hands: tuple[tuple[int, ...], ...]
 
     def __post_init__(self) -> None:
         if type(self.action) is not int or self.action not in legal_actions(self.features):
             raise ValueError("decision must choose a legal action")
         if not legal_action_mask(self.observation)[self.action]:
             raise ValueError("decision action does not match its observation")
-        hands, obs = self.hidden_hands, self.observation
-        if not isinstance(hands, tuple) or len(hands) != 6 or any(
-            not isinstance(hand, tuple) or len(hand) != 52
-            or any(type(value) is not int or not 0 <= value <= obs.config.num_decks for value in hand)
-            for hand in hands
-        ):
-            raise ValueError("hidden_hands must contain six tuples of 52 card counts")
-        if hands[0] != tuple(obs.hand):
-            raise ValueError("hidden_hands observer does not match observation")
-        if any(any(hand) for hand in hands[len(obs.players):]):
-            raise ValueError("hidden_hands absent seats must be empty")
-        if any(sum(hands[seat]) != player.hand_size for seat, player in enumerate(obs.players)):
-            raise ValueError("hidden_hands sizes do not match player views")
 
 
 class Policy(Protocol):
@@ -245,9 +231,7 @@ def run_matches(
         for index, seat, obs, features, action in chosen:
             match, deal = matches[index], deals[index]
             if seat in deal.record_seats:
-                match.decisions[seat].append(Decision(
-                    obs, features, action, match.env.private_hands(seat),
-                ))
+                match.decisions[seat].append(Decision(obs, features, action))
             match.env.step(action)
             match.action_count += 1
     results = []

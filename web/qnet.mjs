@@ -12,17 +12,19 @@ export const CHANNELS = Object.freeze({
   card: Object.freeze([
     "own", "own_ge1", "own_ge2", "own_ge3", "pile", "top", "indicator", "wild",
     "points", "opp_discarded", "next_held", "other_held", "next_passed",
+    "adjacent", "set_mates", "natural", "pure", "any_meld",
   ]),
   seat: Object.freeze(["present", "observer", "active", "hand_size", "turns", "next", "takes", "passes", "held_total"]),
   context: Object.freeze([
     "draw", "discard", "terminal", "to_act", "turns", "stock", "pile", "refills", "decks", "hand",
     "sequences", "recycle", "players", "max_turns", "warm_start", "wilds", "deadwood",
+    "unavoidable_dw",
   ]),
 });
 export const FEATURE_LAYOUT = Object.freeze([
-  ["card", [52, 13]], ["seat", [6, 9]], ["context", [17]], ["legal", [54]], ["top", [1]],
+  ["card", [52, 18]], ["seat", [6, 9]], ["context", [18]], ["legal", [54]], ["top", [1]],
 ].map(([name, shape]) => Object.freeze([name, Object.freeze(shape)])));
-export const FEATURE_SIZE = 802;
+export const FEATURE_SIZE = 1063;
 const FIELDS = {};
 let offset = 0;
 for (const [name, shape] of FEATURE_LAYOUT) {
@@ -33,12 +35,12 @@ for (const [name, shape] of FEATURE_LAYOUT) {
 
 const HEADER = Object.freeze({
   format: "papplu-qnet", formatVersion: 2, checkpointVersion: 5,
-  encodingVersion: 3, architecture: "card_mlp", numActions: NUM_ACTIONS,
+  encodingVersion: 4, architecture: "card_mlp", numActions: NUM_ACTIONS,
 });
 const MODEL_KEYS = [...Object.keys(HEADER), "modelSpec", "gameConfig", "source", "tensors"];
 const GAME_CONFIG_KEYS = ["numDecks", "cardsInHand", "requiredSequences", "maxTurns", "recycleDiscard"];
-const SOURCE_KEYS = ["kind", "trained", "champion", "seed", "registryId", "sha256", "tensorsSha256"];
-const SOURCE_KINDS = ["bootstrap", "checkpoint", "registry"];
+const SOURCE_KEYS = ["kind", "trained", "seed", "sha256", "tensorsSha256"];
+const SOURCE_KINDS = ["bootstrap", "checkpoint"];
 const SHA256 = /^[0-9a-f]{64}$/;
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 const WEIGHTS = new WeakMap();
@@ -50,8 +52,8 @@ export function tensorShapes(spec) {
     shapes.push([`policy.${name}.weight`, inputs === null ? [output] : [output, inputs]]);
     if (bias) shapes.push([`policy.${name}.bias`, [output]]);
   }
-  layer("card_embed", width, CHANNELS.card.length + 5);
-  layer("table_embed", width, SEATS * CHANNELS.seat.length + CHANNELS.context.length + 1);
+  layer("card_embed", width, CHANNELS.card.length);
+  layer("table_embed", width, SEATS * CHANNELS.seat.length + CHANNELS.context.length);
   for (let b = 0; b < blocks; b += 1) {
     const prefix = `blocks.${b}.`;
     layer(`${prefix}card_norm`, width);
@@ -87,7 +89,7 @@ export function parseQModel(json) {
   const source = parseSource(json.source, "model.source");
   const weights = parseTensors(json.tensors, spec, "model.tensors");
   const model = Object.freeze({ kind: "papplu-qnet", spec, gameConfig, source });
-  WEIGHTS.set(model, weights);
+  WEIGHTS.set(model, { weights, buffers: forwardBuffers(spec.width) });
   return model;
 }
 
@@ -113,22 +115,17 @@ function parseGameConfig(config, path) {
 
 function parseSource(source, path) {
   requireKeys(source, SOURCE_KEYS, path);
-  const { kind, trained, champion, seed, registryId, sha256, tensorsSha256 } = source;
+  const { kind, trained, seed, sha256, tensorsSha256 } = source;
   if (!SOURCE_KINDS.includes(kind)) fail(`${path}.kind`, `expected one of ${SOURCE_KINDS.join(", ")}`);
   const bootstrap = kind === "bootstrap";
-  const registry = kind === "registry";
   if (trained !== !bootstrap) fail(`${path}.trained`, `must be ${!bootstrap} for ${kind} weights`);
-  if (champion !== registry) fail(`${path}.champion`, `must be ${registry} for ${kind} weights`);
   if (bootstrap ? !Number.isSafeInteger(seed) : seed !== null) {
     fail(`${path}.seed`, bootstrap ? "expected the integer bootstrap seed" : "expected null");
-  }
-  if (registry ? typeof registryId !== "string" || registryId === "" : registryId !== null) {
-    fail(`${path}.registryId`, registry ? "expected the champion's registry id" : "expected null");
   }
   for (const key of ["sha256", "tensorsSha256"]) {
     if (typeof source[key] !== "string" || !SHA256.test(source[key])) fail(`${path}.${key}`, "expected 64 lowercase hex digits");
   }
-  return Object.freeze({ kind, trained, champion, seed, registryId, sha256, tensorsSha256 });
+  return Object.freeze({ kind, trained, seed, sha256, tensorsSha256 });
 }
 
 function parseTensors(tensors, spec, path) {
@@ -153,7 +150,7 @@ function decodeFloat32(data, length, path) {
   if (bytes.length !== length * 4) fail(path, `expected ${length * 4} bytes, got ${bytes.length}`);
   const view = new DataView(new ArrayBuffer(bytes.length));
   for (let i = 0; i < bytes.length; i += 1) view.setUint8(i, bytes.charCodeAt(i));
-  const values = new Float64Array(length);
+  const values = new Float32Array(length);
   for (let i = 0; i < length; i += 1) {
     values[i] = view.getFloat32(i * 4, true);
     if (!Number.isFinite(values[i])) fail(path, `value ${i} is not finite`);
@@ -246,35 +243,6 @@ function meldMembership(hand, joker) {
   return { natural, pure, anyMeld };
 }
 
-export function meldChannels(card, context) {
-  const decks = Math.max(roundEven(context[8] * 6), 1);
-  const handSize = Math.max(roundEven(context[9] * 30), 1);
-  const hand = Array.from({ length: NUM_FACES }, (_, face) => roundEven(card[face * CHANNELS.card.length] * decks));
-  let joker = 0;
-  for (let face = 0; face < NUM_FACES; face += 1) {
-    if (card[face * CHANNELS.card.length + 6]) {
-      joker = face;
-      break;
-    }
-  }
-  const { natural, pure, anyMeld } = meldMembership(hand, joker);
-  let unavoidable = 0;
-  const cards = Array.from({ length: NUM_FACES }, (_, face) => {
-    const suit = Math.floor(face / 13);
-    const rank = face % 13;
-    const adjacent = Number(hand[suit * 13 + (rank + 12) % 13] > 0) + Number(hand[suit * 13 + (rank + 1) % 13] > 0);
-    const mates = [0, 1, 2, 3].reduce((sum, other) => sum + Number(other !== suit && hand[other * 13 + rank] > 0), 0);
-    unavoidable += hand[face] * card[face * CHANNELS.card.length + 8] * 10 * (1 - anyMeld[face]);
-    return Float32Array.of(adjacent / 2, mates / 3, natural[face], pure[face], anyMeld[face]);
-  });
-  return { cards, unavoidableDw: Math.fround(unavoidable / (10 * handSize)) };
-}
-
-function roundEven(value) {
-  const lower = Math.floor(value);
-  return value - lower === 0.5 ? lower + Number(lower % 2 !== 0) : Math.round(value);
-}
-
 export function encodeObservation(obs) {
   return encode(obs, "observation");
 }
@@ -323,21 +291,32 @@ function encode(obs, path) {
   const top = discardPile.length ? discardPile[discardPile.length - 1] : NUM_FACES;
   const supply = decks * NUM_FACES;
   const values = new Float32Array(FEATURE_SIZE);
+  const { natural, pure, anyMeld } = meldMembership(hand, joker);
   let rawPoints = 0;
   let wildCount = 0;
+  let unavoidable = 0;
   hand.forEach((copies, face) => {
+    const suit = Math.floor(face / 13);
     const rank = face % 13;
     const wild = rank === joker % 13;
     const points = wild ? 0 : RANK_POINTS[rank];
     rawPoints += copies * points;
+    unavoidable += copies * points * (1 - anyMeld[face]);
     if (wild) wildCount += copies;
     let opponentHeld = 0;
     for (let seat = 1; seat < players.length; seat += 1) opponentHeld += held[seat][face];
     const nextHeld = nextOpponent > 0 ? held[nextOpponent][face] : 0;
+    const adjacent = Number(hand[suit * 13 + (rank + 12) % 13] > 0) +
+      Number(hand[suit * 13 + (rank + 1) % 13] > 0);
+    let mates = 0;
+    for (let other = 0; other < 4; other += 1) {
+      if (other !== suit && hand[other * 13 + rank] > 0) mates += 1;
+    }
     values.set([
       copies / decks, Number(copies >= 1), Number(copies >= 2), Number(copies >= 3), pileCounts[face] / decks,
       Number(face === top), Number(face === joker), Number(wild), points / 10, oppDiscarded[face] / decks,
       nextHeld / decks, (opponentHeld - nextHeld) / decks, nextPassed[face] / decks,
+      adjacent / 2, mates / 3, natural[face], pure[face], anyMeld[face],
     ], FIELDS.card.offset + face * CHANNELS.card.length);
   });
   players.forEach((player, s) => {
@@ -357,7 +336,7 @@ function encode(obs, path) {
     obs.stockRemaining / supply, discardPile.length / supply, Math.min(refills, 3) / 3, decks / 6, cards / 30,
     config.requiredSequences / 10, Number(config.recycleDiscard), players.length / 6, turns / 60,
     Number(players.length === 1 && history[0].initialHand.reduce((a, b) => a + b, 0) === cards + 1),
-    wildCount / (4 * decks), rawPoints / 100,
+    wildCount / (4 * decks), rawPoints / 100, unavoidable / (10 * cards),
   ], FIELDS.context.offset);
   if (toAct) {
     if (phase === 0) {
@@ -365,6 +344,10 @@ function encode(obs, path) {
       values[FIELDS.legal.offset + 1] = Number(discardPile.length > 0);
     } else {
       hand.forEach((n, face) => { values[FIELDS.legal.offset + 2 + face] = Number(n > 0); });
+      if (last.kind === TAKE_DISCARD && last.actor === 0 && last.face !== null &&
+          hand.filter(n => n > 0).length > 1) {
+        values[FIELDS.legal.offset + 2 + last.face] = 0;
+      }
     }
   }
   values[FIELDS.top.offset] = top;
@@ -373,104 +356,165 @@ function encode(obs, path) {
 }
 
 export function qValues(model, observations) {
-  const weights = WEIGHTS.get(model);
-  if (weights === undefined) throw new TypeError("qValues: model must come from parseQModel");
+  const state = WEIGHTS.get(model);
+  if (state === undefined) throw new TypeError("qValues: model must come from parseQModel");
   if (!Array.isArray(observations)) throw new TypeError("qValues: observations must be an array");
-  return observations.map((obs, i) => forward(weights, model.spec, encode(obs, `observations[${i}]`)));
+  const results = [];
+  for (let i = 0; i < observations.length; i += 1) {
+    results.push(forward(state.weights, model.spec, encode(observations[i], `observations[${i}]`), state.buffers));
+  }
+  return results;
 }
 
-function forward(w, spec, features) {
+function forwardBuffers(width) {
+  return {
+    cards: new Float32Array(NUM_FACES * width),
+    normalized: new Float32Array(NUM_FACES * width),
+    projected: new Float32Array(NUM_FACES * width * 3),
+    ranks: new Float32Array(13 * width),
+    rankContext: new Float32Array(13 * width),
+    suits: new Float32Array(4 * width),
+    suitContext: new Float32Array(4 * width),
+    table: new Float32Array(width),
+    normalizedTable: new Float32Array(width),
+    tableContext: new Float32Array(width),
+    tableInput: new Float32Array(width * 3),
+    tableHidden: new Float32Array(width),
+    zero: new Float32Array(width),
+    advantage: new Float32Array(NUM_ACTIONS),
+  };
+}
+
+function forward(w, spec, features, buffers) {
   const { width, blocks } = spec;
-  const field = name => features.subarray(FIELDS[name].offset, FIELDS[name].offset + FIELDS[name].size);
-  const card = field("card");
-  const extra = meldChannels(card, field("context"));
-  let x = Array.from({ length: NUM_FACES }, (_, face) =>
-    linear(w, "card_embed", [...row(card, face, CHANNELS.card.length), ...extra.cards[face]]));
-  let table = linear(w, "table_embed", [...field("seat"), ...field("context"), extra.unavoidableDw]);
+  const {
+    cards, normalized, projected, ranks, rankContext, suits, suitContext,
+    table, normalizedTable, tableContext, tableInput, tableHidden, zero, advantage,
+  } = buffers;
+  linear(w, "card_embed", features, CHANNELS.card.length, cards, width, NUM_FACES);
+  linear(w, "table_embed", features, FIELDS.seat.size + FIELDS.context.size, table, width, 1, FIELDS.seat.offset);
   for (let block = 0; block < blocks; block += 1) {
     const prefix = `blocks.${block}.`;
-    const normalized = x.map(card => layerNorm(w, `${prefix}card_norm`, card));
-    const normalizedTable = layerNorm(w, `${prefix}table_norm`, table);
-    const sequence = [];
-    const suitContext = [];
+    layerNorm(w, `${prefix}card_norm`, cards, normalized, width, NUM_FACES);
+    layerNorm(w, `${prefix}table_norm`, table, normalizedTable, width);
+    linear(w, `${prefix}w_seq`, normalized, width, projected, width * 3, NUM_FACES);
+    suitMeans(normalized, ranks, width);
+    linear(w, `${prefix}w_rank_set`, ranks, width, rankContext, width, 13);
     for (let suit = 0; suit < 4; suit += 1) {
-      const track = normalized.slice(suit * 13, (suit + 1) * 13);
-      const projected = [...track, track[0]].map(row => linear(w, `${prefix}w_seq`, row));
-      const seq14 = projected.map((row, position) => Float64Array.from({ length: width }, (_, d) =>
-        row[d] + (position > 0 ? projected[position - 1][width + d] : 0) +
-        (position < 13 ? projected[position + 1][width * 2 + d] : 0)));
-      sequence.push(Float64Array.from(seq14[0], (v, d) => (v + seq14[13][d]) * 0.5), ...seq14.slice(1, 13));
-      suitContext.push(linear(w, `${prefix}w_suit_run`, Float64Array.from({ length: width }, (_, d) =>
-        track.reduce((sum, row) => sum + row[d], 0) / 13)));
+      for (let d = 0; d < width; d += 1) {
+        let sum = 0;
+        for (let rank = 0; rank < 13; rank += 1) sum += normalized[(suit * 13 + rank) * width + d];
+        suits[suit * width + d] = sum / 13;
+      }
     }
-    const rankContext = suitMeans(normalized, width).map(row => linear(w, `${prefix}w_rank_set`, row));
-    const tableContext = linear(w, `${prefix}w_table`, normalizedTable);
-    x = x.map((card, face) => add(card, linear(w, `${prefix}card_out`, silu(add(
-      sequence[face], rankContext[face % 13], suitContext[Math.floor(face / 13)], tableContext,
-    )))));
-    const pooled = x.map(card => layerNorm(w, `${prefix}card_norm`, card));
-    const mean = Float64Array.from({ length: width }, (_, d) => pooled.reduce((sum, row) => sum + row[d], 0) / NUM_FACES);
-    const maximum = Float64Array.from({ length: width }, (_, d) => Math.max(...pooled.map(row => row[d])));
-    table = add(table, linear(w, `${prefix}table_fc2`,
-      silu(linear(w, `${prefix}table_fc1`, [...normalizedTable, ...mean, ...maximum]))));
+    linear(w, `${prefix}w_suit_run`, suits, width, suitContext, width, 4);
+    linear(w, `${prefix}w_table`, normalizedTable, width, tableContext, width);
+    for (let face = 0; face < NUM_FACES; face += 1) {
+      const suit = Math.floor(face / 13);
+      const rank = face % 13;
+      const self = face * width * 3;
+      const left = (suit * 13 + (rank + 12) % 13) * width * 3 + width;
+      const right = (suit * 13 + (rank + 1) % 13) * width * 3 + width * 2;
+      for (let d = 0; d < width; d += 1) {
+        const sequence = rank === 0 ?
+          Math.fround(Math.fround(projected[self + d] + projected[right + d]) +
+            Math.fround(projected[self + d] + projected[left + d])) * 0.5 :
+          Math.fround(Math.fround(projected[self + d] + projected[left + d]) + projected[right + d]);
+        normalized[face * width + d] = Math.fround(Math.fround(
+          sequence + rankContext[rank * width + d],
+        ) + suitContext[suit * width + d]) + tableContext[d];
+      }
+    }
+    silu(normalized);
+    linear(w, `${prefix}card_out`, normalized, width, cards, width, NUM_FACES, 0, 0, true);
+    layerNorm(w, `${prefix}card_norm`, cards, normalized, width, NUM_FACES);
+    tableInput.set(normalizedTable);
+    for (let d = 0; d < width; d += 1) {
+      let sum = 0;
+      let maximum = -Infinity;
+      for (let face = 0; face < NUM_FACES; face += 1) {
+        const value = normalized[face * width + d];
+        sum += value;
+        maximum = Math.max(maximum, value);
+      }
+      tableInput[width + d] = sum / NUM_FACES;
+      tableInput[width * 2 + d] = maximum;
+    }
+    linear(w, `${prefix}table_fc1`, tableInput, width * 3, tableHidden, width);
+    silu(tableHidden);
+    linear(w, `${prefix}table_fc2`, tableHidden, width, table, width, 1, 0, 0, true);
   }
-  x = x.map(card => layerNorm(w, "card_final", card));
-  table = layerNorm(w, "table_final", table);
-  const sets = suitMeans(x, width);
-  const setHidden = sets.map(rank => linear(w, "face_set", rank));
-  const tableHidden = linear(w, "face_table", table);
-  const faceValues = x.map((card, face) =>
-    linear(w, "face_out", silu(add(linear(w, "face_local", card), setHidden[face % 13], tableHidden)))[0]);
-  const top = field("top")[0];
-  const zero = new Float64Array(width);
+  layerNorm(w, "card_final", cards, normalized, width, NUM_FACES);
+  layerNorm(w, "table_final", table, normalizedTable, width);
+  suitMeans(normalized, ranks, width);
+  linear(w, "face_set", ranks, width, rankContext, width, 13);
+  linear(w, "face_table", normalizedTable, width, tableContext, width);
+  linear(w, "face_local", normalized, width, cards, width, NUM_FACES);
+  for (let face = 0; face < NUM_FACES; face += 1) {
+    for (let d = 0; d < width; d += 1) {
+      const at = face * width + d;
+      cards[at] = Math.fround(cards[at] + rankContext[(face % 13) * width + d]) + tableContext[d];
+    }
+  }
+  silu(cards);
+  linear(w, "face_out", cards, width, advantage, 1, NUM_FACES, 0, 2);
+  const top = features[FIELDS.top.offset];
   const hasTop = top >= 0 && top < NUM_FACES;
-  const draw = silu(add(
-    linear(w, "draw_table", table), linear(w, "draw_top", hasTop ? x[top] : zero),
-    linear(w, "draw_set", hasTop ? sets[top % 13] : zero),
-  ));
-  const advantage = [...linear(w, "draw_out", draw), ...faceValues];
-  const legal = field("legal");
+  linear(w, "draw_table", normalizedTable, width, tableHidden, width);
+  linear(w, "draw_top", hasTop ? normalized : zero, width, tableContext, width, 1, hasTop ? top * width : 0);
+  linear(w, "draw_set", hasTop ? ranks : zero, width, tableInput, width, 1, hasTop ? (top % 13) * width : 0);
+  for (let d = 0; d < width; d += 1) {
+    tableHidden[d] = Math.fround(tableHidden[d] + tableContext[d]) + tableInput[d];
+  }
+  silu(tableHidden);
+  linear(w, "draw_out", tableHidden, width, advantage, 2);
   let mean = 0;
   let count = 0;
   for (let action = 0; action < NUM_ACTIONS; action += 1) {
-    mean += advantage[action] * legal[action];
-    count += legal[action];
+    const legal = features[FIELDS.legal.offset + action];
+    mean += advantage[action] * legal;
+    count += legal;
   }
-  mean /= Math.max(count, 1);
-  const value = linear(w, "value_out", silu(linear(w, "value_hidden", table)))[0];
-  return Float32Array.from(advantage, a => value + a - mean);
+  mean = Math.fround(Math.fround(mean) / Math.max(count, 1));
+  linear(w, "value_hidden", normalizedTable, width, tableHidden, width);
+  silu(tableHidden);
+  linear(w, "value_out", tableHidden, width, tableInput, 1);
+  const result = new Float32Array(NUM_ACTIONS);
+  for (let action = 0; action < NUM_ACTIONS; action += 1) {
+    result[action] = Math.fround(tableInput[0] + advantage[action]) - mean;
+  }
+  return result;
 }
 
-function linear(w, name, input) {
+function linear(w, name, input, cols, output, outputs, rows = 1, inputOffset = 0, outputOffset = 0, residual = false) {
   const weight = w[`${name}.weight`];
   const bias = w[`${name}.bias`];
-  const cols = input.length;
-  const out = new Float64Array(weight.length / cols);
-  for (let r = 0; r < out.length; r += 1) {
-    let sum = bias === undefined ? 0 : bias[r];
-    for (let c = 0; c < cols; c += 1) sum += weight[r * cols + c] * input[c];
-    out[r] = sum;
+  for (let row = 0; row < rows; row += 1) {
+    for (let r = 0; r < outputs; r += 1) {
+      let sum = 0;
+      for (let c = 0; c < cols; c += 1) sum += weight[r * cols + c] * input[inputOffset + row * cols + c];
+      const value = Math.fround(sum + (bias === undefined ? 0 : bias[r]));
+      const at = outputOffset + row * outputs + r;
+      output[at] = residual ? output[at] + value : value;
+    }
   }
-  return out;
 }
 
-function layerNorm(w, name, input) {
-  let mean = 0;
-  for (const value of input) mean += value;
-  mean /= input.length;
-  let variance = 0;
-  for (const value of input) variance += (value - mean) ** 2;
-  const scale = 1 / Math.sqrt(variance / input.length + 1e-5);
-  return Float64Array.from(input, (v, i) => (v - mean) * scale * w[`${name}.weight`][i] + w[`${name}.bias`][i]);
-}
-
-function suitMeans(cards, width) {
-  return Array.from({ length: 13 }, (_, rank) => Float64Array.from({ length: width }, (_, d) =>
-    (cards[rank][d] + cards[13 + rank][d] + cards[26 + rank][d] + cards[39 + rank][d]) / 4));
-}
-
-function add(...vectors) {
-  return Float64Array.from(vectors[0], (_, i) => vectors.reduce((sum, v) => sum + v[i], 0));
+function layerNorm(w, name, input, output, width, rows = 1) {
+  const weight = w[`${name}.weight`];
+  const bias = w[`${name}.bias`];
+  for (let row = 0; row < rows; row += 1) {
+    const at = row * width;
+    let mean = 0;
+    for (let d = 0; d < width; d += 1) mean += input[at + d];
+    mean /= width;
+    let variance = 0;
+    for (let d = 0; d < width; d += 1) variance += (input[at + d] - mean) ** 2;
+    const scale = 1 / Math.sqrt(variance / width + 1e-5);
+    for (let d = 0; d < width; d += 1) {
+      output[at + d] = (input[at + d] - mean) * scale * weight[d] + bias[d];
+    }
+  }
 }
 
 function silu(values) {
@@ -478,9 +522,13 @@ function silu(values) {
     const value = values[i];
     values[i] = value >= 0 ? value / (1 + Math.exp(-value)) : value * Math.exp(value) / (1 + Math.exp(value));
   }
-  return values;
 }
 
-function row(values, n, width) {
-  return values.subarray(n * width, (n + 1) * width);
+function suitMeans(cards, output, width) {
+  for (let rank = 0; rank < 13; rank += 1) {
+    for (let d = 0; d < width; d += 1) {
+      const at = rank * width + d;
+      output[at] = (cards[at] + cards[13 * width + at] + cards[26 * width + at] + cards[39 * width + at]) / 4;
+    }
+  }
 }

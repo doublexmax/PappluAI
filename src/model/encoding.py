@@ -9,14 +9,15 @@ from typing import Sequence
 from src.evaluate import NUM_FACES
 from src.game.environment import ENCODING_VERSION, NUM_ACTIONS, Observation, Phase, legal_action_mask
 from src.game.information import EventKind
-from src.game.lookahead import LEGAL_RUNS
 
 
+LEGAL_RUNS = tuple((r, r + 1, r + 2) for r in range(11)) + ((11, 12, 0),)
 NUM_SEAT_SLOTS = 6
 NO_TOP = NUM_FACES
 CARD_CHANNELS = (
     "own", "own_ge1", "own_ge2", "own_ge3", "pile", "top", "indicator", "wild",
     "points", "opp_discarded", "next_held", "other_held", "next_passed",
+    "adjacent", "set_mates", "natural", "pure", "any_meld",
 )
 SEAT_CHANNELS = (
     "present", "observer", "active", "hand_size", "turns", "next", "takes",
@@ -25,7 +26,7 @@ SEAT_CHANNELS = (
 CONTEXT_CHANNELS = (
     "draw", "discard", "terminal", "to_act", "turns", "stock", "pile", "refills",
     "decks", "hand", "sequences", "recycle", "players", "max_turns", "warm_start",
-    "wilds", "deadwood",
+    "wilds", "deadwood", "unavoidable_dw",
 )
 CARD_OFFSET = 0
 SEAT_OFFSET = CARD_OFFSET + NUM_FACES * len(CARD_CHANNELS)
@@ -139,14 +140,16 @@ def encode(obs: Observation) -> Features:
         elif event.kind is EventKind.REFILL:
             refills += 1
     top_face, wild_rank = obs.discard_top, obs.joker % 13
-    raw_pts_sum, wild_cnt = 0, 0
+    natural, pure, any_meld = _meld_membership(hand, obs.joker)
+    raw_pts_sum, wild_cnt, unavoidable_dw = 0, 0, 0
     values = []
     for face, copies in enumerate(hand):
-        rank = face % 13
+        suit, rank = divmod(face, 13)
         is_wild = rank == wild_rank
         pts = 0 if is_wild else (10 if rank == 0 or rank >= 10 else rank + 1)
         raw_pts_sum += copies * pts
         wild_cnt += copies if is_wild else 0
+        unavoidable_dw += copies * pts * (1 - any_meld[face])
         opp_held_face = sum(seat_held[seat][face] for seat in range(1, count))
         next_held_face = seat_held[next_opp][face] if next_opp > 0 else 0
         values.extend((
@@ -154,6 +157,10 @@ def encode(obs: Observation) -> Features:
             pile[face] / decks, float(face == top_face), float(face == obs.joker),
             float(is_wild), pts / 10.0, opp_disc[face] / decks, next_held_face / decks,
             (opp_held_face - next_held_face) / decks, next_passed[face] / decks,
+            (int(hand[suit * 13 + (rank - 1) % 13] > 0)
+             + int(hand[suit * 13 + (rank + 1) % 13] > 0)) / 2.0,
+            sum(hand[other * 13 + rank] > 0 for other in range(4) if other != suit) / 3.0,
+            natural[face], pure[face], any_meld[face],
         ))
     for seat in range(NUM_SEAT_SLOTS):
         if seat >= count:
@@ -181,9 +188,15 @@ def encode(obs: Observation) -> Features:
         min(refills, 3) / 3.0, decks / 6.0, cfg.cards_in_hand / 30.0,
         cfg.required_sequences / 10.0, float(cfg.recycle_discard), count / 6.0, cfg.max_turns / 60.0,
         float(count == 1 and sum(obs.history[0].initial_hand) == cfg.cards_in_hand + 1),
-        wild_cnt / (4 * decks), raw_pts_sum / 100.0,
+        wild_cnt / (4 * decks), raw_pts_sum / 100.0, unavoidable_dw / (10.0 * cfg.cards_in_hand),
     ))
-    values.extend(float(allowed and to_act) for allowed in legal_action_mask(obs))
+    legal = list(legal_action_mask(obs))
+    if (
+        obs.phase is Phase.DISCARD and last.kind is EventKind.TAKE_DISCARD
+        and last.actor == 0 and last.face is not None and sum(c > 0 for c in hand) > 1
+    ):
+        legal[2 + last.face] = False
+    values.extend(float(allowed and to_act) for allowed in legal)
     values.append(float(NO_TOP if top_face is None else top_face))
     return Features(_RECORD.pack(*values))
 

@@ -24,7 +24,7 @@ from src.game.information import EventKind
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
 from src.model.encoding import (
     CARD_CHANNELS, CONTEXT_CHANNELS, LAYOUT, NUM_SEAT_SLOTS, SEAT_CHANNELS,
-    Features, _meld_membership, encode, feature_values,
+    Features, encode, feature_values,
 )
 from src.model.spec import ARCHITECTURE, CHECKPOINT_VERSION, ModelSpec
 
@@ -39,11 +39,11 @@ BOOTSTRAP_SENSITIVITY_GAINS = {
     "face_out.weight": 2.0, "draw_out.weight": 2.0,
 }
 PRODUCTION = GameConfig(max_turns=60)
-TOLERANCE = 1e-4
+TOLERANCE = 1e-5
 INPUT_TOLERANCE = 1e-6
 STEP_LIMIT = 1000
 SOURCES = (
-    "src/evaluate.py", "src/game/environment.py", "src/game/information.py", "src/game/lookahead.py",
+    "src/evaluate.py", "src/game/environment.py", "src/game/information.py",
     "src/model/encoding.py", "src/model/network.py", "src/model/spec.py", "tools/weights_export.py",
 )
 
@@ -57,8 +57,8 @@ def tensor_shapes(spec=ModelSpec()):
         if bias:
             shapes.append(("policy." + name + ".bias", (output,)))
 
-    layer("card_embed", width, len(CARD_CHANNELS) + 5)
-    layer("table_embed", width, NUM_SEAT_SLOTS * len(SEAT_CHANNELS) + len(CONTEXT_CHANNELS) + 1)
+    layer("card_embed", width, len(CARD_CHANNELS))
+    layer("table_embed", width, NUM_SEAT_SLOTS * len(SEAT_CHANNELS) + len(CONTEXT_CHANNELS))
     for block in range(spec.blocks):
         prefix = "blocks.%d." % block
         layer(prefix + "card_norm", width)
@@ -105,11 +105,11 @@ def bootstrap_tensors(seed, spec=ModelSpec()):
     return tensors
 
 
-def model_source(kind, tensors, sha256=None, seed=None, registry_id=None):
+def model_source(kind, tensors, sha256=None, seed=None):
     digest = hashlib.sha256(b"".join(packed(values) for values in tensors.values())).hexdigest()
     return {
-        "kind": kind, "trained": kind != "bootstrap", "champion": kind == "registry",
-        "seed": seed, "registryId": registry_id, "sha256": digest if sha256 is None else sha256,
+        "kind": kind, "trained": kind != "bootstrap",
+        "seed": seed, "sha256": digest if sha256 is None else sha256,
         "tensorsSha256": digest,
     }
 
@@ -196,34 +196,13 @@ def reference_layers(tensors, spec=ModelSpec()):
     }
 
 
-def meld_channels(card, context):
-    decks = max(round(context[8] * 6.0), 1)
-    hand_size = max(round(context[9] * 30.0), 1)
-    hand = [round(row[0] * decks) for row in card]
-    joker = next((face for face, row in enumerate(card) if row[6]), 0)
-    natural, pure, any_meld = _meld_membership(hand, joker)
-    extra = []
-    for face in range(NUM_FACES):
-        suit, rank = divmod(face, 13)
-        extra.append(float32([
-            (int(hand[suit * 13 + (rank - 1) % 13] > 0)
-             + int(hand[suit * 13 + (rank + 1) % 13] > 0)) / 2.0,
-            sum(hand[other * 13 + rank] > 0 for other in range(4) if other != suit) / 3.0,
-            natural[face], pure[face], any_meld[face],
-        ]))
-    unavoidable = math.fsum(copies * row[8] * 10.0 * (1 - member)
-                            for copies, row, member in zip(hand, card, any_meld)) / (10.0 * hand_size)
-    return extra, float32([unavoidable])[0]
-
-
 def reference_q(layers, features, spec=ModelSpec()):
     values = feature_values(features) if isinstance(features, Features) else features
     fields = {field.name: list(values[field.offset:field.offset + field.size]) for field in LAYOUT}
     width = spec.width
     card_rows = rows(fields["card"], len(CARD_CHANNELS))
-    extra, unavoidable = meld_channels(card_rows, fields["context"])
-    cards = [linear(layers, "card_embed", card + channels) for card, channels in zip(card_rows, extra)]
-    table = linear(layers, "table_embed", fields["seat"] + fields["context"] + [unavoidable])
+    cards = [linear(layers, "card_embed", card) for card in card_rows]
+    table = linear(layers, "table_embed", fields["seat"] + fields["context"])
     zeros = [0.0] * width
     for block in range(spec.blocks):
         prefix = "blocks.%d." % block
@@ -386,25 +365,17 @@ def export_checkpoint(args, observations, features, golden):
         import torch
     except ImportError:
         raise SystemExit(
-            "--checkpoint and --registry need torch (pip install -r requirements-training.txt); "
+            "--checkpoint needs torch (pip install -r requirements-training.txt); "
             "--bootstrap runs without it"
         ) from None
     from src.checkpoints.io import file_sha256
-    from src.checkpoints.registry import ModelRegistry
     from src.model.network import collate, load_checkpoint
 
     torch.set_num_threads(1)
-    if args.checkpoint is not None:
-        path, kind, registry_id = args.checkpoint, "checkpoint", None
-        if not path.is_file():
-            raise SystemExit("%s is not a checkpoint file" % path)
-        sha256 = file_sha256(path)
-    else:
-        if not (args.registry / "champion.json").is_file():
-            raise SystemExit("%s has no champion.json; pass --checkpoint instead" % args.registry)
-        registry = ModelRegistry(args.registry)
-        record = registry.champion()
-        path, kind, sha256, registry_id = registry.model_path(record.id), "registry", record.sha256, record.id
+    path = args.checkpoint
+    if not path.is_file():
+        raise SystemExit("%s is not a checkpoint file" % path)
+    sha256 = file_sha256(path)
     network, config, _ = load_checkpoint(str(path), device=torch.device("cpu"))
     spec = network.spec
     tensors = {"policy." + name: value.detach().cpu().float().reshape(-1).tolist()
@@ -423,7 +394,7 @@ def export_checkpoint(args, observations, features, golden):
                 require_close(label + " " + field.name, actual, entry["features"][field.offset:field.offset + field.size], INPUT_TOLERANCE)
             require_close(label + " q", reference_q(layers, feature, spec), q[row], TOLERANCE)
             entry["q"] = q[row]
-    return tensors, config, model_source(kind, tensors, sha256=sha256, registry_id=registry_id), spec
+    return tensors, config, model_source("checkpoint", tensors, sha256=sha256), spec
 
 
 def write_json(path, document):
@@ -435,13 +406,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Export card_mlp v5 policy weights for web/qnet.mjs.")
     weights = parser.add_mutually_exclusive_group()
     weights.add_argument("--checkpoint", type=Path, help="export this .pt checkpoint (needs torch)")
-    weights.add_argument("--registry", type=Path, help="export this registry's champion (needs torch)")
     weights.add_argument("--bootstrap", action="store_true", help="seeded untrained weights without torch, the default")
     parser.add_argument("--seed", type=int, help="bootstrap seed (default %d)" % BOOTSTRAP_SEED)
     parser.add_argument("--output", type=Path, default=ROOT / "web" / "papplu-model.json")
     parser.add_argument("--golden", type=Path, default=ROOT / "tests" / "fixtures" / "qnet-golden.json")
     args = parser.parse_args(argv)
-    from_torch = args.checkpoint is not None or args.registry is not None
+    from_torch = args.checkpoint is not None
     if from_torch and args.seed is not None:
         parser.error("--seed only applies to bootstrap weights")
     observations = [golden_observation(case) for case in GOLDEN_CASES]
@@ -472,8 +442,8 @@ def main(argv=None):
         "cases": golden,
     })
     label = {
-        "bootstrap": "UNTRAINED bootstrap weights, seed %s, not a champion" % source["seed"],
-        "checkpoint": "checkpoint weights", "registry": "registry champion %s" % source["registryId"],
+        "bootstrap": "UNTRAINED bootstrap weights, seed %s" % source["seed"],
+        "checkpoint": "checkpoint weights",
     }[source["kind"]]
     print("wrote %s: %s, sha256 %s" % (args.output, label, source["sha256"]))
     print("wrote %s: %d golden observations" % (args.golden, len(golden)))

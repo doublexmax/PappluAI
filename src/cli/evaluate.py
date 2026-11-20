@@ -11,7 +11,7 @@ from src.cli._runtime import MissingTrainingDependency, load_runtime
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Paired game evaluations with separate discard puzzles."
+        description="Evaluate greedy and random solo play with separate optional discard puzzles."
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)

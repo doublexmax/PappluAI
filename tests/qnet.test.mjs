@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import {
-  CHANNELS, FEATURE_LAYOUT, FEATURE_SIZE, encodeObservation, meldChannels, parseQModel, qValues, tensorShapes,
+  CHANNELS, FEATURE_LAYOUT, FEATURE_SIZE, encodeObservation, parseQModel, qValues, tensorShapes,
 } from "../web/qnet.mjs";
 
 const ROOT = new URL("../", import.meta.url);
@@ -48,7 +48,7 @@ function observation(cards = [0, 1, 30], joker = 7) {
 }
 
 function cardChannel(features, face, name) {
-  return features[OFFSETS.card + face * 13 + CHANNELS.card.indexOf(name)];
+  return features[OFFSETS.card + face * 18 + CHANNELS.card.indexOf(name)];
 }
 
 function context(features, name) {
@@ -66,11 +66,6 @@ function zeroModel(spec, biases = {}) {
   return json;
 }
 
-function meld(cards, joker = 7) {
-  const features = encodeObservation(observation(cards, joker));
-  return meldChannels(features.subarray(OFFSETS.card, OFFSETS.seat), features.subarray(OFFSETS.context, OFFSETS.legal));
-}
-
 describe("qnet golden parity", () => {
   it("encodes real solo through hexa tables with every public event kind", () => {
     const kinds = new Set();
@@ -81,7 +76,7 @@ describe("qnet golden parity", () => {
       c.observation.history.forEach(e => kinds.add(e.kind));
       const actual = encodeObservation(c.observation);
       assert.ok(actual instanceof Float32Array);
-      assert.equal(actual.length, 802);
+      assert.equal(actual.length, 1063);
       assert.deepEqual(Array.from(actual), c.features, c.name);
     }
     assert.deepEqual([...seats].sort(), [1, 2, 3, 4, 5, 6]);
@@ -91,9 +86,9 @@ describe("qnet golden parity", () => {
     assert.equal(FEATURE_SIZE, offset);
   });
 
-  it("reproduces all 54 reference Q values on all 15 cases within 1e-5", () => {
+  it("reproduces all 54 reference Q values within 1e-5", () => {
     const results = qValues(parseQModel(MODEL), GOLDEN.cases.map(c => c.observation));
-    assert.equal(results.length, 15);
+    assert.equal(results.length, GOLDEN.cases.length);
     results.forEach((q, i) => {
       assert.ok(q instanceof Float32Array);
       assertClose(Array.from(q), GOLDEN.cases[i].q, 1e-5, GOLDEN.cases[i].name);
@@ -104,7 +99,7 @@ describe("qnet golden parity", () => {
     assert.equal(GOLDEN.modelSha256, MODEL.source.sha256);
     assert.equal(GOLDEN.tensorsSha256, MODEL.source.tensorsSha256);
     assert.deepEqual(Object.keys(GOLDEN.sources).sort(), [
-      "src/evaluate.py", "src/game/environment.py", "src/game/information.py", "src/game/lookahead.py",
+      "src/evaluate.py", "src/game/environment.py", "src/game/information.py",
       "src/model/encoding.py", "src/model/network.py", "src/model/spec.py", "tools/weights_export.py",
     ]);
     for (const [path, digest] of Object.entries(GOLDEN.sources)) {
@@ -141,6 +136,10 @@ describe("qnet golden parity", () => {
       }
       return [name, { shape, data: Buffer.from(data.buffer).toString("base64") }];
     }));
+    assert.deepEqual(json.tensors["policy.card_embed.weight"].shape, [128, 18]);
+    assert.deepEqual(json.tensors["policy.table_embed.weight"].shape, [128, 72]);
+    assert.equal(Object.values(json.tensors).reduce((sum, tensor) =>
+      sum + tensor.shape.reduce((a, b) => a * b, 1), 0), 672388);
     const inputs = [observation(), GOLDEN.cases.at(-1).observation];
     const full = qValues(parseQModel(json), inputs);
     const ablatedJson = structuredClone(json);
@@ -183,16 +182,21 @@ describe("parseQModel", () => {
     assert.ok(Object.isFrozen(model) && Object.isFrozen(model.spec) && Object.isFrozen(model.gameConfig) && Object.isFrozen(model.source));
     assert.throws(() => qValues({ ...model }, []), /must come from parseQModel/);
     assert.deepEqual(qValues(model, []), []);
+    assert.deepEqual(MODEL.tensors["policy.card_embed.weight"].shape, [64, 18]);
+    assert.deepEqual(MODEL.tensors["policy.table_embed.weight"].shape, [64, 72]);
+    assert.equal(Object.values(MODEL.tensors).reduce((sum, tensor) =>
+      sum + tensor.shape.reduce((a, b) => a * b, 1), 0), 126660);
   });
 
-  it("accepts checkpoint and registry source identities", () => {
+  it("accepts bootstrap and checkpoint source identities without registry metadata", () => {
     for (const source of [
-      { kind: "checkpoint", trained: true, champion: false, seed: null, registryId: null },
-      { kind: "registry", trained: true, champion: true, seed: null, registryId: "gen-12" },
+      { kind: "bootstrap", trained: false, seed: 1729 },
+      { kind: "checkpoint", trained: true, seed: null },
     ]) {
       const json = structuredClone(MODEL);
       Object.assign(json.source, source);
       assert.deepEqual(parseQModel(json).source, json.source);
+      assert.deepEqual(Object.keys(parseQModel(json).source), ["kind", "trained", "seed", "sha256", "tensorsSha256"]);
     }
   });
 
@@ -213,7 +217,7 @@ describe("parseQModel", () => {
     ["another format", m => { m.format = "onnx"; }, /model\.format:/],
     ["a string format version", m => { m.formatVersion = "2"; }, /model\.formatVersion:/],
     ["a v4 checkpoint", m => { m.checkpointVersion = 4; }, /model\.checkpointVersion:/],
-    ["an old encoding", m => { m.encodingVersion = 2; }, /model\.encodingVersion:/],
+    ["an old encoding", m => { m.encodingVersion = 3; }, /model\.encodingVersion:/],
     ["another architecture", m => { m.architecture = "axial_table"; }, /model\.architecture:/],
     ["53 actions", m => { m.numActions = 53; }, /model\.numActions:/],
     ["a missing model spec", m => { delete m.modelSpec; }, /model\.modelSpec: missing/],
@@ -230,9 +234,13 @@ describe("parseQModel", () => {
     ["an impossible quota", m => { m.gameConfig.requiredSequences = 8; }, /model\.gameConfig\.requiredSequences:/],
     ["too few cards", m => { Object.assign(m.gameConfig, { numDecks: 1, cardsInHand: 51 }); }, /model\.gameConfig\.numDecks:/],
     ["an unknown source", m => { m.source.kind = "trained"; }, /model\.source\.kind:/],
+    ["a legacy registry source", m => { m.source.kind = "registry"; }, /model\.source\.kind:/],
     ["bootstrap training claims", m => { m.source.trained = true; }, /model\.source\.trained:/],
     ["bootstrap champion claims", m => { m.source.champion = true; }, /model\.source\.champion:/],
+    ["a legacy registry id", m => { m.source.registryId = null; }, /model\.source\.registryId: unexpected field/],
     ["a missing bootstrap seed", m => { m.source.seed = null; }, /model\.source\.seed:/],
+    ["an untrained checkpoint", m => { Object.assign(m.source, { kind: "checkpoint", seed: null }); }, /model\.source\.trained:/],
+    ["a checkpoint seed", m => { Object.assign(m.source, { kind: "checkpoint", trained: true }); }, /model\.source\.seed:/],
     ["an uppercase digest", m => { m.source.sha256 = m.source.sha256.toUpperCase(); }, /model\.source\.sha256:/],
     ["a short digest", m => { m.source.tensorsSha256 = "abc"; }, /model\.source\.tensorsSha256:/],
     ["a missing tensor", m => { delete m.tensors["policy.face_out.bias"]; }, /model\.tensors\.policy\.face_out\.bias: missing/],
@@ -267,62 +275,61 @@ describe("parseQModel", () => {
   }
 });
 
-describe("meldChannels", () => {
+describe("encoded meld channels", () => {
   it("marks Q-K-A and A-2-3 as natural and excludes K-A-2", () => {
     for (const cards of [[0, 1, 2], [11, 12, 0]]) {
-      const extra = meld(cards);
-      for (const channel of [2, 3, 4]) {
-        assert.deepEqual(extra.cards.flatMap((row, face) => row[channel] ? [face] : []), cards.toSorted((a, b) => a - b));
+      const features = encodeObservation(observation(cards));
+      for (const channel of ["natural", "pure", "any_meld"]) {
+        assert.deepEqual(Array.from({ length: 52 }, (_, face) => face)
+          .filter(face => cardChannel(features, face, channel)), cards.toSorted((a, b) => a - b));
       }
-      assert.equal(extra.unavoidableDw, 0);
+      assert.equal(context(features, "unavoidable_dw"), 0);
     }
-    const bad = meld([12, 0, 1]);
-    for (const row of bad.cards) assert.deepEqual(Array.from(row.slice(2)), [0, 0, 0]);
-    assert.equal(bad.cards[0][0], 1);
-    assert.equal(bad.cards[1][0], 0.5);
-    assert.equal(bad.cards[12][0], 0.5);
-    assertClose([bad.unavoidableDw], [22 / 30], 1e-7, "deadwood");
+    const bad = encodeObservation(observation([12, 0, 1]));
+    for (let face = 0; face < 52; face += 1) {
+      assert.deepEqual(["natural", "pure", "any_meld"].map(name => cardChannel(bad, face, name)), [0, 0, 0]);
+    }
+    assert.equal(cardChannel(bad, 0, "adjacent"), 1);
+    assert.equal(cardChannel(bad, 1, "adjacent"), 0.5);
+    assert.equal(cardChannel(bad, 12, "adjacent"), 0.5);
+    assertClose([context(bad, "unavoidable_dw")], [22 / 30], 1e-7, "deadwood");
   });
 
   it("distinguishes exact-joker purity from same-rank wild substitution", () => {
-    const pure = meld([16, 17, 7]);
-    const impure = meld([16, 17, 33]);
-    for (const face of [16, 17, 7]) assert.equal(pure.cards[face][3], 1);
+    const pure = encodeObservation(observation([16, 17, 7]));
+    const impure = encodeObservation(observation([16, 17, 33]));
+    for (const face of [16, 17, 7]) assert.equal(cardChannel(pure, face, "pure"), 1);
     for (const face of [16, 17, 33]) {
-      assert.equal(impure.cards[face][3], 0);
-      assert.equal(impure.cards[face][4], 1);
+      assert.equal(cardChannel(impure, face, "pure"), 0);
+      assert.equal(cardChannel(impure, face, "any_meld"), 1);
     }
-    assert.equal(pure.cards[16][2], 0);
-    assert.equal(pure.unavoidableDw, 0);
-    assert.equal(impure.unavoidableDw, 0);
-    const naturalWild = meld([32, 33, 34]);
-    for (const face of [32, 33, 34]) assert.deepEqual(Array.from(naturalWild.cards[face].slice(2)), [1, 1, 1]);
+    assert.equal(cardChannel(pure, 16, "natural"), 0);
+    assert.equal(context(pure, "unavoidable_dw"), 0);
+    assert.equal(context(impure, "unavoidable_dw"), 0);
+    const naturalWild = encodeObservation(observation([32, 33, 34]));
+    for (const face of [32, 33, 34]) {
+      assert.deepEqual(["natural", "pure", "any_meld"].map(name => cardChannel(naturalWild, face, name)), [1, 1, 1]);
+    }
   });
 
   it("counts physical triplets and distinct-suit set mates without reusing duplicate faces", () => {
-    const triplet = meld([5, 5, 5]);
-    assert.deepEqual(Array.from(triplet.cards[5]), [0, 0, 0, 1, 1]);
-    const set = meld([5, 18, 31]);
-    for (const face of [5, 18, 31]) assert.deepEqual(Array.from(set.cards[face].slice(2)), [0, 0, 1]);
-    assertClose([set.cards[5][1], set.cards[44][1]], [2 / 3, 1], 1e-7, "set mates");
-    assert.equal(set.cards[4][0], 0.5);
-    const duplicate = meld([5, 5, 7]);
-    for (const row of duplicate.cards) assert.deepEqual(Array.from(row.slice(2)), [0, 0, 0]);
-    assertClose([duplicate.unavoidableDw], [12 / 30], 1e-7, "duplicate deadwood");
-    const wildSet = meld([7, 20, 33]);
-    for (const face of [7, 20, 33]) assert.equal(wildSet.cards[face][4], 1);
-  });
-
-  it("uses ties-to-even when reconstructing tensor card counts", () => {
-    const features = encodeObservation(observation([0, 1, 2]));
-    const card = features.subarray(OFFSETS.card, OFFSETS.seat);
-    const context = features.subarray(OFFSETS.context, OFFSETS.legal);
-    context[8] = 1 / 6;
-    card[0] = 0.5;
-    card[13] = card[26] = 1;
-    const extra = meldChannels(card, context);
-    for (const row of extra.cards) assert.deepEqual(Array.from(row.slice(2)), [0, 0, 0]);
-    assertClose([extra.unavoidableDw], [5 / 30], 1e-7, "rounded deadwood");
+    const triplet = encodeObservation(observation([5, 5, 5]));
+    assert.deepEqual(["adjacent", "set_mates", "natural", "pure", "any_meld"]
+      .map(name => cardChannel(triplet, 5, name)), [0, 0, 0, 1, 1]);
+    const set = encodeObservation(observation([5, 18, 31]));
+    for (const face of [5, 18, 31]) {
+      assert.deepEqual(["natural", "pure", "any_meld"].map(name => cardChannel(set, face, name)), [0, 0, 1]);
+    }
+    assertClose([cardChannel(set, 5, "set_mates"), cardChannel(set, 44, "set_mates")],
+      [2 / 3, 1], 1e-7, "set mates");
+    assert.equal(cardChannel(set, 4, "adjacent"), 0.5);
+    const duplicate = encodeObservation(observation([5, 5, 7]));
+    for (let face = 0; face < 52; face += 1) {
+      assert.deepEqual(["natural", "pure", "any_meld"].map(name => cardChannel(duplicate, face, name)), [0, 0, 0]);
+    }
+    assertClose([context(duplicate, "unavoidable_dw")], [12 / 30], 1e-7, "duplicate deadwood");
+    const wildSet = encodeObservation(observation([7, 20, 33]));
+    for (const face of [7, 20, 33]) assert.equal(cardChannel(wildSet, face, "any_meld"), 1);
   });
 });
 
@@ -376,7 +383,7 @@ describe("encodeObservation", () => {
     assertClose([cardChannel(noNext, 5, "other_held")], [2 / 3], 1e-7, "all opponents");
   });
 
-  it("encodes raw point totals and wild counts without meld channels in the input record", () => {
+  it("encodes raw point totals and wild counts alongside meld membership", () => {
     const obs = observation([0, 1, 7, 12, 20]);
     obs.config.cardsInHand = 5;
     const features = encodeObservation(obs);
@@ -385,7 +392,39 @@ describe("encodeObservation", () => {
     assert.equal(cardChannel(features, 20, "wild"), 1);
     assert.equal(cardChannel(features, 20, "points"), 0);
     assert.equal(cardChannel(features, 0, "points"), 1);
-    assert.equal(features.length, 802);
+    assert.equal(features.length, 1063);
+    assert.equal(context(features, "unavoidable_dw"), 0);
+  });
+
+  it("writes the exact 18-channel card and context layouts", () => {
+    const features = encodeObservation(observation([5, 18, 31]));
+    assert.deepEqual(Array.from(features.slice(5 * 18, 6 * 18)), [
+      1 / 3, 1, 0, 0, 0, 0, 0, 0, 0.6, 0, 0, 0, 0, 0, 2 / 3, 0, 0, 1,
+    ].map(Math.fround));
+    assert.deepEqual(Array.from(features.slice(OFFSETS.context, OFFSETS.legal)), [
+      1, 0, 0, 1, 1, 151 / 156, 1 / 156, 0, 0.5, 0.1, 0.1, 1, 1 / 6, 2 / 3, 0, 0, 0.18, 0,
+    ].map(Math.fround));
+  });
+
+  it("masks a just-taken face even when another copy is held and keeps a single-face fallback", () => {
+    const obs = observation([0, 5, 30]);
+    obs.hand[30] += 1;
+    obs.phase = 1;
+    obs.players[0].handSize = 4;
+    obs.history.push({
+      ...obs.history[0], kind: 2, face: 30, offeredTop: 30, initialHand: [], handSize: 4,
+    });
+    const legal = input => Array.from(encodeObservation(input).slice(OFFSETS.legal, OFFSETS.top))
+      .flatMap((allowed, action) => allowed ? [action] : []);
+    assert.deepEqual(legal(obs), [2, 7]);
+    obs.history.at(-1).kind = 1;
+    assert.deepEqual(legal(obs), [2, 7, 32]);
+    obs.history.at(-1).kind = 2;
+    obs.hand = counts([30, 30, 30, 30]);
+    obs.config.numDecks = 4;
+    assert.deepEqual(legal(obs), [32]);
+    obs.phase = 2;
+    assert.deepEqual(legal(obs), []);
   });
 
   it("zeros the legal mask for terminal states and afterstates awaiting another seat", () => {
@@ -400,6 +439,11 @@ describe("encodeObservation", () => {
     const after = encodeObservation(obs);
     assert.equal(context(after, "to_act"), 0);
     assert.deepEqual(Array.from(after.slice(OFFSETS.legal, OFFSETS.top)), new Array(54).fill(0));
+    obs.phase = 1;
+    Object.assign(obs.history.at(-1), { kind: 2, actor: 1 });
+    const otherDiscard = encodeObservation(obs);
+    assert.equal(context(otherDiscard, "to_act"), 0);
+    assert.deepEqual(Array.from(otherDiscard.slice(OFFSETS.legal, OFFSETS.top)), new Array(54).fill(0));
   });
 
   it("uses the empty-top sentinel and derives warm starts from the initial hand", () => {

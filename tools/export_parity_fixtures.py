@@ -17,7 +17,6 @@ from src.evaluate import (
     NUM_FACES, SCORING_VERSION, evaluate_hand, hand_reward, is_valid_hand, minimum_penalty,
     pure_sequence_upper_bound,
 )
-from src.game.lookahead import can_declare_ub, winning_discard
 
 
 OUTPUT = ROOT / "tests" / "fixtures" / "evaluate-parity.json"
@@ -26,7 +25,7 @@ RANDOM_CASES = 400
 NEAR_WIN_CASES = 200
 SUITS = "shdc"
 RANKS = ("A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K")
-SOURCES = ("src/evaluate.py", "src/game/lookahead.py", "tools/export_parity_fixtures.py")
+SOURCES = ("src/evaluate.py", "tools/export_parity_fixtures.py")
 
 
 def face(name):
@@ -67,9 +66,20 @@ def parity_case(name, group, hand, joker, required=5, size=21):
         entry["is_valid_hand"] = is_valid_hand(hand, joker, required, size)
         entry["hand_reward"] = hand_reward(hand, joker, required, size)
     if "errors" not in entry:
-        entry["pure_sequence_upper_bound"] = pure_sequence_upper_bound(hand, joker)
-        entry["can_declare_ub"] = can_declare_ub(hand, joker, required)
-        entry["winning_discard"] = winning_discard(hand, joker, required, size)
+        bound = pure_sequence_upper_bound(hand, joker)
+        entry["pure_sequence_upper_bound"] = bound
+        entry["can_declare_ub"] = bound >= required
+        entry["winning_discard"] = None
+        if sum(hand) == size + 1 and bound >= required:
+            remaining = list(hand)
+            for card, copies in enumerate(hand):
+                if copies:
+                    remaining[card] -= 1
+                    wins = is_valid_hand(remaining, joker, required, size)
+                    remaining[card] += 1
+                    if wins:
+                        entry["winning_discard"] = card
+                        break
     return entry
 
 
