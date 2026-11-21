@@ -8,10 +8,9 @@ import {
   beginDeclaration, createGame, discardCard, drawCard, observe, resolveDeclaration, toCounts,
 } from "../web/game.mjs";
 import { evaluateHand } from "../web/evaluate.mjs";
-import { parseQModel } from "../web/qnet.mjs";
+import { parseQModel, qValues, tensorShapes } from "../web/qnet.mjs";
 
 const modelFile = JSON.parse(readFileSync(new URL("../web/papplu-model.json", import.meta.url)));
-const model = parseQModel(modelFile);
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/evaluate-parity.json", import.meta.url)));
 const tiers = ["neural", "tactical", "casual"];
 function seeded(seed) {
@@ -19,6 +18,47 @@ function seeded(seed) {
     seed = Math.imul(seed, 1664525) + 1013904223 | 0;
     return (seed >>> 0) / 4294967296;
   };
+}
+
+function policyView(cards, phase = "discard") {
+  const drawing = phase === "draw";
+  const initial = drawing ? cards : cards.slice(0, -1);
+  return {
+    seat: 0, currentPlayer: 0, phase, joker: 7, stockCount: 100, pile: [2],
+    hand: cards.map((face, id) => ({ face, id })),
+    rules: { decks: 3, cardsInHand: initial.length, requiredSequences: 1, recycleDiscard: true },
+    players: [{ handSize: cards.length, active: true }, { handSize: initial.length, active: true }],
+    events: [
+      { kind: "deal", hand: initial, stock: 101, top: 2 },
+      ...(drawing ? [] : [{
+        kind: "draw", source: "stock", seat: 0, face: cards.at(-1), offeredTop: 2, stock: 100,
+      }]),
+    ],
+  };
+}
+
+function policyModel(view, { draw = [0, 0], preferCopies = false } = {}) {
+  const spec = { width: 8, blocks: 1 };
+  const tensors = Object.fromEntries(tensorShapes(spec).map(([name, shape]) => {
+    const data = new Float32Array(shape.reduce((a, b) => a * b, 1));
+    if (name === "policy.draw_out.bias") data.set(draw);
+    if (preferCopies) {
+      if (name === "policy.card_embed.weight" || name === "policy.face_local.weight") data[0] = 1;
+      if (name === "policy.card_embed.bias") data[1] = 1;
+      if (name === "policy.card_final.weight") data.fill(1);
+      if (name === "policy.face_out.weight") data[0] = 0.001;
+    }
+    return [name, { shape, data: Buffer.from(data.buffer).toString("base64") }];
+  }));
+  return parseQModel({
+    format: "papplu-qnet", formatVersion: 2, checkpointVersion: 5, encodingVersion: 5,
+    architecture: "card_mlp", numActions: 54, modelSpec: spec, tensors,
+    source: { kind: "bootstrap", trained: false, seed: 0, sha256: "0".repeat(64), tensorsSha256: "0".repeat(64) },
+    gameConfig: {
+      numDecks: view.rules.decks, cardsInHand: view.rules.cardsInHand,
+      requiredSequences: view.rules.requiredSequences, recycleDiscard: view.rules.recycleDiscard, maxTurns: 60,
+    },
+  });
 }
 
 test("winning discard and sequence upper bounds match the Python search fixtures", () => {
@@ -41,17 +81,81 @@ test("every tier declares an exact win with a valid snake_case witness", () => {
   const view = observe(state, 0);
   view.hand = [0, 1, 2, 9].map((face, id) => ({ face, id }));
   view.joker = 7;
+  const exactModel = policyModel(view);
   for (const tier of tiers) {
-    const choice = chooseMove(view, tier, { model, random: seeded(3) });
+    const choice = chooseMove(view, tier, { model: exactModel, random: seeded(3) });
     assert.equal(choice.move.type, "declare", tier);
     assert.equal(choice.reason, "exact-win");
+    assert.equal(choice.tier, tier);
+    assert.equal(choice.downgrade, null);
     const remaining = view.hand.filter((card) => card.id !== choice.move.cardId);
     assert.deepEqual(choice.move.evaluation, evaluateHand(toCounts(remaining), 7, view.rules));
     assert.equal(choice.move.evaluation.is_valid, true);
   }
 });
 
+test("neural draw follows Q-values without the tactical winning-take override", () => {
+  const view = policyView([0, 1, 9], "draw");
+  assert.deepEqual(chooseMove(view, "neural", { model: policyModel(view, { draw: [6, -4] }) }), {
+    move: { type: "draw", source: "stock" }, tier: "neural", downgrade: null, reason: "greedy",
+  });
+  assert.deepEqual(chooseMove(view, "tactical"), {
+    move: { type: "draw", source: "discard" }, tier: "tactical", downgrade: null, reason: "exact-win",
+  });
+  assert.deepEqual(chooseMove(view, "neural", { model: policyModel(view, { draw: [-4, 6] }) }), {
+    move: { type: "draw", source: "discard" }, tier: "neural", downgrade: null, reason: "greedy",
+  });
+});
+
+test("neural discard ignores feed risk and one-ply outs when ranking Q-values", () => {
+  const view = policyView([0, 5, 30, 0]);
+  view.events.splice(1, 0,
+    { kind: "draw", source: "discard", seat: 1, face: 0, offeredTop: 0, stock: 101 },
+    { kind: "discard", seat: 1, face: 14, stock: 101 },
+  );
+  const obs = observationFromView(view);
+  assert.equal(new BeliefState(obs).feedRisk(0), 1 / 3);
+  const preferred = policyModel(view, { preferCopies: true, draw: [100, 100] });
+  const values = qValues(preferred, [obs])[0];
+  assert.ok(values[2] > values[7] && values[2] - values[7] < 0.01);
+  assert.deepEqual(chooseMove(view, "neural", { model: preferred }), {
+    move: { type: "discard", cardId: 0 }, tier: "neural", downgrade: null, reason: "greedy",
+  });
+});
+
+test("neural ties use the first legal action and cannot repeat a discard take", () => {
+  const view = policyView([0, 5, 30, 0]);
+  const tied = policyModel(view, { draw: [100, 100] });
+  assert.deepEqual(chooseMove(view, "neural", { model: tied }), {
+    move: { type: "discard", cardId: 0 }, tier: "neural", downgrade: null, reason: "greedy",
+  });
+  view.events.at(-1).source = "discard";
+  assert.deepEqual(chooseMove(view, "neural", { model: tied }), {
+    move: { type: "discard", cardId: 1 }, tier: "neural", downgrade: null, reason: "greedy",
+  });
+  const draw = policyView([0, 5, 30], "draw");
+  assert.deepEqual(chooseMove(draw, "neural", { model: policyModel(draw) }), {
+    move: { type: "draw", source: "stock" }, tier: "neural", downgrade: null, reason: "greedy",
+  });
+});
+
+test("neural keeps a legal single-face discard when it just took that face", () => {
+  const view = policyView([5, 5, 5]);
+  view.rules.requiredSequences = 0;
+  view.events.at(-1).source = "discard";
+  assert.deepEqual(chooseMove(view, "neural", { model: policyModel(view) }), {
+    move: { type: "discard", cardId: 0 }, tier: "neural", downgrade: null, reason: "forced",
+  });
+});
+
+test("tactical still discards the minimum-penalty face", () => {
+  assert.deepEqual(chooseMove(policyView([0, 5, 30, 18]), "tactical"), {
+    move: { type: "discard", cardId: 0 }, tier: "tactical", downgrade: null, reason: "min-penalty",
+  });
+});
+
 test("hidden opponent hands and stock order cannot change a tier's decision", () => {
+  const model = parseQModel(modelFile);
   for (let seed = 1; seed <= 8; seed += 1) {
     let state = createGame({ players: 3, recycleDiscard: true }, seeded(seed));
     if (seed % 2) state = drawCard(state, "stock");
@@ -133,6 +237,7 @@ test("observation replay matches Python multiplayer history field for field", ()
 });
 
 test("neural reports explicit downgrades and rejects out-of-turn calls", () => {
+  const model = parseQModel(modelFile);
   const state = createGame({ recycleDiscard: true }, seeded(10));
   const view = observe(state, 0);
   assert.equal(chooseMove(view, "neural").downgrade, "no-model");

@@ -10,7 +10,6 @@ on:
       - "requirements-training.txt"
       - "README.md"
       - "TRAINING.md"
-      - "RATINGS.md"
       - ".github/workflows/training-ci.yml"
   pull_request: {}
   workflow_dispatch: {}
@@ -31,14 +30,19 @@ jobs:
           python -m unittest -v
           tests.test_evaluate
           tests.test_evaluate_oracle
-          tests.test_search_patterns
           tests.test_penalty
-          tests.test_execution
           tests.test_atomic_io
           tests.test_environment
           tests.test_multiplayer
           tests.test_information
-          tests.test_registry
+          tests.test_outcome
+          tests.test_features
+          tests.test_match_telemetry
+          tests.test_reward_cache
+          tests.test_training_architecture
+          tests.test_train.TestTrainCli
+          tests.test_weights_export.TestPortableExport
+          tests.test_weights_export.TestReferenceExport
       - name: Check browser simulator
         run: >-
           node --test
@@ -51,15 +55,9 @@ jobs:
           tests/table.test.mjs
       - name: Check command help without training dependencies
         run: |
-          python -m src.cli.solo --help
-          python -m src.cli.curriculum --help
-          python -m src.cli.benchmark --help
+          python -m src.cli.train --help
+          python -m src.cli.evaluate --help
           python -m src.cli.arena --help
-          python -m src.cli.league --help
-          python -m src.cli.improve --help
-          python -m src.cli.calibration --help
-          python -m src.cli.tournament --help
-          python -m src.cli.ratings --help
 
   training:
     needs: portable
@@ -75,14 +73,21 @@ jobs:
       - run: python -m pip install -r requirements-training.txt
       - name: Run complete Python regression suite
         run: python -m unittest discover -s tests -v
-      - name: Check bounded dynamic model lifecycle
-        run: python tools/verify_dynamic_model.py --output-dir "${RUNNER_TEMP}/dynamic-model"
+      - name: Check bounded DMC lifecycle
+        run: |
+          python -m src.cli.train --output-dir "${RUNNER_TEMP}/dmc" --players 1 2 3 4 --max-turns 2 --round-episodes 4 --batch-size 8 --replay-capacity 128 --validate-every 4 --validation-games 1 --actors 2 --max-episodes 4
+          python -m src.cli.train --output-dir "${RUNNER_TEMP}/dmc" --max-episodes 8
+          python tools/weights_export.py --checkpoint "${RUNNER_TEMP}/dmc/best-model.pt" --output "${RUNNER_TEMP}/dmc/model.json" --golden "${RUNNER_TEMP}/dmc/golden.json"
+          python -m src.cli.evaluate --checkpoint "${RUNNER_TEMP}/dmc/best-model.pt" --games 4 --warm-games 0 --output "${RUNNER_TEMP}/dmc/evaluation.json"
+          python -m src.cli.arena --model "${RUNNER_TEMP}/dmc/best-model.pt" --model random --games 4 --max-turns 2 --output "${RUNNER_TEMP}/dmc/arena.json"
+          node --test tests/*.test.mjs
       - name: Upload lifecycle evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dynamic-model-${{ github.sha }}
+          name: dmc-lifecycle-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/dynamic-model/**/evidence.json
-            ${{ runner.temp }}/dynamic-model/**/rating-report.json
-            ${{ runner.temp }}/dynamic-model/**/benchmark.json
+            ${{ runner.temp }}/dmc/status.json
+            ${{ runner.temp }}/dmc/metrics.jsonl
+            ${{ runner.temp }}/dmc/evaluation.json
+            ${{ runner.temp }}/dmc/arena.json

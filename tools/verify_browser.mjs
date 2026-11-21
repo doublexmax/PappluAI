@@ -90,7 +90,8 @@ try {
   await page.locator("#table-discard-drawn").click();
   await page.waitForFunction(() => document.querySelector("#table-board h2")?.textContent.includes("Turn 3"), { timeout: 30000 });
   assert.equal(await page.locator("#table-board .hand [data-card-id]").count(), 21);
-  assert.match(await page.locator(".seat-list").innerText(), /Neural \+ Search/);
+  assert.equal(await page.locator(".seat-list .ai-tier").innerText(), "Neural");
+  assert.equal(await page.locator(".seat-list .muted").filter({ hasText: "greedy" }).count(), 1);
   console.log("PASS a neural AI turn through the real worker.");
 
   await page.locator("#table-preset").selectOption("ai-watch");

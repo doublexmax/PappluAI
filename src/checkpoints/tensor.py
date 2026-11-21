@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Mapping
@@ -49,29 +48,3 @@ def validate_model_state(
             )
         result[key] = tensor.detach().cpu().clone()
     return result
-
-
-def validate_checkpoint_tree(value: Any, name: str) -> None:
-    if isinstance(value, torch.Tensor):
-        if (value.is_floating_point() or value.is_complex()) and not bool(
-            torch.isfinite(value).all().item()
-        ):
-            raise ValueError("%s contains a non-finite tensor" % name)
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("%s contains a non-finite number" % name)
-        return
-    if isinstance(value, Mapping):
-        for child in value.values():
-            validate_checkpoint_tree(child, name)
-        return
-    if isinstance(value, (list, tuple)):
-        for child in value:
-            validate_checkpoint_tree(child, name)
-        return
-    if value is None or isinstance(value, (bool, int, str, bytes)):
-        return
-    raise ValueError(
-        "%s contains unsupported value %s" % (name, type(value).__name__)
-    )

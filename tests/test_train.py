@@ -1,496 +1,399 @@
-from __future__ import annotations
-
-from collections import deque
+from collections import Counter
+import copy
 import io
 import json
-import os
-import random
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from src.game.environment import (
-    GameConfig,
-    PappluEnv,
-    Phase,
-    discard_action,
-)
-from src.cli.solo import main as train_main
-from src.training.core import EpisodeReplay, discounted_returns
+from src.cli._runtime import MissingTrainingDependency
+from src.cli.train import build_arg_parser, main
+from src.game.environment import GameConfig, PappluEnv
+from src.game.multiplayer import MultiplayerEnv
+from src.model.encoding import unpack
+from src.model.spec import ModelSpec
 
 try:
     import torch
 except ImportError:
     torch = None
 
-TORCH_REASON = "PyTorch not installed (see requirements-training.txt)"
+if torch is not None:
+    from concurrent.futures import ProcessPoolExecutor
+    from src.model.network import QNetwork, load_checkpoint, save_checkpoint
+    from src.training.train import TrainConfig, Trainer, collect_round
 
 
-class TestDiscountedReturns(unittest.TestCase):
-    def test_known_returns(self):
-        rewards = [0.0, 0.0, 1.0]
-        got = discounted_returns(rewards, gamma=0.5)
-        self.assertEqual(got, [0.25, 0.5, 1.0])
+ROOT = Path(__file__).resolve().parents[1]
 
-    def test_empty(self):
-        self.assertEqual(discounted_returns([], 0.9), [])
 
-    def test_bad_gamma(self):
-        for gamma in (-0.1, 1.5, float("nan"), float("inf")):
-            with self.subTest(gamma=gamma), self.assertRaises(ValueError):
-                discounted_returns([1.0], gamma=gamma)
+class TestTrainCli(unittest.TestCase):
+    def test_help_and_invalid_arguments_do_not_load_training(self):
+        with mock.patch("src.cli.train.load_runtime", side_effect=AssertionError("runtime loaded")):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(main(["--help"]), 0)
+                self.assertIn("winning-trajectory margins", output.getvalue())
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                self.assertEqual(main([]), 2)
+                self.assertIn("--output-dir", error.getvalue())
+            for flag in ("--warm-start-fraction", "--curriculum-distances", "--pfsp-exponent",
+                         "--promote", "--rebase-after-rejections", "--heads", "--target-tau"):
+                with self.subTest(flag=flag), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                    self.assertEqual(main(["--output-dir", "unused", flag, "1"]), 2)
+                    self.assertIn("unrecognized arguments", error.getvalue())
+        parsed = build_arg_parser().parse_args(["--output-dir", "run", "--players", "1", "3", "--actors", "2"])
+        self.assertEqual((parsed.player_counts, parsed.actors), ([1, 3], 2))
 
-    def test_help_without_training_dependencies(self):
+    def test_update_epsilon_and_torch_thread_flags_parse_as_integers(self):
+        parsed = build_arg_parser().parse_args([
+            "--output-dir", "run", "--updates-per-episode", "3",
+            "--epsilon-decay-episodes", "12", "--torch-threads", "2",
+        ])
+        self.assertEqual((parsed.updates_per_episode, parsed.epsilon_decay_episodes, parsed.torch_threads), (3, 12, 2))
+        self.assertEqual(build_arg_parser().parse_args(["--output-dir", "run", "--margin-weight", "0.25"]).margin_weight, 0.25)
+
+    def test_missing_dependency_is_reported_without_creating_a_run(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch(
+            "src.cli.train.load_runtime", side_effect=MissingTrainingDependency("PyTorch is missing"),
+        ), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+            path = Path(temporary) / "run"
+            self.assertEqual(main(["--output-dir", str(path)]), 2)
+            self.assertIn("PyTorch is missing", error.getvalue())
+            self.assertFalse(path.exists())
+
+    def test_command_help_runs_with_torch_and_numpy_blocked(self):
         script = """
-import builtins
-import runpy
-import sys
-real_import = builtins.__import__
-def import_without_torch(name, *args, **kwargs):
-    if name == "torch" or name.startswith("torch."):
-        raise ModuleNotFoundError("blocked for CLI help test", name="torch")
-    return real_import(name, *args, **kwargs)
-builtins.__import__ = import_without_torch
-sys.argv = ["src.cli.solo", "--help"]
-runpy.run_module("src.cli.solo", run_name="__main__")
+import builtins, runpy, sys
+real = builtins.__import__
+def blocked(name, *args, **kwargs):
+    if name.split('.')[0] in ('torch', 'numpy'):
+        raise AssertionError('help imported ' + name)
+    return real(name, *args, **kwargs)
+builtins.__import__ = blocked
+sys.argv = ['src.cli.train', '--help']
+runpy.run_module('src.cli.train', run_name='__main__')
 """
-        completed = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        for flag in (
-            "--episodes",
-            "--max-turns",
-            "--cards-in-hand",
-            "--required-sequences",
-            "--num-decks",
-            "--seed",
-            "--warm-start-fraction",
-            "--checkpoint",
-            "--load",
-            "--replay-sampling",
-            "--eval-episodes",
-            "--eval-seed",
+        result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--self-play-share", result.stdout)
+
+
+@unittest.skipIf(torch is None, "PyTorch not installed")
+class TestSelfPlayTrainer(unittest.TestCase):
+    def setUp(self):
+        torch.set_num_threads(1)
+        self.overrides = {
+            "num_decks": 1, "cards_in_hand": 3, "required_sequences": 1, "max_turns": 2,
+            "player_counts": (1, 2), "round_episodes": 4, "updates_per_episode": 1,
+            "replay_capacity": 64, "batch_size": 4, "validate_every": 4, "validation_games": 1,
+            "checkpoint_every": 4, "self_play_share": 1.0, "max_pool": 2,
+        }
+
+    def test_self_play_and_sparring_record_every_seats_negative_outcome(self):
+        torch.manual_seed(41)
+        network = QNetwork(ModelSpec(9, 1))
+        config = TrainConfig(**{**self.overrides, "player_counts": (1, 2, 3, 4), "max_turns": 1})
+        with mock.patch("src.game.environment.hand_reward", return_value=0.0), mock.patch(
+            "src.game.multiplayer.hand_reward", return_value=0.0,
         ):
-            self.assertIn(flag, completed.stdout)
-        self.assertIn("fine-tune", completed.stdout.lower())
+            trajectories = collect_round(config, network, [], 0, 4, 1.0)
+            opponents = collect_round(TrainConfig(**{**config.__dict__, "self_play_share": 0.0}), network, [], 0, 4, 1.0)
+        observed = Counter(round(unpack(t.steps[0].features)["context"][12] * 6) for t in trajectories)
+        self.assertEqual(observed, {1: 1, 2: 2, 3: 3, 4: 4})
+        self.assertEqual(Counter(round(unpack(t.steps[0].features)["context"][12] * 6) for t in opponents),
+                         {1: 1, 2: 2, 3: 3, 4: 4})
+        self.assertEqual([len(t.steps) for t in trajectories], [2] * 10)
+        self.assertTrue(all(-0.8 <= t.utility < 0 for t in [*trajectories, *opponents]))
+        self.assertEqual([unpack(t.steps[0].features)["context"][0] for t in trajectories], [1.0] * 10)
 
-    def test_old_architecture_argument_is_rejected(self):
-        from src.cli.solo import build_arg_parser
+    def test_resume_matches_uninterrupted_weights_replay_optimizer_and_metrics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            whole = Trainer.open(root / "whole", self.overrides, initial=ModelSpec(9, 1))
+            self.assertEqual(whole.run(max_episodes=8), "max_episodes")
+            partial = Trainer.open(root / "split", self.overrides, initial=ModelSpec(9, 1))
+            partial.run(max_episodes=4)
+            resumed = Trainer.open(root / "split")
+            resumed.run(max_episodes=8)
+            self.assertEqual(whole.summary(), resumed.summary())
+            self.assertEqual(whole.learner.replay.state_dict(), resumed.learner.replay.state_dict())
+            self.assertEqual(whole.learner.rng.getstate(), resumed.learner.rng.getstate())
+            for name, value in whole.learner.online.state_dict().items():
+                torch.testing.assert_close(value, resumed.learner.online.state_dict()[name], rtol=0, atol=0)
+            for left, right in zip(whole.learner.optimizer.state.values(), resumed.learner.optimizer.state.values()):
+                for key in left:
+                    torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
+            self.assertEqual((root / "whole/metrics.jsonl").read_text(), (root / "split/metrics.jsonl").read_text())
+            status = json.loads((root / "split/status.json").read_text())
+            self.assertEqual((status["status"], status["episodes"], status["updates"]), ("max_episodes", 8, 8))
+            for name in ("latest-state.pt", "latest-model.pt", "best-model.pt", "initial-model.pt"):
+                self.assertTrue((root / "split" / name).is_file())
+            latest, game, meta = load_checkpoint(str(root / "split/latest-model.pt"))
+            self.assertEqual((latest.spec, game, meta["episodes"]), (ModelSpec(9, 1), resumed.config.game, 8))
+            self.assertEqual(meta["algorithm"], "dmc")
 
-        parser = build_arg_parser()
-        with mock.patch("sys.stderr", new_callable=io.StringIO):
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["--architecture", "mlp"])
+    def test_validation_is_fixed_and_periodic_snapshots_roll_without_repromoting_ties(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = Trainer.open(Path(temporary), {
+                **self.overrides, "max_turns": 1, "round_episodes": 1,
+                "updates_per_episode": 0, "validate_every": 1,
+            }, initial=ModelSpec(9, 1))
+            trainer.run(max_episodes=1)
+            first = copy.deepcopy(trainer.validation)
+            self.assertEqual(set(first), {"score", "solo", "2p_heuristic", "2p_best", "vs_best", "promoted"})
+            self.assertGreaterEqual(first["score"], 0)
+            self.assertLessEqual(first["score"], 1)
+            self.assertEqual((first["2p_best"], first["vs_best"], first["promoted"]), (0.5, 0.5, True))
+            selected = (Path(temporary) / "best-model.pt").read_bytes()
+            trainer.run(max_episodes=3)
+            self.assertEqual(trainer.validation, {**first, "promoted": False})
+            self.assertEqual(trainer.best_score, first["score"])
+            self.assertEqual(trainer.snapshot_pool, [
+                "opponents/snap-000000000002.pt", "opponents/snap-000000000003.pt",
+            ])
+            self.assertEqual((Path(temporary) / "best-model.pt").read_bytes(), selected)
+            self.assertTrue((Path(temporary) / "initial-model.pt").is_file())
+            self.assertTrue((Path(temporary) / "opponents/best-000000000001.pt").is_file())
+            best, _, meta = load_checkpoint(str(Path(temporary) / "best-model.pt"))
+            self.assertEqual(meta["episodes"], 1)
+            for name, value in trainer.learner.online.state_dict().items():
+                torch.testing.assert_close(value, best.state_dict()[name], rtol=0, atol=0)
 
-    def test_unknown_replay_sampling_mode_is_rejected(self):
-        from src.cli.solo import build_arg_parser
+    def test_validation_metrics_match_with_one_or_two_actors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            results = []
+            for actors in (1, 2):
+                with Trainer.open(Path(temporary) / str(actors), {
+                    **self.overrides, "actors": actors, "player_counts": (1, 2, 3),
+                    "validation_games": 9, "max_turns": 1,
+                }, initial=ModelSpec(9, 1)) as trainer:
+                    trainer.learner.online.train()
+                    results.append(trainer.validate())
+                    self.assertFalse(trainer.learner.online.training)
+                    self.assertEqual(trainer._executor is None, actors == 1)
+            self.assertEqual(results[0], results[1])
+            self.assertEqual((results[0]["2p_best"], results[0]["3p_best"], results[0]["vs_best"]), (0.5, 0.5, 0.5))
+            self.assertIs(results[0]["promoted"], True)
+            self.assertAlmostEqual(results[0]["score"], sum(results[0][key] for key in (
+                "solo", "2p_heuristic", "3p_heuristic",
+            )) / 3)
 
-        parser = build_arg_parser()
-        with mock.patch("sys.stderr", new_callable=io.StringIO):
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["--replay-sampling", "unknown"])
+    def test_stronger_model_replaces_reigning_best_after_real_head_to_head_games(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            weak = QNetwork(ModelSpec(9, 1))
+            with torch.no_grad():
+                for parameter in weak.parameters():
+                    parameter.zero_()
+                weak.policy.card_embed.weight[0, 8] = 1
+                weak.policy.card_embed.bias[1] = 1
+                weak.policy.card_final.weight.fill_(1)
+                weak.policy.face_local.weight[0, 0] = 1
+                weak.policy.face_out.weight[0, 0] = -1
+                weak.policy.draw_out.bias[0] = 1
+            save_checkpoint(str(root / "weak.pt"), weak, TrainConfig(**self.overrides).game)
+            with Trainer.open(root / "run", {
+                **self.overrides, "player_counts": (2, 3), "validation_games": 9,
+            }, initial=root / "weak.pt") as trainer:
+                baseline = trainer.validate()
+                self.assertEqual((baseline["vs_best"], baseline["promoted"]), (0.5, True))
+                selected = (trainer.root / "best-model.pt").read_bytes()
+                with torch.no_grad():
+                    trainer.learner.online.policy.face_out.weight[0, 0] = 1
+                trainer.episodes = 7
+                result = trainer.validate()
+                self.assertEqual(result["2p_best"], 1.0)
+                self.assertAlmostEqual(result["3p_best"], 101 / 108)
+                self.assertAlmostEqual(result["vs_best"], 209 / 216)
+                self.assertIs(result["promoted"], True)
+                self.assertEqual(trainer.best_score, max(baseline["score"], result["score"]))
+                self.assertNotEqual((trainer.root / "best-model.pt").read_bytes(), selected)
+                best, _, meta = load_checkpoint(str(trainer.root / "best-model.pt"))
+                self.assertEqual(meta["episodes"], 7)
+                for name, value in trainer.learner.online.state_dict().items():
+                    torch.testing.assert_close(value, best.state_dict()[name], rtol=0, atol=0)
+                self.assertEqual(trainer.snapshot_pool[-1], "opponents/best-000000000007.pt")
 
-
-class TestEpisodeReplay(unittest.TestCase):
-    @staticmethod
-    def transition(index):
-        state = PappluEnv().reset(seed=index)
-        return (state, 0, float(index))
-
-    def test_rejects_empty_episode_and_invalid_batch(self):
-        replay = EpisodeReplay(capacity=3)
-        with self.assertRaises(ValueError):
-            replay.append(())
-        for size in (0, -1, True):
-            with self.subTest(size=size), self.assertRaises(ValueError):
-                replay.sample(random.Random(0), size)
-
-    def test_capacity_trims_oldest_episode_prefix(self):
-        replay = EpisodeReplay(capacity=5)
-        replay.append(tuple(self.transition(index) for index in range(3)))
-        replay.append(tuple(self.transition(index) for index in range(3, 7)))
-        self.assertEqual(len(replay), 5)
-
-        rng = mock.Mock()
-        rng.randrange.side_effect = [0, 0, 1, 0, 1, 1, 1, 2, 1, 3]
-        sampled = replay.sample(rng, 5)
-        self.assertEqual([transition[2] for transition in sampled], [2, 3, 4, 5, 6])
-
-    def test_oversized_episode_keeps_last_capacity_transitions(self):
-        replay = EpisodeReplay(capacity=3)
-        replay.append(tuple(self.transition(index) for index in range(8)))
-        self.assertEqual(len(replay), 3)
-
-        rng = mock.Mock()
-        rng.randrange.side_effect = [0, 0, 0, 1, 0, 2]
-        sampled = replay.sample(rng, 3)
-        self.assertEqual([transition[2] for transition in sampled], [5, 6, 7])
-
-    def test_sampling_is_seeded_and_repeatable(self):
-        replay = EpisodeReplay(capacity=20)
-        replay.append(tuple(self.transition(index) for index in range(3)))
-        replay.append(tuple(self.transition(index) for index in range(3, 10)))
-        first = replay.sample(random.Random(41), 100)
-        second = replay.sample(random.Random(41), 100)
-        self.assertEqual(first, second)
-
-    def test_sampling_weights_episodes_equally(self):
-        replay = EpisodeReplay(capacity=61)
-        replay.append((self.transition(0),))
-        replay.append(tuple(self.transition(1) for _ in range(60)))
-        sampled = replay.sample(random.Random(73), 2000)
-        short_episode_draws = sum(transition[2] == 0 for transition in sampled)
-        self.assertGreater(short_episode_draws, 900)
-        self.assertLess(short_episode_draws, 1100)
-
-
-@unittest.skipIf(torch is None, TORCH_REASON)
-class TestTrainLearning(unittest.TestCase):
-    def test_transition_sampling_uses_separate_seeded_streams(self):
-        from src.training.solo import train
-
-        def state(index):
-            return PappluEnv().reset(seed=index)
-
-        episode_steps = (
-            (
-                (state(0), 0, 0.0),
-                (state(1), 1, 1.0),
-            ),
-            (
-                (state(2), 2, 0.0),
-                (state(3), 3, 0.0),
-                (state(4), 4, 1.0),
-            ),
+    def test_promotion_thresholds_anchor_floor_and_fresh_snapshot_contents(self):
+        cases = (
+            (0.80, 0.50, False, "snap", 0.80),
+            (0.77, 0.51, False, "snap", 0.80),
+            (0.78, 0.51, True, "best", 0.80),
+            (0.82, 0.50, False, "snap", 0.80),
+            (0.83, 0.44, True, "best", 0.83),
+            (0.79, 0.44, False, None, 0.80),
+            (0.85, 0.52, True, "best", 0.85),
         )
-        captured = []
-        action_draws = []
-        warm_sources = []
-        episodes = iter(episode_steps)
+        with tempfile.TemporaryDirectory() as temporary, Trainer.open(Path(temporary), {
+            **self.overrides, "player_counts": (2,),
+        }, initial=ModelSpec(9, 1)) as trainer:
+            trainer.best_score = 0.80
+            for episode, (score, vs_best, promoted, snapshot, best_score) in enumerate(cases, 1):
+                with self.subTest(score=score, vs_best=vs_best):
+                    trainer.best_score = 0.80
+                    with torch.no_grad():
+                        trainer.learner.online.policy.face_out.weight.add_(0.1)
+                    trainer.episodes = episode
+                    selected = (trainer.root / "best-model.pt").read_bytes()
+                    pool = list(trainer.snapshot_pool)
+                    credits = {"2p_heuristic": 2 * score, "2p_best": 2 * vs_best}
+                    with mock.patch("src.training.train._validation_job", side_effect=lambda job: (job[3], credits[job[3]])):
+                        self.assertEqual(trainer.validate(), {
+                            "score": score, "2p_heuristic": score,
+                            "2p_best": vs_best, "vs_best": vs_best, "promoted": promoted,
+                        })
+                    self.assertEqual(trainer.best_score, best_score)
+                    if not promoted:
+                        self.assertEqual((trainer.root / "best-model.pt").read_bytes(), selected)
+                    if snapshot is None:
+                        self.assertEqual(trainer.snapshot_pool, pool)
+                    else:
+                        self.assertEqual(trainer.snapshot_pool[-1], "opponents/%s-%012d.pt" % (snapshot, episode))
+                        saved, _, meta = load_checkpoint(str(trainer.root / trainer.snapshot_pool[-1]))
+                        self.assertEqual(meta["episodes"], episode)
+                        for name, value in trainer.learner.online.state_dict().items():
+                            torch.testing.assert_close(value, saved.state_dict()[name], rtol=0, atol=0)
+                    self.assertTrue((trainer.root / "initial-model.pt").is_file())
 
-        def run_seeded_episode(
-            _env,
-            _network,
-            epsilon,
-            rng,
-            warm_start,
-            device,
-        ):
-            del epsilon, device
-            action_draws.append(rng.random())
-            warm_sources.append(warm_start)
-            return list(next(episodes)), mock.Mock(won=False)
+    def test_solo_validation_does_not_repromote_equal_scores(self):
+        with tempfile.TemporaryDirectory() as temporary, Trainer.open(Path(temporary), {
+            **self.overrides, "player_counts": (1,), "max_turns": 1,
+        }, initial=ModelSpec(9, 1)) as trainer:
+            for episode in (1, 2):
+                trainer.episodes = episode
+                self.assertEqual(trainer.validate(), {"score": 0.0, "solo": 0.0, "promoted": episode == 1})
+            self.assertEqual(trainer.best_score, 0.0)
+            self.assertEqual(trainer.snapshot_pool, [
+                "initial-model.pt", "opponents/best-000000000001.pt",
+            ])
 
-        def capture_batch(_network, _optimizer, _loss, batch, _device, _clip):
-            captured.append(tuple(batch))
-            return 0.0
+    def test_spawned_actors_reuse_one_pool_and_close_it_after_multiple_rounds(self):
+        executors = []
 
-        with mock.patch(
-            "src.training.solo.run_episode",
-            side_effect=run_seeded_episode,
-        ), mock.patch(
-            "src.training.optimization.train_batch",
-            side_effect=capture_batch,
-        ):
-            summary = train(
-                episodes=2,
-                seed=29,
-                gamma=0.9,
-                batch_size=2,
-                replay_capacity=10,
-                updates_per_episode=2,
-                log_every=0,
-                warm_start_fraction=0.5,
-            )
+        def create_pool(**kwargs):
+            pool = ProcessPoolExecutor(**kwargs)
+            executors.append(pool)
+            return pool
 
-        seed_source = random.Random(29)
-        source_rng = random.Random(seed_source.getrandbits(64))
-        action_rng = random.Random(seed_source.getrandbits(64))
-        replay_rng = random.Random(seed_source.getrandbits(64))
-        expected = []
-        replay = deque(maxlen=10)
-        for steps in episode_steps:
-            returns = discounted_returns([step[2] for step in steps], 0.9)
-            for (state, action, _reward), ret in zip(steps, returns):
-                replay.append((state, action, ret))
-            for _ in range(2):
-                expected.append(tuple(
-                    replay_rng.sample(
-                        list(replay),
-                        min(2, len(replay)),
-                    )
-                ))
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = Trainer.open(Path(temporary), {
+                **self.overrides, "actors": 2, "round_episodes": 2,
+            }, initial=ModelSpec(9, 1))
+            before = copy.deepcopy(trainer.learner.online.state_dict())
+            with mock.patch("src.training.train.ProcessPoolExecutor", side_effect=create_pool):
+                self.assertEqual(trainer.run(max_episodes=4), "max_episodes")
+            self.assertEqual((trainer.episodes, trainer.learner.update_count), (4, 4))
+            self.assertEqual(len(executors), 1)
+            self.assertIsNone(trainer._executor)
+            self.assertIsNone(executors[0]._processes)
+            self.assertTrue(any(not torch.equal(before[name], value) for name, value in trainer.learner.online.state_dict().items()))
+            resumed = Trainer.open(Path(temporary), {"actors": 1})
+            self.assertEqual(resumed.run(max_episodes=5), "max_episodes")
+            self.assertEqual(resumed.episodes, 5)
 
-        self.assertEqual(
-            warm_sources,
-            [source_rng.random() < 0.5 for _ in episode_steps],
-        )
-        self.assertEqual(
-            action_draws,
-            [action_rng.random() for _ in episode_steps],
-        )
-        self.assertEqual(captured, expected)
-        self.assertEqual(summary["replay_sampling"], "transition")
+    def test_solo_and_multiplayer_validation_use_only_fixed_odd_deal_seeds(self):
+        solo_seeds, multiplayer_seeds = [], []
+        solo_reset, multiplayer_reset = PappluEnv.reset, MultiplayerEnv.reset
 
-    def test_current_model_summary_and_loaded_weights(self):
-        from src.model.network import load_checkpoint
-        from src.training.solo import train
+        def reset_solo(env, seed=None):
+            solo_seeds.append(seed)
+            return solo_reset(env, seed)
 
-        cfg = GameConfig(
-            num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "current.pt")
-            summary = train(episodes=0, seed=7, config=cfg, checkpoint_path=path)
-            loaded, _, _ = load_checkpoint(path)
-            self.assertEqual(summary["architecture"], loaded.architecture)
-            self.assertEqual(summary["param_count"], sum(p.numel() for p in loaded.parameters()))
-            inferred = train(episodes=0, seed=7, load_path=path)
-            self.assertEqual(inferred["architecture"], summary["architecture"])
+        def reset_multiplayer(env, seed):
+            multiplayer_seeds.append(seed)
+            return multiplayer_reset(env, seed)
 
-    def test_old_checkpoint_is_a_clean_training_error(self):
-        from src.training.solo import train
-        from src.model.network import QNetwork, build_checkpoint
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = Trainer.open(Path(temporary), {
+                **self.overrides, "validation_games": 3, "max_turns": 1,
+            }, initial=ModelSpec(9, 1))
+            with mock.patch.object(PappluEnv, "reset", reset_solo), mock.patch.object(
+                MultiplayerEnv, "reset", reset_multiplayer,
+            ):
+                result = trainer.validate()
+            self.assertEqual(solo_seeds, [30000001, 30000003, 30000005])
+            self.assertEqual(multiplayer_seeds, [30000013, 30000013, 30000015, 30000015, 30000017, 30000017] * 2)
+            self.assertGreaterEqual(result["score"], 0)
+            self.assertLessEqual(result["score"], 1)
 
-        cfg = GameConfig(
-            num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "old.pt")
-            payload = build_checkpoint(QNetwork(), cfg)
-            payload["checkpoint_version"] = 2
-            torch.save(payload, path)
-            with self.assertRaisesRegex(ValueError, "fresh dynamic weights"):
-                train(episodes=0, load_path=path)
-            with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
-                code = train_main(
-                    [
-                        "--load",
-                        path,
-                        "--episodes",
-                        "0",
-                    ]
-                )
-            self.assertEqual(code, 2)
-            self.assertIn("fresh dynamic weights", err.getvalue())
+    def test_stop_and_time_limits_save_clean_resumable_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = Trainer.open(Path(temporary), self.overrides, initial=ModelSpec(9, 1))
+            self.assertEqual(trainer.run(stop=lambda: True), "stopped")
+            self.assertEqual(trainer.episodes, 0)
+            self.assertEqual(trainer.run(max_seconds=1e-12), "budget")
+            self.assertEqual(trainer.episodes, 0)
+            stopped = iter((False, True))
+            self.assertEqual(trainer.run(stop=lambda: next(stopped)), "stopped")
+            self.assertEqual(trainer.episodes, 4)
+            resumed = Trainer.open(Path(temporary))
+            self.assertEqual(resumed.run(max_episodes=4), "max_episodes")
+            self.assertEqual(resumed.learner.replay.state_dict(), trainer.learner.replay.state_dict())
 
-    def test_controlled_discard_task_raises_chosen_q(self):
-        """Repeated warm-start 3-card puzzle: correct discard value should rise."""
-        from src.model.network import load_checkpoint, select_greedy_action
-        from src.model.encoding import collate_observations
-        from src.training.solo import train
+    def test_initial_checkpoint_and_optional_opponents_are_copied_into_the_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initial = root / "initial.pt"
+            game = GameConfig(num_decks=1, cards_in_hand=3, required_sequences=1, max_turns=2)
+            save_checkpoint(str(initial), QNetwork(ModelSpec(9, 1)), game)
+            trainer = Trainer.open(root / "run", {
+                "player_counts": (2,), "replay_capacity": 64, "validation_games": 0,
+            }, initial=initial, opponents=[initial])
+            self.assertEqual((trainer.learner.online.spec, trainer.config.game), (ModelSpec(9, 1), game))
+            self.assertEqual(trainer.snapshot_pool, ["initial-model.pt", "opponents/seed-000.pt"])
+            initial.unlink()
+            self.assertEqual(trainer.run(max_episodes=2), "max_episodes")
+            resumed = Trainer.open(root / "run")
+            self.assertEqual(resumed.run(max_episodes=3), "max_episodes")
 
-        cfg = GameConfig(
-            num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
-        )
-        env = PappluEnv(cfg)
-        obs = env.reset_warm_start(seed=99)
-        self.assertEqual(obs.phase, Phase.DISCARD)
-        win_face = None
-        lose_face = None
-        from src.evaluate import hand_reward
+    def test_resume_rejects_recipe_changes_and_missing_opponents(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Trainer.open(root, self.overrides, initial=ModelSpec(9, 1))
+            with self.assertRaisesRegex(ValueError, "cannot change"):
+                Trainer.open(root, {"gamma": 1.0})
+            with self.assertRaisesRegex(ValueError, "fresh runs"):
+                Trainer.open(root, initial=ModelSpec(9, 1))
+            (root / "initial-model.pt").unlink()
+            with self.assertRaisesRegex(ValueError, "missing opponent"):
+                Trainer.open(root)
 
-        for face, count in enumerate(obs.hand):
-            if count <= 0:
-                continue
-            trial = list(obs.hand)
-            trial[face] -= 1
-            r = hand_reward(trial, obs.joker, required_sequences=1, cards_in_hand=3)
-            if r == 1.0 and win_face is None:
-                win_face = face
-            if r == 0.0 and lose_face is None:
-                lose_face = face
-        self.assertIsNotNone(win_face)
-        self.assertIsNotNone(lose_face)
+    def test_invalid_recipe_and_limits_fail_at_the_boundary(self):
+        for change in ({"gamma": 0}, {"gamma": float("nan")}, {"actors": 0}, {"player_counts": (1, 1)},
+                       {"self_play_share": 1.1}, {"batch_size": True}, {"learning_rate": 0},
+                       {"margin_weight": -0.01}, {"margin_weight": float("inf")}, {"margin_weight": True}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                TrainConfig(**change)
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = Trainer.open(Path(temporary), self.overrides, initial=ModelSpec(9, 1))
+            for limits in ({"max_episodes": -1}, {"max_seconds": 0}, {"max_seconds": float("inf")}):
+                with self.subTest(limits=limits), self.assertRaises(ValueError):
+                    trainer.run(**limits)
 
-        class FixedPuzzleEnv(PappluEnv):
-            def reset_warm_start(self, seed=None):
-                return super().reset_warm_start(seed=99)
-
-        state_t = collate_observations([obs], torch.device("cpu"))
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "model.pt")
-            train(episodes=0, seed=42, config=cfg, checkpoint_path=path)
-            initial, _, _ = load_checkpoint(path)
-            with mock.patch("src.training.solo.PappluEnv", FixedPuzzleEnv):
-                summary = train(
-                    episodes=80, seed=42, config=cfg,
-                    warm_start_fraction=1.0, epsilon_decay_episodes=60,
-                    checkpoint_path=path, log_every=0,
-                )
-            net, _, _ = load_checkpoint(path)
-        with torch.no_grad():
-            q0 = initial(state_t)[0]
-            q1 = net(state_t)[0]
-        win_action = discard_action(win_face)
-        lose_action = discard_action(lose_face)
-        self.assertGreater(summary["warm_wins"], 0)
-        self.assertGreater(float(q1[win_action]), float(q0[win_action]))
-        self.assertGreater(float(q1[win_action]), float(q1[lose_action]))
-        self.assertEqual(env.step(select_greedy_action(net, obs)).last_reward, 1.0)
-
-    def test_seeded_train_reproducible_metrics(self):
-        from src.training.solo import train
-
-        cfg = GameConfig(
-            num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
-        )
-        kwargs = dict(
-            episodes=3,
-            seed=123,
-            gamma=0.95,
-            lr=1e-3,
-            batch_size=4,
-            warm_start_fraction=0.5,
-            updates_per_episode=2,
-            config=cfg,
-            log_every=0,
-            epsilon_decay_episodes=3,
-        )
-        a = train(**kwargs)
-        b = train(**kwargs)
-        self.assertEqual(a, b)
-
-    def test_heldout_eval_no_param_mutation(self):
-        from src.model.network import QNetwork
-        from src.training.solo import evaluate_policy
-
-        cfg = GameConfig(
-            num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
-        )
-        net = QNetwork()
-        before = [p.detach().clone() for p in net.parameters()]
-        rng_before = torch.get_rng_state().clone()
-        first = evaluate_policy(net, config=cfg, games=3, seed=50)
-        second = evaluate_policy(net, config=cfg, games=3, seed=50)
-        self.assertEqual(first, second)
-        self.assertTrue(net.training)
-        self.assertTrue(torch.equal(rng_before, torch.get_rng_state()))
-        for a, b in zip(before, net.parameters()):
-            self.assertTrue(torch.allclose(a, b))
-
-    def test_checkpoint_save_load_cli_smoke(self):
-        from src.training.solo import train
-        from src.model.network import load_checkpoint
-
-        cfg = GameConfig(
-            num_decks=2, cards_in_hand=3, required_sequences=1, max_turns=3
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "m.pt")
-            summary = train(
-                episodes=2,
-                seed=0,
-                config=cfg,
-                checkpoint_path=path,
-                warm_start_fraction=1.0,
-                log_every=0,
-                updates_per_episode=2,
-                replay_sampling="episode",
-            )
-            net, loaded_cfg, meta = load_checkpoint(path)
-            self.assertEqual(summary["replay_sampling"], "episode")
-            self.assertEqual(loaded_cfg.to_dict(), cfg.to_dict())
-            self.assertEqual(meta.get("algorithm"), "episodic_monte_carlo_q_regression")
-            self.assertEqual(meta["summary"]["replay_sampling"], "episode")
-
-            summary = train(
-                episodes=1,
-                seed=1,
-                config=cfg,
-                load_path=path,
-                warm_start_fraction=1.0,
-                log_every=0,
-            )
-            self.assertEqual(summary["episodes"], 1)
-            self.assertEqual(summary["replay_sampling"], "transition")
-            inherited = train(episodes=0, load_path=path)
-            self.assertEqual(inherited["game_config"], cfg.to_dict())
-
-
-    def test_cli_rejects_bad_config(self):
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            code = train_main(
-                [
-                    "--episodes",
-                    "1",
-                    "--cards-in-hand",
-                    "3",
-                    "--required-sequences",
-                    "9",
-                ]
-            )
-        self.assertEqual(code, 2)
-        self.assertIn("error:", err.getvalue())
-
-    def test_cli_short_smoke(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "checkpoints", "cli.pt")
-            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-                code = train_main(
-                    [
-                        "--episodes",
-                        "2",
-                        "--cards-in-hand",
-                        "3",
-                        "--required-sequences",
-                        "1",
-                        "--num-decks",
-                        "2",
-                        "--max-turns",
-                        "3",
-                        "--warm-start-fraction",
-                        "1",
-                        "--replay-sampling",
-                        "episode",
-                        "--log-every",
-                        "0",
-                        "--checkpoint",
-                        path,
-                        "--seed",
-                        "0",
-                    ]
-                )
-            self.assertEqual(code, 0)
-            self.assertEqual(json.loads(output.getvalue())["replay_sampling"], "episode")
-            self.assertTrue(os.path.isfile(path))
-            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-                self.assertEqual(train_main([
-                    "--load", path, "--episodes", "1", "--warm-start-fraction", "1",
-                    "--max-turns", "3", "--checkpoint", path,
-                ]), 0)
-            self.assertEqual(json.loads(output.getvalue())["replay_sampling"], "transition")
-            with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
-                self.assertEqual(train_main([
-                    "--load", path, "--episodes", "0", "--cards-in-hand", "6",
-                ]), 2)
-                self.assertIn("does not match", err.getvalue())
-
-    def test_rejects_invalid_hyperparameters_before_any_game(self):
-        from src.training.solo import train
-
-        for name, value in (
-            ("episodes", -1), ("episodes", True), ("batch_size", 0),
-            ("replay_capacity", 0), ("gamma", float("nan")),
-            ("lr", 0), ("lr", float("inf")), ("epsilon_start", 1.1),
-            ("epsilon_end", -0.1), ("epsilon_decay_episodes", -1),
-            ("warm_start_fraction", float("nan")), ("grad_clip", -1),
-            ("updates_per_episode", 0), ("eval_episodes", -1),
-            ("log_every", -1), ("torch_threads", 0),
-            ("replay_sampling", "unknown"),
-        ):
-            with self.subTest(name=name, value=value):
-                with mock.patch("src.training.solo.PappluEnv") as env:
-                    with self.assertRaises(ValueError):
-                        train(**{name: value})
-                    env.assert_not_called()
+    def test_real_cli_runs_and_resumes_the_saved_nondefault_model(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            command = [sys.executable, "-m", "src.cli.train", "--output-dir", temporary]
+            flags = [
+                "--players", "1", "2", "--max-turns", "1", "--round-episodes", "2",
+                "--batch-size", "2", "--replay-capacity", "32", "--validation-games", "1",
+                "--validate-every", "2", "--width", "9", "--blocks", "1", "--max-episodes", "2",
+                "--updates-per-episode", "3", "--epsilon-decay-episodes", "12", "--torch-threads", "2",
+                "--margin-weight", "0.25",
+            ]
+            fresh = subprocess.run(command + flags, cwd=ROOT, capture_output=True, text=True, timeout=60)
+            self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+            resumed = subprocess.run(command + ["--max-episodes", "4"], cwd=ROOT, capture_output=True, text=True, timeout=60)
+            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+            report = json.loads(resumed.stdout)
+            self.assertEqual((report["episodes"], report["updates"], report["model_spec"]),
+                             (4, 12, {"width": 9, "blocks": 1}))
+            config = TrainConfig(**torch.load(Path(temporary) / "latest-state.pt", weights_only=True)["config"])
+            self.assertEqual((config.updates_per_episode, config.epsilon_decay_episodes, config.torch_threads), (3, 12, 2))
+            self.assertEqual(config.margin_weight, 0.25)
+            self.assertEqual(len((Path(temporary) / "metrics.jsonl").read_text().splitlines()), 2)
 
 
 if __name__ == "__main__":

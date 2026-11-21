@@ -1,133 +1,365 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 import math
+import struct
 from typing import Sequence
 
-import torch
-
 from src.evaluate import NUM_FACES
-from src.game.environment import Observation
+from src.game.environment import ENCODING_VERSION, NUM_ACTIONS, Observation, Phase, legal_action_mask
+from src.game.information import EventKind
 
-CONTEXT_FEATURES = 11
-PLAYER_FEATURES = 6
-EVENT_FEATURES = 8
+
+LEGAL_RUNS = tuple((r, r + 1, r + 2) for r in range(11)) + ((11, 12, 0),)
+NUM_SEAT_SLOTS = 6
+NO_TOP = NUM_FACES
+CARD_CHANNELS = (
+    "own", "own_ge1", "own_ge2", "own_ge3", "pile", "top", "indicator", "wild",
+    "points", "opp_discarded", "next_held", "other_held", "next_passed",
+    "adjacent", "set_mates", "natural", "pure", "any_meld",
+    "spare_frac", "disc_pseq_delta", "disc_pts_saved", "disc_pairs_delta",
+)
+SEAT_CHANNELS = (
+    "present", "observer", "active", "hand_size", "turns", "next", "takes",
+    "passes", "held_total",
+)
+CONTEXT_CHANNELS = (
+    "draw", "discard", "terminal", "to_act", "turns", "stock", "pile", "refills",
+    "decks", "hand", "sequences", "recycle", "players", "max_turns", "warm_start",
+    "wilds", "deadwood", "unavoidable_dw",
+    "disjoint_pseq_frac", "disjoint_gated_pts", "top_gain_pseq", "top_gain_pts",
+)
+CARD_OFFSET = 0
+SEAT_OFFSET = CARD_OFFSET + NUM_FACES * len(CARD_CHANNELS)
+CONTEXT_OFFSET = SEAT_OFFSET + NUM_SEAT_SLOTS * len(SEAT_CHANNELS)
+LEGAL_OFFSET = CONTEXT_OFFSET + len(CONTEXT_CHANNELS)
+TOP_OFFSET = LEGAL_OFFSET + NUM_ACTIONS
+FEATURE_SIZE = TOP_OFFSET + 1
+_RUN_FACES = tuple(tuple(suit * 13 + rank for rank in run)
+                   for suit in range(4) for run in LEGAL_RUNS)
+_SET_FACES = tuple(tuple(suit * 13 + rank for suit in suits)
+                   for rank in range(13) for suits in combinations(range(4), 3))
+_RANK_POINTS = (10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10)
+_ORDERED_RUNS = tuple(sorted(_RUN_FACES, key=lambda run: (
+    run[0] // 13, -sum(_RANK_POINTS[f % 13] for f in run), run[0] % 13,
+)))
+_RUN_PAIRS = tuple(sorted(
+    {tuple(sorted(pair)) for run in _RUN_FACES for pair in combinations(run, 2)},
+    key=lambda pair: (-sum(_RANK_POINTS[f % 13] for f in pair), pair),
+))
+_PURE_PAIRS = tuple(tuple(pair for pair in _RUN_PAIRS if joker not in pair) for joker in range(NUM_FACES))
+_WILD_PAIRS = tuple(tuple(sorted(
+    {pair for pair in _RUN_PAIRS if all(f % 13 != rank for f in pair)}
+    | {(a * 13 + r, b * 13 + r) for r in range(13) if r != rank
+       for a, b in combinations(range(4), 2)},
+    key=lambda pair: (-sum(_RANK_POINTS[f % 13] for f in pair), pair),
+)) for rank in range(13))
+_SET_RANKS = tuple(sorted(range(13), key=lambda rank: (-_RANK_POINTS[rank], rank)))
+_POINT_ORDER = tuple(sorted(range(NUM_FACES), key=lambda face: (-_RANK_POINTS[face % 13], face)))
+_RUN_STARTS = {run[0]: run for run in _RUN_FACES}
 
 
 @dataclass(frozen=True)
-class ObservationBatch:
-    cards: torch.Tensor
-    initial_hand: torch.Tensor
-    top: torch.Tensor
-    context: torch.Tensor
-    players: torch.Tensor
-    player_mask: torch.Tensor
-    next_player: torch.Tensor
-    previous_player: torch.Tensor
-    event_kind: torch.Tensor
-    event_face: torch.Tensor
-    offered_top: torch.Tensor
-    event_features: torch.Tensor
-    event_actor: torch.Tensor
-    history_mask: torch.Tensor
-    history_lengths: torch.Tensor
+class FeatureField:
+    name: str
+    shape: tuple[int, ...]
+    offset: int
+
+    @property
+    def size(self) -> int:
+        return math.prod(self.shape)
 
 
-def collate_observations(
-    observations: Sequence[Observation],
-    device: torch.device,
-) -> ObservationBatch:
-    if not observations or any(not obs.history or not obs.players for obs in observations):
-        raise ValueError("model input needs observations with complete history and player views")
-    batch = len(observations)
-    players = max(len(obs.players) for obs in observations)
-    events = max(len(obs.history) for obs in observations)
+def _layout(fields: Sequence[tuple[str, tuple[int, ...]]]) -> tuple[FeatureField, ...]:
+    offset, result = 0, []
+    for name, shape in fields:
+        result.append(FeatureField(name, shape, offset))
+        offset += math.prod(shape)
+    return tuple(result)
 
-    def zeros(*shape: int) -> torch.Tensor:
-        return torch.zeros(shape, dtype=torch.float32, device=device)
 
-    def indices(*shape: int, fill: int = 0) -> torch.Tensor:
-        return torch.full(shape, fill, dtype=torch.long, device=device)
+LAYOUT = _layout((
+    ("card", (NUM_FACES, len(CARD_CHANNELS))),
+    ("seat", (NUM_SEAT_SLOTS, len(SEAT_CHANNELS))),
+    ("context", (len(CONTEXT_CHANNELS),)),
+    ("legal", (NUM_ACTIONS,)),
+    ("top", (1,)),
+))
+_RECORD = struct.Struct("<%df" % FEATURE_SIZE)
 
-    cards = zeros(batch, NUM_FACES, 5)
-    initial_hand = zeros(batch, NUM_FACES)
-    top = indices(batch, fill=NUM_FACES)
-    context = zeros(batch, CONTEXT_FEATURES)
-    player_values = zeros(batch, players, PLAYER_FEATURES)
-    player_mask = torch.zeros((batch, players), dtype=torch.bool, device=device)
-    next_player = indices(batch, players)
-    previous_player = indices(batch, players)
-    event_kind = indices(batch, events)
-    event_face = indices(batch, events, fill=NUM_FACES)
-    offered_top = indices(batch, events, fill=NUM_FACES)
-    event_features = zeros(batch, events, EVENT_FEATURES)
-    event_actor = indices(batch, events)
-    history_mask = torch.zeros((batch, events), dtype=torch.bool, device=device)
-    lengths = []
 
-    for row, obs in enumerate(observations):
-        cfg = obs.config
-        count = len(obs.players)
-        sins = [math.sin(2.0 * math.pi * i / count) for i in range(count)]
-        coss = [math.cos(2.0 * math.pi * i / count) for i in range(count)]
-        history_length = len(obs.history)
-        lengths.append(history_length)
-        card_values = [[n / cfg.num_decks, 0.0, 0.0, 0.0, 0.0] for n in obs.hand]
-        for face in obs.discard_pile:
-            card_values[face][1] += 1.0 / cfg.num_decks
-        if obs.discard_top is not None:
-            top[row] = obs.discard_top
-            card_values[obs.discard_top][2] = 1.0
-        card_values[obs.joker][3] = 1.0
-        for suit in range(4):
-            card_values[suit * 13 + obs.joker % 13][4] = 1.0
-        cards[row] = torch.tensor(card_values, device=device)
-        initial_hand[row] = torch.tensor(obs.history[0].initial_hand, device=device) / cfg.num_decks
-        phase = [float(obs.phase.value == value) for value in range(3)]
-        context[row] = torch.tensor(phase + [
-            obs.turns_remaining / cfg.max_turns,
-            obs.stock_remaining / (cfg.num_decks * NUM_FACES),
-            cfg.num_decks / 6.0, cfg.cards_in_hand / 30.0,
-            cfg.required_sequences / 10.0, float(cfg.recycle_discard),
-            count / 6.0, cfg.max_turns / 60.0,
-        ], device=device)
-        for relative, player in enumerate(obs.players):
-            player_values[row, relative] = torch.tensor([
-                float(relative == 0), player.hand_size / cfg.cards_in_hand,
-                player.turns_remaining / cfg.max_turns, float(player.active),
-                sins[relative], coss[relative],
-            ], device=device)
-            next_player[row, relative] = player.next_player
-            previous_player[row, relative] = player.previous_player
-        player_mask[row, :count] = True
-        event_kind[row, :history_length] = torch.tensor(
-            [int(event.kind) for event in obs.history], device=device,
-        )
-        event_face[row, :history_length] = torch.tensor([
-            NUM_FACES if event.face is None else event.face for event in obs.history
-        ], device=device)
-        offered_top[row, :history_length] = torch.tensor([
-            NUM_FACES if event.offered_top is None else event.offered_top for event in obs.history
-        ], device=device)
-        event_actor[row, :history_length] = torch.tensor(
-            [event.actor for event in obs.history], device=device,
-        )
-        event_features[row, :history_length] = torch.tensor([
-            [
-                float(event.actor == 0),
-                sins[event.actor],
-                coss[event.actor],
-                event.hand_size / cfg.cards_in_hand,
-                event.turns_remaining / cfg.max_turns,
-                event.stock_remaining / (cfg.num_decks * NUM_FACES),
-                sins[event.next_player],
-                coss[event.next_player],
-            ] for event in obs.history
-        ], device=device)
-        history_mask[row, :history_length] = True
-    return ObservationBatch(
-        cards, initial_hand, top, context, player_values, player_mask,
-        next_player, previous_player, event_kind, event_face, offered_top,
-        event_features, event_actor, history_mask,
-        torch.tensor(lengths, dtype=torch.int64, device="cpu"),
+@dataclass(frozen=True)
+class Features:
+    data: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, bytes) or len(self.data) != _RECORD.size:
+            raise ValueError("features must contain %d bytes of little-endian float32 data" % _RECORD.size)
+
+
+def disjoint_pack(hand: Sequence[int], joker: int, required_sequences: int) -> tuple[int, int, int, int, list[int]]:
+    rem = list(hand)
+    pure_seqs = 0
+    for a, b, c in _ORDERED_RUNS:
+        if joker in (a, b, c):
+            continue
+        while rem[a] and rem[b] and rem[c]:
+            rem[a] -= 1
+            rem[b] -= 1
+            rem[c] -= 1
+            pure_seqs += 1
+            if c % 13 < 12 and c == b + 1:
+                nxt = c + 1
+                run = _RUN_STARTS.get(nxt)
+                starts = run is not None and rem[run[0]] and rem[run[1]] and rem[run[2]]
+                if nxt != joker and rem[nxt] and not starts:
+                    rem[nxt] -= 1
+    for face in range(NUM_FACES):
+        if face != joker:
+            while rem[face] >= 3:
+                rem[face] -= 3
+                pure_seqs += 1
+    for a, b, c in _ORDERED_RUNS:
+        if joker not in (a, b, c):
+            continue
+        while rem[a] and rem[b] and rem[c]:
+            rem[a] -= 1
+            rem[b] -= 1
+            rem[c] -= 1
+            pure_seqs += 1
+    while rem[joker]:
+        pair = next((pair for pair in _PURE_PAIRS[joker] if rem[pair[0]] and rem[pair[1]]), None)
+        if pair is not None:
+            rem[pair[0]] -= 1
+            rem[pair[1]] -= 1
+            rem[joker] -= 1
+            pure_seqs += 1
+        elif rem[joker] >= 2:
+            face = next((face for face in _POINT_ORDER if face != joker and rem[face]), None)
+            if face is None:
+                break
+            rem[face] -= 1
+            rem[joker] -= 2
+            pure_seqs += 1
+        else:
+            break
+    after_pure = list(rem)
+    pairs = sum(
+        ((a != joker and rem[a] > 0) + (b != joker and rem[b] > 0) + (c != joker and rem[c] > 0)) >= 2
+        for a, b, c in _RUN_FACES
     )
+    rank, wilds = joker % 13, 0
+    for suit in range(4):
+        face = suit * 13 + rank
+        wilds += rem[face]
+        rem[face] = 0
+    for r in _SET_RANKS:
+        if r == rank:
+            continue
+        while True:
+            faces = [suit * 13 + r for suit in range(4) if rem[suit * 13 + r]]
+            if len(faces) < 3:
+                break
+            for face in faces:
+                rem[face] -= 1
+    while wilds:
+        pair = next((pair for pair in _WILD_PAIRS[rank] if rem[pair[0]] and rem[pair[1]]), None)
+        if pair is None:
+            break
+        rem[pair[0]] -= 1
+        rem[pair[1]] -= 1
+        wilds -= 1
+    points = sum(n * _RANK_POINTS[f % 13] for f, n in enumerate(rem) if n)
+    gated = points if pure_seqs >= required_sequences else sum(
+        n * _RANK_POINTS[f % 13] for f, n in enumerate(after_pure) if n and f % 13 != rank
+    )
+    return pure_seqs, gated, points, pairs, rem
+
+
+def _meld_membership(hand: Sequence[int], joker: int) -> tuple[list[int], list[int], list[int]]:
+    natural, pure, any_meld = [[0] * NUM_FACES for _ in range(3)]
+    wilds = tuple(suit * 13 + joker % 13 for suit in range(4))
+
+    def mark(represented: tuple[int, ...], flexible: tuple[int, ...], result: list[int]) -> None:
+        missing = sum(not hand[face] or face in flexible for face in represented)
+        available = sum(hand[face] for face in flexible)
+        if missing > available:
+            return
+        for face in represented:
+            if hand[face] and face not in flexible:
+                result[face] = 1
+        if available:
+            for face in flexible:
+                if hand[face]:
+                    result[face] = 1
+
+    for represented in _RUN_FACES:
+        if all(hand[face] for face in represented):
+            for face in represented:
+                natural[face] = 1
+        mark(represented, (joker,), pure)
+        mark(represented, wilds, any_meld)
+    for represented in _SET_FACES:
+        mark(represented, wilds, any_meld)
+    for face, copies in enumerate(hand):
+        if copies >= 3:
+            pure[face] = any_meld[face] = 1
+    return natural, pure, any_meld
+
+
+def encode(obs: Observation) -> Features:
+    cfg, hand, count = obs.config, obs.hand, len(obs.players)
+    decks, supply = cfg.num_decks, cfg.num_decks * NUM_FACES
+    pile = [0] * NUM_FACES
+    for face in obs.discard_pile:
+        pile[face] += 1
+    seat_held = [[0] * NUM_FACES for _ in range(count)]
+    seat_held_total, seat_takes, seat_passes = [0] * count, [0] * count, [0] * count
+    opp_disc, next_passed = [0] * NUM_FACES, [0] * NUM_FACES
+    next_opp = obs.players[0].next_player if count > 1 and obs.players[0].next_player > 0 else -1
+    refills = 0
+    for event in obs.history:
+        actor, face = event.actor, event.face
+        if event.kind is EventKind.TAKE_DISCARD:
+            seat_held[actor][face] += 1
+            seat_held_total[actor] += 1
+            seat_takes[actor] += 1
+        elif event.kind is EventKind.DISCARD:
+            if seat_held[actor][face] > 0:
+                seat_held[actor][face] -= 1
+                seat_held_total[actor] -= 1
+            if actor > 0:
+                opp_disc[face] += 1
+        elif event.kind is EventKind.DRAW_STOCK:
+            if event.offered_top is not None:
+                seat_passes[actor] += 1
+                if actor == next_opp:
+                    next_passed[event.offered_top] += 1
+        elif event.kind is EventKind.REFILL:
+            refills += 1
+    top_face, wild_rank = obs.discard_top, obs.joker % 13
+    required = cfg.required_sequences
+    base = disjoint_pack(hand, obs.joker, required)
+    natural, pure, any_meld = _meld_membership(hand, obs.joker)
+    raw_pts_sum, wild_cnt, unavoidable_dw = 0, 0, 0
+    values = []
+    for face, copies in enumerate(hand):
+        suit, rank = divmod(face, 13)
+        is_wild = rank == wild_rank
+        pts = 0 if is_wild else (10 if rank == 0 or rank >= 10 else rank + 1)
+        raw_pts_sum += copies * pts
+        wild_cnt += copies if is_wild else 0
+        unavoidable_dw += copies * pts * (1 - any_meld[face])
+        opp_held_face = sum(seat_held[seat][face] for seat in range(1, count))
+        next_held_face = seat_held[next_opp][face] if next_opp > 0 else 0
+        values.extend((
+            copies / decks, float(copies >= 1), float(copies >= 2), float(copies >= 3),
+            pile[face] / decks, float(face == top_face), float(face == obs.joker),
+            float(is_wild), pts / 10.0, opp_disc[face] / decks, next_held_face / decks,
+            (opp_held_face - next_held_face) / decks, next_passed[face] / decks,
+            (int(hand[suit * 13 + (rank - 1) % 13] > 0)
+             + int(hand[suit * 13 + (rank + 1) % 13] > 0)) / 2.0,
+            sum(hand[other * 13 + rank] > 0 for other in range(4) if other != suit) / 3.0,
+            natural[face], pure[face], any_meld[face],
+            base[4][face] / copies if copies else 0.0, 0.0, 0.0, 0.0,
+        ))
+    for seat in range(NUM_SEAT_SLOTS):
+        if seat >= count:
+            values.extend((0.0,) * len(SEAT_CHANNELS))
+            continue
+        player = obs.players[seat]
+        values.extend((
+            1.0, float(seat == 0), float(player.active), player.hand_size / cfg.cards_in_hand,
+            player.turns_remaining / cfg.max_turns,
+            float(seat > 0 and seat == obs.players[0].next_player),
+            seat_takes[seat] / cfg.max_turns, seat_passes[seat] / cfg.max_turns,
+            seat_held_total[seat] / cfg.cards_in_hand,
+        ))
+    last = obs.history[-1]
+    to_act = not obs.done and obs.players[0].active and (
+        last.kind is EventKind.INITIAL
+        or obs.phase is Phase.DISCARD and last.kind in (EventKind.DRAW_STOCK, EventKind.TAKE_DISCARD)
+        and last.actor == 0
+        or obs.phase is Phase.DRAW and last.kind in (EventKind.DISCARD, EventKind.REFILL)
+        and last.next_player == 0
+    )
+    values.extend((
+        float(obs.phase is Phase.DRAW), float(obs.phase is Phase.DISCARD), float(obs.done), float(to_act),
+        obs.turns_remaining / cfg.max_turns, obs.stock_remaining / supply, len(obs.discard_pile) / supply,
+        min(refills, 3) / 3.0, decks / 6.0, cfg.cards_in_hand / 30.0,
+        cfg.required_sequences / 10.0, float(cfg.recycle_discard), count / 6.0, cfg.max_turns / 60.0,
+        float(count == 1 and sum(obs.history[0].initial_hand) == cfg.cards_in_hand + 1),
+        wild_cnt / (4 * decks), raw_pts_sum / 100.0, unavoidable_dw / (10.0 * cfg.cards_in_hand),
+        min(base[0], required) / max(1, required), base[1] / 100.0, 0.0, 0.0,
+    ))
+    legal = list(legal_action_mask(obs))
+    if (
+        obs.phase is Phase.DISCARD and last.kind is EventKind.TAKE_DISCARD
+        and last.actor == 0 and last.face is not None and sum(c > 0 for c in hand) > 1
+    ):
+        legal[2 + last.face] = False
+    if to_act and obs.phase is Phase.DISCARD:
+        for face, copies in enumerate(hand):
+            if not copies or not legal[2 + face]:
+                continue
+            after = list(hand)
+            after[face] -= 1
+            packed = disjoint_pack(after, obs.joker, required)
+            offset = face * len(CARD_CHANNELS)
+            values[offset + 19:offset + 22] = (
+                min(packed[0], required) - min(base[0], required),
+                (base[2] - packed[2]) / 10.0, (packed[3] - base[3]) / 3.0,
+            )
+    if to_act and obs.phase is Phase.DRAW and legal[1]:
+        plus = list(hand)
+        plus[top_face] += 1
+        best, best_key = None, None
+        for face, copies in enumerate(plus):
+            if not copies or face == top_face:
+                continue
+            plus[face] -= 1
+            packed = disjoint_pack(plus, obs.joker, required)
+            plus[face] += 1
+            key = (min(packed[0], required), -packed[2], packed[3], -packed[1])
+            if best_key is None or key > best_key:
+                best, best_key = packed, key
+        if best is not None:
+            values[CONTEXT_OFFSET + 20:CONTEXT_OFFSET + 22] = (
+                min(best[0], required) - min(base[0], required), (base[2] - best[2]) / 20.0,
+            )
+    values.extend(float(allowed and to_act) for allowed in legal)
+    values.append(float(NO_TOP if top_face is None else top_face))
+    return Features(_RECORD.pack(*values))
+
+
+def legal_actions(features: Features) -> tuple[int, ...]:
+    return tuple(action for action, allowed in enumerate(
+        struct.unpack_from("<%df" % NUM_ACTIONS, features.data, LEGAL_OFFSET * 4),
+    ) if allowed)
+
+
+def feature_values(features: Features) -> tuple[float, ...]:
+    return _RECORD.unpack(features.data)
+
+
+def unpack(features: Features) -> dict[str, tuple[float, ...]]:
+    values = feature_values(features)
+    return {field.name: values[field.offset:field.offset + field.size] for field in LAYOUT}
+
+
+def encoding_layout() -> tuple[FeatureField, ...]:
+    return LAYOUT
+
+
+def encoding_metadata() -> dict:
+    return {
+        "encoding_version": ENCODING_VERSION,
+        "feature_size": FEATURE_SIZE,
+        "feature_bytes": _RECORD.size,
+        "layout": [
+            {"name": field.name, "shape": list(field.shape), "offset": field.offset}
+            for field in LAYOUT
+        ],
+        "channels": {"card": CARD_CHANNELS, "seat": SEAT_CHANNELS, "context": CONTEXT_CHANNELS},
+    }

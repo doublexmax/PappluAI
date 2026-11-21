@@ -1,96 +1,130 @@
 const NUM_FACES = 52;
 const NUM_ACTIONS = 54;
-const NO_FACE = NUM_FACES;
-const WIDTH = 64;
-const HEADS = 4;
-const HEAD_SIZE = WIDTH / HEADS;
-const STEPS = 14;
-const CARD_FEATURES = 5;
-const CONTEXT_FEATURES = 11;
-const PLAYER_FEATURES = 6;
-const EVENT_FEATURES = 8;
-const EVENT_KINDS = 6;
-const DRAW_STOCK = 1;
-const TAKE_DISCARD = 2;
-const DISCARD = 3;
+const SEATS = 6;
+const [INITIAL, DRAW_STOCK, TAKE_DISCARD, DISCARD, REFILL] = [0, 1, 2, 3, 4];
+const RANK_POINTS = [10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10];
+const LEGAL_RUNS = [...Array.from({ length: 11 }, (_, r) => [r, r + 1, r + 2]), [11, 12, 0]];
+const RUN_FACES = Array.from({ length: 4 }, (_, s) => LEGAL_RUNS.map(run => run.map(r => s * 13 + r))).flat();
+const SET_FACES = Array.from({ length: 13 }, (_, r) =>
+  [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]].map(suits => suits.map(s => s * 13 + r))).flat();
+const meldPoints = faces => faces.reduce((sum, face) => sum + RANK_POINTS[face % 13], 0);
+const pairOrder = (a, b) => meldPoints(b) - meldPoints(a) || a[0] - b[0] || a[1] - b[1];
+const ORDERED_RUNS = [...RUN_FACES].sort((a, b) =>
+  Math.floor(a[0] / 13) - Math.floor(b[0] / 13) || meldPoints(b) - meldPoints(a) || a[0] % 13 - b[0] % 13);
+const pairMap = new Map();
+for (const run of RUN_FACES) for (let a = 0; a < 3; a++) for (let b = a + 1; b < 3; b++) {
+  const pair = [run[a], run[b]].sort((a, b) => a - b);
+  pairMap.set(pair.join(","), pair);
+}
+const RUN_PAIRS = [...pairMap.values()].sort(pairOrder);
+const PURE_PAIRS = Array.from({ length: 52 }, (_, joker) => RUN_PAIRS.filter(pair => !pair.includes(joker)));
+const WILD_PAIRS = Array.from({ length: 13 }, (_, rank) => {
+  const pairs = new Map(RUN_PAIRS.filter(pair => pair.every(face => face % 13 !== rank))
+    .map(pair => [pair.join(","), pair]));
+  for (let r = 0; r < 13; r++) if (r !== rank) for (let a = 0; a < 4; a++) for (let b = a + 1; b < 4; b++) {
+    const pair = [a * 13 + r, b * 13 + r];
+    pairs.set(pair.join(","), pair);
+  }
+  return [...pairs.values()].sort(pairOrder);
+});
+const SET_RANKS = Array.from({ length: 13 }, (_, rank) => rank)
+  .sort((a, b) => RANK_POINTS[b] - RANK_POINTS[a] || a - b);
+const POINT_ORDER = Array.from({ length: 52 }, (_, face) => face)
+  .sort((a, b) => RANK_POINTS[b % 13] - RANK_POINTS[a % 13] || a - b);
+const RUN_STARTS = new Map(RUN_FACES.map(run => [run[0], run]));
+
+export const CHANNELS = Object.freeze({
+  card: Object.freeze([
+    "own", "own_ge1", "own_ge2", "own_ge3", "pile", "top", "indicator", "wild",
+    "points", "opp_discarded", "next_held", "other_held", "next_passed",
+    "adjacent", "set_mates", "natural", "pure", "any_meld",
+    "spare_frac", "disc_pseq_delta", "disc_pts_saved", "disc_pairs_delta",
+  ]),
+  seat: Object.freeze(["present", "observer", "active", "hand_size", "turns", "next", "takes", "passes", "held_total"]),
+  context: Object.freeze([
+    "draw", "discard", "terminal", "to_act", "turns", "stock", "pile", "refills", "decks", "hand",
+    "sequences", "recycle", "players", "max_turns", "warm_start", "wilds", "deadwood",
+    "unavoidable_dw",
+    "disjoint_pseq_frac", "disjoint_gated_pts", "top_gain_pseq", "top_gain_pts",
+  ]),
+});
+export const FEATURE_LAYOUT = Object.freeze([
+  ["card", [52, 22]], ["seat", [6, 9]], ["context", [22]], ["legal", [54]], ["top", [1]],
+].map(([name, shape]) => Object.freeze([name, Object.freeze(shape)])));
+export const FEATURE_SIZE = 1275;
+const FIELDS = {};
+let offset = 0;
+for (const [name, shape] of FEATURE_LAYOUT) {
+  const size = shape.reduce((a, b) => a * b, 1);
+  FIELDS[name] = { offset, size };
+  offset += size;
+}
 
 const HEADER = Object.freeze({
-  format: "papplu-qnet",
-  formatVersion: 1,
-  checkpointVersion: 3,
-  encodingVersion: 2,
-  architecture: "dynamic_table",
-  numActions: NUM_ACTIONS,
+  format: "papplu-qnet", formatVersion: 2, checkpointVersion: 5,
+  encodingVersion: 5, architecture: "card_mlp", numActions: NUM_ACTIONS,
 });
 const MODEL_KEYS = [...Object.keys(HEADER), "modelSpec", "gameConfig", "source", "tensors"];
 const GAME_CONFIG_KEYS = ["numDecks", "cardsInHand", "requiredSequences", "maxTurns", "recycleDiscard"];
-const SOURCE_KEYS = ["kind", "trained", "champion", "seed", "registryId", "sha256", "tensorsSha256"];
-const SOURCE_KINDS = ["bootstrap", "checkpoint", "registry"];
+const SOURCE_KEYS = ["kind", "trained", "seed", "sha256", "tensorsSha256"];
+const SOURCE_KINDS = ["bootstrap", "checkpoint"];
 const SHA256 = /^[0-9a-f]{64}$/;
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
-
-const TENSOR_SHAPES = Object.freeze({
-  "suit_conv1.weight": [64, 5, 3], "suit_conv1.bias": [64],
-  "suit_conv2.weight": [64, 64, 3], "suit_conv2.bias": [64],
-  "card_attention.in_proj_weight": [192, 64], "card_attention.in_proj_bias": [192],
-  "card_attention.out_proj.weight": [64, 64], "card_attention.out_proj.bias": [64],
-  "card_norm.weight": [64], "card_norm.bias": [64],
-  "history_proj.weight": [1, 5], "history_proj.bias": [1],
-  "context_features.weight": [64, 11], "context_features.bias": [64],
-  "player_features.weight": [64, 6], "player_features.bias": [64],
-  "event_summary.weight": [64, 8], "event_summary.bias": [64],
-  "turn_relations.weight": [64, 192], "turn_relations.bias": [64],
-  "context_gate.weight": [2, 64], "context_gate.bias": [2],
-  "draw_head.0.weight": [64, 197], "draw_head.0.bias": [64],
-  "draw_head.2.weight": [2, 64], "draw_head.2.bias": [2],
-  "score.0.weight": [64, 210], "score.0.bias": [64],
-  "score.2.weight": [1, 64], "score.2.bias": [1],
-});
-
 const WEIGHTS = new WeakMap();
 
-/**
- * @typedef {{ numDecks: number, cardsInHand: number, requiredSequences: number, maxTurns: number, recycleDiscard: boolean }} ModelGameConfig
- *
- * Bootstrap weights are seeded and untrained. A registry export is the champion it names.
- * @typedef {{
- *   kind: "bootstrap" | "checkpoint" | "registry", trained: boolean, champion: boolean,
- *   seed: number | null, registryId: string | null, sha256: string, tensorsSha256: string,
- * }} ModelSource
- *
- * @typedef {{ readonly kind: "papplu-qnet", readonly gameConfig: ModelGameConfig, readonly source: ModelSource }} QModel
- *
- * The Python Observation with camelCase fields. Seats are relative to the observer.
- * @typedef {{
- *   hand: number[], discardPile: number[], joker: number, phase: 0 | 1 | 2,
- *   turnsRemaining: number, stockRemaining: number, config: ModelGameConfig,
- *   players: Array<{ handSize: number, turnsRemaining: number, nextPlayer: number, previousPlayer: number, active: boolean }>,
- *   history: Array<{ kind: 0 | 1 | 2 | 3 | 4 | 5, actor: number, handSize: number, turnsRemaining: number,
- *                    stockRemaining: number, nextPlayer: number, face: number | null,
- *                    offeredTop: number | null, initialHand: number[] }>,
- * }} Observation
- */
+export function tensorShapes(spec) {
+  const { width, blocks } = parseModelSpec(spec, "modelSpec");
+  const shapes = [];
+  function layer(name, output, inputs = null, bias = true) {
+    shapes.push([`policy.${name}.weight`, inputs === null ? [output] : [output, inputs]]);
+    if (bias) shapes.push([`policy.${name}.bias`, [output]]);
+  }
+  layer("card_embed", width, CHANNELS.card.length);
+  layer("table_embed", width, SEATS * CHANNELS.seat.length + CHANNELS.context.length);
+  for (let b = 0; b < blocks; b += 1) {
+    const prefix = `blocks.${b}.`;
+    layer(`${prefix}card_norm`, width);
+    layer(`${prefix}table_norm`, width);
+    layer(`${prefix}w_seq`, width * 3, width);
+    for (const name of ["w_rank_set", "w_suit_run", "w_table"]) layer(prefix + name, width, width, false);
+    layer(`${prefix}card_out`, width, width);
+    layer(`${prefix}table_fc1`, width, width * 3);
+    layer(`${prefix}table_fc2`, width, width);
+  }
+  layer("card_final", width);
+  layer("table_final", width);
+  layer("face_local", width, width);
+  layer("face_set", width, width, false);
+  layer("face_table", width, width, false);
+  layer("face_out", 1, width);
+  layer("draw_table", width, width);
+  layer("draw_top", width, width, false);
+  layer("draw_set", width, width, false);
+  layer("draw_out", 2, width);
+  layer("value_hidden", width, width);
+  layer("value_out", 1, width);
+  return shapes;
+}
 
-/**
- * Validates a parsed web/papplu-model.json and throws a TypeError naming the first bad field.
- * @param {unknown} json
- * @returns {QModel}
- */
 export function parseQModel(json) {
   requireKeys(json, MODEL_KEYS, "model");
   for (const [key, expected] of Object.entries(HEADER)) {
     if (json[key] !== expected) fail(`model.${key}`, `expected ${JSON.stringify(expected)}`);
   }
-  requireKeys(json.modelSpec, ["width", "heads"], "model.modelSpec");
-  if (json.modelSpec.width !== WIDTH || json.modelSpec.heads !== HEADS) {
-    fail("model.modelSpec", `expected width ${WIDTH} and heads ${HEADS}`);
-  }
+  const spec = parseModelSpec(json.modelSpec, "model.modelSpec");
   const gameConfig = parseGameConfig(json.gameConfig, "model.gameConfig");
   const source = parseSource(json.source, "model.source");
-  const weights = parseTensors(json.tensors, "model.tensors");
-  const model = Object.freeze({ kind: "papplu-qnet", gameConfig, source });
-  WEIGHTS.set(model, weights);
+  const weights = parseTensors(json.tensors, spec, "model.tensors");
+  const model = Object.freeze({ kind: "papplu-qnet", spec, gameConfig, source });
+  WEIGHTS.set(model, { weights, buffers: forwardBuffers(spec.width) });
   return model;
+}
+
+function parseModelSpec(spec, path) {
+  requireKeys(spec, ["width", "blocks"], path);
+  if (!Number.isSafeInteger(spec.width) || spec.width < 8) fail(`${path}.width`, "expected an integer of at least 8");
+  if (!Number.isSafeInteger(spec.blocks) || spec.blocks < 1) fail(`${path}.blocks`, "expected a positive integer");
+  return Object.freeze({ width: spec.width, blocks: spec.blocks });
 }
 
 function parseGameConfig(config, path) {
@@ -99,48 +133,40 @@ function parseGameConfig(config, path) {
     if (!Number.isSafeInteger(config[key]) || config[key] < 1) fail(`${path}.${key}`, "expected a positive integer");
   }
   const { numDecks, cardsInHand, requiredSequences, maxTurns, recycleDiscard } = config;
-  if (!Number.isSafeInteger(requiredSequences) || requiredSequences < 0) {
-    fail(`${path}.requiredSequences`, "expected a nonnegative integer");
-  }
+  if (!Number.isSafeInteger(requiredSequences) || requiredSequences < 0) fail(`${path}.requiredSequences`, "expected a nonnegative integer");
   if (typeof recycleDiscard !== "boolean") fail(`${path}.recycleDiscard`, "expected a boolean");
-  if (numDecks * NUM_FACES < cardsInHand + 2) {
-    fail(`${path}.numDecks`, "too few cards to deal a hand plus the joker and first discard");
-  }
+  if (numDecks * NUM_FACES < cardsInHand + 2) fail(`${path}.numDecks`, "too few cards to deal a hand plus the joker and first discard");
   if (requiredSequences * 3 > cardsInHand) fail(`${path}.requiredSequences`, "needs more cards than a hand holds");
   return Object.freeze({ numDecks, cardsInHand, requiredSequences, maxTurns, recycleDiscard });
 }
 
 function parseSource(source, path) {
   requireKeys(source, SOURCE_KEYS, path);
-  const { kind, trained, champion, seed, registryId, sha256, tensorsSha256 } = source;
+  const { kind, trained, seed, sha256, tensorsSha256 } = source;
   if (!SOURCE_KINDS.includes(kind)) fail(`${path}.kind`, `expected one of ${SOURCE_KINDS.join(", ")}`);
   const bootstrap = kind === "bootstrap";
-  const registry = kind === "registry";
   if (trained !== !bootstrap) fail(`${path}.trained`, `must be ${!bootstrap} for ${kind} weights`);
-  if (champion !== registry) fail(`${path}.champion`, `must be ${registry} for ${kind} weights`);
   if (bootstrap ? !Number.isSafeInteger(seed) : seed !== null) {
     fail(`${path}.seed`, bootstrap ? "expected the integer bootstrap seed" : "expected null");
-  }
-  if (registry ? typeof registryId !== "string" || registryId === "" : registryId !== null) {
-    fail(`${path}.registryId`, registry ? "expected the champion's registry id" : "expected null");
   }
   for (const key of ["sha256", "tensorsSha256"]) {
     if (typeof source[key] !== "string" || !SHA256.test(source[key])) fail(`${path}.${key}`, "expected 64 lowercase hex digits");
   }
-  return Object.freeze({ kind, trained, champion, seed, registryId, sha256, tensorsSha256 });
+  return Object.freeze({ kind, trained, seed, sha256, tensorsSha256 });
 }
 
-function parseTensors(tensors, path) {
-  requireKeys(tensors, Object.keys(TENSOR_SHAPES), path);
+function parseTensors(tensors, spec, path) {
+  const shapes = tensorShapes(spec);
+  requireKeys(tensors, shapes.map(([name]) => name), path);
   const weights = {};
-  for (const [name, shape] of Object.entries(TENSOR_SHAPES)) {
+  for (const [name, shape] of shapes) {
     const at = `${path}["${name}"]`;
     const entry = tensors[name];
     requireKeys(entry, ["shape", "data"], at);
     if (!Array.isArray(entry.shape) || entry.shape.length !== shape.length || entry.shape.some((n, i) => n !== shape[i])) {
       fail(`${at}.shape`, `expected [${shape.join(", ")}]`);
     }
-    weights[name] = decodeFloat32(entry.data, shape.reduce((a, b) => a * b, 1), `${at}.data`);
+    weights[name.slice("policy.".length)] = decodeFloat32(entry.data, shape.reduce((a, b) => a * b, 1), `${at}.data`);
   }
   return weights;
 }
@@ -151,7 +177,7 @@ function decodeFloat32(data, length, path) {
   if (bytes.length !== length * 4) fail(path, `expected ${length * 4} bytes, got ${bytes.length}`);
   const view = new DataView(new ArrayBuffer(bytes.length));
   for (let i = 0; i < bytes.length; i += 1) view.setUint8(i, bytes.charCodeAt(i));
-  const values = new Float64Array(length);
+  const values = new Float32Array(length);
   for (let i = 0; i < length; i += 1) {
     values[i] = view.getFloat32(i * 4, true);
     if (!Number.isFinite(values[i])) fail(path, `value ${i} is not finite`);
@@ -174,354 +200,455 @@ function fail(path, message) {
   throw new TypeError(`${path}: ${message}`);
 }
 
-/**
- * src/model/encoding.py for one observation, as flat row-major arrays: cards [52, 5],
- * initialHand [52], context [11], players [n, 6], events [m, 8]. A missing face encodes as 52.
- * @param {Observation} obs
- */
-export function encodeObservation(obs) {
-  return encode(obs, "observation");
-}
-
-/**
- * QNetwork._history_channels as a [52, 5] row-major array. The channels are own events, next
- * seat takes, next seat discards, other seat takes, and other seat discards. An opponent's stock
- * draw counts as passing on the card it left on the pile. Event i of m weighs (0.5 + 0.5 i / m) / m.
- * @param {Observation} obs
- */
-export function historyChannels(obs) {
-  return channelsOf(encode(obs, "observation"));
-}
-
-function encode(obs, path) {
-  if (!isRecord(obs)) fail(path, "expected an observation");
-  const { hand, discardPile, joker, phase, config, players, history } = obs;
-  if (!isRecord(config)) fail(`${path}.config`, "expected a game config");
-  requireFaceCounts(hand, `${path}.hand`);
-  if (!Array.isArray(discardPile)) fail(`${path}.discardPile`, "expected an array of faces");
-  if (!Array.isArray(players) || players.length === 0) fail(`${path}.players`, "expected at least one player view");
-  if (!Array.isArray(history) || history.length === 0) fail(`${path}.history`, "expected at least one event");
-  if (!isRecord(history[0])) fail(`${path}.history[0]`, "expected an event");
-  requireFaceCounts(history[0].initialHand, `${path}.history[0].initialHand`);
-
-  const decks = config.numDecks;
-  const supply = decks * NUM_FACES;
-  const count = players.length;
-  const sin = new Float64Array(count);
-  const cos = new Float64Array(count);
-  for (let seat = 0; seat < count; seat += 1) {
-    sin[seat] = Math.sin(2 * Math.PI * seat / count);
-    cos[seat] = Math.cos(2 * Math.PI * seat / count);
-  }
-
-  const cards = new Float64Array(NUM_FACES * CARD_FEATURES);
-  for (let face = 0; face < NUM_FACES; face += 1) cards[face * CARD_FEATURES] = hand[face] / decks;
-  discardPile.forEach((face, i) => {
-    cards[faceIndex(face, `${path}.discardPile[${i}]`) * CARD_FEATURES + 1] += 1 / decks;
-  });
-  const top = discardPile.length > 0 ? discardPile[discardPile.length - 1] : NO_FACE;
-  if (top !== NO_FACE) cards[top * CARD_FEATURES + 2] = 1;
-  const wild = faceIndex(joker, `${path}.joker`);
-  cards[wild * CARD_FEATURES + 3] = 1;
-  for (let suit = 0; suit < 4; suit += 1) cards[(suit * 13 + (wild % 13)) * CARD_FEATURES + 4] = 1;
-
-  const context = new Float64Array(CONTEXT_FEATURES);
-  context[index(phase, 3, `${path}.phase`)] = 1;
-  context.set([
-    obs.turnsRemaining / config.maxTurns, obs.stockRemaining / supply, decks / 6, config.cardsInHand / 30,
-    config.requiredSequences / 10, Number(config.recycleDiscard), count / 6, config.maxTurns / 60,
-  ], 3);
-
-  const playerRows = new Float64Array(count * PLAYER_FEATURES);
-  const nextPlayer = new Int32Array(count);
-  const previousPlayer = new Int32Array(count);
-  players.forEach((player, seat) => {
-    const at = `${path}.players[${seat}]`;
-    if (!isRecord(player)) fail(at, "expected a player view");
-    nextPlayer[seat] = index(player.nextPlayer, count, `${at}.nextPlayer`);
-    previousPlayer[seat] = index(player.previousPlayer, count, `${at}.previousPlayer`);
-    playerRows.set([
-      Number(seat === 0), player.handSize / config.cardsInHand, player.turnsRemaining / config.maxTurns,
-      Number(player.active), sin[seat], cos[seat],
-    ], seat * PLAYER_FEATURES);
-  });
-
-  const length = history.length;
-  const eventKind = new Int32Array(length);
-  const eventFace = new Int32Array(length);
-  const offeredTop = new Int32Array(length);
-  const eventActor = new Int32Array(length);
-  const events = new Float64Array(length * EVENT_FEATURES);
-  history.forEach((event, i) => {
-    const at = `${path}.history[${i}]`;
-    if (!isRecord(event)) fail(at, "expected an event");
-    const actor = index(event.actor, count, `${at}.actor`);
-    const next = index(event.nextPlayer, count, `${at}.nextPlayer`);
-    eventKind[i] = index(event.kind, EVENT_KINDS, `${at}.kind`);
-    eventFace[i] = event.face === null ? NO_FACE : faceIndex(event.face, `${at}.face`);
-    offeredTop[i] = event.offeredTop === null ? NO_FACE : faceIndex(event.offeredTop, `${at}.offeredTop`);
-    eventActor[i] = actor;
-    events.set([
-      Number(actor === 0), sin[actor], cos[actor], event.handSize / config.cardsInHand,
-      event.turnsRemaining / config.maxTurns, event.stockRemaining / supply, sin[next], cos[next],
-    ], i * EVENT_FEATURES);
-  });
-
-  const encoded = {
-    cards,
-    initialHand: Float64Array.from(history[0].initialHand, (n) => n / decks),
-    top,
-    context,
-    players: playerRows,
-    nextPlayer,
-    previousPlayer,
-    eventKind,
-    eventFace,
-    offeredTop,
-    eventActor,
-    events,
-  };
-  for (const key of ["cards", "initialHand", "context", "players", "events"]) {
-    if (!encoded[key].every(Number.isFinite)) fail(path, `${key} features are not finite; check the counts and config`);
-  }
-  return encoded;
-}
-
-function channelsOf(encoded) {
-  const channels = new Float64Array((NUM_FACES + 1) * CARD_FEATURES);
-  for (let face = 0; face < NUM_FACES; face += 1) {
-    channels[face * CARD_FEATURES] = encoded.initialHand[face] - encoded.cards[face * CARD_FEATURES];
-  }
-  const length = encoded.eventKind.length;
-  for (let i = 0; i < length; i += 1) {
-    const recency = (0.5 + 0.5 * ((i + 1) / length)) / length;
-    const actor = encoded.eventActor[i];
-    const kind = encoded.eventKind[i];
-    if (actor === 0) {
-      channels[encoded.eventFace[i] * CARD_FEATURES] += recency;
-      continue;
-    }
-    const take = actor === 1 ? 1 : 3;
-    if (kind === TAKE_DISCARD) channels[encoded.eventFace[i] * CARD_FEATURES + take] += recency;
-    else if (kind === DISCARD) channels[encoded.eventFace[i] * CARD_FEATURES + take + 1] += recency;
-    else if (kind === DRAW_STOCK) channels[encoded.offeredTop[i] * CARD_FEATURES + take + 1] += recency;
-  }
-  return channels.slice(0, NUM_FACES * CARD_FEATURES);
-}
-
-function requireFaceCounts(value, path) {
-  if (!Array.isArray(value) || value.length !== NUM_FACES) fail(path, `expected ${NUM_FACES} face counts`);
-}
-
-function faceIndex(value, path) {
-  return index(value, NUM_FACES, path);
-}
-
 function index(value, limit, path) {
   if (!Number.isInteger(value) || value < 0 || value >= limit) fail(path, `expected an integer from 0 to ${limit - 1}`);
   return value;
 }
 
-/**
- * QNetwork.forward over a batch. Each result holds 54 Q values: 0 draws from the stock,
- * 1 takes the discard, and 2 + face discards that face.
- * @param {QModel} model
- * @param {Observation[]} observations
- * @returns {Float32Array[]}
- */
-export function qValues(model, observations) {
-  const weights = WEIGHTS.get(model);
-  if (weights === undefined) throw new TypeError("qValues: model must come from parseQModel");
-  if (!Array.isArray(observations)) throw new TypeError("qValues: observations must be an array");
-  return observations.map((obs, i) => {
-    const encoded = encode(obs, `observations[${i}]`);
-    return forward(weights, encoded, channelsOf(encoded));
-  });
+function requireFaceCounts(value, path) {
+  if (!Array.isArray(value) || value.length !== NUM_FACES) fail(path, "expected 52 face counts");
+  if (value.some(n => !Number.isSafeInteger(n) || n < 0)) fail(path, "expected nonnegative integer face counts");
 }
 
-function forward(w, encoded, channels) {
-  const { cards } = encoded;
-  const tokens = new Float64Array(NUM_FACES * WIDTH);
-  const suitInput = new Float64Array(CARD_FEATURES * STEPS);
-  const conv1 = new Float64Array(WIDTH * STEPS);
-  const conv2 = new Float64Array(WIDTH * STEPS);
-  for (let suit = 0; suit < 4; suit += 1) {
-    for (let t = 0; t < STEPS; t += 1) {
-      for (let c = 0; c < CARD_FEATURES; c += 1) {
-        suitInput[c * STEPS + t] = cards[(suit * 13 + (t % 13)) * CARD_FEATURES + c];
-      }
-    }
-    convRelu(conv1, w["suit_conv1.weight"], w["suit_conv1.bias"], suitInput);
-    convRelu(conv2, w["suit_conv2.weight"], w["suit_conv2.bias"], conv1);
-    for (let rank = 0; rank < 13; rank += 1) {
-      const token = (suit * 13 + rank) * WIDTH;
-      for (let o = 0; o < WIDTH; o += 1) {
-        tokens[token + o] = rank === 0
-          ? 0.5 * (conv2[o * STEPS] + conv2[o * STEPS + 13])
-          : conv2[o * STEPS + rank];
-      }
-    }
-  }
+function nonnegativeInteger(value, path) {
+  if (!Number.isSafeInteger(value) || value < 0) fail(path, "expected a nonnegative safe integer");
+}
 
-  const mixed = attention(w, tokens);
-  const local = new Float64Array(NUM_FACES * WIDTH);
-  for (let i = 0; i < mixed.length; i += 1) mixed[i] += tokens[i];
-  for (let face = 0; face < NUM_FACES; face += 1) {
-    layerNorm(row(local, face, WIDTH), row(mixed, face, WIDTH), w["card_norm.weight"], w["card_norm.bias"]);
+function validateObservation(obs, path) {
+  if (!isRecord(obs)) fail(path, "expected an observation");
+  if (!isRecord(obs.config)) fail(`${path}.config`, "expected a game config");
+  parseGameConfig(obs.config, `${path}.config`);
+  requireFaceCounts(obs.hand, `${path}.hand`);
+  index(obs.joker, NUM_FACES, `${path}.joker`);
+  index(obs.phase, 3, `${path}.phase`);
+  nonnegativeInteger(obs.turnsRemaining, `${path}.turnsRemaining`);
+  nonnegativeInteger(obs.stockRemaining, `${path}.stockRemaining`);
+  if (!Array.isArray(obs.discardPile)) fail(`${path}.discardPile`, "expected an array of faces");
+  obs.discardPile.forEach((face, i) => index(face, NUM_FACES, `${path}.discardPile[${i}]`));
+  if (!Array.isArray(obs.players) || obs.players.length < 1 || obs.players.length > SEATS) {
+    fail(`${path}.players`, "expected 1..6 player views");
   }
-  const sets = new Float64Array(13 * WIDTH);
-  const global = new Float64Array(WIDTH);
-  for (let face = 0; face < NUM_FACES; face += 1) {
-    for (let o = 0; o < WIDTH; o += 1) {
-      sets[(face % 13) * WIDTH + o] += local[face * WIDTH + o];
-      global[o] += local[face * WIDTH + o];
-    }
-  }
-  for (let i = 0; i < sets.length; i += 1) sets[i] /= 4;
-  for (let o = 0; o < WIDTH; o += 1) global[o] /= NUM_FACES;
-
-  const relationInput = new Float64Array(3 * WIDTH);
-  [0, encoded.nextPlayer[0], encoded.previousPlayer[0]].forEach((seat, slot) => {
-    linear(
-      row(relationInput, slot, WIDTH), w["player_features.weight"], w["player_features.bias"],
-      row(encoded.players, seat, PLAYER_FEATURES),
-    );
+  obs.players.forEach((player, seat) => {
+    const at = `${path}.players[${seat}]`;
+    if (!isRecord(player)) fail(at, "expected a player view");
+    nonnegativeInteger(player.handSize, `${at}.handSize`);
+    nonnegativeInteger(player.turnsRemaining, `${at}.turnsRemaining`);
+    index(player.nextPlayer, obs.players.length, `${at}.nextPlayer`);
+    index(player.previousPlayer, obs.players.length, `${at}.previousPlayer`);
+    if (typeof player.active !== "boolean") fail(`${at}.active`, "expected a boolean");
   });
-  const relation = relu(linear(new Float64Array(WIDTH), w["turn_relations.weight"], w["turn_relations.bias"], relationInput));
-  const length = encoded.eventKind.length;
-  const eventMean = new Float64Array(EVENT_FEATURES);
-  let weightTotal = 0;
-  for (let i = 0; i < length; i += 1) {
-    const weight = (i + 1) / length;
-    weightTotal += weight;
-    for (let k = 0; k < EVENT_FEATURES; k += 1) eventMean[k] += weight * encoded.events[i * EVENT_FEATURES + k];
-  }
-  for (let k = 0; k < EVENT_FEATURES; k += 1) eventMean[k] /= Math.max(weightTotal, 1);
-  const summary = linear(new Float64Array(WIDTH), w["event_summary.weight"], w["event_summary.bias"], eventMean);
-  const table = linear(new Float64Array(WIDTH), w["context_features.weight"], w["context_features.bias"], encoded.context);
-  for (let o = 0; o < WIDTH; o += 1) table[o] += relation[o] + 0.1 * summary[o];
-  const gate = linear(new Float64Array(2), w["context_gate.weight"], w["context_gate.bias"], table).map((v) => 0.02 * Math.tanh(v));
+  if (!Array.isArray(obs.history) || obs.history.length === 0) fail(`${path}.history`, "expected at least one event");
+}
 
-  const q = new Float32Array(NUM_ACTIONS);
-  const hidden = new Float64Array(WIDTH);
-  const drawInput = new Float64Array(3 * WIDTH + CARD_FEATURES);
-  drawInput.set(global);
-  const { top } = encoded;
-  if (top !== NO_FACE) {
-    drawInput.set(row(local, top, WIDTH), WIDTH);
-    drawInput.set(row(sets, top % 13, WIDTH), 2 * WIDTH);
-    drawInput.set(row(cards, top, CARD_FEATURES), 3 * WIDTH);
-  }
-  relu(linear(hidden, w["draw_head.0.weight"], w["draw_head.0.bias"], drawInput));
-  const raw = linear(new Float64Array(2), w["draw_head.2.weight"], w["draw_head.2.bias"], hidden);
-  q[0] = raw[0] + gate[0];
-  q[1] = raw[0] + gate[0] + 0.25 * Math.tanh(raw[1] + gate[1]);
+function countsOf(faces) {
+  const counts = new Int32Array(NUM_FACES);
+  for (const face of faces) counts[face] += 1;
+  return counts;
+}
 
-  const faceInput = new Float64Array(3 * WIDTH + CARD_FEATURES + 13);
-  const score = new Float64Array(1);
-  const bonus = new Float64Array(1);
-  faceInput.set(global, 2 * WIDTH);
-  for (let face = 0; face < NUM_FACES; face += 1) {
+export function disjointPack(hand, joker, requiredSequences) {
+  const rem = [...hand];
+  let pure = 0;
+  for (const [a, b, c] of ORDERED_RUNS) {
+    if (joker === a || joker === b || joker === c) continue;
+    while (rem[a] && rem[b] && rem[c]) {
+      rem[a]--; rem[b]--; rem[c]--; pure++;
+      if (c % 13 < 12 && c === b + 1) {
+        const next = c + 1;
+        const run = RUN_STARTS.get(next);
+        const starts = run !== undefined && run.every(face => rem[face]);
+        if (next !== joker && rem[next] && !starts) rem[next]--;
+      }
+    }
+  }
+  for (let face = 0; face < 52; face++) if (face !== joker) {
+    while (rem[face] >= 3) { rem[face] -= 3; pure++; }
+  }
+  for (const [a, b, c] of ORDERED_RUNS) {
+    if (joker !== a && joker !== b && joker !== c) continue;
+    while (rem[a] && rem[b] && rem[c]) { rem[a]--; rem[b]--; rem[c]--; pure++; }
+  }
+  while (rem[joker]) {
+    const pair = PURE_PAIRS[joker].find(([a, b]) => rem[a] && rem[b]);
+    if (pair) { rem[pair[0]]--; rem[pair[1]]--; rem[joker]--; pure++; }
+    else if (rem[joker] >= 2) {
+      const face = POINT_ORDER.find(face => face !== joker && rem[face]);
+      if (face === undefined) break;
+      rem[face]--; rem[joker] -= 2; pure++;
+    } else break;
+  }
+  const afterPure = [...rem];
+  const pairs = RUN_FACES.filter(run => run.filter(face => face !== joker && rem[face] > 0).length >= 2).length;
+  const rank = joker % 13;
+  let wilds = 0;
+  for (let suit = 0; suit < 4; suit++) {
+    const face = suit * 13 + rank;
+    wilds += rem[face]; rem[face] = 0;
+  }
+  for (const r of SET_RANKS) {
+    if (r === rank) continue;
+    while (true) {
+      const faces = [0, 1, 2, 3].map(suit => suit * 13 + r).filter(face => rem[face]);
+      if (faces.length < 3) break;
+      for (const face of faces) rem[face]--;
+    }
+  }
+  while (wilds) {
+    const pair = WILD_PAIRS[rank].find(([a, b]) => rem[a] && rem[b]);
+    if (!pair) break;
+    rem[pair[0]]--; rem[pair[1]]--; wilds--;
+  }
+  const score = counts => counts.reduce((sum, n, face) => sum + (face % 13 === rank ? 0 : n * RANK_POINTS[face % 13]), 0);
+  const points = score(rem);
+  return [pure, pure >= requiredSequences ? points : score(afterPure), points, pairs, rem];
+}
+
+function meldMembership(hand, joker) {
+  const natural = new Int32Array(52);
+  const pure = new Int32Array(52);
+  const anyMeld = new Int32Array(52);
+  const wilds = [0, 1, 2, 3].map(s => s * 13 + joker % 13);
+  function mark(represented, flexible, result) {
+    const missing = represented.reduce((sum, face) => sum + Number(!hand[face] || flexible.includes(face)), 0);
+    const available = flexible.reduce((sum, face) => sum + hand[face], 0);
+    if (missing > available) return;
+    for (const face of represented) if (hand[face] && !flexible.includes(face)) result[face] = 1;
+    if (available) for (const face of flexible) if (hand[face]) result[face] = 1;
+  }
+  for (const represented of RUN_FACES) {
+    if (represented.every(face => hand[face] > 0)) for (const face of represented) natural[face] = 1;
+    mark(represented, [joker], pure);
+    mark(represented, wilds, anyMeld);
+  }
+  for (const represented of SET_FACES) mark(represented, wilds, anyMeld);
+  hand.forEach((copies, face) => {
+    if (copies >= 3) pure[face] = anyMeld[face] = 1;
+  });
+  return { natural, pure, anyMeld };
+}
+
+export function encodeObservation(obs) {
+  return encode(obs, "observation");
+}
+
+function encode(obs, path) {
+  validateObservation(obs, path);
+  const { hand, config, players, history, joker, phase, discardPile } = obs;
+  const { numDecks: decks, cardsInHand: cards, maxTurns: turns } = config;
+  const held = Array.from({ length: players.length }, () => new Int32Array(NUM_FACES));
+  const heldTotal = new Int32Array(players.length);
+  const takes = new Int32Array(players.length);
+  const passes = new Int32Array(players.length);
+  const oppDiscarded = new Int32Array(NUM_FACES);
+  const nextPassed = new Int32Array(NUM_FACES);
+  const nextOpponent = players.length > 1 && players[0].nextPlayer > 0 ? players[0].nextPlayer : -1;
+  let refills = 0;
+  for (let i = 0; i < history.length; i += 1) {
+    const event = history[i];
+    const at = `${path}.history[${i}]`;
+    if (!isRecord(event)) fail(at, "expected an event");
+    index(event.kind, 6, `${at}.kind`);
+    index(event.actor, players.length, `${at}.actor`);
+    index(event.nextPlayer, players.length, `${at}.nextPlayer`);
+    if (event.face !== null || event.kind === TAKE_DISCARD || event.kind === DISCARD) {
+      index(event.face, NUM_FACES, `${at}.face`);
+    }
+    if (event.offeredTop !== null) index(event.offeredTop, NUM_FACES, `${at}.offeredTop`);
+    if (i === 0) requireFaceCounts(event.initialHand, `${at}.initialHand`);
+    const { actor, face, kind } = event;
+    if (kind === TAKE_DISCARD) {
+      held[actor][face] += 1;
+      heldTotal[actor] += 1;
+      takes[actor] += 1;
+    } else if (kind === DISCARD) {
+      if (held[actor][face] > 0) {
+        held[actor][face] -= 1;
+        heldTotal[actor] -= 1;
+      }
+      if (actor > 0) oppDiscarded[face] += 1;
+    } else if (kind === DRAW_STOCK && event.offeredTop !== null) {
+      passes[actor] += 1;
+      if (actor === nextOpponent) nextPassed[event.offeredTop] += 1;
+    } else if (kind === REFILL) refills += 1;
+  }
+  const pileCounts = countsOf(discardPile);
+  const top = discardPile.length ? discardPile[discardPile.length - 1] : NUM_FACES;
+  const supply = decks * NUM_FACES;
+  const values = new Float32Array(FEATURE_SIZE);
+  const required = config.requiredSequences;
+  const base = disjointPack(hand, joker, required);
+  const { natural, pure, anyMeld } = meldMembership(hand, joker);
+  let rawPoints = 0;
+  let wildCount = 0;
+  let unavoidable = 0;
+  hand.forEach((copies, face) => {
+    const suit = Math.floor(face / 13);
     const rank = face % 13;
-    faceInput.set(row(local, face, WIDTH));
-    faceInput.set(row(sets, rank, WIDTH), WIDTH);
-    faceInput.set(row(cards, face, CARD_FEATURES), 3 * WIDTH);
-    faceInput.fill(0, 3 * WIDTH + CARD_FEATURES);
-    faceInput[3 * WIDTH + CARD_FEATURES + rank] = 1;
-    relu(linear(hidden, w["score.0.weight"], w["score.0.bias"], faceInput));
-    linear(score, w["score.2.weight"], w["score.2.bias"], hidden);
-    linear(bonus, w["history_proj.weight"], w["history_proj.bias"], row(channels, face, CARD_FEATURES));
-    q[2 + face] = score[0] + 0.02 * Math.tanh(bonus[0]) + gate[0];
-  }
-  return q;
-}
-
-function attention(w, tokens) {
-  const qkv = new Float64Array(NUM_FACES * 3 * WIDTH);
-  for (let face = 0; face < NUM_FACES; face += 1) {
-    linear(
-      row(qkv, face, 3 * WIDTH), w["card_attention.in_proj_weight"], w["card_attention.in_proj_bias"],
-      row(tokens, face, WIDTH),
-    );
-  }
-  const heads = new Float64Array(NUM_FACES * WIDTH);
-  const scores = new Float64Array(NUM_FACES);
-  const scale = 1 / Math.sqrt(HEAD_SIZE);
-  for (let head = 0; head < WIDTH; head += HEAD_SIZE) {
-    for (let query = 0; query < NUM_FACES; query += 1) {
-      let peak = -Infinity;
-      for (let key = 0; key < NUM_FACES; key += 1) {
-        let dot = 0;
-        for (let d = 0; d < HEAD_SIZE; d += 1) {
-          dot += qkv[query * 3 * WIDTH + head + d] * qkv[key * 3 * WIDTH + WIDTH + head + d];
+    const wild = rank === joker % 13;
+    const points = wild ? 0 : RANK_POINTS[rank];
+    rawPoints += copies * points;
+    unavoidable += copies * points * (1 - anyMeld[face]);
+    if (wild) wildCount += copies;
+    let opponentHeld = 0;
+    for (let seat = 1; seat < players.length; seat += 1) opponentHeld += held[seat][face];
+    const nextHeld = nextOpponent > 0 ? held[nextOpponent][face] : 0;
+    const adjacent = Number(hand[suit * 13 + (rank + 12) % 13] > 0) +
+      Number(hand[suit * 13 + (rank + 1) % 13] > 0);
+    let mates = 0;
+    for (let other = 0; other < 4; other += 1) {
+      if (other !== suit && hand[other * 13 + rank] > 0) mates += 1;
+    }
+    values.set([
+      copies / decks, Number(copies >= 1), Number(copies >= 2), Number(copies >= 3), pileCounts[face] / decks,
+      Number(face === top), Number(face === joker), Number(wild), points / 10, oppDiscarded[face] / decks,
+      nextHeld / decks, (opponentHeld - nextHeld) / decks, nextPassed[face] / decks,
+      adjacent / 2, mates / 3, natural[face], pure[face], anyMeld[face],
+      copies ? base[4][face] / copies : 0, 0, 0, 0,
+    ], FIELDS.card.offset + face * CHANNELS.card.length);
+  });
+  players.forEach((player, s) => {
+    values.set([
+      1, Number(s === 0), Number(player.active), player.handSize / cards, player.turnsRemaining / turns,
+      Number(s > 0 && s === players[0].nextPlayer), takes[s] / turns, passes[s] / turns, heldTotal[s] / cards,
+    ], FIELDS.seat.offset + s * CHANNELS.seat.length);
+  });
+  const last = history[history.length - 1];
+  const toAct = phase !== 2 && players[0].active && (
+    last.kind === INITIAL ||
+    (phase === 1 && [DRAW_STOCK, TAKE_DISCARD].includes(last.kind) && last.actor === 0) ||
+    (phase === 0 && [DISCARD, REFILL].includes(last.kind) && last.nextPlayer === 0)
+  );
+  values.set([
+    Number(phase === 0), Number(phase === 1), Number(phase === 2), Number(toAct), obs.turnsRemaining / turns,
+    obs.stockRemaining / supply, discardPile.length / supply, Math.min(refills, 3) / 3, decks / 6, cards / 30,
+    config.requiredSequences / 10, Number(config.recycleDiscard), players.length / 6, turns / 60,
+    Number(players.length === 1 && history[0].initialHand.reduce((a, b) => a + b, 0) === cards + 1),
+    wildCount / (4 * decks), rawPoints / 100, unavoidable / (10 * cards),
+    Math.min(base[0], required) / Math.max(1, required), base[1] / 100, 0, 0,
+  ], FIELDS.context.offset);
+  if (toAct) {
+    if (phase === 0) {
+      values[FIELDS.legal.offset] = Number(obs.stockRemaining > 0);
+      values[FIELDS.legal.offset + 1] = Number(discardPile.length > 0);
+    } else {
+      hand.forEach((n, face) => { values[FIELDS.legal.offset + 2 + face] = Number(n > 0); });
+      if (last.kind === TAKE_DISCARD && last.actor === 0 && last.face !== null &&
+          hand.filter(n => n > 0).length > 1) {
+        values[FIELDS.legal.offset + 2 + last.face] = 0;
+      }
+    }
+    if (toAct && phase === 1) {
+      hand.forEach((copies, face) => {
+        if (!copies || !values[FIELDS.legal.offset + 2 + face]) return;
+        const after = [...hand];
+        after[face]--;
+        const packed = disjointPack(after, joker, required);
+        values.set([
+          Math.min(packed[0], required) - Math.min(base[0], required),
+          (base[2] - packed[2]) / 10, (packed[3] - base[3]) / 3,
+        ], face * CHANNELS.card.length + 19);
+      });
+    }
+    if (toAct && phase === 0 && values[FIELDS.legal.offset + 1]) {
+      const plus = [...hand];
+      plus[top]++;
+      let best = null;
+      let bestKey = null;
+      plus.forEach((copies, face) => {
+        if (!copies || face === top) return;
+        plus[face]--;
+        const packed = disjointPack(plus, joker, required);
+        plus[face]++;
+        const key = [Math.min(packed[0], required), -packed[2], packed[3], -packed[1]];
+        const firstDifference = bestKey === null ? 0 : key.findIndex((value, i) => value !== bestKey[i]);
+        if (bestKey === null || firstDifference >= 0 && key[firstDifference] > bestKey[firstDifference]) {
+          best = packed; bestKey = key;
         }
-        scores[key] = dot * scale;
-        peak = Math.max(peak, scores[key]);
-      }
-      let total = 0;
-      for (let key = 0; key < NUM_FACES; key += 1) {
-        scores[key] = Math.exp(scores[key] - peak);
-        total += scores[key];
-      }
-      for (let d = 0; d < HEAD_SIZE; d += 1) {
-        let sum = 0;
-        for (let key = 0; key < NUM_FACES; key += 1) sum += scores[key] * qkv[key * 3 * WIDTH + 2 * WIDTH + head + d];
-        heads[query * WIDTH + head + d] = sum / total;
-      }
+      });
+      if (best !== null) values.set([
+        Math.min(best[0], required) - Math.min(base[0], required), (base[2] - best[2]) / 20,
+      ], FIELDS.context.offset + 20);
     }
   }
-  const mixed = new Float64Array(NUM_FACES * WIDTH);
-  for (let face = 0; face < NUM_FACES; face += 1) {
-    linear(
-      row(mixed, face, WIDTH), w["card_attention.out_proj.weight"], w["card_attention.out_proj.bias"],
-      row(heads, face, WIDTH),
-    );
-  }
-  return mixed;
-}
-
-function convRelu(out, weight, bias, input) {
-  const channels = input.length / STEPS;
-  for (let o = 0; o < WIDTH; o += 1) {
-    for (let t = 0; t < STEPS; t += 1) {
-      let sum = bias[o];
-      for (let c = 0; c < channels; c += 1) {
-        const k = (o * channels + c) * 3;
-        const x = c * STEPS + t;
-        if (t > 0) sum += weight[k] * input[x - 1];
-        sum += weight[k + 1] * input[x];
-        if (t < STEPS - 1) sum += weight[k + 2] * input[x + 1];
-      }
-      out[o * STEPS + t] = sum > 0 ? sum : 0;
-    }
-  }
-}
-
-function layerNorm(out, input, gamma, beta) {
-  let mean = 0;
-  for (let i = 0; i < input.length; i += 1) mean += input[i];
-  mean /= input.length;
-  let variance = 0;
-  for (let i = 0; i < input.length; i += 1) variance += (input[i] - mean) ** 2;
-  const scale = 1 / Math.sqrt(variance / input.length + 1e-5);
-  for (let i = 0; i < input.length; i += 1) out[i] = (input[i] - mean) * scale * gamma[i] + beta[i];
-}
-
-function linear(out, weight, bias, input) {
-  const cols = input.length;
-  for (let r = 0; r < out.length; r += 1) {
-    let sum = bias[r];
-    for (let c = 0; c < cols; c += 1) sum += weight[r * cols + c] * input[c];
-    out[r] = sum;
-  }
-  return out;
-}
-
-function relu(values) {
-  for (let i = 0; i < values.length; i += 1) if (values[i] < 0) values[i] = 0;
+  values[FIELDS.top.offset] = top;
+  if (!values.every(Number.isFinite)) fail(path, "features are not finite; check the counts and config");
   return values;
 }
 
-function row(values, n, width) {
-  return values.subarray(n * width, (n + 1) * width);
+export function qValues(model, observations) {
+  const state = WEIGHTS.get(model);
+  if (state === undefined) throw new TypeError("qValues: model must come from parseQModel");
+  if (!Array.isArray(observations)) throw new TypeError("qValues: observations must be an array");
+  const results = [];
+  for (let i = 0; i < observations.length; i += 1) {
+    results.push(forward(state.weights, model.spec, encode(observations[i], `observations[${i}]`), state.buffers));
+  }
+  return results;
+}
+
+function forwardBuffers(width) {
+  return {
+    cards: new Float32Array(NUM_FACES * width),
+    normalized: new Float32Array(NUM_FACES * width),
+    projected: new Float32Array(NUM_FACES * width * 3),
+    ranks: new Float32Array(13 * width),
+    rankContext: new Float32Array(13 * width),
+    suits: new Float32Array(4 * width),
+    suitContext: new Float32Array(4 * width),
+    table: new Float32Array(width),
+    normalizedTable: new Float32Array(width),
+    tableContext: new Float32Array(width),
+    tableInput: new Float32Array(width * 3),
+    tableHidden: new Float32Array(width),
+    zero: new Float32Array(width),
+    advantage: new Float32Array(NUM_ACTIONS),
+  };
+}
+
+function forward(w, spec, features, buffers) {
+  const { width, blocks } = spec;
+  const {
+    cards, normalized, projected, ranks, rankContext, suits, suitContext,
+    table, normalizedTable, tableContext, tableInput, tableHidden, zero, advantage,
+  } = buffers;
+  linear(w, "card_embed", features, CHANNELS.card.length, cards, width, NUM_FACES);
+  linear(w, "table_embed", features, FIELDS.seat.size + FIELDS.context.size, table, width, 1, FIELDS.seat.offset);
+  for (let block = 0; block < blocks; block += 1) {
+    const prefix = `blocks.${block}.`;
+    layerNorm(w, `${prefix}card_norm`, cards, normalized, width, NUM_FACES);
+    layerNorm(w, `${prefix}table_norm`, table, normalizedTable, width);
+    linear(w, `${prefix}w_seq`, normalized, width, projected, width * 3, NUM_FACES);
+    suitMeans(normalized, ranks, width);
+    linear(w, `${prefix}w_rank_set`, ranks, width, rankContext, width, 13);
+    for (let suit = 0; suit < 4; suit += 1) {
+      for (let d = 0; d < width; d += 1) {
+        let sum = 0;
+        for (let rank = 0; rank < 13; rank += 1) sum += normalized[(suit * 13 + rank) * width + d];
+        suits[suit * width + d] = sum / 13;
+      }
+    }
+    linear(w, `${prefix}w_suit_run`, suits, width, suitContext, width, 4);
+    linear(w, `${prefix}w_table`, normalizedTable, width, tableContext, width);
+    for (let face = 0; face < NUM_FACES; face += 1) {
+      const suit = Math.floor(face / 13);
+      const rank = face % 13;
+      const self = face * width * 3;
+      const left = (suit * 13 + (rank + 12) % 13) * width * 3 + width;
+      const right = (suit * 13 + (rank + 1) % 13) * width * 3 + width * 2;
+      for (let d = 0; d < width; d += 1) {
+        const sequence = rank === 0 ?
+          Math.fround(Math.fround(projected[self + d] + projected[right + d]) +
+            Math.fround(projected[self + d] + projected[left + d])) * 0.5 :
+          Math.fround(Math.fround(projected[self + d] + projected[left + d]) + projected[right + d]);
+        normalized[face * width + d] = Math.fround(Math.fround(
+          sequence + rankContext[rank * width + d],
+        ) + suitContext[suit * width + d]) + tableContext[d];
+      }
+    }
+    silu(normalized);
+    linear(w, `${prefix}card_out`, normalized, width, cards, width, NUM_FACES, 0, 0, true);
+    layerNorm(w, `${prefix}card_norm`, cards, normalized, width, NUM_FACES);
+    tableInput.set(normalizedTable);
+    for (let d = 0; d < width; d += 1) {
+      let sum = 0;
+      let maximum = -Infinity;
+      for (let face = 0; face < NUM_FACES; face += 1) {
+        const value = normalized[face * width + d];
+        sum += value;
+        maximum = Math.max(maximum, value);
+      }
+      tableInput[width + d] = sum / NUM_FACES;
+      tableInput[width * 2 + d] = maximum;
+    }
+    linear(w, `${prefix}table_fc1`, tableInput, width * 3, tableHidden, width);
+    silu(tableHidden);
+    linear(w, `${prefix}table_fc2`, tableHidden, width, table, width, 1, 0, 0, true);
+  }
+  layerNorm(w, "card_final", cards, normalized, width, NUM_FACES);
+  layerNorm(w, "table_final", table, normalizedTable, width);
+  suitMeans(normalized, ranks, width);
+  linear(w, "face_set", ranks, width, rankContext, width, 13);
+  linear(w, "face_table", normalizedTable, width, tableContext, width);
+  linear(w, "face_local", normalized, width, cards, width, NUM_FACES);
+  for (let face = 0; face < NUM_FACES; face += 1) {
+    for (let d = 0; d < width; d += 1) {
+      const at = face * width + d;
+      cards[at] = Math.fround(cards[at] + rankContext[(face % 13) * width + d]) + tableContext[d];
+    }
+  }
+  silu(cards);
+  linear(w, "face_out", cards, width, advantage, 1, NUM_FACES, 0, 2);
+  const top = features[FIELDS.top.offset];
+  const hasTop = top >= 0 && top < NUM_FACES;
+  linear(w, "draw_table", normalizedTable, width, tableHidden, width);
+  linear(w, "draw_top", hasTop ? normalized : zero, width, tableContext, width, 1, hasTop ? top * width : 0);
+  linear(w, "draw_set", hasTop ? ranks : zero, width, tableInput, width, 1, hasTop ? (top % 13) * width : 0);
+  for (let d = 0; d < width; d += 1) {
+    tableHidden[d] = Math.fround(tableHidden[d] + tableContext[d]) + tableInput[d];
+  }
+  silu(tableHidden);
+  linear(w, "draw_out", tableHidden, width, advantage, 2);
+  let mean = 0;
+  let count = 0;
+  for (let action = 0; action < NUM_ACTIONS; action += 1) {
+    const legal = features[FIELDS.legal.offset + action];
+    mean += advantage[action] * legal;
+    count += legal;
+  }
+  mean = Math.fround(Math.fround(mean) / Math.max(count, 1));
+  linear(w, "value_hidden", normalizedTable, width, tableHidden, width);
+  silu(tableHidden);
+  linear(w, "value_out", tableHidden, width, tableInput, 1);
+  const result = new Float32Array(NUM_ACTIONS);
+  for (let action = 0; action < NUM_ACTIONS; action += 1) {
+    result[action] = Math.fround(tableInput[0] + advantage[action]) - mean;
+  }
+  return result;
+}
+
+function linear(w, name, input, cols, output, outputs, rows = 1, inputOffset = 0, outputOffset = 0, residual = false) {
+  const weight = w[`${name}.weight`];
+  const bias = w[`${name}.bias`];
+  for (let row = 0; row < rows; row += 1) {
+    for (let r = 0; r < outputs; r += 1) {
+      let sum = 0;
+      for (let c = 0; c < cols; c += 1) sum += weight[r * cols + c] * input[inputOffset + row * cols + c];
+      const value = Math.fround(sum + (bias === undefined ? 0 : bias[r]));
+      const at = outputOffset + row * outputs + r;
+      output[at] = residual ? output[at] + value : value;
+    }
+  }
+}
+
+function layerNorm(w, name, input, output, width, rows = 1) {
+  const weight = w[`${name}.weight`];
+  const bias = w[`${name}.bias`];
+  for (let row = 0; row < rows; row += 1) {
+    const at = row * width;
+    let mean = 0;
+    for (let d = 0; d < width; d += 1) mean += input[at + d];
+    mean /= width;
+    let variance = 0;
+    for (let d = 0; d < width; d += 1) variance += (input[at + d] - mean) ** 2;
+    const scale = 1 / Math.sqrt(variance / width + 1e-5);
+    for (let d = 0; d < width; d += 1) {
+      output[at + d] = (input[at + d] - mean) * scale * weight[d] + bias[d];
+    }
+  }
+}
+
+function silu(values) {
+  for (let i = 0; i < values.length; i += 1) {
+    const value = values[i];
+    values[i] = value >= 0 ? value / (1 + Math.exp(-value)) : value * Math.exp(value) / (1 + Math.exp(value));
+  }
+}
+
+function suitMeans(cards, output, width) {
+  for (let rank = 0; rank < 13; rank += 1) {
+    for (let d = 0; d < width; d += 1) {
+      const at = rank * width + d;
+      output[at] = (cards[at] + cards[13 * width + at] + cards[26 * width + at] + cards[39 * width + at]) / 4;
+    }
+  }
 }

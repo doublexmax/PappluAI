@@ -5,6 +5,7 @@ import {
   createEngine, createLocalEngine, ENGINE_WORKER_SOURCE, EngineDisposed, EngineTimeout, serveEngine,
 } from "../web/engine.mjs";
 import { evaluateHand, minimumPenalty } from "../web/evaluate.mjs";
+import { parseQModel } from "../web/qnet.mjs";
 import { createTable } from "../web/table.mjs";
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -171,6 +172,30 @@ test("verified AI declarations resolve synchronously without an evaluation round
   assert.equal(round.declaration.evaluation.is_valid, true);
   assert.equal(round.summary.status, "ready");
   assert.equal(checks, 0);
+  h.table.stop();
+});
+
+test("the table preserves the neural tier and greedy reason through the local engine", async () => {
+  const model = parseQModel(JSON.parse(readFileSync(new URL("../web/papplu-model.json", import.meta.url), "utf8")));
+  const h = harness(() => createLocalEngine({ model }));
+  h.table.dispatch({ type: "preset", name: "vs-ai" });
+  h.table.dispatch({ type: "configure", patch: { aiSpeed: "instant" } });
+  h.table.dispatch({ type: "deal" });
+  act(h.table, "draw", { source: "stock" });
+  act(h.table, "discard", { cardId: h.table.getSnapshot().round.seats[0].drawnCardId });
+  assert.equal(await h.advance(), true);
+  let round = h.table.getSnapshot().round;
+  assert.equal(round.phase, "discard");
+  assert.equal(round.currentSeat, 1);
+  assert.equal(round.seats[1].effectiveTier, "neural");
+  assert.equal(round.seats[1].downgrade, null);
+  assert.equal(round.seats[1].lastReason, "greedy");
+  assert.equal(await h.advance(), true);
+  round = h.table.getSnapshot().round;
+  assert.equal(round.phase, "draw");
+  assert.equal(round.currentSeat, 0);
+  assert.equal(round.seats[1].handSize, 21);
+  assert.equal(round.seats[1].lastReason, "greedy");
   h.table.stop();
 });
 

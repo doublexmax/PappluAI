@@ -6,7 +6,7 @@ from pathlib import Path
 import shutil
 import hashlib
 import time
-from typing import AbstractSet, Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping
 
 __all__ = (
     "atomic_copy",
@@ -14,8 +14,6 @@ __all__ = (
     "atomic_write_json",
     "file_metadata",
     "file_sha256",
-    "require_checkpoint_fields",
-    "require_checkpoint_int",
 )
 
 
@@ -54,31 +52,6 @@ def file_metadata(path: Path) -> Dict[str, Any]:
 
 def file_sha256(path: Path) -> str:
     return str(file_metadata(path)["sha256"])
-
-
-def require_checkpoint_fields(
-    value: Any,
-    fields: AbstractSet[str],
-    name: str,
-) -> Dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != set(fields):
-        raise ValueError("%s fields do not match this checkpoint" % name)
-    return value
-
-
-def require_checkpoint_int(
-    value: Any,
-    name: str,
-    minimum: Optional[int] = None,
-    maximum: Optional[int] = None,
-) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError("%s must be an int" % name)
-    if minimum is not None and value < minimum:
-        raise ValueError("%s must be at least %d" % (name, minimum))
-    if maximum is not None and value > maximum:
-        raise ValueError("%s must be at most %d" % (name, maximum))
-    return value
 
 
 def atomic_replace(stage: Path, target: Path) -> None:

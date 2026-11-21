@@ -25,7 +25,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--model",
         action="append",
         required=True,
-        help="checkpoint path or the sentinel 'random'; repeat once per seat",
+        help="checkpoint path, 'random', or 'heuristic'; repeat once per seat",
     )
     parser.add_argument("--games", type=_positive_int, required=True)
     parser.add_argument("--seed", type=int, default=0)
@@ -50,53 +50,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
-    policies: Tuple[runtime.Policy, ...] = tuple(
-        runtime.RandomPolicy()
-        if value == "random"
-        else runtime.CheckpointPolicy(value)
-        for value in args.model
-    )
-    labels = [
-        "random" if value == "random" else Path(value).stem
-        for value in args.model
-    ]
+    policies: Tuple[runtime.Policy, ...] = tuple(runtime.resolve_policy(value) for value in args.model)
+    labels = [Path(value).stem for value in args.model]
     config = runtime.MatchConfig(
         game=runtime.GameConfig(max_turns=args.max_turns),
         players=players,
     )
     games = []
-    for index in range(args.games):
-        rotation = index % players
-        seated = policies[rotation:] + policies[:rotation]
-        result = runtime.play_match(
-            seated,
-            config,
-            seed=args.seed + index,
-        )
-        winner_agent = (
-            None
-            if result.winner is None
-            else (rotation + result.winner) % players
-        )
-        games.append(
-            {
-                "seed": result.seed,
-                "seat_order": [
-                    (rotation + seat) % players
-                    for seat in range(players)
-                ],
-                "winner_seat": result.winner,
-                "winner_agent": winner_agent,
-                "winner_label": (
-                    None if winner_agent is None else labels[winner_agent]
-                ),
-                "terminal_reason": result.terminal_reason,
-                "seat_turns": result.seat_turns,
-                "action_count": result.action_count,
-                "stock_remaining": result.stock_remaining,
-                "telemetry": asdict(result.telemetry),
-            }
-        )
+    for start in range(0, args.games, 32):
+        deals = [
+            runtime.Deal(
+                args.seed + index,
+                tuple((index + seat) % players for seat in range(players)), players,
+            )
+            for index in range(start, min(start + 32, args.games))
+        ]
+        results = runtime.run_matches(deals, policies, config.game, score_outcome=False)
+        for deal, result in zip(deals, results):
+            winner_agent = None if result.winner is None else deal.seats[result.winner]
+            games.append(
+                {
+                    "seed": result.seed,
+                    "seat_order": list(deal.seats),
+                    "winner_seat": result.winner,
+                    "winner_agent": winner_agent,
+                    "winner_label": (
+                        None if winner_agent is None else labels[winner_agent]
+                    ),
+                    "terminal_reason": result.terminal_reason,
+                    "seat_turns": result.seat_turns,
+                    "action_count": result.action_count,
+                    "stock_remaining": result.stock_remaining,
+                    "telemetry": asdict(result.telemetry),
+                }
+            )
 
     report = {
         "agents": [

@@ -40,7 +40,6 @@ class LocalImportVisitor(ast.NodeVisitor):
         self.errors = errors
         self.classes: list[str] = []
         self.functions: list[str] = []
-        self.allowed = 0
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.classes.append(node.name)
@@ -64,13 +63,6 @@ class LocalImportVisitor(ast.NodeVisitor):
         if not self.functions:
             return
         relative = self.path.relative_to(ROOT).as_posix()
-        if (
-            relative == "src/checkpoints/registry.py"
-            and self.classes[-1:] == ["ModelRegistry"]
-            and self.functions[-1:] == ["register"]
-        ):
-            self.allowed += 1
-            return
         scope = ".".join((*self.classes, *self.functions))
         self.errors.append(
             "function-local import at %s:%d in %s"
@@ -82,12 +74,10 @@ def check_import_placement(
     trees: dict[Path, ast.Module],
     errors: list[str],
 ) -> int:
-    allowed = 0
     for path, tree in trees.items():
         visitor = LocalImportVisitor(path, errors)
         visitor.visit(tree)
-        allowed += visitor.allowed
-    return allowed
+    return 0
 
 
 def check_cli_boundaries(
@@ -246,18 +236,32 @@ def check_cycles(
         visit(module)
 
 
+def check_evaluation_boundaries(
+    trees: dict[Path, ast.Module],
+    errors: list[str],
+) -> None:
+    for path in sorted((SRC / "evaluation").glob("*.py")):
+        visitor = ModuleImportVisitor()
+        visitor.visit(trees[path])
+        for node in visitor.nodes:
+            for imported in imported_names(node):
+                if imported == "src.training" or imported.startswith("src.training."):
+                    errors.append(
+                        "evaluation module imports training at %s:%d"
+                        % (path.relative_to(ROOT), node.lineno)
+                    )
+
+
 def pure_modules(trees: dict[Path, ast.Module]) -> list[str]:
     modules = set()
     for path in trees:
         relative = path.relative_to(SRC)
-        if path.name == "__init__.py" or relative.parts[0] == "game":
+        if path.name == "__init__.py" or relative.parts[0] in ("game", "cli"):
             modules.add(module_name(path))
     for relative in (
-        "training/core.py",
-        "checkpoints/evidence.py",
         "checkpoints/io.py",
-        "checkpoints/registry.py",
         "model/spec.py",
+        "model/encoding.py",
     ):
         path = SRC / relative
         if path in trees:
@@ -274,8 +278,8 @@ def check_pure_imports(
         "real=builtins.__import__;"
         "builtins.__import__=lambda name,*a,**k: "
         "(_ for _ in ()).throw(ModuleNotFoundError("
-        "'blocked optional dependency',name='torch')) "
-        "if name=='torch' or name.startswith('torch.') else real(name,*a,**k);"
+        "'blocked optional dependency',name=name)) "
+        "if name.split('.')[0] in ('torch','numpy') else real(name,*a,**k);"
         "importlib.import_module(sys.argv[1])"
     )
     for module in pure_modules(trees):
@@ -298,6 +302,7 @@ def main() -> int:
     trees = source_trees()
     deferred_imports = check_import_placement(trees, errors)
     check_cli_boundaries(trees, errors)
+    check_evaluation_boundaries(trees, errors)
     check_cycles(trees, errors)
     check_pure_imports(trees, errors)
     if errors:
@@ -306,7 +311,7 @@ def main() -> int:
         return 1
     print(
         "training architecture: %d modules, no cycles, "
-        "%d documented deferred import"
+        "%d function-local imports"
         % (len(trees), deferred_imports)
     )
     return 0

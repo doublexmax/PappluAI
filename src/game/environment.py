@@ -1,12 +1,3 @@
-"""Solo finite-deck Papplu environment for Monte Carlo Q training.
-
-Phases are DRAW -> DISCARD -> (DRAW | TERMINAL). Actions are a fixed 54-slot
-mask: 0 draw stock, 1 take discard top, 2..53 discard face 0..51. Terminal
-reward is the evaluator binary hand_reward on the post-discard hand of size
-cards_in_hand. Illegal actions and bad config raise without mutating state.
-Older discards refill an empty stock after a nonterminal discard.
-"""
-
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -33,7 +24,7 @@ ACTION_TAKE_DISCARD = 1
 NUM_DISCARD_ACTIONS = NUM_FACES
 NUM_ACTIONS = 2 + NUM_DISCARD_ACTIONS
 
-ENCODING_VERSION = 2
+ENCODING_VERSION = 5
 
 
 class Phase(Enum):
@@ -93,8 +84,6 @@ class GameConfig:
 
 @dataclass(frozen=True)
 class Observation:
-    """The observer's own cards, public table, and complete visible history."""
-
     hand: Tuple[int, ...]
     discard_pile: Tuple[int, ...]
     joker: int
@@ -296,8 +285,6 @@ def legal_action_mask(obs: Observation) -> Tuple[bool, ...]:
 
 
 class PappluEnv:
-    """Mutable solo game. reset/step return immutable Observation snapshots."""
-
     def __init__(self, config: Optional[GameConfig] = None) -> None:
         self.config = config if config is not None else GameConfig()
         self._rng = random.Random()
@@ -343,11 +330,6 @@ class PappluEnv:
         return self.observe()
 
     def reset_warm_start(self, seed: Optional[int] = None) -> Observation:
-        """Discard-phase start: winning hand plus one extra card.
-
-        The agent only chooses the discard. Reward is still hand_reward on the
-        resulting cards_in_hand-sized hand. Not a held-out full-game win.
-        """
         if seed is not None:
             self._rng.seed(seed)
         cfg = self.config
@@ -552,19 +534,12 @@ class PappluEnv:
             self._record(EventKind.REFILL)
 
     def total_cards_in_play(self) -> int:
-        """Physical cards still tracked (excludes removed joker indicator)."""
         return sum(self._hand) + len(self._stock) + len(self._discard)
 
 
 def build_warm_start_deal(
     config: GameConfig, rng: random.Random
 ) -> Tuple[List[int], int, List[int]]:
-    """Return (hand_counts with +1 extra, joker, remaining stock faces).
-
-    Builds natural melds under deck multiplicity, reserves the indicator, and
-    adds one extra card from leftover supply. Fails with ValueError rather than
-    hanging when the config cannot support a constructed win.
-    """
     hand, joker, stock = _build_natural_winning_deal(config, rng)
     hand[stock.pop()] += 1
     return hand, joker, stock
