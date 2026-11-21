@@ -4,6 +4,35 @@ Use this guide to create a resumable self-play run and export its selected check
 The [model contract](README.md#model-and-training-contract) describes the network, encoding, and terminal utility.
 No command here provisions Azure resources or spends cloud credit.
 
+## Shipped checkpoint
+
+The browser ships trained Azure checkpoint A1, `trackA_p1/best-model.pt`, in `web/papplu-model.json`.
+Its `source.kind` is `checkpoint` and `source.trained` is `true`.
+The `card_mlp` v5 network has 127,172 parameters at width 64 with two blocks.
+Its version 5 encoding contains 1,275 float32 values.
+The checkpoint SHA256 is `094bbe8946fc890e93de7a2ce77f0ad45ad8f8d24a38f2249ffb31fdef39882b`.
+Training used a 16-vCPU Azure VM and repository commit `5d59de7`.
+
+The final held-out evaluation locked A1 before gameplay.
+Cold Python solo won 243 of 256 deals, or 94.9%, with a 95% Wilson interval of 91.5% to 97.0%.
+The separate warm discard puzzles yielded 208 of 256 wins, or 81.25%.
+For two, three, and four players, declaration rates were 99.2%, 99.2%, and 97.5% against Python Random.
+Browser Casual rates were 83.3%, 71.7%, and 57.5%.
+Against 2p Casual, Neural won 100/120 by declaration, or 83.3%.
+It finished first in 101/120, or 84.2%, including one turn-cap penalty win.
+Python Heuristic rates were 45.0%, 31.7%, and 16.7%.
+Browser Tactical rates were 42.7%, 31.7%, and 25.0%.
+Neural beats Random and Casual in these cells.
+It plays near first-place parity against Tactical at three and four players, but trails at two players and against four-player Heuristic.
+
+The fresh idle bundle benchmark measured 4.44 ms median and 4.84 ms p95 per `qValues` call over five 1,000-observation passes.
+That call includes validation, encoding, and one forward pass, not a complete turn.
+In the 18-worker browser run, Tactical's exact `minimumPenalty` and `outs1ply` searches averaged 4.76 to 4.98 seconds per move.
+Neural averaged 30.59 to 43.04 ms under that load.
+Do not compare those loaded move timings directly with the idle network benchmark.
+See the [A1 held-out results](README.md#a1-held-out-results) for counts, seat balancing, and deal-cluster intervals.
+The requested seeds are disjoint from this production run's training and selection, but earlier project models used them.
+
 ## Install PyTorch
 
 Use Python 3.11, as CI does.
@@ -241,7 +270,8 @@ The exporter writes the model and its matching golden cases together.
 It checks the portable forward pass against Torch.
 The full Python suite also exports nonzero 128-by-3 weights and checks all 54 Node Q-values within `1e-5`.
 Keep `web/papplu-model.json` and `tests/fixtures/qnet-golden.json` together.
-Use `--bootstrap --seed 1729` to restore the deterministic untrained model.
+`--bootstrap --seed 1729` replaces the shipped trained weights with a deterministic untrained model.
+Use that option for compatibility checks, not to publish playing-strength results.
 
 Run the [verification commands](README.md#verification) before accepting a training-code change.
 

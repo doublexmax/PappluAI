@@ -33,11 +33,6 @@ class Policy(Protocol):
         ...
 
 
-class BatchPolicy(Policy, Protocol):
-    def act_features(self, features: Sequence[Features], rngs: Sequence[random.Random]) -> list[int]:
-        ...
-
-
 class MatchInterrupted(RuntimeError):
     """Raised when a match reaches its caller-owned monotonic deadline."""
 

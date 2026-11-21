@@ -20,8 +20,8 @@ except ImportError:
 if torch is not None:
     from src.evaluation.arena import CheckpointPolicy
     from src.model.network import (
-        QNetwork, checkpoint_payload, collate, collate_observations, load_checkpoint,
-        masked_q_values, save_checkpoint, select_action, select_greedy_action,
+        QNetwork, checkpoint_payload, collate, collate_observations, greedy_actions,
+        load_checkpoint, save_checkpoint,
     )
 
 
@@ -135,21 +135,23 @@ class TestCardNetwork(unittest.TestCase):
                 values_after = policy.network(collate_observations([first], self.device))
             torch.testing.assert_close(values_before, values_after, rtol=0, atol=0)
 
-    def test_mask_and_exploration_use_only_legal_actions(self):
+    def test_greedy_masks_illegal_values_and_rejects_terminal_rows(self):
         env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1))
         env.reset(12)
-        obs = env.step(0)
-        mask = legal_action_mask(obs)
+        obs = replace(env.step(0), hand=(1, 1, 1, 1) + (0,) * 48)
+        batch = collate_observations([obs], self.device)
         with torch.no_grad():
+            for parameter in self.network.parameters():
+                parameter.zero_()
+            self.network.policy.value_out.bias.fill_(-1e10)
             self.network.policy.face_out.bias.fill_(-1e10)
-        values = masked_q_values(self.network, obs, mask)
-        self.assertTrue(torch.isneginf(values[0]))
-        self.assertTrue(torch.isfinite(values[2:][torch.tensor(mask[2:])]).all())
-        self.assertTrue(mask[select_greedy_action(self.network, obs)])
-        seen = {select_action(self.network, obs, 1.0, random.Random(seed)) for seed in range(100)}
-        self.assertEqual(seen, {i for i, allowed in enumerate(mask) if allowed})
+        values = self.network(batch)
+        self.assertEqual(values[0, 0].item(), 0.0)
+        torch.testing.assert_close(values[batch.legal.bool()], torch.full((4,), -1e10), rtol=0, atol=0)
+        self.assertEqual(greedy_actions(self.network, batch).tolist(), [2])
+        terminal = replace(obs, phase=type(obs.phase).TERMINAL)
         with self.assertRaisesRegex(ValueError, "no legal actions"):
-            select_greedy_action(self.network, replace(obs, phase=type(obs.phase).TERMINAL))
+            greedy_actions(self.network, collate_observations([obs, terminal], self.device))
 
     def test_card_relationships_change_action_specific_values(self):
         obs = self.observation(3, 2)
@@ -186,12 +188,13 @@ class TestCardNetwork(unittest.TestCase):
 
     def test_draw_head_can_select_both_stock_and_discard(self):
         observations = [self.observation(2, turns) for turns in range(1, 9)]
+        batch = collate_observations(observations, self.device)
         selected = set()
         for seed in range(8):
             torch.manual_seed(100 + seed)
             net = QNetwork()
             net.eval()
-            selected.update(select_greedy_action(net, obs, device=self.device) for obs in observations)
+            selected.update(greedy_actions(net, batch).tolist())
         self.assertEqual(selected, {0, 1})
 
     def test_q_only_policy_returns_dueling_values_for_legal_and_terminal_rows(self):

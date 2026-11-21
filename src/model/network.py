@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import random
 from typing import Any, Mapping, Optional, Sequence
 
 import torch
@@ -14,7 +13,7 @@ from src.checkpoints.tensor import validate_model_state
 from src.game.environment import ENCODING_VERSION, NUM_ACTIONS, NUM_FACES, GameConfig, Observation
 from src.model.encoding import (
     CARD_CHANNELS, CONTEXT_CHANNELS, FEATURE_SIZE, LAYOUT,
-    NUM_SEAT_SLOTS, SEAT_CHANNELS, Features, encode, legal_actions,
+    NUM_SEAT_SLOTS, SEAT_CHANNELS, Features, encode,
 )
 from src.model.spec import ARCHITECTURE, CHECKPOINT_VERSION, ModelSpec
 
@@ -147,49 +146,6 @@ def greedy_actions(network: QNetwork, batch: ObservationBatch) -> Tensor:
     if not bool(batch.legal.any(dim=1).all()):
         raise ValueError("no legal actions")
     return network(batch).masked_fill(batch.legal == 0, -torch.inf).argmax(dim=1)
-
-
-def masked_q_values(
-    network: QNetwork, obs: Observation, mask: Sequence[bool],
-    device: Optional[torch.device] = None,
-) -> Tensor:
-    if device is None:
-        device = next(network.parameters()).device
-    with torch.no_grad():
-        values = network(collate_observations([obs], device))[0]
-    return values.masked_fill(~torch.tensor(mask, dtype=torch.bool, device=device), -torch.inf)
-
-
-def select_action(
-    network: QNetwork, obs: Observation, epsilon: float, rng: random.Random,
-    device: Optional[torch.device] = None,
-) -> int:
-    if not 0.0 <= epsilon <= 1.0:
-        raise ValueError("epsilon must be in [0, 1]")
-    features = encode(obs)
-    legal = legal_actions(features)
-    if not legal:
-        raise ValueError("no legal actions")
-    if rng.random() < epsilon:
-        return rng.choice(legal)
-    if device is None:
-        device = next(network.parameters()).device
-    return int(greedy_actions(network, collate([features], device))[0].item())
-
-
-def select_greedy_action(
-    network: QNetwork, obs: Observation, device: Optional[torch.device] = None,
-) -> int:
-    if device is None:
-        device = next(network.parameters()).device
-    return int(greedy_actions(network, collate_observations([obs], device))[0].item())
-
-
-def select_random_legal(obs: Observation, rng: random.Random) -> int:
-    legal = legal_actions(encode(obs))
-    if not legal:
-        raise ValueError("no legal actions")
-    return rng.choice(legal)
 
 
 def checkpoint_payload(

@@ -259,6 +259,7 @@ describe("parseQModel", () => {
   for (const [label, mutate, message] of MALFORMED) {
     it(`rejects ${label}`, () => {
       const json = structuredClone(MODEL);
+      Object.assign(json.source, { kind: "bootstrap", trained: false, seed: 1729 });
       mutate(json);
       assert.throws(() => parseQModel(json), { name: "TypeError", message });
     });

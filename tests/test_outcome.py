@@ -30,7 +30,18 @@ class TestDealOutcome(unittest.TestCase):
         self.assertEqual(outcome.margin(1, 2), 0)
         self.assertTrue(outcome.seat(0).won)
         self.assertEqual(outcome.seat(3).penalty, 130)
-        self.assertEqual(placements((0, 0, 20), 0, "win", "points"), (1, 2, 3))
+        self.assertEqual(placements((0, 0, 20), 0, "win"), (1, 2, 3))
+
+    def test_turn_cap_ranks_points_without_counting_declaration_wins(self):
+        for points, ranks in (
+            ((40, 0), (2, 1)),
+            ((40, 0, 0, 100), (3, 1, 1, 4)),
+            ((20, 20), (1, 1)),
+        ):
+            with self.subTest(points=points):
+                outcome = self.outcome(points)
+                self.assertEqual(outcome.ranks(), ranks)
+                self.assertEqual(tuple(outcome.seat(seat).won for seat in range(len(points))), (False,) * len(points))
 
     def test_opponent_declaration_penalties_are_monotonic_and_capped(self):
         for players in (2, 3, 4):

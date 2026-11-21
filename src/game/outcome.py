@@ -7,12 +7,7 @@ from src.evaluate import HandPenalty, minimum_penalty
 from src.game.multiplayer import TerminalSnapshot
 
 
-CAP_POLICIES = ("undecided", "points", "weighted-points", "tie", "exclude")
-
-
-def placements(points: Sequence[int], winner: Optional[int], ending: str, cap_policy: str) -> Optional[tuple[int, ...]]:
-    if cap_policy not in CAP_POLICIES:
-        raise ValueError("unknown cap policy")
+def placements(points: Sequence[int], winner: Optional[int], ending: str) -> tuple[int, ...]:
     if len(points) < 2 or any(type(point) is not int or point < 0 for point in points):
         raise ValueError("penalties must contain nonnegative integer points for every player")
     if ending == "win":
@@ -27,11 +22,7 @@ def placements(points: Sequence[int], winner: Optional[int], ending: str, cap_po
         )
     if ending != "turns_exhausted" or winner is not None:
         raise ValueError("only completed declarations and draw-limit endings have placements")
-    if cap_policy in ("points", "weighted-points"):
-        return tuple(1 + sum(other < mine for other in points) for mine in points)
-    if cap_policy == "tie":
-        return (1,) * len(points)
-    return None
+    return tuple(1 + sum(other < mine for other in points) for mine in points)
 
 
 @dataclass(frozen=True)
@@ -63,7 +54,7 @@ class DealOutcome:
             return (1,)
         return placements(
             tuple(penalty.points for penalty in self.penalties),
-            self.winner, self.ending, "points",
+            self.winner, self.ending,
         )
 
     def margin(self, seat: int, other: int) -> int:
