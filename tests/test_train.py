@@ -9,13 +9,14 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import zlib
 
 from src.cli._runtime import MissingTrainingDependency
 from src.cli.train import build_arg_parser, main
 from src.evaluate import evaluate_hand
 from src.game.environment import GameConfig, PappluEnv
 from src.game.multiplayer import MultiplayerEnv
-from src.model.encoding import unpack
+from src.model.encoding import encode, unpack
 from src.model.spec import ModelSpec
 
 try:
@@ -26,7 +27,7 @@ except ImportError:
 if torch is not None:
     from concurrent.futures import ProcessPoolExecutor
     from src.model.network import QNetwork, load_checkpoint, save_checkpoint
-    from src.training.train import STATE_VERSION, TrainConfig, Trainer, _Rollout, collect_round
+    from src.training.train import STATE_VERSION, Step, Trajectory, TrainConfig, Trainer, _Rollout, collect_round, load_rollout_batch, save_rollout_batch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +60,28 @@ class TestTrainCli(unittest.TestCase):
         self.assertEqual(parsed.epsilons, [0.01, 0.05])
         self.assertEqual(build_arg_parser().parse_args(["--output-dir", "run", "--margin-weight", "0.25"]).margin_weight, 0.25)
 
+    def test_rollout_and_checkpoint_flags_parse_without_an_output_directory(self):
+        parsed = build_arg_parser().parse_args([
+            "--collect-batch", "batch.pt", "--initial-model", "online.pt", "--best-model", "best.pt",
+            "--start-episode", "12", "--checkpoint-every", "100", "--max-pool", "3",
+        ])
+        self.assertEqual((parsed.collect_batch, parsed.initial_model, parsed.best_model),
+                         (Path("batch.pt"), Path("online.pt"), Path("best.pt")))
+        self.assertEqual((parsed.start_episode, parsed.checkpoint_every, parsed.max_pool), (12, 100, 3))
+        self.assertEqual(build_arg_parser().parse_args(["--collect-batch", "batch.pt"]).start_episode, 0)
+
+    def test_collect_mode_requirements_fail_before_loading_training(self):
+        for flags, message in (
+            (["--collect-batch", "batch.pt"], "requires --initial-model"),
+            (["--collect-batch", "batch.pt", "--initial-model", "online.pt", "--start-episode", "-1"], "nonnegative"),
+            (["--output-dir", "unused", "--best-model", "best.pt"], "require --collect-batch"),
+        ):
+            with self.subTest(flags=flags), mock.patch(
+                "src.cli.train.load_runtime", side_effect=AssertionError("runtime loaded"),
+            ), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+                self.assertEqual(main(flags), 2)
+                self.assertIn(message, error.getvalue())
+
     def test_missing_dependency_is_reported_without_creating_a_run(self):
         with tempfile.TemporaryDirectory() as temporary, mock.patch(
             "src.cli.train.load_runtime", side_effect=MissingTrainingDependency("PyTorch is missing"),
@@ -83,6 +106,53 @@ runpy.run_module('src.cli.train', run_name='__main__')
         result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--self-play-share", result.stdout)
+        self.assertIn("--collect-batch", result.stdout)
+        self.assertIn("--checkpoint-every", result.stdout)
+        self.assertIn("--max-pool", result.stdout)
+
+
+@unittest.skipIf(torch is None, "PyTorch not installed")
+class TestRolloutBatch(unittest.TestCase):
+    def test_round_trip_preserves_feature_bytes_actions_greedy_flags_and_utilities(self):
+        env = PappluEnv(GameConfig(num_decks=1, cards_in_hand=3, required_sequences=1, max_turns=1))
+        env.reset(41)
+        first = encode(env.observe())
+        env.step(0)
+        second = encode(env.observe())
+        trajectories = [
+            Trajectory((Step(first, 0, True), Step(second, 53, False)), 0.625),
+            Trajectory((), -0.75),
+            Trajectory((Step(first, 1, False),), -0.875),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "inbox/batch-001.pt"
+            save_rollout_batch(path, episodes=2, trajectories=trajectories)
+            self.assertEqual(load_rollout_batch(path), (2, trajectories))
+            payload = torch.load(path, weights_only=True)
+            self.assertEqual(zlib.decompress(payload["features"]), first.data + second.data + first.data)
+            self.assertEqual(payload["records"], (((0, 53), (True, False), 0.625), ((), (), -0.75), ((1,), (False,), -0.875)))
+
+    def test_loading_rejects_corrupt_features_and_inconsistent_records(self):
+        env = PappluEnv(GameConfig(num_decks=1, cards_in_hand=3, required_sequences=1, max_turns=1))
+        env.reset(41)
+        trajectory = Trajectory((Step(encode(env.observe()), 0),), -0.75)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "batch-001.pt"
+            save_rollout_batch(path, episodes=1, trajectories=[trajectory])
+            payload = torch.load(path, weights_only=True)
+            for change, message in (
+                ({"features": zlib.compress(trajectory.steps[0].features.data[:-1])}, "byte length mismatch"),
+                ({"features": zlib.compress(trajectory.steps[0].features.data + b"\0")}, "byte length mismatch"),
+                ({"features": b"corrupt"}, "corrupted rollout features"),
+                ({"records": (((0,), (), -0.75),)}, "lengths mismatch"),
+                ({"version": STATE_VERSION + 1}, "version or episode count"),
+                ({"episodes": -1}, "version or episode count"),
+                ({"episodes": True}, "version or episode count"),
+            ):
+                with self.subTest(change=change):
+                    torch.save({**payload, **change}, path)
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_rollout_batch(path)
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
@@ -95,6 +165,86 @@ class TestSelfPlayTrainer(unittest.TestCase):
             "replay_capacity": 64, "batch_size": 4, "validate_every": 4, "validation_games": 1,
             "checkpoint_every": 4, "self_play_share": 1.0, "max_pool": 2,
         }
+
+    def test_inbox_batches_replace_local_rollouts_and_persist_episode_step_and_update_counts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = Trainer.open(Path(temporary), {
+                **self.overrides, "actors": 2, "max_turns": 1, "round_episodes": 2,
+                "updates_per_episode": 2, "validation_games": 0,
+            }, initial=ModelSpec(9, 1))
+            trajectories = collect_round(trainer.config, trainer.learner.online, str(trainer.root / "best-model.pt"), [], 0, 4)
+            path = trainer.root / "inbox/batch-001.pt"
+            save_rollout_batch(path, episodes=4, trajectories=trajectories)
+            saved, save = [], trainer.save
+
+            def record_save(status):
+                save(status)
+                saved.append(json.loads((trainer.root / "status.json").read_text()))
+
+            with mock.patch("src.training.train.collect_round", side_effect=AssertionError("local rollout")), mock.patch(
+                "src.training.train.ProcessPoolExecutor", side_effect=AssertionError("actor pool"),
+            ), mock.patch.object(trainer, "save", side_effect=record_save):
+                self.assertEqual(trainer.run(max_episodes=4), "max_episodes")
+            self.assertEqual((trainer.episodes, trainer.learner.step_count, trainer.learner.update_count), (4, 12, 8))
+            self.assertFalse(path.exists())
+            self.assertEqual([(s["status"], s["episodes"], s["updates"]) for s in saved],
+                             [("running", 4, 8), ("max_episodes", 4, 8)])
+            metrics = json.loads((trainer.root / "metrics.jsonl").read_text())
+            self.assertEqual((metrics["episodes"], metrics["trajectories"], metrics["updates"]), (4, 6, 8))
+            with Trainer.open(trainer.root) as resumed:
+                self.assertEqual(resumed.summary(), trainer.summary())
+
+    def test_partial_inbox_batch_collects_only_the_deficit_and_still_validates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = Trainer.open(Path(temporary), {
+                **self.overrides, "player_counts": (1,), "max_turns": 1,
+            }, initial=ModelSpec(9, 1))
+            trajectories = collect_round(trainer.config, trainer.learner.online, str(trainer.root / "best-model.pt"), [], 0, 2)
+            path = trainer.root / "inbox/batch-001.pt"
+            save_rollout_batch(path, episodes=2, trajectories=trajectories)
+            self.assertEqual(trainer.run(max_episodes=4), "max_episodes")
+            self.assertEqual((trainer.episodes, trainer.learner.step_count, trainer.learner.update_count), (4, 8, 4))
+            self.assertFalse(path.exists())
+            raw = b"".join(s.features.data for t in trajectories for s in t.steps)
+            self.assertEqual(zlib.decompress(trainer.learner.replay.state_dict()["features"])[:len(raw)], raw)
+            metrics = json.loads((trainer.root / "metrics.jsonl").read_text())
+            self.assertEqual((metrics["episodes"], metrics["trajectories"], metrics["validation"]["promoted"]), (4, 4, True))
+            self.assertEqual(trainer.snapshot_pool[-1], "opponents/best-000000000004.pt")
+
+    def test_inbox_leaves_oversized_batches_pending_without_exceeding_the_episode_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = Trainer.open(Path(temporary), {
+                **self.overrides, "player_counts": (1,), "max_turns": 1, "validation_games": 0,
+            }, initial=ModelSpec(9, 1))
+            trajectories = collect_round(trainer.config, trainer.learner.online, str(trainer.root / "best-model.pt"), [], 0, 4)
+            path = trainer.root / "inbox/batch-001.pt"
+            save_rollout_batch(path, episodes=4, trajectories=trajectories)
+            original = path.read_bytes()
+            self.assertEqual(trainer.run(max_episodes=2), "max_episodes")
+            self.assertEqual((trainer.episodes, trainer.learner.step_count, trainer.learner.update_count), (2, 4, 2))
+            self.assertEqual(path.read_bytes(), original)
+            with mock.patch("src.training.train.collect_round", side_effect=AssertionError("local rollout")):
+                self.assertEqual(trainer.run(max_episodes=6), "max_episodes")
+            self.assertEqual((trainer.episodes, trainer.learner.step_count, trainer.learner.update_count), (6, 12, 6))
+            self.assertFalse(path.exists())
+
+    def test_inbox_consumes_at_most_eight_sorted_batches_per_round(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = Trainer.open(Path(temporary), {
+                **self.overrides, "player_counts": (1,), "max_turns": 1, "round_episodes": 1,
+                "updates_per_episode": 0, "validation_games": 0,
+            }, initial=ModelSpec(9, 1))
+            trajectories = collect_round(trainer.config, trainer.learner.online, str(trainer.root / "best-model.pt"), [], 0, 1)
+            for index in range(9, 0, -1):
+                save_rollout_batch(trainer.root / ("inbox/batch-%03d.pt" % index), episodes=1, trajectories=trajectories)
+            stopping = iter((False, True))
+            with mock.patch("src.training.train.collect_round", side_effect=AssertionError("local rollout")):
+                self.assertEqual(trainer.run(max_episodes=9, stop=lambda: next(stopping)), "stopped")
+            self.assertEqual((trainer.episodes, trainer.learner.step_count, trainer.learner.update_count), (8, 16, 0))
+            self.assertEqual([p.name for p in (trainer.root / "inbox").glob("batch-*.pt")], ["batch-009.pt"])
+            self.assertEqual(trainer.run(max_episodes=9), "max_episodes")
+            self.assertEqual((trainer.episodes, trainer.learner.step_count, trainer.learner.update_count), (9, 18, 0))
+            self.assertFalse((trainer.root / "inbox/batch-009.pt").exists())
 
     def test_self_play_and_sparring_record_every_seats_negative_outcome(self):
         torch.manual_seed(41)
@@ -477,10 +627,12 @@ class TestSelfPlayTrainer(unittest.TestCase):
                 "--updates-per-episode", "3", "--lr-decay-updates", "12", "--torch-threads", "2",
                 "--epsilons", "0.01", "0.05",
                 "--margin-weight", "0.25",
+                "--checkpoint-every", "1", "--max-pool", "1",
             ]
             fresh = subprocess.run(command + flags, cwd=ROOT, capture_output=True, text=True, timeout=60)
             self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
-            resumed = subprocess.run(command + ["--max-episodes", "4"], cwd=ROOT, capture_output=True, text=True, timeout=60)
+            resumed = subprocess.run(command + ["--max-episodes", "4", "--checkpoint-every", "3"],
+                                     cwd=ROOT, capture_output=True, text=True, timeout=60)
             self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
             report = json.loads(resumed.stdout)
             self.assertEqual((report["episodes"], report["updates"], report["model_spec"]),
@@ -489,7 +641,44 @@ class TestSelfPlayTrainer(unittest.TestCase):
             self.assertEqual((config.updates_per_episode, config.lr_decay_updates, config.torch_threads), (3, 12, 2))
             self.assertEqual(config.epsilons, (0.01, 0.05))
             self.assertEqual(config.margin_weight, 0.25)
+            self.assertEqual((config.checkpoint_every, config.max_pool), (3, 1))
+            self.assertEqual(len(report["snapshot_pool"]), 1)
             self.assertEqual(len((Path(temporary) / "metrics.jsonl").read_text().splitlines()), 2)
+
+    def test_real_cli_collects_serial_and_parallel_batches_without_creating_trainer_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = GameConfig(num_decks=1, cards_in_hand=3, required_sequences=1, max_turns=1)
+            online = QNetwork(ModelSpec(9, 1)).eval()
+            best = copy.deepcopy(online)
+            with torch.no_grad():
+                best.policy.draw_out.bias.add_(1)
+            save_checkpoint(str(root / "online.pt"), online, game)
+            save_checkpoint(str(root / "best.pt"), best, game)
+            for actors in (1, 2):
+                with self.subTest(actors=actors):
+                    path = root / ("inbox/batch-%03d.pt" % actors)
+                    best_path = root / ("online.pt" if actors == 1 else "best.pt")
+                    command = [
+                        sys.executable, "-m", "src.cli.train", "--collect-batch", str(path),
+                        "--initial-model", str(root / "online.pt"), "--opponent", str(root / "best.pt"),
+                        "--players", "1", "2", "--self-play-share", "0",
+                        "--round-episodes", "3", "--actors", str(actors), "--max-pool", "1",
+                        "--seed", "77", "--start-episode", "7",
+                    ]
+                    if actors == 2:
+                        command += ["--best-model", str(best_path), "--output-dir", str(root / "unused")]
+                    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=90)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {"episodes": 3, "trajectories": 5})
+                    config = TrainConfig(**{
+                        **game.to_dict(), "player_counts": (1, 2), "self_play_share": 0.0,
+                        "round_episodes": 3, "actors": actors, "max_pool": 1, "seed": 77,
+                    })
+                    expected = collect_round(config, online, str(best_path), [str(root / "best.pt")], 7, 3)
+                    self.assertEqual(load_rollout_batch(path), (3, expected))
+            self.assertFalse((root / "unused").exists())
+            self.assertEqual(list(root.rglob("latest-state.pt")), [])
 
     def test_cli_uses_default_dimensions_for_omitted_width_or_blocks(self):
         for flags, expected in (

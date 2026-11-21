@@ -41,6 +41,36 @@ class Trajectory(NamedTuple):
     utility: float
 
 
+def save_rollout_batch(path: Path, episodes: int, trajectories: Sequence[Trajectory]) -> None:
+    atomic_torch_save({
+        "version": STATE_VERSION, "episodes": episodes,
+        "features": zlib.compress(bytearray().join(step.features.data for t in trajectories for step in t.steps), level=1),
+        "records": tuple((tuple(s.action for s in t.steps), tuple(s.greedy for s in t.steps), float(t.utility))
+                         for t in trajectories),
+    }, path)
+
+
+def load_rollout_batch(path: Path) -> tuple[int, list[Trajectory]]:
+    batch = torch.load(path, map_location="cpu", weights_only=True)
+    episodes, records = batch["episodes"], batch["records"]
+    if batch.get("version") != STATE_VERSION or type(episodes) is not int or episodes < 1:
+        raise ValueError("invalid rollout batch version or episode count")
+    if any(len(actions) != len(greedy) for actions, greedy, _ in records):
+        raise ValueError("rollout action and greedy lengths mismatch")
+    try:
+        raw = zlib.decompress(batch["features"])
+    except zlib.error as exc:
+        raise ValueError("corrupted rollout features") from exc
+    size = FEATURE_SIZE * 4
+    if len(raw) != sum(len(actions) for actions, _, _ in records) * size:
+        raise ValueError("rollout byte length mismatch")
+    features = iter(Features(raw[offset:offset + size]) for offset in range(0, len(raw), size))
+    return episodes, [
+        Trajectory(tuple(Step(next(features), action, flag) for action, flag in zip(actions, greedy)), utility)
+        for actions, greedy, utility in records
+    ]
+
+
 @dataclass(frozen=True)
 class TrainConfig:
     num_decks: int = 3
@@ -473,17 +503,31 @@ class Trainer:
                     break
                 count = min(cfg.round_episodes, max_episodes - self.episodes) if max_episodes is not None else cfg.round_episodes
                 start = self.episodes
+                extra_episodes, extra_trajs = 0, []
+                for path in sorted((self.root / "inbox").glob("batch-*.pt"))[:8]:
+                    episodes, batch = load_rollout_batch(path)
+                    if max_episodes is not None and start + extra_episodes + episodes > max_episodes:
+                        continue
+                    extra_episodes += episodes
+                    extra_trajs.extend(batch)
+                    path.unlink()
+                count = max(0, count - extra_episodes)
+                rollout_start = start + extra_episodes
                 best_path = str(self.root / "best-model.pt")
                 pool = [str(self.root / path) for path in self.snapshot_pool]
-                if cfg.actors == 1:
-                    trajectories = collect_round(cfg, self.learner.online, best_path, pool, start, count)
+                if not count:
+                    trajectories = []
+                elif cfg.actors == 1:
+                    trajectories = collect_round(cfg, self.learner.online, best_path, pool, rollout_start, count)
                 else:
                     if self._executor is None:
                         self._executor = ProcessPoolExecutor(max_workers=cfg.actors, initializer=_actor_init)
                     chunk, state = math.ceil(count / cfg.actors), clone_model_state(self.learner.online.state_dict())
-                    jobs = [(cfg, self.learner.online.spec, state, best_path, pool, offset, min(chunk, start + count - offset))
-                            for offset in range(start, start + count, chunk)]
+                    jobs = [(cfg, self.learner.online.spec, state, best_path, pool, offset, min(chunk, rollout_start + count - offset))
+                            for offset in range(rollout_start, rollout_start + count, chunk)]
                     trajectories = [t for batch in self._executor.map(_actor_job, jobs) for t in batch]
+                trajectories = extra_trajs + trajectories
+                count += extra_episodes
                 stats = self.learner.learn(trajectories, cfg.updates_per_episode * count)
                 self.episodes += count
                 validation = self.validate() if cfg.validation_games and self.episodes // cfg.validate_every > start // cfg.validate_every else None

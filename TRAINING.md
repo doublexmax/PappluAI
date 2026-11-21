@@ -133,6 +133,8 @@ On each multiplayer deal, self-play has probability 0.35.
 Other deals place the learner in a random seat against stationary opponents.
 Each opponent seat chooses the reigning `best-model.pt` with probability 0.45, `HeuristicPolicy` with 0.20, `RandomPolicy` with 0.05, and a uniform snapshot with 0.30.
 The snapshot pool includes imported `--opponent` checkpoints.
+`--max-pool` defaults to eight active snapshots and applies when starting a run.
+It limits the pool, not checkpoint files on disk.
 An empty pool sends its share to the reigning best.
 Every seat contributes its own terminal utility and trajectory in both modes.
 Solo deals always use the learner.
@@ -157,6 +159,10 @@ Time limits and stop requests are checked between completed rounds.
 A rollout round or validation can overrun the requested time limit.
 Use a smaller `--round-episodes` when starting a run that needs shorter stop intervals.
 The trainer saves completed work and closes actor processes before returning.
+`--checkpoint-every` defaults to 64 completed deals.
+Crossing an interval saves the latest model, replay, optimizer, and counters at the end of that round.
+Stops always save, regardless of this interval.
+You can change `--checkpoint-every` on resume.
 
 ## Use more CPU actors or a GPU learner
 
@@ -193,6 +199,35 @@ Compare completed deals and updates over the same time budget before renting mor
 Keep validation settings fixed when comparing runs.
 The fixed validation workload can cost more than a short training round.
 
+## Feed a learner from other machines
+
+Actor machines can publish rollout batches through a shared filesystem or your own file-transfer tool.
+Collect from frozen model files without opening a trainer run.
+
+```powershell
+.\.venv\Scripts\python -m src.cli.train --collect-batch runs\parallel\inbox\batch-vm01-000001.pt --initial-model runs\parallel\latest-model.pt --best-model runs\parallel\best-model.pt --opponent runs\parallel\initial-model.pt --players 1 2 3 4 --round-episodes 32 --actors 16 --seed 101 --start-episode 0
+```
+
+`--collect-batch` atomically writes compressed feature bytes and trajectory records to the destination.
+It prints `episodes` and `trajectories` counts, then exits without creating `latest-state.pt`.
+This mode does not require `--output-dir`.
+`--initial-model` supplies the online weights and game settings.
+`--best-model` supplies the reigning opponent and defaults to `--initial-model`.
+Repeated `--opponent` flags supply additional snapshots, bounded by `--max-pool`.
+`--round-episodes` sets the batch's deal count. Multiple `--actors` split those deals across processes.
+`--start-episode` defaults to zero and sets the first deal index used for seeds and player-count rotation.
+Give each actor machine a distinct `--seed` or disjoint episode ranges.
+Use a unique destination filename for every batch and only one trainer per run directory.
+
+Before each round, the trainer loads up to eight `inbox/batch-*.pt` files in filename order.
+If their total reaches `--round-episodes`, the trainer skips local collection and only learns.
+Smaller batches reduce the local deal count. An empty inbox uses local rollouts.
+Imported deals drive episode counters, learner updates, validation, and checkpoints.
+A batch that exceeds the remaining `--max-episodes` budget stays in the inbox.
+The trainer fills that round's remaining budget locally rather than splitting or discarding the batch.
+To transfer a batch, copy it under a temporary name, then rename it to `batch-*.pt` inside the inbox.
+The trainer deletes each batch after loading it, before learning. Keep a copy if you need recovery after a crash.
+
 ## Choose a model size or initial checkpoint
 
 Start the smaller v5 network in a fresh directory.
@@ -218,8 +253,7 @@ The trainer copies them into the new run.
 Initial models and imported opponents apply only to fresh runs.
 
 Resume restores the recipe rather than changing it.
-The CLI allows `--actors`, `--device`, and `--torch-threads` changes on resume.
-The Python API also allows `checkpoint_every` changes.
+The CLI allows `--actors`, `--device`, `--torch-threads`, and `--checkpoint-every` changes on resume.
 Other changed settings fail before training.
 Encoding versions before 5 and trainer state versions before 12 require a fresh run.
 Version 5 model checkpoints remain compatible at both model sizes.
