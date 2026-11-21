@@ -53,11 +53,10 @@ class CardBlock(nn.Module):
         super().__init__()
         self.card_norm = nn.LayerNorm(width)
         self.table_norm = nn.LayerNorm(width)
-        self.w_seq = nn.Linear(width, width * 5, bias=False)
+        self.w_seq = nn.Linear(width, width * 3)
         self.w_rank_set = nn.Linear(width, width, bias=False)
         self.w_suit_run = nn.Linear(width, width, bias=False)
         self.w_table = nn.Linear(width, width, bias=False)
-        self.card_ffn = nn.Linear(width, width * 2)
         self.card_out = nn.Linear(width, width)
         self.table_fc1 = nn.Linear(width * 3, width)
         self.table_fc2 = nn.Linear(width, width)
@@ -65,13 +64,11 @@ class CardBlock(nn.Module):
     def forward(self, cards: Tensor, table: Tensor) -> tuple[Tensor, Tensor]:
         c, t = self.card_norm(cards), self.table_norm(table)
         c14 = torch.cat((c, c[:, :, :1, :]), dim=2)
-        u_m2, u_m1, u_self, u_p1, u_p2 = self.w_seq(c14).chunk(5, dim=-1)
+        u_self, u_left, u_right = self.w_seq(c14).chunk(3, dim=-1)
         zeros = torch.zeros_like(u_self[:, :, :1, :])
-        left14 = torch.cat((zeros, u_m1[:, :, :-1, :]), dim=2)
-        right14 = torch.cat((u_p1[:, :, 1:, :], zeros), dim=2)
-        left2 = torch.cat((zeros, zeros, u_m2[:, :, :-2, :]), dim=2)
-        right2 = torch.cat((u_p2[:, :, 2:, :], zeros, zeros), dim=2)
-        seq14 = u_self + left14 + right14 + left2 + right2
+        left14 = torch.cat((zeros, u_left[:, :, :-1, :]), dim=2)
+        right14 = torch.cat((u_right[:, :, 1:, :], zeros), dim=2)
+        seq14 = u_self + left14 + right14
         seq = torch.cat((
             (seq14[:, :, :1, :] + seq14[:, :, 13:, :]) * 0.5,
             seq14[:, :, 1:13, :],
@@ -79,8 +76,7 @@ class CardBlock(nn.Module):
         rank_ctx = self.w_rank_set(c.mean(dim=1))[:, None, :, :]
         suit_ctx = self.w_suit_run(c.mean(dim=2))[:, :, None, :]
         tbl_ctx = self.w_table(t)[:, None, None, :]
-        a, b = self.card_ffn(seq + rank_ctx + suit_ctx + tbl_ctx).chunk(2, dim=-1)
-        cards = cards + self.card_out(F.silu(a) * b)
+        cards = cards + self.card_out(F.silu(seq + rank_ctx + suit_ctx + tbl_ctx))
         c_post = self.card_norm(cards)
         t_in = torch.cat((t, c_post.mean(dim=(1, 2)), c_post.amax(dim=(1, 2))), dim=-1)
         table = table + self.table_fc2(F.silu(self.table_fc1(t_in)))
@@ -186,12 +182,12 @@ def load_checkpoint(
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must be a dict")
     if type(payload.get("checkpoint_version")) is not int or payload["checkpoint_version"] != CHECKPOINT_VERSION:
-        raise ValueError("unsupported checkpoint_version %r; train fresh card_mlp weights"
+        raise ValueError("unsupported checkpoint_version %r; train fresh card_mlp v5 weights"
                          % payload.get("checkpoint_version"))
     if type(payload.get("encoding_version")) is not int or payload["encoding_version"] != ENCODING_VERSION:
-        raise ValueError("incompatible encoding_version; card_mlp requires encoding_version %d" % ENCODING_VERSION)
+        raise ValueError("incompatible encoding_version; card_mlp v5 requires encoding_version 5")
     if payload.get("architecture") != ARCHITECTURE:
-        raise ValueError("unsupported architecture; expected card_mlp")
+        raise ValueError("unsupported architecture; expected card_mlp v5")
     required = {
         "checkpoint_version", "encoding_version", "architecture", "model_spec",
         "num_actions", "game_config", "model_state_dict",

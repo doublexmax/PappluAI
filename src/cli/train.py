@@ -10,7 +10,7 @@ from src.cli._runtime import MissingTrainingDependency, load_runtime
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train card_mlp with v8 encoding and champion-anchored fictitious self-play DMC. Reuse the output directory to resume.")
+    parser = argparse.ArgumentParser(description="Train card_mlp v5 with DMC and winning-trajectory margins. Reuse the output directory to resume.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--initial-model", type=Path)
     parser.add_argument("--opponent", type=Path, action="append", default=[])
@@ -26,6 +26,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--lr-decay-updates", type=int)
     parser.add_argument("--gamma", type=float)
+    parser.add_argument("--margin-weight", type=float)
+    parser.add_argument("--epsilons", type=float, nargs="+")
     parser.add_argument("--self-play-share", type=float)
     parser.add_argument("--validate-every", type=int)
     parser.add_argument("--validation-games", type=int)
@@ -58,9 +60,9 @@ def main(argv=None) -> int:
             raise ValueError("--initial-model cannot be combined with --width or --blocks")
         initial = args.initial_model
         if args.width is not None or args.blocks is not None:
-            default = runtime.ModelSpec()
-            initial = runtime.ModelSpec(default.width if args.width is None else args.width,
-                                        default.blocks if args.blocks is None else args.blocks)
+            defaults = runtime.ModelSpec()
+            initial = runtime.ModelSpec(defaults.width if args.width is None else args.width,
+                                        defaults.blocks if args.blocks is None else args.blocks)
         overrides = {name: getattr(args, name) for name in runtime.TrainConfig.__dataclass_fields__
                      if getattr(args, name, None) is not None}
         with runtime.Trainer.open(args.output_dir, overrides, initial=initial, opponents=args.opponent) as trainer:

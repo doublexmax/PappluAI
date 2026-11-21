@@ -48,7 +48,7 @@ function observation(cards = [0, 1, 30], joker = 7) {
 }
 
 function cardChannel(features, face, name) {
-  return features[OFFSETS.card + face * CHANNELS.card.length + CHANNELS.card.indexOf(name)];
+  return features[OFFSETS.card + face * 22 + CHANNELS.card.indexOf(name)];
 }
 
 function context(features, name) {
@@ -76,7 +76,7 @@ describe("qnet golden parity", () => {
       c.observation.history.forEach(e => kinds.add(e.kind));
       const actual = encodeObservation(c.observation);
       assert.ok(actual instanceof Float32Array);
-      assert.equal(actual.length, 1433);
+      assert.equal(actual.length, 1275);
       assert.deepEqual(Array.from(actual), c.features, c.name);
     }
     assert.deepEqual([...seats].sort(), [1, 2, 3, 4, 5, 6]);
@@ -136,10 +136,10 @@ describe("qnet golden parity", () => {
       }
       return [name, { shape, data: Buffer.from(data.buffer).toString("base64") }];
     }));
-    assert.deepEqual(json.tensors["policy.card_embed.weight"].shape, [128, 25]);
-    assert.deepEqual(json.tensors["policy.table_embed.weight"].shape, [128, 78]);
+    assert.deepEqual(json.tensors["policy.card_embed.weight"].shape, [128, 22]);
+    assert.deepEqual(json.tensors["policy.table_embed.weight"].shape, [128, 76]);
     assert.equal(Object.values(json.tensors).reduce((sum, tensor) =>
-      sum + tensor.shape.reduce((a, b) => a * b, 1), 0), 870276);
+      sum + tensor.shape.reduce((a, b) => a * b, 1), 0), 673412);
     const inputs = [observation(), GOLDEN.cases.at(-1).observation];
     const full = qValues(parseQModel(json), inputs);
     const ablatedJson = structuredClone(json);
@@ -182,10 +182,10 @@ describe("parseQModel", () => {
     assert.ok(Object.isFrozen(model) && Object.isFrozen(model.spec) && Object.isFrozen(model.gameConfig) && Object.isFrozen(model.source));
     assert.throws(() => qValues({ ...model }, []), /must come from parseQModel/);
     assert.deepEqual(qValues(model, []), []);
-    assert.deepEqual(MODEL.tensors["policy.card_embed.weight"].shape, [80, 25]);
-    assert.deepEqual(MODEL.tensors["policy.table_embed.weight"].shape, [80, 78]);
+    assert.deepEqual(MODEL.tensors["policy.card_embed.weight"].shape, [128, 22]);
+    assert.deepEqual(MODEL.tensors["policy.table_embed.weight"].shape, [128, 76]);
     assert.equal(Object.values(MODEL.tensors).reduce((sum, tensor) =>
-      sum + tensor.shape.reduce((a, b) => a * b, 1), 0), 344244);
+      sum + tensor.shape.reduce((a, b) => a * b, 1), 0), 673412);
   });
 
   it("accepts bootstrap and checkpoint source identities without registry metadata", () => {
@@ -218,8 +218,6 @@ describe("parseQModel", () => {
     ["a string format version", m => { m.formatVersion = "2"; }, /model\.formatVersion:/],
     ["a v4 checkpoint", m => { m.checkpointVersion = 4; }, /model\.checkpointVersion:/],
     ["an old encoding", m => { m.encodingVersion = 3; }, /model\.encodingVersion:/],
-    ["v6 observable-only encoding", m => { m.encodingVersion = 6; }, /model\.encodingVersion:/],
-    ["v7 encoding without meld savings", m => { m.encodingVersion = 7; }, /model\.encodingVersion:/],
     ["another architecture", m => { m.architecture = "axial_table"; }, /model\.architecture:/],
     ["53 actions", m => { m.numActions = 53; }, /model\.numActions:/],
     ["a missing model spec", m => { delete m.modelSpec; }, /model\.modelSpec: missing/],
@@ -248,9 +246,12 @@ describe("parseQModel", () => {
     ["a missing tensor", m => { delete m.tensors["policy.face_out.bias"]; }, /model\.tensors\.policy\.face_out\.bias: missing/],
     ["an auxiliary tensor", m => { m.tensors["aux.face_win.bias"] = m.tensors["policy.face_out.bias"]; }, /model\.tensors\.aux\.face_win\.bias: unexpected/],
     ["an extra tensor field", m => { m.tensors["policy.face_out.bias"].dtype = "float32"; }, /model\.tensors\["policy.face_out.bias"\]\.dtype:/],
-    ["a transposed shape", m => { m.tensors["policy.face_out.weight"].shape = [80, 1]; }, /model\.tensors\["policy.face_out.weight"\]\.shape:/],
+    ["a transposed shape", m => { m.tensors["policy.face_out.weight"].shape = [128, 1]; }, /model\.tensors\["policy.face_out.weight"\]\.shape:/],
     ["a string shape", m => { m.tensors["policy.face_out.bias"].shape = "1"; }, /model\.tensors\["policy.face_out.bias"\]\.shape:/],
-    ["truncated data", m => { m.tensors["policy.face_local.bias"].data = m.tensors["policy.face_local.bias"].data.slice(0, -4); }, /expected 320 bytes, got 318/],
+    ["truncated data", m => {
+      const tensor = m.tensors["policy.face_local.bias"];
+      tensor.data = Buffer.from(tensor.data, "base64").subarray(0, -4).toString("base64");
+    }, /expected 512 bytes, got 508/],
     ["invalid base64", m => { m.tensors["policy.face_out.bias"].data = "not base64"; }, /expected base64 text/],
     ["unpadded base64", m => { m.tensors["policy.face_out.bias"].data = "AAAAAA"; }, /expected base64 text/],
     ["numeric tensor data", m => { m.tensors["policy.face_out.bias"].data = 0; }, /expected base64 text/],
@@ -278,100 +279,94 @@ describe("parseQModel", () => {
   }
 });
 
-describe("observable copy channels", () => {
-  it("encodes exactly one, exactly two, and at least three copies separately", () => {
-    const features = encodeObservation(observation([0, 5, 5, 18, 18, 18]));
-    assert.deepEqual(["own_eq1", "own_eq2", "own_ge3"].map(name => cardChannel(features, 0, name)), [1, 0, 0]);
-    assert.deepEqual(["own_eq1", "own_eq2", "own_ge3"].map(name => cardChannel(features, 5, name)), [0, 1, 0]);
-    assert.deepEqual(["own_eq1", "own_eq2", "own_ge3"].map(name => cardChannel(features, 18, name)), [0, 0, 1]);
-    assertClose([cardChannel(features, 0, "unseen"), cardChannel(features, 5, "unseen"),
-      cardChannel(features, 18, "unseen"), cardChannel(features, 7, "unseen")],
-    [2 / 3, 1 / 3, 0, 2 / 3], 1e-7, "unseen copies");
-  });
-});
-
-describe("sequence-gated disjoint features", () => {
-  it("keeps sets gated until the pure-sequence quota and returns both remaining counts", () => {
-    const hand = counts([1, 2, 3, 14, 15, 16, 6, 19, 32]);
-    const packed = disjointPack(hand, 51, 3);
-    assert.deepEqual(packed.slice(0, 4), [2, 21, 0, 0]);
-    assert.deepEqual(packed[4], new Array(52).fill(0));
-    assert.deepEqual(packed[5], counts([6, 19, 32]));
-    assert.deepEqual(hand, counts([1, 2, 3, 14, 15, 16, 6, 19, 32]));
-    assert.deepEqual(disjointPack(counts([1, 2, 3, 14, 15, 16, 27, 28, 29, 6, 19, 32]), 51, 3).slice(0, 4),
-      [3, 0, 0, 0]);
-  });
-
-  it("separates spare pure and meld copies for duplicate cards and sets", () => {
-    const obs = observation([1, 1, 2, 3, 6, 19, 32], 51);
-    Object.assign(obs.config, { cardsInHand: 7, requiredSequences: 2 });
-    obs.discardPile = [];
+describe("encoded meld channels", () => {
+  it("uses each joker once and keeps below-quota set points gated", () => {
+    const cards = [0, 1, 13, 14, 26, 27, 39, 40, 9, 10, 22, 23, 7];
+    const packed = disjointPack(counts(cards), 7, 5);
+    assert.deepEqual(packed.slice(0, 3), [1, 68, 20]);
+    assert.equal(packed[4][7], 0);
+    const obs = observation(cards);
+    obs.config.cardsInHand = cards.length;
+    obs.config.requiredSequences = 4;
     const features = encodeObservation(obs);
-    assert.deepEqual(["spare_pure", "spare_meld"].map(name => cardChannel(features, 1, name)), [0.5, 0.5]);
-    assert.deepEqual(["spare_pure", "spare_meld"].map(name => cardChannel(features, 6, name)), [1, 0]);
-    assertClose([context(features, "disjoint_pseq_frac"), context(features, "disjoint_gated_pts")],
-      [0.5, 0.23], 1e-7, "disjoint summary");
+    assert.equal(context(features, "disjoint_pseq_frac"), 0.25);
+    assertClose([context(features, "disjoint_gated_pts")], [0.68], 1e-7, "gated points");
   });
 
-  it("keeps both gated and ungated meld savings for a legal set discard", () => {
-    const obs = observation([1, 2, 3, 14, 15, 16, 6, 19, 32, 49], 51);
-    Object.assign(obs.config, { cardsInHand: 9, requiredSequences: 3 });
+  it("does not consume two after Q-K-A and preserves two disjoint runs", () => {
+    const high = disjointPack(counts([11, 12, 0, 1]), 7, 1);
+    assert.deepEqual(high.slice(0, 3), [1, 2, 2]);
+    assert.equal(high[4][1], 1);
+    assert.deepEqual(disjointPack(counts([0, 1, 2, 3, 4, 5]), 7, 2).slice(0, 3), [2, 0, 0]);
+    assert.deepEqual(disjointPack(counts([12, 0, 1]), 7, 1).slice(0, 3), [0, 22, 22]);
+  });
+
+  it("encodes the sequence gain of a legal top-card exchange", () => {
+    const features = encodeObservation(observation());
+    assert.equal(context(features, "top_gain_pseq"), 1);
+    assertClose([context(features, "top_gain_pts")], [0.85], 1e-7, "top points");
+    const obs = observation([0, 1, 2, 9]);
     obs.phase = 1;
-    const features = encodeObservation(obs);
-    assertClose(["disc_pseq_delta", "disc_gated_saved", "disc_meld_saved", "disc_pairs_delta"]
-      .map(name => cardChannel(features, 6, name)), [0, 0.7, -1.4, 0], 1e-7, "discard savings");
-    obs.history.push({ ...obs.history[0], kind: 2, face: 6, initialHand: [] });
-    const taken = encodeObservation(obs);
-    assert.deepEqual(["disc_pseq_delta", "disc_gated_saved", "disc_meld_saved", "disc_pairs_delta"]
-      .map(name => cardChannel(taken, 6, name)), [0, 0, 0, 0]);
-    obs.phase = 2;
-    const terminal = encodeObservation(obs);
+    const discard = encodeObservation(obs);
+    assert.deepEqual(["spare_frac", "disc_pseq_delta", "disc_pts_saved", "disc_pairs_delta"]
+      .map(channel => cardChannel(discard, 9, channel)), [1, 0, 1, 0]);
+    assert.equal(cardChannel(discard, 0, "disc_pseq_delta"), -1);
+  });
+
+  it("marks Q-K-A and A-2-3 as natural and excludes K-A-2", () => {
+    for (const cards of [[0, 1, 2], [11, 12, 0]]) {
+      const features = encodeObservation(observation(cards));
+      for (const channel of ["natural", "pure", "any_meld"]) {
+        assert.deepEqual(Array.from({ length: 52 }, (_, face) => face)
+          .filter(face => cardChannel(features, face, channel)), cards.toSorted((a, b) => a - b));
+      }
+      assert.equal(context(features, "unavoidable_dw"), 0);
+    }
+    const bad = encodeObservation(observation([12, 0, 1]));
     for (let face = 0; face < 52; face += 1) {
-      assert.deepEqual(["disc_pseq_delta", "disc_gated_saved", "disc_meld_saved", "disc_pairs_delta"]
-        .map(name => cardChannel(terminal, face, name)), [0, 0, 0, 0]);
+      assert.deepEqual(["natural", "pure", "any_meld"].map(name => cardChannel(bad, face, name)), [0, 0, 0]);
+    }
+    assert.equal(cardChannel(bad, 0, "adjacent"), 1);
+    assert.equal(cardChannel(bad, 1, "adjacent"), 0.5);
+    assert.equal(cardChannel(bad, 12, "adjacent"), 0.5);
+    assertClose([context(bad, "unavoidable_dw")], [22 / 30], 1e-7, "deadwood");
+  });
+
+  it("distinguishes exact-joker purity from same-rank wild substitution", () => {
+    const pure = encodeObservation(observation([16, 17, 7]));
+    const impure = encodeObservation(observation([16, 17, 33]));
+    for (const face of [16, 17, 7]) assert.equal(cardChannel(pure, face, "pure"), 1);
+    for (const face of [16, 17, 33]) {
+      assert.equal(cardChannel(impure, face, "pure"), 0);
+      assert.equal(cardChannel(impure, face, "any_meld"), 1);
+    }
+    assert.equal(cardChannel(pure, 16, "natural"), 0);
+    assert.equal(context(pure, "unavoidable_dw"), 0);
+    assert.equal(context(impure, "unavoidable_dw"), 0);
+    const naturalWild = encodeObservation(observation([32, 33, 34]));
+    for (const face of [32, 33, 34]) {
+      assert.deepEqual(["natural", "pure", "any_meld"].map(name => cardChannel(naturalWild, face, name)), [1, 1, 1]);
     }
   });
 
-  it("exposes the cost of breaking a King set below five pure sequences", () => {
-    const cards = [...Array(3).fill([1, 14, 27, 40]).flat(), 12, 25, 38, 4, 4, 17, 17, 8, 8, 47];
-    const obs = observation(cards, 6);
-    Object.assign(obs.config, { cardsInHand: 21, requiredSequences: 5 });
-    obs.phase = 1;
-    assert.deepEqual(disjointPack(obs.hand, 6, 5).slice(0, 4), [4, 77, 47, 0]);
-    const features = encodeObservation(obs);
-    for (const [face, expected] of [[12, [0, 1, -2, 0]], [47, [0, 0.9, 0.9, 0]]]) {
-      assertClose(["disc_pseq_delta", "disc_gated_saved", "disc_meld_saved", "disc_pairs_delta"]
-        .map(name => cardChannel(features, face, name)), expected, 1e-7, `discard ${face}`);
+  it("counts physical triplets and distinct-suit set mates without reusing duplicate faces", () => {
+    const triplet = encodeObservation(observation([5, 5, 5]));
+    assert.deepEqual(["adjacent", "set_mates", "natural", "pure", "any_meld"]
+      .map(name => cardChannel(triplet, 5, name)), [0, 0, 0, 1, 1]);
+    const set = encodeObservation(observation([5, 18, 31]));
+    for (const face of [5, 18, 31]) {
+      assert.deepEqual(["natural", "pure", "any_meld"].map(name => cardChannel(set, face, name)), [0, 0, 1]);
     }
-  });
-
-  it("surfaces a meld-completing swap even when gated points increase below the quota", () => {
-    const cards = [...Array(3).fill([1, 14, 27, 40]).flat(), 12, 25, 4, 4, 17, 17, 8, 8, 47];
-    const obs = observation(cards, 6);
-    Object.assign(obs.config, { cardsInHand: 21, requiredSequences: 5 });
-    obs.discardPile = [38];
-    assert.deepEqual(disjointPack(obs.hand, 6, 5).slice(0, 4), [4, 67, 67, 0]);
-    const features = encodeObservation(obs);
-    assertClose(["top_gain_pseq", "top_gain_gated", "top_gain_meld", "top_gain_pairs"]
-      .map(name => context(features, name)), [0, -0.05, 1.45, 0], 1e-7, "King-set completion");
-  });
-
-  it("balances gated and ungated meld points before pure-sequence pairs for top swaps", () => {
-    for (const [cards, joker, top, gains] of [
-      [[3, 7, 10, 11, 16, 18, 23, 26, 28, 29, 31, 32, 33, 35, 36, 37, 40, 41, 46, 47, 50],
-        32, 46, [0, 0.2, 1.4, -2 / 3]],
-      [[1, 5, 6, 10, 13, 15, 20, 21, 24, 27, 28, 30, 33, 35, 37, 39, 41, 44, 48, 49, 51],
-        30, 9, [0, 0, 1.5, 0]],
-    ]) {
-      const obs = observation(cards, joker);
-      Object.assign(obs.config, { cardsInHand: 21, requiredSequences: 5 });
-      obs.discardPile = [top];
-      assertClose(["top_gain_pseq", "top_gain_gated", "top_gain_meld", "top_gain_pairs"].map(name => context(encodeObservation(obs), name)),
-        gains, 1e-7, "top swap");
-      obs.discardPile = [];
-      assert.deepEqual(["top_gain_pseq", "top_gain_gated", "top_gain_meld", "top_gain_pairs"].map(name => context(encodeObservation(obs), name)),
-        [0, 0, 0, 0]);
+    assertClose([cardChannel(set, 5, "set_mates"), cardChannel(set, 44, "set_mates")],
+      [2 / 3, 1], 1e-7, "set mates");
+    assert.equal(cardChannel(set, 4, "adjacent"), 0.5);
+    const duplicate = encodeObservation(observation([5, 5, 7]));
+    for (let face = 0; face < 52; face += 1) {
+      assert.deepEqual(["natural", "pure", "any_meld"].map(name => cardChannel(duplicate, face, name)), [0, 0, 0]);
     }
+    assertClose([context(duplicate, "unavoidable_dw")], [12 / 30], 1e-7, "duplicate deadwood");
+    const wildSet = encodeObservation(observation([7, 20, 33]));
+    for (const face of [7, 20, 33]) assert.equal(cardChannel(wildSet, face, "any_meld"), 1);
   });
 });
 
@@ -416,9 +411,6 @@ describe("encodeObservation", () => {
     assert.equal(seat(3, "next"), 1);
     assert.equal(seat(1, "next"), 0);
     assert.equal(cardChannel(features, 14, "next_held"), 0);
-    assertClose([cardChannel(features, 5, "unseen"), cardChannel(features, 16, "unseen"),
-      cardChannel(features, 14, "unseen"), cardChannel(features, 7, "unseen")],
-    [1 / 3, 1, 2 / 3, 2 / 3], 1e-7, "unseen after public events");
     assert.equal(context(features, "refills"), 1);
     assert.deepEqual(Array.from(features.slice(OFFSETS.seat + 4 * 9, OFFSETS.context)), new Array(18).fill(0));
     obs.players[0].nextPlayer = 0;
@@ -428,28 +420,27 @@ describe("encodeObservation", () => {
     assertClose([cardChannel(noNext, 5, "other_held")], [2 / 3], 1e-7, "all opponents");
   });
 
-  it("encodes raw point totals and exact-joker and wild counts", () => {
+  it("encodes raw point totals and wild counts alongside meld membership", () => {
     const obs = observation([0, 1, 7, 12, 20]);
     obs.config.cardsInHand = 5;
     const features = encodeObservation(obs);
-    assertClose([context(features, "raw_points"), context(features, "jokers_held"), context(features, "wilds_held")],
-      [0.22, 1 / 3, 2 / 12], 1e-7, "hand totals");
-    assert.equal(cardChannel(features, 7, "joker"), 1);
+    assertClose([context(features, "deadwood"), context(features, "wilds")], [0.22, 2 / 12], 1e-7, "hand totals");
+    assert.equal(cardChannel(features, 7, "indicator"), 1);
     assert.equal(cardChannel(features, 20, "wild"), 1);
     assert.equal(cardChannel(features, 20, "points"), 0);
     assert.equal(cardChannel(features, 0, "points"), 1);
-    assert.equal(features.length, 1433);
+    assert.equal(features.length, 1275);
+    assert.equal(context(features, "unavoidable_dw"), 0);
   });
 
-  it("writes the exact 25-channel card and 24-channel context layouts", () => {
+  it("writes the exact 22-channel card and context layouts", () => {
     const features = encodeObservation(observation([5, 18, 31]));
-    assert.deepEqual(Array.from(features.slice(5 * 25, 6 * 25)), [
-      1 / 3, 1, 0, 0, 0, 0, 0, 0, 0.6, 2 / 3, 0, 0, 0, 0,
-      0, 2 / 3, 0, 0, 1, 1, 0, 0, 0, 0, 0,
+    assert.deepEqual(Array.from(features.slice(5 * 22, 6 * 22)), [
+      1 / 3, 1, 0, 0, 0, 0, 0, 0, 0.6, 0, 0, 0, 0, 0, 2 / 3, 0, 0, 1, 0, 0, 0, 0,
     ].map(Math.fround));
     assert.deepEqual(Array.from(features.slice(OFFSETS.context, OFFSETS.legal)), [
-      1, 0, 0, 1, 1, 151 / 156, 1 / 156, 0, 0.5, 0.1, 0.1, 1, 1 / 6, 2 / 3, 0, 0, 0.18,
-      0, 0, 0.18, 0, 0.15, -0.75, 0,
+      1, 0, 0, 1, 1, 151 / 156, 1 / 156, 0, 0.5, 0.1, 0.1, 1, 1 / 6, 2 / 3, 0, 0, 0.18, 0,
+      0, 0.18, 0, -0.75,
     ].map(Math.fround));
   });
 
@@ -474,21 +465,19 @@ describe("encodeObservation", () => {
     assert.deepEqual(legal(obs), []);
   });
 
-  it("masks a previous own discard only while stock remains and zeros its top gains", () => {
-    const obs = observation([0, 1, 9]);
-    obs.history.push({ ...obs.history[0], kind: 3, face: 2, offeredTop: null, initialHand: [] });
+  it("masks solo self-discard pickup only when stock is available", () => {
+    const obs = observation();
     const legal = input => Array.from(encodeObservation(input).slice(OFFSETS.legal, OFFSETS.top))
       .flatMap((allowed, action) => allowed ? [action] : []);
+    assert.deepEqual(legal(obs), [0, 1]);
+    obs.history.push({
+      ...obs.history[0], kind: 3, face: 2, offeredTop: null, initialHand: [],
+    });
     assert.deepEqual(legal(obs), [0]);
-    const features = encodeObservation(obs);
-    assert.deepEqual(["top_gain_pseq", "top_gain_gated", "top_gain_meld", "top_gain_pairs"].map(name => context(features, name)),
-      [0, 0, 0, 0]);
     obs.stockRemaining = 0;
     assert.deepEqual(legal(obs), [1]);
-    assert.equal(context(encodeObservation(obs), "top_gain_pseq"), 1);
     obs.stockRemaining = 151;
     obs.players.push({ ...obs.players[0] });
-    Object.assign(obs.players[0], { nextPlayer: 1, previousPlayer: 1 });
     obs.history.at(-1).actor = 1;
     assert.deepEqual(legal(obs), [0, 1]);
   });
@@ -512,14 +501,14 @@ describe("encodeObservation", () => {
     assert.deepEqual(Array.from(otherDiscard.slice(OFFSETS.legal, OFFSETS.top)), new Array(54).fill(0));
   });
 
-  it("uses the empty-top sentinel for an initial discard phase", () => {
+  it("uses the empty-top sentinel and derives warm starts from the initial hand", () => {
     const obs = observation([0, 1, 2, 30]);
     obs.discardPile = [];
     obs.history[0].offeredTop = null;
     obs.phase = 1;
     const features = encodeObservation(obs);
     assert.equal(features[OFFSETS.top], 52);
-    assert.equal(context(features, "discard"), 1);
+    assert.equal(context(features, "warm_start"), 1);
     assert.equal(context(features, "to_act"), 1);
   });
 

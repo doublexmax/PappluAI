@@ -12,48 +12,46 @@ const pairOrder = (a, b) => meldPoints(b) - meldPoints(a) || a[0] - b[0] || a[1]
 const ORDERED_RUNS = [...RUN_FACES].sort((a, b) =>
   Math.floor(a[0] / 13) - Math.floor(b[0] / 13) || meldPoints(b) - meldPoints(a) || a[0] % 13 - b[0] % 13);
 const pairMap = new Map();
-for (const run of RUN_FACES) for (let a = 0; a < 3; a += 1) for (let b = a + 1; b < 3; b += 1) {
+for (const run of RUN_FACES) for (let a = 0; a < 3; a++) for (let b = a + 1; b < 3; b++) {
   const pair = [run[a], run[b]].sort((a, b) => a - b);
   pairMap.set(pair.join(","), pair);
 }
 const RUN_PAIRS = [...pairMap.values()].sort(pairOrder);
-const PURE_PAIRS = Array.from({ length: NUM_FACES }, (_, joker) => RUN_PAIRS.filter(pair => !pair.includes(joker)));
+const PURE_PAIRS = Array.from({ length: 52 }, (_, joker) => RUN_PAIRS.filter(pair => !pair.includes(joker)));
 const WILD_PAIRS = Array.from({ length: 13 }, (_, rank) => {
   const pairs = new Map(RUN_PAIRS.filter(pair => pair.every(face => face % 13 !== rank))
     .map(pair => [pair.join(","), pair]));
-  for (let r = 0; r < 13; r += 1) if (r !== rank) {
-    for (let a = 0; a < 4; a += 1) for (let b = a + 1; b < 4; b += 1) {
-      const pair = [a * 13 + r, b * 13 + r];
-      pairs.set(pair.join(","), pair);
-    }
+  for (let r = 0; r < 13; r++) if (r !== rank) for (let a = 0; a < 4; a++) for (let b = a + 1; b < 4; b++) {
+    const pair = [a * 13 + r, b * 13 + r];
+    pairs.set(pair.join(","), pair);
   }
   return [...pairs.values()].sort(pairOrder);
 });
 const SET_RANKS = Array.from({ length: 13 }, (_, rank) => rank)
   .sort((a, b) => RANK_POINTS[b] - RANK_POINTS[a] || a - b);
-const POINT_ORDER = Array.from({ length: NUM_FACES }, (_, face) => face)
+const POINT_ORDER = Array.from({ length: 52 }, (_, face) => face)
   .sort((a, b) => RANK_POINTS[b % 13] - RANK_POINTS[a % 13] || a - b);
 const RUN_STARTS = new Map(RUN_FACES.map(run => [run[0], run]));
 
 export const CHANNELS = Object.freeze({
   card: Object.freeze([
-    "own", "own_eq1", "own_eq2", "own_ge3", "pile", "top", "joker", "wild",
-    "points", "unseen", "opp_discarded", "next_held", "other_held", "next_passed",
+    "own", "own_ge1", "own_ge2", "own_ge3", "pile", "top", "indicator", "wild",
+    "points", "opp_discarded", "next_held", "other_held", "next_passed",
     "adjacent", "set_mates", "natural", "pure", "any_meld",
-    "spare_pure", "spare_meld", "disc_pseq_delta", "disc_gated_saved", "disc_meld_saved", "disc_pairs_delta",
+    "spare_frac", "disc_pseq_delta", "disc_pts_saved", "disc_pairs_delta",
   ]),
   seat: Object.freeze(["present", "observer", "active", "hand_size", "turns", "next", "takes", "passes", "held_total"]),
   context: Object.freeze([
     "draw", "discard", "terminal", "to_act", "turns", "stock", "pile", "refills", "decks", "hand",
-    "sequences", "recycle", "players", "max_turns", "jokers_held", "wilds_held", "raw_points",
-    "unavoidable_dw", "disjoint_pseq_frac", "disjoint_gated_pts",
-    "top_gain_pseq", "top_gain_gated", "top_gain_meld", "top_gain_pairs",
+    "sequences", "recycle", "players", "max_turns", "warm_start", "wilds", "deadwood",
+    "unavoidable_dw",
+    "disjoint_pseq_frac", "disjoint_gated_pts", "top_gain_pseq", "top_gain_pts",
   ]),
 });
 export const FEATURE_LAYOUT = Object.freeze([
-  ["card", [52, 25]], ["seat", [6, 9]], ["context", [24]], ["legal", [54]], ["top", [1]],
+  ["card", [52, 22]], ["seat", [6, 9]], ["context", [22]], ["legal", [54]], ["top", [1]],
 ].map(([name, shape]) => Object.freeze([name, Object.freeze(shape)])));
-export const FEATURE_SIZE = 1433;
+export const FEATURE_SIZE = 1275;
 const FIELDS = {};
 let offset = 0;
 for (const [name, shape] of FEATURE_LAYOUT) {
@@ -63,8 +61,8 @@ for (const [name, shape] of FEATURE_LAYOUT) {
 }
 
 const HEADER = Object.freeze({
-  format: "papplu-qnet", formatVersion: 2, checkpointVersion: 6,
-  encodingVersion: 8, architecture: "card_mlp", numActions: NUM_ACTIONS,
+  format: "papplu-qnet", formatVersion: 2, checkpointVersion: 5,
+  encodingVersion: 5, architecture: "card_mlp", numActions: NUM_ACTIONS,
 });
 const MODEL_KEYS = [...Object.keys(HEADER), "modelSpec", "gameConfig", "source", "tensors"];
 const GAME_CONFIG_KEYS = ["numDecks", "cardsInHand", "requiredSequences", "maxTurns", "recycleDiscard"];
@@ -87,9 +85,8 @@ export function tensorShapes(spec) {
     const prefix = `blocks.${b}.`;
     layer(`${prefix}card_norm`, width);
     layer(`${prefix}table_norm`, width);
-    layer(`${prefix}w_seq`, width * 5, width, false);
+    layer(`${prefix}w_seq`, width * 3, width);
     for (const name of ["w_rank_set", "w_suit_run", "w_table"]) layer(prefix + name, width, width, false);
-    layer(`${prefix}card_ffn`, width * 2, width);
     layer(`${prefix}card_out`, width, width);
     layer(`${prefix}table_fc1`, width, width * 3);
     layer(`${prefix}table_fc2`, width, width);
@@ -255,81 +252,61 @@ export function disjointPack(hand, joker, requiredSequences) {
   for (const [a, b, c] of ORDERED_RUNS) {
     if (joker === a || joker === b || joker === c) continue;
     while (rem[a] && rem[b] && rem[c]) {
-      rem[a] -= 1;
-      rem[b] -= 1;
-      rem[c] -= 1;
-      pure += 1;
+      rem[a]--; rem[b]--; rem[c]--; pure++;
       if (c % 13 < 12 && c === b + 1) {
         const next = c + 1;
         const run = RUN_STARTS.get(next);
         const starts = run !== undefined && run.every(face => rem[face]);
-        if (next !== joker && rem[next] && !starts) rem[next] -= 1;
+        if (next !== joker && rem[next] && !starts) rem[next]--;
       }
     }
   }
-  for (let face = 0; face < NUM_FACES; face += 1) if (face !== joker) {
-    while (rem[face] >= 3) {
-      rem[face] -= 3;
-      pure += 1;
-    }
+  for (let face = 0; face < 52; face++) if (face !== joker) {
+    while (rem[face] >= 3) { rem[face] -= 3; pure++; }
   }
   for (const [a, b, c] of ORDERED_RUNS) {
     if (joker !== a && joker !== b && joker !== c) continue;
-    while (rem[a] && rem[b] && rem[c]) {
-      rem[a] -= 1;
-      rem[b] -= 1;
-      rem[c] -= 1;
-      pure += 1;
-    }
+    while (rem[a] && rem[b] && rem[c]) { rem[a]--; rem[b]--; rem[c]--; pure++; }
   }
   while (rem[joker]) {
     const pair = PURE_PAIRS[joker].find(([a, b]) => rem[a] && rem[b]);
-    if (pair) {
-      rem[pair[0]] -= 1;
-      rem[pair[1]] -= 1;
-      rem[joker] -= 1;
-      pure += 1;
-    } else if (rem[joker] >= 2) {
+    if (pair) { rem[pair[0]]--; rem[pair[1]]--; rem[joker]--; pure++; }
+    else if (rem[joker] >= 2) {
       const face = POINT_ORDER.find(face => face !== joker && rem[face]);
       if (face === undefined) break;
-      rem[face] -= 1;
-      rem[joker] -= 2;
-      pure += 1;
+      rem[face]--; rem[joker] -= 2; pure++;
     } else break;
   }
   const afterPure = [...rem];
   const pairs = RUN_FACES.filter(run => run.filter(face => face !== joker && rem[face] > 0).length >= 2).length;
   const rank = joker % 13;
   let wilds = 0;
-  for (let suit = 0; suit < 4; suit += 1) {
+  for (let suit = 0; suit < 4; suit++) {
     const face = suit * 13 + rank;
-    wilds += rem[face];
-    rem[face] = 0;
+    wilds += rem[face]; rem[face] = 0;
   }
   for (const r of SET_RANKS) {
     if (r === rank) continue;
     while (true) {
       const faces = [0, 1, 2, 3].map(suit => suit * 13 + r).filter(face => rem[face]);
       if (faces.length < 3) break;
-      for (const face of faces) rem[face] -= 1;
+      for (const face of faces) rem[face]--;
     }
   }
   while (wilds) {
     const pair = WILD_PAIRS[rank].find(([a, b]) => rem[a] && rem[b]);
     if (!pair) break;
-    rem[pair[0]] -= 1;
-    rem[pair[1]] -= 1;
-    wilds -= 1;
+    rem[pair[0]]--; rem[pair[1]]--; wilds--;
   }
   const score = counts => counts.reduce((sum, n, face) => sum + (face % 13 === rank ? 0 : n * RANK_POINTS[face % 13]), 0);
   const points = score(rem);
-  return [pure, pure >= requiredSequences ? points : score(afterPure), points, pairs, rem, afterPure];
+  return [pure, pure >= requiredSequences ? points : score(afterPure), points, pairs, rem];
 }
 
 function meldMembership(hand, joker) {
-  const natural = new Int32Array(NUM_FACES);
-  const pure = new Int32Array(NUM_FACES);
-  const anyMeld = new Int32Array(NUM_FACES);
+  const natural = new Int32Array(52);
+  const pure = new Int32Array(52);
+  const anyMeld = new Int32Array(52);
   const wilds = [0, 1, 2, 3].map(s => s * 13 + joker % 13);
   function mark(represented, flexible, result) {
     const missing = represented.reduce((sum, face) => sum + Number(!hand[face] || flexible.includes(face)), 0);
@@ -410,24 +387,23 @@ function encode(obs, path) {
     const wild = rank === joker % 13;
     const points = wild ? 0 : RANK_POINTS[rank];
     rawPoints += copies * points;
-    if (wild) wildCount += copies;
     unavoidable += copies * points * (1 - anyMeld[face]);
-    let setMates = 0;
-    for (let other = 0; other < 4; other += 1) {
-      if (other !== suit && hand[other * 13 + rank]) setMates += 1;
-    }
+    if (wild) wildCount += copies;
     let opponentHeld = 0;
     for (let seat = 1; seat < players.length; seat += 1) opponentHeld += held[seat][face];
     const nextHeld = nextOpponent > 0 ? held[nextOpponent][face] : 0;
-    const unseen = Math.max(0, decks - copies - pileCounts[face] - Number(face === joker) -
-      held[0][face] - opponentHeld);
+    const adjacent = Number(hand[suit * 13 + (rank + 12) % 13] > 0) +
+      Number(hand[suit * 13 + (rank + 1) % 13] > 0);
+    let mates = 0;
+    for (let other = 0; other < 4; other += 1) {
+      if (other !== suit && hand[other * 13 + rank] > 0) mates += 1;
+    }
     values.set([
-      copies / decks, Number(copies === 1), Number(copies === 2), Number(copies >= 3), pileCounts[face] / decks,
-      Number(face === top), Number(face === joker), Number(wild), points / 10, unseen / decks,
-      oppDiscarded[face] / decks, nextHeld / decks, (opponentHeld - nextHeld) / decks, nextPassed[face] / decks,
-      (Number(hand[suit * 13 + (rank + 12) % 13] > 0) + Number(hand[suit * 13 + (rank + 1) % 13] > 0)) / 2,
-      setMates / 3, natural[face], pure[face], anyMeld[face],
-      copies ? base[5][face] / copies : 0, copies ? base[4][face] / copies : 0, 0, 0, 0, 0,
+      copies / decks, Number(copies >= 1), Number(copies >= 2), Number(copies >= 3), pileCounts[face] / decks,
+      Number(face === top), Number(face === joker), Number(wild), points / 10, oppDiscarded[face] / decks,
+      nextHeld / decks, (opponentHeld - nextHeld) / decks, nextPassed[face] / decks,
+      adjacent / 2, mates / 3, natural[face], pure[face], anyMeld[face],
+      copies ? base[4][face] / copies : 0, 0, 0, 0,
     ], FIELDS.card.offset + face * CHANNELS.card.length);
   });
   players.forEach((player, s) => {
@@ -446,16 +422,16 @@ function encode(obs, path) {
     Number(phase === 0), Number(phase === 1), Number(phase === 2), Number(toAct), obs.turnsRemaining / turns,
     obs.stockRemaining / supply, discardPile.length / supply, Math.min(refills, 3) / 3, decks / 6, cards / 30,
     config.requiredSequences / 10, Number(config.recycleDiscard), players.length / 6, turns / 60,
-    hand[joker] / decks, wildCount / (4 * decks), rawPoints / 100,
-    unavoidable / (10 * cards), Math.min(base[0], required) / Math.max(1, required), base[1] / 100, 0, 0, 0, 0,
+    Number(players.length === 1 && history[0].initialHand.reduce((a, b) => a + b, 0) === cards + 1),
+    wildCount / (4 * decks), rawPoints / 100, unavoidable / (10 * cards),
+    Math.min(base[0], required) / Math.max(1, required), base[1] / 100, 0, 0,
   ], FIELDS.context.offset);
   if (toAct) {
     if (phase === 0) {
       values[FIELDS.legal.offset] = Number(obs.stockRemaining > 0);
       values[FIELDS.legal.offset + 1] = Number(discardPile.length > 0);
-      if (last.kind === DISCARD && last.actor === 0 && values[FIELDS.legal.offset]) {
+      if (last.kind === DISCARD && last.actor === 0 && values[FIELDS.legal.offset])
         values[FIELDS.legal.offset + 1] = 0;
-      }
     } else {
       hand.forEach((n, face) => { values[FIELDS.legal.offset + 2 + face] = Number(n > 0); });
       if (last.kind === TAKE_DISCARD && last.actor === 0 && last.face !== null &&
@@ -463,41 +439,37 @@ function encode(obs, path) {
         values[FIELDS.legal.offset + 2 + last.face] = 0;
       }
     }
-  }
-  if (toAct && phase === 1) {
-    hand.forEach((copies, face) => {
-      if (!copies || !values[FIELDS.legal.offset + 2 + face]) return;
-      const after = [...hand];
-      after[face] -= 1;
-      const packed = disjointPack(after, joker, required);
-      values.set([
-        Math.min(packed[0], required) - Math.min(base[0], required),
-        (base[1] - packed[1]) / 10, (base[2] - packed[2]) / 10, (packed[3] - base[3]) / 3,
-      ], FIELDS.card.offset + face * CHANNELS.card.length + CHANNELS.card.indexOf("disc_pseq_delta"));
-    });
-  }
-  if (toAct && phase === 0 && values[FIELDS.legal.offset + 1]) {
-    const plus = [...hand];
-    plus[top] += 1;
-    let best = null;
-    let bestKey = null;
-    plus.forEach((copies, face) => {
-      if (!copies || face === top) return;
-      plus[face] -= 1;
-      const packed = disjointPack(plus, joker, required);
-      plus[face] += 1;
-      const key = [Math.min(packed[0], required), -(0.5 * packed[1] + 0.5 * packed[2]), packed[3], -packed[1]];
-      const difference = bestKey === null ? -1 : key.findIndex((value, i) => value !== bestKey[i]);
-      if (bestKey === null || difference >= 0 && key[difference] > bestKey[difference]) {
-        best = packed;
-        bestKey = key;
-      }
-    });
-    if (best !== null) {
-      values.set([
-        Math.min(best[0], required) - Math.min(base[0], required),
-        (base[1] - best[1]) / 20, (base[2] - best[2]) / 20, (best[3] - base[3]) / 3,
-      ], FIELDS.context.offset + CHANNELS.context.indexOf("top_gain_pseq"));
+    if (toAct && phase === 1) {
+      hand.forEach((copies, face) => {
+        if (!copies || !values[FIELDS.legal.offset + 2 + face]) return;
+        const after = [...hand];
+        after[face]--;
+        const packed = disjointPack(after, joker, required);
+        values.set([
+          Math.min(packed[0], required) - Math.min(base[0], required),
+          (base[2] - packed[2]) / 10, (packed[3] - base[3]) / 3,
+        ], face * CHANNELS.card.length + 19);
+      });
+    }
+    if (toAct && phase === 0 && values[FIELDS.legal.offset + 1]) {
+      const plus = [...hand];
+      plus[top]++;
+      let best = null;
+      let bestKey = null;
+      plus.forEach((copies, face) => {
+        if (!copies || face === top) return;
+        plus[face]--;
+        const packed = disjointPack(plus, joker, required);
+        plus[face]++;
+        const key = [Math.min(packed[0], required), -packed[2], packed[3], -packed[1]];
+        const firstDifference = bestKey === null ? 0 : key.findIndex((value, i) => value !== bestKey[i]);
+        if (bestKey === null || firstDifference >= 0 && key[firstDifference] > bestKey[firstDifference]) {
+          best = packed; bestKey = key;
+        }
+      });
+      if (best !== null) values.set([
+        Math.min(best[0], required) - Math.min(base[0], required), (base[2] - best[2]) / 20,
+      ], FIELDS.context.offset + 20);
     }
   }
   values[FIELDS.top.offset] = top;
@@ -520,9 +492,7 @@ function forwardBuffers(width) {
   return {
     cards: new Float32Array(NUM_FACES * width),
     normalized: new Float32Array(NUM_FACES * width),
-    projected: new Float32Array(NUM_FACES * width * 5),
-    sequence: new Float32Array(4 * 14 * width),
-    gated: new Float32Array(NUM_FACES * width * 2),
+    projected: new Float32Array(NUM_FACES * width * 3),
     ranks: new Float32Array(13 * width),
     rankContext: new Float32Array(13 * width),
     suits: new Float32Array(4 * width),
@@ -540,7 +510,7 @@ function forwardBuffers(width) {
 function forward(w, spec, features, buffers) {
   const { width, blocks } = spec;
   const {
-    cards, normalized, projected, sequence, gated, ranks, rankContext, suits, suitContext,
+    cards, normalized, projected, ranks, rankContext, suits, suitContext,
     table, normalizedTable, tableContext, tableInput, tableHidden, zero, advantage,
   } = buffers;
   linear(w, "card_embed", features, CHANNELS.card.length, cards, width, NUM_FACES);
@@ -549,7 +519,7 @@ function forward(w, spec, features, buffers) {
     const prefix = `blocks.${block}.`;
     layerNorm(w, `${prefix}card_norm`, cards, normalized, width, NUM_FACES);
     layerNorm(w, `${prefix}table_norm`, table, normalizedTable, width);
-    linear(w, `${prefix}w_seq`, normalized, width, projected, width * 5, NUM_FACES);
+    linear(w, `${prefix}w_seq`, normalized, width, projected, width * 3, NUM_FACES);
     suitMeans(normalized, ranks, width);
     linear(w, `${prefix}w_rank_set`, ranks, width, rankContext, width, 13);
     for (let suit = 0; suit < 4; suit += 1) {
@@ -561,43 +531,23 @@ function forward(w, spec, features, buffers) {
     }
     linear(w, `${prefix}w_suit_run`, suits, width, suitContext, width, 4);
     linear(w, `${prefix}w_table`, normalizedTable, width, tableContext, width);
-    for (let suit = 0; suit < 4; suit += 1) {
-      for (let position = 0; position < 14; position += 1) {
-        const face = suit * 13 + position % 13;
-        for (let d = 0; d < width; d += 1) {
-          let value = projected[face * width * 5 + width * 2 + d];
-          if (position > 0) value = Math.fround(value +
-            projected[(suit * 13 + position - 1) * width * 5 + width + d]);
-          if (position < 13) value = Math.fround(value +
-            projected[(suit * 13 + (position + 1) % 13) * width * 5 + width * 3 + d]);
-          if (position > 1) value = Math.fround(value +
-            projected[(suit * 13 + position - 2) * width * 5 + d]);
-          if (position < 12) value = Math.fround(value +
-            projected[(suit * 13 + (position + 2) % 13) * width * 5 + width * 4 + d]);
-          sequence[(suit * 14 + position) * width + d] = value;
-        }
-      }
-    }
     for (let face = 0; face < NUM_FACES; face += 1) {
       const suit = Math.floor(face / 13);
       const rank = face % 13;
+      const self = face * width * 3;
+      const left = (suit * 13 + (rank + 12) % 13) * width * 3 + width;
+      const right = (suit * 13 + (rank + 1) % 13) * width * 3 + width * 2;
       for (let d = 0; d < width; d += 1) {
-        const seq = rank === 0 ? Math.fround(
-          sequence[suit * 14 * width + d] + sequence[(suit * 14 + 13) * width + d],
-        ) * 0.5 : sequence[(suit * 14 + rank) * width + d];
+        const sequence = rank === 0 ?
+          Math.fround(Math.fround(projected[self + d] + projected[right + d]) +
+            Math.fround(projected[self + d] + projected[left + d])) * 0.5 :
+          Math.fround(Math.fround(projected[self + d] + projected[left + d]) + projected[right + d]);
         normalized[face * width + d] = Math.fround(Math.fround(
-          seq + rankContext[rank * width + d],
+          sequence + rankContext[rank * width + d],
         ) + suitContext[suit * width + d]) + tableContext[d];
       }
     }
-    linear(w, `${prefix}card_ffn`, normalized, width, gated, width * 2, NUM_FACES);
-    for (let face = 0; face < NUM_FACES; face += 1) {
-      for (let d = 0; d < width; d += 1) {
-        const at = face * width * 2 + d;
-        const a = gated[at];
-        normalized[face * width + d] = Math.fround(a / (1 + Math.exp(-a))) * gated[at + width];
-      }
-    }
+    silu(normalized);
     linear(w, `${prefix}card_out`, normalized, width, cards, width, NUM_FACES, 0, 0, true);
     layerNorm(w, `${prefix}card_norm`, cards, normalized, width, NUM_FACES);
     tableInput.set(normalizedTable);
@@ -662,32 +612,9 @@ function linear(w, name, input, cols, output, outputs, rows = 1, inputOffset = 0
   const weight = w[`${name}.weight`];
   const bias = w[`${name}.bias`];
   for (let row = 0; row < rows; row += 1) {
-    const inputAt = inputOffset + row * cols;
-    let r = 0;
-    for (; r + 3 < outputs; r += 4) {
-      const wa = r * cols, wb = wa + cols, wc = wb + cols, wd = wc + cols;
-      let a = 0, b = 0, c = 0, d = 0;
-      for (let column = 0; column < cols; column += 1) {
-        const value = input[inputAt + column];
-        a += weight[wa + column] * value;
-        b += weight[wb + column] * value;
-        c += weight[wc + column] * value;
-        d += weight[wd + column] * value;
-      }
-      const at = outputOffset + row * outputs + r;
-      a = Math.fround(a + (bias === undefined ? 0 : bias[r]));
-      b = Math.fround(b + (bias === undefined ? 0 : bias[r + 1]));
-      c = Math.fround(c + (bias === undefined ? 0 : bias[r + 2]));
-      d = Math.fround(d + (bias === undefined ? 0 : bias[r + 3]));
-      output[at] = residual ? output[at] + a : a;
-      output[at + 1] = residual ? output[at + 1] + b : b;
-      output[at + 2] = residual ? output[at + 2] + c : c;
-      output[at + 3] = residual ? output[at + 3] + d : d;
-    }
-    for (; r < outputs; r += 1) {
-      const weightAt = r * cols;
+    for (let r = 0; r < outputs; r += 1) {
       let sum = 0;
-      for (let column = 0; column < cols; column += 1) sum += weight[weightAt + column] * input[inputAt + column];
+      for (let c = 0; c < cols; c += 1) sum += weight[r * cols + c] * input[inputOffset + row * cols + c];
       const value = Math.fround(sum + (bias === undefined ? 0 : bias[r]));
       const at = outputOffset + row * outputs + r;
       output[at] = residual ? output[at] + value : value;

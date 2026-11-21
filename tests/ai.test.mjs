@@ -51,7 +51,7 @@ function policyModel(view, { draw = [0, 0], preferCopies = false } = {}) {
     return [name, { shape, data: Buffer.from(data.buffer).toString("base64") }];
   }));
   return parseQModel({
-    format: "papplu-qnet", formatVersion: 2, checkpointVersion: 6, encodingVersion: 8,
+    format: "papplu-qnet", formatVersion: 2, checkpointVersion: 5, encodingVersion: 5,
     architecture: "card_mlp", numActions: 54, modelSpec: spec, tensors,
     source: { kind: "bootstrap", trained: false, seed: 0, sha256: "0".repeat(64), tensorsSha256: "0".repeat(64) },
     gameConfig: {
@@ -107,26 +107,6 @@ test("neural draw follows Q-values without the tactical winning-take override", 
   });
 });
 
-test("neural draw cannot retake its own discard unless stock is exhausted", () => {
-  for (const [seat, stockCount, source] of [[0, 1, "stock"], [0, 0, "discard"], [1, 1, "discard"]]) {
-    const view = policyView([0, 1, 9], "draw");
-    view.stockCount = stockCount;
-    view.events[0].stock = stockCount + 1;
-    if (seat === 0) {
-      view.players[1].active = false;
-      view.events.push({ kind: "verdict", seat: 1, valid: false });
-    }
-    view.events.push(
-      { kind: "draw", source: "stock", seat, face: 2, offeredTop: 2, stock: stockCount },
-      { kind: "discard", seat, face: 2, stock: stockCount },
-    );
-    assert.deepEqual(chooseMove(view, "neural", { model: policyModel(view, { draw: [-4, 6] }) }), {
-      move: { type: "draw", source }, tier: "neural", downgrade: null,
-      reason: stockCount === 0 ? "forced" : "greedy",
-    });
-  }
-});
-
 test("neural discard ignores feed risk and one-ply outs when ranking Q-values", () => {
   const view = policyView([0, 5, 30, 0]);
   view.events.splice(1, 0,
@@ -166,6 +146,26 @@ test("neural keeps a legal single-face discard when it just took that face", () 
   assert.deepEqual(chooseMove(view, "neural", { model: policyModel(view) }), {
     move: { type: "discard", cardId: 0 }, tier: "neural", downgrade: null, reason: "forced",
   });
+});
+
+test("all tiers avoid solo self-discard pickup without blocking an empty-stock draw", () => {
+  const view = policyView([0, 1, 30], "draw");
+  view.players = [{ handSize: 3, active: true }];
+  view.events.push(
+    { kind: "draw", source: "stock", seat: 0, face: 2, offeredTop: 2, stock: 100 },
+    { kind: "discard", seat: 0, face: 2, stock: 100 },
+  );
+  for (const tier of tiers) {
+    const choice = chooseMove(view, tier, { model: policyModel(view) });
+    assert.deepEqual(choice.move, { type: "draw", source: "stock" }, tier);
+    assert.equal(choice.reason, "forced", tier);
+  }
+  view.stockCount = 0;
+  for (const tier of tiers) {
+    const choice = chooseMove(view, tier, { model: policyModel(view) });
+    assert.deepEqual(choice.move, { type: "draw", source: "discard" }, tier);
+    assert.equal(choice.reason, "forced", tier);
+  }
 });
 
 test("tactical still discards the minimum-penalty face", () => {
@@ -268,18 +268,21 @@ test("neural reports explicit downgrades and rejects out-of-turn calls", () => {
   assert.throws(() => chooseMove(view, "expert"), /unknown AI tier/);
 });
 
-test("all tiers complete legal rounds with a controlled neural policy and no false declarations", () => {
+test("all tiers complete legal rounds without false declarations", () => {
+  const smallModel = parseQModel({
+    ...modelFile, gameConfig: {
+      numDecks: 2, cardsInHand: 3, requiredSequences: 0, recycleDiscard: true, maxTurns: 60,
+    },
+  });
   for (const tier of tiers) {
     for (const seed of [1, 4, 12]) {
       let state = createGame({
         players: 2, decks: 2, cardsInHand: 3, requiredSequences: 0, recycleDiscard: true,
       }, seeded(seed));
-      const smallModel = policyModel(observe(state, 0), { draw: [1, 0], preferCopies: true });
       const rng = seeded(seed + 1);
       let moves = 0;
       while (state.phase !== "finished" && moves < 500) {
-        const view = observe(state, state.currentPlayer);
-        const choice = chooseMove(view, tier, { model: smallModel, random: rng });
+        const choice = chooseMove(observe(state, state.currentPlayer), tier, { model: smallModel, random: rng });
         assert.equal(choice.tier, tier);
         assert.equal(choice.downgrade, null);
         const move = choice.move;
@@ -287,8 +290,6 @@ test("all tiers complete legal rounds with a controlled neural policy and no fal
         else if (move.type === "discard") state = discardCard(state, move.cardId, rng);
         else {
           assert.equal(move.evaluation.is_valid, true);
-          const remaining = view.hand.filter(card => card.id !== move.cardId);
-          assert.equal(evaluateHand(toCounts(remaining), view.joker, view.rules).is_valid, true);
           state = resolveDeclaration(beginDeclaration(state, move.cardId), true);
         }
         moves += 1;

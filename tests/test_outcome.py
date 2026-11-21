@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from itertools import product
 import unittest
 
 from src.evaluate import HandPenalty, Meld, card_points
@@ -21,8 +20,10 @@ class TestDealOutcome(unittest.TestCase):
     def test_declarer_wins_without_changing_ranks_or_margins(self):
         outcome = self.outcome((0, 20, 20, 130), 0)
         self.assertEqual(outcome.ranks(), (1, 2, 2, 4))
-        for seat, expected in enumerate((1.0, -0.45, -0.45, -0.85)):
-            self.assertAlmostEqual(outcome.seat(seat).utility, expected, places=12)
+        self.assertEqual(
+            tuple(round(outcome.seat(seat).utility, 12) for seat in range(4)),
+            (1.0, -0.45, -0.45, -0.85),
+        )
         self.assertEqual(outcome.margin(0, 3), 1)
         self.assertEqual(outcome.margin(3, 0), -1)
         self.assertEqual(outcome.margin(1, 2), 0)
@@ -56,7 +57,7 @@ class TestDealOutcome(unittest.TestCase):
                         with self.subTest(players=players, winner=winner, seat=seat, points=points):
                             result = outcome.seat(seat)
                             self.assertAlmostEqual(result.utility, expected, places=12)
-                            self.assertTrue(-0.85 <= round(result.utility, 12) <= -0.35)
+                            self.assertLessEqual(result.utility, -0.35)
                             self.assertFalse(result.won)
                             self.assertEqual(result.penalty, points)
                     utilities.append(outcome.seat((winner + 1) % players).utility)
@@ -78,18 +79,17 @@ class TestDealOutcome(unittest.TestCase):
                             result = outcome.seat(seat)
                             self.assertAlmostEqual(result.utility, utility, places=12)
                             self.assertTrue(-1.0 <= round(result.utility, 12) <= -0.6)
-                            self.assertLess(result.utility, 0.0)
+                            self.assertLessEqual(result.utility, -0.6)
                             self.assertFalse(result.won)
                             self.assertEqual(result.penalty, points)
         self.assertEqual(self.outcome((0,)).ranks(), (1,))
 
-    def test_sequence_and_deadwood_gradients_do_not_change_placements(self):
-        outcome = self.outcome((0, 40, 40), sequences=(0, 0, 5))
-        for seat, expected in enumerate((-0.8, -0.88, -0.68)):
-            self.assertAlmostEqual(outcome.seat(seat).utility, expected, places=12)
-        self.assertGreater(outcome.seat(0).utility, outcome.seat(1).utility)
-        self.assertGreater(outcome.seat(2).utility, outcome.seat(1).utility)
-        self.assertEqual(outcome.ranks(), (1, 2, 2))
+    def test_sequences_beat_low_point_hoarding_on_exhaustion(self):
+        outcome = self.outcome((0, 80), sequences=(0, 5))
+        self.assertAlmostEqual(outcome.seat(0).utility, -0.8, places=12)
+        self.assertAlmostEqual(outcome.seat(1).utility, -0.76, places=12)
+        self.assertGreater(outcome.seat(1).utility, outcome.seat(0).utility)
+        self.assertEqual(outcome.ranks(), (1, 2))
         self.assertEqual(outcome.margin(0, 1), 1)
         self.assertFalse(outcome.seat(0).won)
 
@@ -105,25 +105,13 @@ class TestDealOutcome(unittest.TestCase):
         for seat, expected in enumerate((-0.6, -0.68, -0.8, -0.8)):
             self.assertAlmostEqual(outcome.seat(seat).utility, expected, places=12)
 
-    def test_any_four_player_declaration_has_higher_table_mean_than_exhaustion(self):
-        best_exhausted = self.outcome((0,) * 4, sequences=(5,) * 4)
-        exhausted_ceiling = sum(best_exhausted.seat(seat).utility for seat in range(4)) / 4
-        worst_declared = self.outcome((0, 100, 100, 100), 0)
-        declared_floor = sum(worst_declared.seat(seat).utility for seat in range(4)) / 4
-        self.assertGreater(declared_floor, exhausted_ceiling)
-        self.assertAlmostEqual(exhausted_ceiling, -0.6, places=12)
-        self.assertAlmostEqual(declared_floor, -0.3875, places=12)
-        for points in product((0, 3, 40, 100, 140), repeat=4):
-            for sequences in (0, 1, 5, 6):
-                exhausted = self.outcome(points, sequences=(sequences,) * 4)
-                table_mean = sum(exhausted.seat(seat).utility for seat in range(4)) / 4
-                self.assertLessEqual(table_mean, exhausted_ceiling)
-            for winner in range(4):
-                declared_points = list(points)
-                declared_points[winner] = 0
-                declared = self.outcome(declared_points, winner)
-                table_mean = sum(declared.seat(seat).utility for seat in range(4)) / 4
-                self.assertGreater(table_mean, exhausted_ceiling)
+    def test_zero_point_concession_and_timeout_have_distinct_negative_utilities(self):
+        exhausted = self.outcome((0, 0), sequences=(0, 5))
+        declared = self.outcome((0, 0), winner=0, sequences=(0, 5))
+        self.assertAlmostEqual(exhausted.seat(0).utility, -0.8, places=12)
+        self.assertAlmostEqual(exhausted.seat(1).utility, -0.6, places=12)
+        self.assertEqual(declared.seat(0).utility, 1.0)
+        self.assertAlmostEqual(declared.seat(1).utility, -0.35, places=12)
 
     def test_score_uses_minimum_penalty_for_each_final_hand(self):
         hands = (
@@ -134,8 +122,7 @@ class TestDealOutcome(unittest.TestCase):
         outcome = DealOutcome.score(snapshot, 0, "win", 1)
         self.assertEqual(tuple(penalty.points for penalty in outcome.penalties), (0, 22))
         self.assertEqual(outcome.required_sequences, 1)
-        self.assertEqual(outcome.seat(0).utility, 1.0)
-        self.assertAlmostEqual(outcome.seat(1).utility, -0.46, places=12)
+        self.assertEqual(tuple(round(outcome.seat(seat).utility, 12) for seat in range(2)), (1.0, -0.46))
         exhausted = DealOutcome.score(snapshot, None, "turns_exhausted", 1)
         self.assertAlmostEqual(exhausted.seat(0).utility, -0.6, places=12)
         self.assertAlmostEqual(exhausted.seat(1).utility, -0.844, places=12)

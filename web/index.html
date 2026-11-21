@@ -298,12 +298,9 @@
                 </label>
                 <p class="muted">Seat and rule changes apply at the next deal.</p>
                 <p class="model-note">
-                  Neural uses untrained CardMLP v6 bootstrap weights.
-                  The 80-wide model has three five-tap SwiGLU blocks, 342,804 parameters,
-                  and 854 observable inputs with encoding version 6.
-                  Checkpoint version 6 supports the pure self-play DMC trainer.
+                  Neural ranks legal moves with the included model.
                   Tactical uses exact deadwood scoring. Neural falls back to Tactical
-                  when its model is unavailable, the rules differ, or play is solo.
+                  when its model is unavailable or the rules differ.
                 </p>
                 <details class="rules-details">
                   <summary>House rules</summary>

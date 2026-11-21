@@ -231,8 +231,10 @@ function cardIdForFace(view, face) {
 }
 
 function legalActions(obs) {
+  const last = obs.history.at(-1);
+  const ownDiscard = obs.phase === 0 && last.kind === DISCARD && last.actor === 0 && obs.stockRemaining > 0;
   return obs.phase === 0 ?
-    [...(obs.stockRemaining > 0 ? [0] : []), ...(obs.discardPile.length ? [1] : [])] :
+    [...(obs.stockRemaining > 0 ? [0] : []), ...(obs.discardPile.length && !ownDiscard ? [1] : [])] :
     obs.hand.flatMap((copies, face) => copies > 0 ? [face + 2] : []);
 }
 
@@ -318,9 +320,7 @@ function casualPolicy(obs, random) {
 
 function neuralPolicy(obs, model) {
   const values = qValues(model, [obs])[0];
-  let actions = obs.phase === 0 ? legalActions(obs) : candidateFaces(obs, true).map(face => face + 2);
-  const last = obs.history.at(-1);
-  if (obs.phase === 0 && last?.actor === 0 && last.kind === DISCARD && obs.stockRemaining > 0) actions = [0];
+  const actions = obs.phase === 0 ? legalActions(obs) : candidateFaces(obs, true).map(face => face + 2);
   const action = actions.reduce((best, candidate) => values[candidate] > values[best] ? candidate : best, actions[0]);
   return { action, reason: "greedy" };
 }

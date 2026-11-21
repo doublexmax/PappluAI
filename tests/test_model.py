@@ -9,7 +9,7 @@ from unittest import mock
 from src.game.environment import GameConfig, PappluEnv, discard_action, legal_action_mask
 from src.game.information import EventKind
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.model.encoding import encode
+from src.model.encoding import _meld_membership, encode
 from src.model.spec import ModelSpec, ModelSpecError
 
 try:
@@ -20,7 +20,7 @@ except ImportError:
 if torch is not None:
     from src.evaluation.arena import CheckpointPolicy
     from src.model.network import (
-        CardBlock, QNetwork, checkpoint_payload, collate, collate_observations, greedy_actions,
+        QNetwork, checkpoint_payload, collate, collate_observations, greedy_actions,
         load_checkpoint, save_checkpoint,
     )
 
@@ -85,9 +85,9 @@ class TestCardNetwork(unittest.TestCase):
             torch.set_default_device("meta")
             batch = collate(features, self.device)
             self.assertEqual(batch.card.device.type, "cpu")
-            self.assertEqual(batch.card.shape, (2, 52, 25))
+            self.assertEqual(batch.card.shape, (2, 52, 22))
             self.assertEqual(batch.seat.shape, (2, 6, 9))
-            self.assertEqual(batch.context.shape, (2, 24))
+            self.assertEqual(batch.context.shape, (2, 22))
             torch.testing.assert_close(self.network(batch), expected, rtol=0, atol=0)
         finally:
             torch.set_default_device(previous)
@@ -241,8 +241,8 @@ class TestCardNetwork(unittest.TestCase):
             torch.testing.assert_close(self.values(obs), loaded(collate_observations([obs], self.device)), rtol=0, atol=0)
             payload = torch.load(path, weights_only=True)
             self.assertEqual(payload["architecture"], "card_mlp")
-            self.assertEqual(payload["checkpoint_version"], 6)
-            self.assertEqual(payload["encoding_version"], 8)
+            self.assertEqual(payload["checkpoint_version"], 5)
+            self.assertEqual(payload["encoding_version"], 5)
             self.assertEqual(payload["model_spec"], {"width": 32, "blocks": 3})
             self.assertNotIn("state_dim", payload)
 
@@ -250,11 +250,9 @@ class TestCardNetwork(unittest.TestCase):
         baseline = copy.deepcopy(self.network.state_dict())
         changes = [
             {"checkpoint_version": 1}, {"checkpoint_version": 2}, {"checkpoint_version": 3},
-            {"checkpoint_version": 4}, {"checkpoint_version": 5},
-            {"checkpoint_version": True}, {"checkpoint_version": 6.0},
+            {"checkpoint_version": 4}, {"checkpoint_version": True}, {"checkpoint_version": 5.0},
             {"encoding_version": 1}, {"encoding_version": 2}, {"encoding_version": 3},
-            {"encoding_version": 4}, {"encoding_version": 5}, {"encoding_version": 6},
-            {"encoding_version": 7}, {"encoding_version": 8.0},
+            {"encoding_version": 4}, {"encoding_version": 5.0},
             {"architecture": "mlp"}, {"architecture": "axial_table"}, {"state_dim": 164},
             {"model_spec": {"width": 32, "blocks": 2}}, {"num_actions": 12},
             {"model_spec": {"width": 64, "heads": 4, "blocks": 2}},
@@ -289,25 +287,77 @@ class TestCardNetwork(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "game_config"):
                 load_checkpoint(str(path), expected_config=GameConfig(max_turns=1))
 
-    def test_card_block_multiplies_the_silu_gate_by_the_second_projection(self):
-        block = CardBlock(8)
-        with torch.no_grad():
-            for parameter in block.parameters():
-                parameter.zero_()
-            block.card_ffn.bias[:8].fill_(1)
-            block.card_ffn.bias[8:].fill_(2)
-            block.card_out.weight[0, 0] = 1
-        cards, table = block(torch.zeros(1, 4, 13, 8), torch.zeros(1, 8))
-        torch.testing.assert_close(cards[..., 0], torch.full((1, 4, 13), 1.4621172), rtol=0, atol=1e-7)
-        torch.testing.assert_close(cards[..., 1:], torch.zeros(1, 4, 13, 7), rtol=0, atol=0)
-        torch.testing.assert_close(table, torch.zeros(1, 8), rtol=0, atol=0)
+    def assert_meld_parity(self, observations):
+        batch = collate_observations(observations, self.device)
+        cards = batch.card[:, :, 13:18].reshape(len(observations), 4, 13, 5)
+        context = batch.context[:, 17:18]
+        self.assertEqual(cards.shape, (len(observations), 4, 13, 5))
+        self.assertEqual(context.shape, (len(observations), 1))
+        for idx, obs in enumerate(observations):
+            natural, pure, any_meld = _meld_membership(obs.hand, obs.joker)
+            expected, unavoidable = [], 0
+            for face, copies in enumerate(obs.hand):
+                suit, rank = divmod(face, 13)
+                neighbors = (1, 12) if rank == 0 else (11, 0) if rank == 12 else (rank - 1, rank + 1)
+                expected.append((
+                    sum(obs.hand[suit * 13 + neighbor] > 0 for neighbor in neighbors) / 2.0,
+                    sum(obs.hand[other * 13 + rank] > 0 for other in range(4) if other != suit) / 3.0,
+                    natural[face], pure[face], any_meld[face],
+                ))
+                pts = 0 if rank == obs.joker % 13 else (10 if rank == 0 or rank >= 10 else rank + 1)
+                unavoidable += copies * pts * (1 - any_meld[face])
+            torch.testing.assert_close(
+                cards[idx].reshape(52, 5), torch.tensor(expected, dtype=torch.float32),
+                rtol=0, atol=0,
+            )
+            self.assertAlmostEqual(
+                context[idx, 0].item(), unavoidable / (10.0 * obs.config.cards_in_hand), places=6,
+            )
+        return cards
 
-    def test_model_sizes_include_observable_and_disjoint_card_and_context_inputs(self):
-        for spec, count in ((ModelSpec(), 344244), (ModelSpec(128, 3), 870276)):
+    def test_encoded_meld_channels_match_membership_across_random_deals(self):
+        observations = []
+        for decks, hand_size, sequences in ((1, 3, 1), (2, 7, 2), (3, 21, 5), (6, 30, 10)):
+            env = PappluEnv(GameConfig(
+                num_decks=decks, cards_in_hand=hand_size, required_sequences=sequences,
+            ))
+            for seed in range(64):
+                observations.append(env.reset(seed))
+                observations.append(env.step(seed % 2))
+        self.assert_meld_parity(observations)
+
+    def test_encoded_meld_channels_handle_aces_papplus_wilds_and_physical_sets(self):
+        cases = (
+            ((0, 1, 2), 7, (0, 1, 2), (0, 1, 2), (0, 1, 2)),
+            ((11, 12, 0), 7, (0, 11, 12), (0, 11, 12), (0, 11, 12)),
+            ((12, 0, 1), 7, (), (), ()),
+            ((16, 17, 7), 7, (), (7, 16, 17), (7, 16, 17)),
+            ((16, 17, 33), 7, (), (), (16, 17, 33)),
+            ((32, 33, 34), 7, (32, 33, 34), (32, 33, 34), (32, 33, 34)),
+            ((5, 5, 5), 7, (), (5,), (5,)),
+            ((5, 18, 31, 44), 7, (), (), (5, 18, 31, 44)),
+            ((5, 5, 7), 7, (), (), ()),
+            ((7, 20, 33), 7, (), (), (7, 20, 33)),
+            ((7, 7, 7), 7, (), (7,), (7,)),
+            ((), 7, (), (), ()),
+        )
+        obs = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1)).reset(17)
+        observations = [replace(
+            obs, hand=tuple(cards.count(face) for face in range(52)), joker=joker,
+        ) for cards, joker, *_ in cases]
+        extras = self.assert_meld_parity(observations).reshape(len(cases), 52, 5)
+        for idx, (_, _, natural, pure, any_meld) in enumerate(cases):
+            for channel, expected in zip((2, 3, 4), (natural, pure, any_meld)):
+                self.assertEqual(
+                    tuple(face for face in range(52) if extras[idx, face, channel].item()), expected,
+                )
+
+    def test_model_sizes_include_disjoint_card_and_context_inputs(self):
+        for spec, count in ((ModelSpec(64, 2), 127172), (ModelSpec(128, 3), 673412)):
             network = QNetwork(spec)
             self.assertEqual(sum(p.numel() for p in network.parameters()), count)
-            self.assertEqual(network.policy.card_embed.in_features, 25)
-            self.assertEqual(network.policy.table_embed.in_features, 78)
+            self.assertEqual(network.policy.card_embed.in_features, 22)
+            self.assertEqual(network.policy.table_embed.in_features, 76)
             self.assertEqual(network(collate_observations([PappluEnv().reset(17)], self.device)).shape, (1, 54))
 
 

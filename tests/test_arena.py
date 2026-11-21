@@ -11,6 +11,7 @@ from unittest import mock
 from src.evaluation.arena import (
     CheckpointPolicy,
     EpsilonPolicy,
+    HeuristicPolicy,
     MatchInterrupted,
     MatchResult,
     RandomPolicy,
@@ -257,12 +258,45 @@ class TestArenaMatches(unittest.TestCase):
 
 
 class TestArenaPolicies(unittest.TestCase):
-    def test_model_resolver_supports_random_and_checkpoint_paths(self):
+    def test_heuristic_uses_cached_gains_to_take_sequences_and_discard_spares(self):
+        env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1))
+        obs = env.reset(17)
+        hand = tuple(int(face in (0, 1, 30)) for face in range(52))
+        helpful = replace(obs, hand=hand, joker=7, discard_pile=(2,))
+        unhelpful = replace(helpful, discard_pile=(45,))
+        discard = replace(
+            env.reset_warm_start(17), joker=7,
+            hand=tuple(int(face in (0, 1, 2, 9)) for face in range(52)),
+        )
+        features = [encode(row) for row in (helpful, unhelpful, discard)]
+        policy, rngs = HeuristicPolicy(), [random.Random(1) for _ in features]
+        with mock.patch("src.evaluation.arena.encode", side_effect=AssertionError("re-encoding")), mock.patch(
+            "src.evaluate.minimum_penalty", side_effect=AssertionError("backtracking"),
+        ):
+            self.assertEqual(policy.act_features(features, rngs), [1, 0, 11])
+        self.assertEqual(policy.act(helpful, rngs[0]), 1)
+        self.assertEqual(policy.act(replace(unhelpful, stock_remaining=0), rngs[0]), 1)
+        self.assertEqual(policy.act_features([], []), [])
+        with self.assertRaises(ValueError):
+            policy.act_features(features, [])
+
+    def test_heuristic_never_discards_the_just_taken_face(self):
+        env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1))
+        env.reset(17)
+        obs = env.step(1)
+        obs = replace(
+            obs, joker=7, hand=tuple(int(face in (0, 1, 2, 9)) for face in range(52)),
+            history=(*obs.history[:-1], replace(obs.history[-1], face=9)),
+        )
+        self.assertEqual(HeuristicPolicy().act(obs, random.Random(1)), 2)
+
+    def test_model_resolver_keeps_named_sparring_policies_and_checkpoint_paths(self):
         obs = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1)).reset(17)
         obs = replace(
             obs, joker=7, discard_pile=(2,),
             hand=tuple(int(face in (0, 1, 30)) for face in range(52)),
         )
+        self.assertEqual(resolve_policy("heuristic").act(obs, random.Random(1)), 1)
         self.assertEqual(resolve_policy("random").act(obs, random.Random(0)), 1)
         checkpoint = resolve_policy("unopened-model.pt")
         self.assertEqual(checkpoint.path, "unopened-model.pt")
@@ -276,16 +310,16 @@ class TestArenaPolicies(unittest.TestCase):
 
 
 class TestArenaCli(unittest.TestCase):
-    def test_cli_runs_random_against_random_without_a_checkpoint(self):
+    def test_cli_runs_heuristic_against_random_without_a_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = os.path.join(temporary, "matches.json")
             self.assertEqual(main([
-                "--model", "random", "--model", "random", "--games", "2",
+                "--model", "heuristic", "--model", "random", "--games", "2",
                 "--seed", "800", "--max-turns", "1", "--output", output,
             ]), 0)
             with open(output, encoding="utf-8") as handle:
                 report = json.load(handle)
-        self.assertEqual([agent["label"] for agent in report["agents"]], ["random", "random"])
+        self.assertEqual([agent["label"] for agent in report["agents"]], ["heuristic", "random"])
         self.assertEqual([game["seat_order"] for game in report["games"]], [[0, 1], [1, 0]])
         self.assertEqual([game["action_count"] for game in report["games"]], [4, 4])
 
@@ -367,29 +401,6 @@ class TestArenaCli(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class TestArenaCheckpoints(unittest.TestCase):
-    def test_per_row_epsilons_share_one_greedy_batch(self):
-        from src.model.network import QNetwork
-
-        torch.set_num_threads(1)
-        network = QNetwork()
-        with torch.no_grad():
-            for parameter in network.parameters():
-                parameter.zero_()
-            network.policy.draw_out.bias[0] = 1
-        feature = encode(PappluEnv().reset(17))
-        batches = []
-        hook = network.register_forward_pre_hook(lambda _network, args: batches.append(args[0].card.shape[0]))
-        try:
-            actions = EpsilonPolicy(network, 0.5).act_features(
-                [feature] * 4, [random.Random(0) for _ in range(4)], [0.0, 1.0, 0.0, 1.0],
-            )
-        finally:
-            hook.remove()
-        self.assertEqual(actions, [0, 1, 0, 1])
-        self.assertEqual(batches, [2])
-        with self.assertRaisesRegex(ValueError, "own epsilon"):
-            EpsilonPolicy(network, 0.5).act_features([feature], [random.Random(0)], [])
-
     def test_current_checkpoint_loads_lazily_in_eval_mode(self):
         from src.model.network import QNetwork, save_checkpoint
 
@@ -435,6 +446,9 @@ class TestArenaCheckpoints(unittest.TestCase):
             with self.subTest(epsilon=epsilon):
                 network = QNetwork()
                 network.train()
+                with torch.no_grad():
+                    for parameter in network.parameters():
+                        parameter.zero_()
                 env = MultiplayerEnv(
                     MatchConfig(
                         game=GameConfig(
@@ -447,14 +461,33 @@ class TestArenaCheckpoints(unittest.TestCase):
                     )
                 )
                 env.reset(seed=901)
-                action = EpsilonPolicy(network, epsilon).act(
+                policy = EpsilonPolicy(network, epsilon)
+                action = policy.act(
                     env.observe(),
                     random.Random(1),
                 )
+                self.assertEqual(action, 0)
+                self.assertEqual(policy.last_greedy, [epsilon == 0.0])
                 self.assertTrue(
                     legal_action_mask(env.observe())[action]
                 )
                 self.assertTrue(network.training)
+
+    def test_per_row_epsilon_flags_follow_the_exploration_branch_even_on_greedy_actions(self):
+        from src.model.network import QNetwork
+
+        network = QNetwork()
+        with torch.no_grad():
+            for parameter in network.parameters():
+                parameter.zero_()
+        feature = encode(PappluEnv().reset(17))
+        policy = EpsilonPolicy(network, 0.99)
+        actions = policy.act_features([feature] * 3, [random.Random(1), random.Random(1), random.Random(2)],
+                                     [0.0, 1.0, 0.5])
+        self.assertEqual(actions, [0, 0, 0])
+        self.assertEqual(policy.last_greedy, [True, False, True])
+        self.assertEqual(policy.act_features([], []), [])
+        self.assertEqual(policy.last_greedy, [])
 
 
 if __name__ == "__main__":

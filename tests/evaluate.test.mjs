@@ -137,6 +137,52 @@ test("penalty ties select a quota-meeting grouping even when unmatched cards cos
   }
 });
 
+test("lossless fast paths preserve exact ordered witnesses", () => {
+  const counts = (cards) => {
+    const hand = Array(52).fill(0);
+    for (const face of cards) hand[face] += 1;
+    return hand;
+  };
+  const sequence = (cards, represented = cards) => ({
+    kind: "sequence", cards, represented_cards: represented, is_pure: true,
+  });
+  const set = (cards, represented = cards) => ({
+    kind: "set", cards, represented_cards: represented, is_pure: false,
+  });
+  const cases = [
+    ["sets_below_quota", [1, 14, 27, 4, 17, 30], 2, false, 21, [], [1, 14, 27, 4, 17, 30]],
+    ["sets_zero_quota", [1, 14, 27, 4, 17, 30], 0, true, 0,
+      [set([1, 14, 27]), set([4, 17, 30])], []],
+    ["exact_joker_below_quota", [16, 17, 7], 2, false, 0,
+      [sequence([7, 16, 17], [15, 16, 17])], []],
+    ["natural_rank_joker_below_quota", [32, 33, 34], 2, false, 0,
+      [sequence([32, 33, 34])], []],
+    ["off_suit_substitute_below_quota", [16, 17, 33], 1, false, 9, [], [16, 17, 33]],
+    ["duplicate_triplets_below_quota", [30, 30, 30, 30, 30, 30], 3, false, 0,
+      [sequence([30, 30, 30]), sequence([30, 30, 30])], []],
+    ["ace_high", [24, 25, 13], 1, true, 0, [sequence([24, 25, 13])], []],
+    ["ace_no_wrap", [12, 0, 1], 0, false, 22, [], [12, 0, 1]],
+    ["wild_set", [6, 19, 33], 0, true, 0, [set([6, 19, 33], [6, 19, 32])], []],
+    ["unmeldable_leftover", [0, 1, 2, 3, 4, 51], 1, false, 10,
+      [sequence([0, 1, 2, 3, 4])], [51]],
+    ["two_exact_jokers", [16, 7, 7, 19, 20, 21], 2, true, 0,
+      [sequence([7, 7, 16], [14, 15, 16]), sequence([19, 20, 21])], []],
+  ];
+  for (const [name, cards, quota, valid, points, melds, leftover] of cases) {
+    const hand = Object.freeze(counts(cards));
+    const options = { requiredSequences: quota, cardsInHand: cards.length };
+    assert.deepEqual(evaluateHand(hand, 7, options), {
+      is_valid: valid, melds: valid ? melds : [],
+    }, name);
+    assert.deepEqual(minimumPenalty(hand, 7, options), {
+      points,
+      exempt_melds: melds,
+      counted_cards: counts(leftover),
+      qualifying_sequences: melds.filter((meld) => meld.is_pure).length,
+    }, name);
+  }
+});
+
 test("Python winning_discard fixtures select the first face whose remainder declares", () => {
   let checked = 0;
   for (const entry of fixture.cases) {

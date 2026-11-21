@@ -63,10 +63,9 @@ def tensor_shapes(spec=ModelSpec()):
         prefix = "blocks.%d." % block
         layer(prefix + "card_norm", width)
         layer(prefix + "table_norm", width)
-        layer(prefix + "w_seq", width * 5, width, bias=False)
+        layer(prefix + "w_seq", width * 3, width)
         for name in ("w_rank_set", "w_suit_run", "w_table"):
             layer(prefix + name, width, width, bias=False)
-        layer(prefix + "card_ffn", width * 2, width)
         layer(prefix + "card_out", width, width)
         layer(prefix + "table_fc1", width, width * 3)
         layer(prefix + "table_fc2", width, width)
@@ -215,25 +214,18 @@ def reference_q(layers, features, spec=ModelSpec()):
             track = normalized[suit * 13:(suit + 1) * 13]
             projected = [linear(layers, prefix + "w_seq", row) for row in track + track[:1]]
             seq14 = [add(
-                row[width * 2:width * 3],
+                row[:width],
                 projected[position - 1][width:width * 2] if position > 0 else zeros,
-                projected[position + 1][width * 3:width * 4] if position < 13 else zeros,
-                projected[position - 2][:width] if position > 1 else zeros,
-                projected[position + 2][width * 4:] if position < 12 else zeros,
+                projected[position + 1][width * 2:] if position < 13 else zeros,
             ) for position, row in enumerate(projected)]
             sequence.extend([[0.5 * (a + b) for a, b in zip(seq14[0], seq14[13])], *seq14[1:13]])
             suit_context.append(linear(layers, prefix + "w_suit_run",
                                        [math.fsum(column) / 13.0 for column in zip(*track)]))
         rank_context = [linear(layers, prefix + "w_rank_set", row) for row in suit_means(normalized)]
         table_context = linear(layers, prefix + "w_table", normalized_table)
-        updated = []
-        for face, card in enumerate(cards):
-            gated = linear(layers, prefix + "card_ffn", add(
-                sequence[face], rank_context[face % 13], suit_context[face // 13], table_context,
-            ))
-            activated = [a * b for a, b in zip(silu(gated[:width]), gated[width:])]
-            updated.append(add(card, linear(layers, prefix + "card_out", activated)))
-        cards = updated
+        cards = [add(card, linear(layers, prefix + "card_out", silu(add(
+            sequence[face], rank_context[face % 13], suit_context[face // 13], table_context,
+        )))) for face, card in enumerate(cards)]
         pooled = list(zip(*[layer_norm(layers, prefix + "card_norm", card) for card in cards]))
         table_input = normalized_table + [math.fsum(column) / NUM_FACES for column in pooled] + [
             max(column) for column in pooled
@@ -389,7 +381,7 @@ def export_checkpoint(args, observations, features, golden):
     tensors = {"policy." + name: value.detach().cpu().float().reshape(-1).tolist()
                for name, value in network.policy.state_dict().items()}
     if [("policy." + name, tuple(value.shape)) for name, value in network.policy.state_dict().items()] != list(tensor_shapes(spec)):
-        raise SystemExit("policy tensors do not match the card_mlp export schema")
+        raise SystemExit("policy tensors do not match the card_mlp v5 export schema")
     layers = reference_layers(tensors, spec)
     with torch.inference_mode():
         batch = collate(features, torch.device("cpu"))
@@ -411,7 +403,7 @@ def write_json(path, document):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Export card_mlp policy weights with v8 encoding for web/qnet.mjs.")
+    parser = argparse.ArgumentParser(description="Export card_mlp v5 policy weights for web/qnet.mjs.")
     weights = parser.add_mutually_exclusive_group()
     weights.add_argument("--checkpoint", type=Path, help="export this .pt checkpoint (needs torch)")
     weights.add_argument("--bootstrap", action="store_true", help="seeded untrained weights without torch, the default")

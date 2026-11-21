@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import itertools
 import unittest
+from enum import IntEnum
 
 from src.evaluate import (
     NUM_FACES,
     HandEvaluation,
+    HandPenalty,
     Meld,
     evaluate_hand,
     hand_reward,
     is_valid_hand,
+    minimum_penalty,
 )
 
 
@@ -223,6 +226,61 @@ class TestEvaluateValid(unittest.TestCase):
                     ),
                     expected,
                 )
+
+    def test_fast_paths_preserve_exact_witnesses(self):
+        cases = (
+            ("sets_below_quota", [1, 14, 27, 4, 17, 30], 2, False, 21, (), [1, 14, 27, 4, 17, 30]),
+            ("sets_zero_quota", [1, 14, 27, 4, 17, 30], 0, True, 0, (
+                Meld("set", (1, 14, 27), (1, 14, 27), False),
+                Meld("set", (4, 17, 30), (4, 17, 30), False),
+            ), []),
+            ("exact_joker_below_quota", [16, 17, 7], 2, False, 0, (
+                Meld("sequence", (7, 16, 17), (15, 16, 17), True),
+            ), []),
+            ("natural_rank_joker_below_quota", [32, 33, 34], 2, False, 0, (
+                Meld("sequence", (32, 33, 34), (32, 33, 34), True),
+            ), []),
+            ("off_suit_substitute_below_quota", [16, 17, 33], 1, False, 9, (), [16, 17, 33]),
+            ("duplicate_triplets_below_quota", [30] * 6, 3, False, 0, (
+                Meld("sequence", (30, 30, 30), (30, 30, 30), True),
+                Meld("sequence", (30, 30, 30), (30, 30, 30), True),
+            ), []),
+            ("ace_high", [24, 25, 13], 1, True, 0, (
+                Meld("sequence", (24, 25, 13), (24, 25, 13), True),
+            ), []),
+            ("ace_no_wrap", [12, 0, 1], 0, False, 22, (), [12, 0, 1]),
+            ("wild_set", [6, 19, 33], 0, True, 0, (
+                Meld("set", (6, 19, 33), (6, 19, 32), False),
+            ), []),
+            ("unmeldable_leftover", [0, 1, 2, 3, 4, 51], 1, False, 10, (
+                Meld("sequence", (0, 1, 2, 3, 4), (0, 1, 2, 3, 4), True),
+            ), [51]),
+            ("two_exact_jokers", [16, 7, 7, 19, 20, 21], 2, True, 0, (
+                Meld("sequence", (7, 7, 16), (14, 15, 16), True),
+                Meld("sequence", (19, 20, 21), (19, 20, 21), True),
+            ), []),
+        )
+        for name, cards, quota, valid, points, melds, leftover in cases:
+            with self.subTest(name=name):
+                hand = tuple(from_cards(cards))
+                self.assertEqual(
+                    evaluate_hand(hand, JOKER_8S, quota, len(cards)),
+                    HandEvaluation(valid, melds if valid else ()),
+                )
+                self.assertEqual(
+                    minimum_penalty(hand, JOKER_8S, quota),
+                    HandPenalty(points, melds, tuple(from_cards(leftover))),
+                )
+
+    def test_integral_subclass_counts_keep_exact_witnesses(self):
+        class Count(IntEnum):
+            ZERO = 0
+            ONE = 1
+
+        hand = tuple(Count(value) for value in from_cards([0, 1, 2]))
+        melds = (Meld("sequence", (0, 1, 2), (0, 1, 2), True),)
+        self.assertEqual(evaluate_hand(hand, JOKER_8S, 1, 3), HandEvaluation(True, melds))
+        self.assertEqual(minimum_penalty(hand, JOKER_8S, 2), HandPenalty(0, melds, (0,) * 52))
 
     def test_defaults_match_21_and_5(self):
         hand = classic_valid_21()

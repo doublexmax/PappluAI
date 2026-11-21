@@ -53,21 +53,21 @@ runpy.run_path('tools/weights_export.py', run_name='__main__')
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             document = json.loads(model.read_text())
             fixture = json.loads(golden.read_text())
-            self.assertEqual(document["checkpointVersion"], 6)
-            self.assertEqual(document["encodingVersion"], 8)
+            self.assertEqual(document["checkpointVersion"], 5)
+            self.assertEqual(document["encodingVersion"], 5)
             self.assertEqual(document["architecture"], "card_mlp")
-            self.assertEqual(document["modelSpec"], {"width": 80, "blocks": 3})
+            self.assertEqual(document["modelSpec"], {"width": 128, "blocks": 3})
             self.assertEqual(document["source"]["kind"], "bootstrap")
             self.assertEqual(fixture["oracle"], "python-reference")
             self.assertEqual(len(fixture["cases"]), 15)
             self.assertTrue(all(name.startswith("policy.") for name in document["tensors"]))
             self.assertEqual(document["source"]["tensorsSha256"], fixture["tensorsSha256"])
-            self.assertEqual(len(fixture["cases"][0]["features"]), 1433)
+            self.assertEqual(len(fixture["cases"][0]["features"]), 1275)
             self.assertEqual(fixture["featureLayout"], [
-                ["card", [52, 25]], ["seat", [6, 9]], ["context", [24]], ["legal", [54]], ["top", [1]],
+                ["card", [52, 22]], ["seat", [6, 9]], ["context", [22]], ["legal", [54]], ["top", [1]],
             ])
             self.assertEqual(
-                sum(len(base64.b64decode(entry["data"])) // 4 for entry in document["tensors"].values()), 344244,
+                sum(len(base64.b64decode(entry["data"])) // 4 for entry in document["tensors"].values()), 673412,
             )
 
     def test_legacy_heads_flag_is_rejected(self):
@@ -100,17 +100,28 @@ class TestReferenceExport(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "not sensitive to the card feature field"):
             require_sensitive(zero_tensors(), [feature], [{"q": [0.0] * 54}])
 
-    def test_observable_encoding_keeps_wild_counts_and_points_alongside_meld_flags(self):
+    def test_meld_channels_cover_ace_runs_exact_jokers_wilds_and_physical_sets(self):
         obs = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1)).reset(17)
-        hand = tuple((5, 5, 7, 20).count(face) for face in range(52))
-        features = unpack(encode(replace(obs, hand=hand, joker=7)))
-        card_rows = rows(features["card"], 25)
-        self.assertEqual(card_rows[5][1:4], (0.0, 1.0, 0.0))
-        self.assertEqual(card_rows[7][6:9], (1.0, 1.0, 0.0))
-        self.assertEqual(card_rows[20][6:9], (0.0, 1.0, 0.0))
-        self.assertAlmostEqual(features["context"][14], 1 / 3, places=7)
-        self.assertAlmostEqual(features["context"][15], 1 / 6, places=7)
-        self.assertAlmostEqual(features["context"][16], 0.12, places=7)
+        cases = (
+            ((0, 1, 2), (0, 1, 2), (0, 1, 2), (0, 1, 2), 0.0),
+            ((11, 12, 0), (0, 11, 12), (0, 11, 12), (0, 11, 12), 0.0),
+            ((12, 0, 1), (), (), (), 22 / 30),
+            ((16, 17, 7), (), (7, 16, 17), (7, 16, 17), 0.0),
+            ((16, 17, 33), (), (), (16, 17, 33), 0.0),
+            ((5, 5, 5), (), (5,), (5,), 0.0),
+            ((5, 18, 31), (), (), (5, 18, 31), 0.0),
+            ((5, 5, 7), (), (), (), 12 / 30),
+        )
+        for cards, natural, pure, any_meld, expected_deadwood in cases:
+            with self.subTest(cards=cards):
+                features = unpack(encode(replace(
+                    obs, hand=tuple(cards.count(face) for face in range(52)), joker=7,
+                )))
+                extra = [row[13:18] for row in rows(features["card"], 22)]
+                deadwood = features["context"][17]
+                for channel, expected in zip((2, 3, 4), (natural, pure, any_meld)):
+                    self.assertEqual(tuple(face for face, row in enumerate(extra) if row[channel]), expected)
+                self.assertAlmostEqual(deadwood, expected_deadwood, places=7)
 
     def test_removed_registry_source_is_rejected(self):
         result = subprocess.run(
@@ -138,7 +149,7 @@ console.log(JSON.stringify({
 """
         torch.set_num_threads(1)
         config = GameConfig(max_turns=60)
-        for spec in (ModelSpec(80, 3), ModelSpec(128, 3), ModelSpec(9, 1)):
+        for spec in (ModelSpec(64, 2), ModelSpec(128, 3), ModelSpec(9, 1)):
             with self.subTest(spec=spec), tempfile.TemporaryDirectory(dir=ROOT) as temporary:
                 torch.manual_seed(1729)
                 network = QNetwork(spec).eval()

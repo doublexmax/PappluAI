@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Mapping
 
-CHECKPOINT_VERSION = 6
+CHECKPOINT_VERSION = 5
 ARCHITECTURE = "card_mlp"
 
 
@@ -11,7 +11,7 @@ class ModelSpecError(ValueError):
 
 @dataclass(frozen=True)
 class ModelSpec:
-    width: int = 80
+    width: int = 128
     blocks: int = 3
 
     def __post_init__(self) -> None:
@@ -26,5 +26,5 @@ class ModelSpec:
     @staticmethod
     def from_dict(data: Mapping[str, object]) -> "ModelSpec":
         if not isinstance(data, Mapping) or set(data) != {"width", "blocks"}:
-            raise ModelSpecError("checkpoint model_spec must contain width and blocks for card_mlp")
+            raise ModelSpecError("checkpoint model_spec must contain width and blocks for card_mlp v5")
         return ModelSpec(**data)

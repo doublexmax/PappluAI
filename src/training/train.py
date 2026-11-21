@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from src.checkpoints.io import atomic_copy, atomic_write_json
 from src.checkpoints.tensor import atomic_torch_save, clone_model_state, validate_model_state
-from src.evaluation.arena import CheckpointPolicy, Deal, EpsilonPolicy, GreedyPolicy, RandomPolicy, run_matches
+from src.evaluation.arena import CheckpointPolicy, Deal, EpsilonPolicy, GreedyPolicy, HeuristicPolicy, RandomPolicy, run_matches
 from src.evaluation.benchmark import evaluate_games
 from src.game.environment import GameConfig, PappluEnv
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
@@ -26,13 +26,14 @@ from src.model.network import ObservationBatch, QNetwork, checkpoint_payload, lo
 from src.model.spec import ModelSpec
 
 
-STATE_VERSION = 11
+STATE_VERSION = 12
 VALIDATION_SEED = 30_000_001
 
 
 class Step(NamedTuple):
     features: Features
     action: int
+    greedy: bool = True
 
 
 class Trajectory(NamedTuple):
@@ -49,17 +50,18 @@ class TrainConfig:
     recycle_discard: bool = True
     player_counts: tuple[int, ...] = (1, 2, 3, 4)
     round_episodes: int = 32
-    updates_per_episode: int = 1
+    updates_per_episode: int = 2
     batch_size: int = 256
     replay_capacity: int = 60_000
-    learning_rate: float = 3e-4
+    learning_rate: float = 4e-4
     lr_decay_updates: int = 20_000
     weight_decay: float = 1e-4
     gamma: float = 0.99
+    margin_weight: float = 0.35
     grad_clip: float = 1.0
     epsilons: tuple[float, ...] = (0.01, 0.02, 0.05)
     actors: int = 1
-    self_play_share: float = 0.25
+    self_play_share: float = 0.35
     max_pool: int = 8
     validate_every: int = 1_000
     validation_games: int = 64
@@ -79,21 +81,19 @@ class TrainConfig:
                 MatchConfig(game, count)
         for name, low in (
             ("round_episodes", 1), ("updates_per_episode", 0), ("batch_size", 1),
-            ("replay_capacity", 1), ("actors", 1),
+            ("replay_capacity", 1), ("lr_decay_updates", 0), ("actors", 1),
             ("max_pool", 1), ("validate_every", 1), ("validation_games", 0),
             ("checkpoint_every", 1), ("seed", 0), ("torch_threads", 1),
         ):
             if type(getattr(self, name)) is not int or getattr(self, name) < low:
                 raise ValueError("%s must be an integer >= %d" % (name, low))
-        if type(self.lr_decay_updates) is not int:
-            raise ValueError("lr_decay_updates must be an integer")
         if not isinstance(self.epsilons, (tuple, list)) or not self.epsilons or any(
             type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1
             for value in self.epsilons
         ):
             raise ValueError("epsilons must contain finite numbers in [0, 1]")
         object.__setattr__(self, "epsilons", tuple(float(value) for value in self.epsilons))
-        for name in ("learning_rate", "weight_decay", "gamma", "grad_clip", "self_play_share"):
+        for name in ("learning_rate", "weight_decay", "gamma", "margin_weight", "grad_clip", "self_play_share"):
             value = getattr(self, name)
             high = 1.0 if name in ("gamma", "self_play_share") else math.inf
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= high:
@@ -115,6 +115,7 @@ class Replay:
         self.features = torch.empty((capacity, FEATURE_SIZE), dtype=torch.float32, device="cpu")
         self.actions = torch.empty(capacity, dtype=torch.int64, device="cpu")
         self.returns = torch.empty(capacity, dtype=torch.float32, device="cpu")
+        self.greedy = torch.empty(capacity, dtype=torch.bool, device="cpu")
 
     def __len__(self) -> int:
         return self.size
@@ -132,9 +133,13 @@ class Replay:
              for offset in range(len(kept) - 1, -1, -1)],
             dtype=torch.float32, device="cpu",
         )
+        greedy = torch.tensor([step.greedy for step in kept], dtype=torch.bool, device="cpu")
         start = (self.cursor + length - len(kept)) % self.capacity
         first = min(len(kept), self.capacity - start)
-        for target, source in ((self.features, data.reshape(-1, FEATURE_SIZE)), (self.actions, actions), (self.returns, returns)):
+        for target, source in (
+            (self.features, data.reshape(-1, FEATURE_SIZE)), (self.actions, actions),
+            (self.returns, returns), (self.greedy, greedy),
+        ):
             target[start:start + first].copy_(source[:first])
             target[:len(kept) - first].copy_(source[first:])
         self.cursor = (self.cursor + length) % self.capacity
@@ -143,7 +148,7 @@ class Replay:
 
     def state_dict(self) -> dict:
         state = {"capacity": self.capacity, "gamma": self.gamma, "size": self.size, "cursor": self.cursor}
-        for name in ("features", "actions", "returns"):
+        for name in ("features", "actions", "returns", "greedy"):
             tensor = getattr(self, name)[:self.size]
             state[name] = zlib.compress(ctypes.string_at(tensor.data_ptr(), tensor.numel() * tensor.element_size()), level=1)
         return state
@@ -154,7 +159,7 @@ class Replay:
             raise ValueError("replay configuration mismatch")
         if type(size) is not int or not 0 <= size <= self.capacity or type(cursor) is not int or not 0 <= cursor < self.capacity:
             raise ValueError("invalid replay size or cursor")
-        for name in ("features", "actions", "returns"):
+        for name in ("features", "actions", "returns", "greedy"):
             target = getattr(self, name)[:size]
             try:
                 raw = bytearray(zlib.decompress(state[name]))
@@ -192,14 +197,13 @@ class Learner:
             raise ValueError("updates must be a nonnegative integer")
         if not len(self.replay) or not updates:
             return LearnStats()
-        cfg = self.config
         self.online.train()
-        total, count = 0.0, min(cfg.batch_size, len(self.replay))
+        total, count = 0.0, min(self.config.batch_size, len(self.replay))
         for _ in range(updates):
             learning_rate = max(
-                cfg.learning_rate * 0.15,
-                cfg.learning_rate / math.sqrt(1.0 + self.update_count / cfg.lr_decay_updates),
-            ) if cfg.lr_decay_updates > 0 else cfg.learning_rate
+                self.config.learning_rate * 0.15,
+                self.config.learning_rate / math.sqrt(1.0 + self.update_count / self.config.lr_decay_updates),
+            ) if self.config.lr_decay_updates else self.config.learning_rate
             for group in self.optimizer.param_groups:
                 group["lr"] = learning_rate
             idx = torch.tensor(self.rng.choices(range(len(self.replay)), k=count), dtype=torch.long, device="cpu")
@@ -211,9 +215,18 @@ class Learner:
             fields["top"] = fields["top"].squeeze(-1).long()
             actions = self.replay.actions[idx].to(self.device)
             targets = self.replay.returns[idx].to(self.device)
+            greedy = self.replay.greedy[idx].to(self.device)
             q_all = self.online(ObservationBatch(**fields))
             q_taken = q_all.gather(1, actions[:, None]).squeeze(1)
-            loss = F.smooth_l1_loss(q_taken, targets)
+            mc_loss = F.smooth_l1_loss(q_taken, targets)
+            if self.config.margin_weight > 0:
+                margin = torch.where(fields["legal"] > 0, 0.10, -1e9)
+                margin.scatter_(1, actions[:, None], 0.0)
+                win_mask = ((targets > 0) & greedy).to(q_all.dtype)
+                margin_loss = (((q_all + margin).amax(dim=1) - q_taken) * win_mask).sum() / win_mask.sum().clamp_min(1.0)
+                loss = mc_loss + self.config.margin_weight * margin_loss
+            else:
+                loss = mc_loss
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.online.parameters(), self.config.grad_clip, error_if_nonfinite=True)
@@ -249,7 +262,7 @@ def collect_round(
     config: TrainConfig, online: QNetwork, best_path: str, pool: Sequence[str], start: int, count: int,
 ) -> list[Trajectory]:
     learner = EpsilonPolicy(online, config.epsilons[0])
-    policies = [learner, CheckpointPolicy(best_path), RandomPolicy(),
+    policies = [learner, CheckpointPolicy(best_path), HeuristicPolicy(), RandomPolicy(),
                 *(CheckpointPolicy(path) for path in pool[-config.max_pool:])]
     rollouts, trajectories = [], []
     for episode in range(start, start + count):
@@ -257,19 +270,17 @@ def collect_round(
         seed = 2 * (config.seed * 10_000_000 + episode)
         rng = random.Random(seed ^ 0x9E3779B97F4A7C15)
         seats = [0] * players
-        record_seats = frozenset(range(players))
         if players > 1 and rng.random() >= config.self_play_share:
             seat = rng.randrange(players)
-            record_seats = frozenset((seat,))
             for other in range(players):
                 if other == seat:
                     continue
                 draw = rng.random()
                 seats[other] = (
-                    1 if draw < 0.55 else 2 if draw < 0.60
-                    else rng.randrange(3, len(policies)) if len(policies) > 3 else 1
+                    1 if draw < 0.45 else 2 if draw < 0.65 else 3 if draw < 0.70
+                    else rng.randrange(4, len(policies)) if len(policies) > 4 else 1
                 )
-        deal = Deal(seed, tuple(seats), players, record_seats)
+        deal = Deal(seed, tuple(seats), players, frozenset(range(players)))
         rngs = tuple(random.Random(seed ^ ((seat + 1) * 0x9E3779B97F4A7C15)) for seat in range(players))
         epsilons = tuple(seat_rng.choice(config.epsilons) if policy == 0 else 0.0
                          for policy, seat_rng in zip(seats, rngs))
@@ -291,11 +302,12 @@ def collect_round(
             rngs = [rollout.rngs[seat] for rollout, seat, _ in rows]
             if policy == 0:
                 actions = learner.act_features(features, rngs, [rollout.epsilons[seat] for rollout, seat, _ in rows])
+                greedy = learner.last_greedy
             else:
                 actions = policies[policy].act_features(features, rngs)
-            for (rollout, seat, feature), action in zip(rows, actions):
-                if seat in rollout.deal.record_seats:
-                    rollout.steps[seat].append(Step(feature, action))
+                greedy = [policy != 3] * len(rows)
+            for (rollout, seat, feature), action, was_greedy in zip(rows, actions, greedy):
+                rollout.steps[seat].append(Step(feature, action, was_greedy))
                 rollout.env.step(action)
     for rollout in rollouts:
         deal, env = rollout.deal, rollout.env
@@ -333,11 +345,6 @@ def _validation_job(job: tuple) -> tuple[str, float]:
     if players == 1:
         return key, sum(evaluate_games(online, cfg.game, len(deals), deals[0].seed, seed_stride=2).outcomes)
     results = run_matches(deals, [GreedyPolicy(online), opponent], cfg.game)
-    if key.endswith("_random"):
-        return key, sum(
-            1.0 for deal, result in zip(deals, results)
-            if result.outcome.winner == deal.seats.index(0)
-        )
     return key, sum(
         (1 + result.outcome.margin(deal.seats.index(0), other)) / 2
         for deal, result in zip(deals, results) for other in range(players) if deal.seats[other] != 0
@@ -411,43 +418,32 @@ class Trainer:
         cfg, online = self.config, self.learner.online.eval()
         if cfg.actors > 1 and self._executor is None:
             self._executor = ProcessPoolExecutor(max_workers=cfg.actors, initializer=_actor_init)
-        opponents = (
-            ("random", RandomPolicy()),
-            ("initial", CheckpointPolicy(str(self.root / "initial-model.pt"))),
-            ("best", CheckpointPolicy(str(self.root / "best-model.pt"))),
-        )
+        opponents = (("heuristic", HeuristicPolicy()), ("best", CheckpointPolicy(str(self.root / "best-model.pt"))))
         cases = [("solo", 1, None)] if 1 in cfg.player_counts else []
         cases += [("%dp_%s" % (players, name), players, path)
                   for players in cfg.player_counts if players > 1 for name, path in opponents]
-        jobs, denominators, state = [], {}, clone_model_state(online.state_dict())
+        jobs, state = [], clone_model_state(online.state_dict())
         for key, players, opponent in cases:
             seed = VALIDATION_SEED + (2 * players * cfg.validation_games if players > 1 else 0)
             deals = [Deal(seed + 2 * block, tuple(0 if s == seat else 1 for s in range(players)), players)
                      for block in range(cfg.validation_games) for seat in range(players)]
-            denominators[key] = len(deals) * (1 if key == "solo" or key.endswith("_random") else players - 1)
             jobs.extend((cfg, online.spec, state, key, opponent, deals[start:start + 8 * players])
                         for start in range(0, len(deals), 8 * players))
         results = list(map(_validation_job, jobs) if cfg.actors == 1 else self._executor.map(_validation_job, jobs))
         metrics = {key: sum(credit for name, credit in results if name == key)
-                   / denominators[key] for key, _, _ in cases}
+                   / (cfg.validation_games * players * max(1, players - 1)) for key, players, _ in cases}
         anchors = [value for key, value in metrics.items() if not key.endswith("_best")]
         score = sum(anchors) / len(anchors)
         best = [value for key, value in metrics.items() if key.endswith("_best")]
         if best:
             metrics["vs_best"] = sum(best) / len(best)
-        if self.best_score < 0:
-            promoted = True
-        elif cfg.player_counts == (1,):
-            promoted = score >= self.best_score
-        else:
-            promoted = (
-                metrics.get("vs_best", 0.0) >= 0.52
-                and metrics.get("solo", 1.0) >= self.validation.get("solo", 0.0) - 0.05
-            )
+        promoted = self.best_score < 0 or (
+            metrics.get("vs_best", 0) >= 0.51 and score >= self.best_score - 0.02
+        ) or (score > self.best_score + 0.02 and (not best or metrics["vs_best"] >= 0.49))
         if promoted:
-            self.best_score = max(self.best_score, score)
+            self.best_score = max(self.best_score, score) if best else score
             self.export_model(self.root / "best-model.pt")
-        if promoted or metrics.get("vs_best", 0.0) >= 0.48:
+        if promoted or metrics.get("vs_best", 0) >= 0.45:
             name = "opponents/%s-%012d.pt" % ("best" if promoted else "snap", self.episodes)
             if promoted:
                 atomic_copy(self.root / "best-model.pt", self.root / name)
@@ -477,8 +473,8 @@ class Trainer:
                     break
                 count = min(cfg.round_episodes, max_episodes - self.episodes) if max_episodes is not None else cfg.round_episodes
                 start = self.episodes
-                pool = [str(self.root / path) for path in self.snapshot_pool]
                 best_path = str(self.root / "best-model.pt")
+                pool = [str(self.root / path) for path in self.snapshot_pool]
                 if cfg.actors == 1:
                     trajectories = collect_round(cfg, self.learner.online, best_path, pool, start, count)
                 else:
