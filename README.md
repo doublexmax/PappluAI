@@ -239,22 +239,29 @@ Each learner seat draws one exploration rate per deal from `(0.01, 0.01, 0.03, 0
 Exploration does not depend on seat index or training progress.
 All active learner rows, including solo deals, share one neural forward batch.
 
-Replay stores contiguous float32 features, int64 actions, and float32 discounted returns.
-Replay retains the most recent 40,000 steps.
-For terminal utility `u`, step `t` of a length-`T` trajectory targets `u * 0.99 ** (T - 1 - t)`.
+Replay stores contiguous float32 features, int64 actions, and float32 returns.
+Replay retains the most recent 60,000 steps.
+For positive terminal utility `u`, step `t` of a length-`T` trajectory targets `u * 0.99 ** (T - 1 - t)`.
+For `u <= 0`, every step targets `u` without discounting.
+Earlier declarations earn larger positive returns.
+Delaying termination never reduces a penalty.
 AdamW fits selected-action Q-values with Smooth-L1 loss and gradient clipping.
-The default round holds 32 deals and schedules two updates per completed deal, with up to 256 replay samples per update.
-The learning rate starts at `5e-4` and decays with `lr / sqrt(1 + updates / 8000)`, with a floor of `7.5e-5`.
+The default round holds 32 deals and schedules one update per completed deal, with up to 256 replay samples per update.
+The learning rate starts at `5e-4` and decays with `lr / sqrt(1 + updates / 15000)`, with a floor of `7.5e-5`.
 There is no margin loss, scripted opponent, epsilon schedule, warm-start curriculum, target network, or registry.
 
 Solo and multiplayer use the same declaration-first utility.
 A valid declaration earns +1.
-Losing to a declaration earns `-0.5 - 0.5 * min(p, 100) / 100`, where `p` is the seat's penalty.
-Without a declaration, utility is `-0.5 + 0.4 * seq_frac - 0.3 * min(p, 100) / 100`.
+Losing to a declaration earns `-0.35 - 0.50 * min(p, 100) / 100`, where `p` is the seat's penalty.
+Without a declaration, utility is `-0.80 + 0.20 * seq_frac - 0.20 * min(p, 100) / 100`.
 `seq_frac` caps qualifying sequences at the required quota and equals 1 when no sequences are required.
-Exhaustion always earns negative utility, even for zero penalty.
+Declaration losses lie in `[-0.85, -0.35]`.
+Exhaustion lies in `[-1.00, -0.60]`.
+In a four-player table, any declaration averages at least `-0.3875`, while exhaustion averages at most `-0.60`.
 Validation compares against random play, the frozen initial model, and the reigning best checkpoint.
-The fixed-anchor score averages solo, random-opponent, and initial-opponent results.
+`Xp_random` measures valid learner declarations per deal, not placement credit for low deadwood.
+`Xp_initial` and `Xp_best` measure mean pairwise placement credit.
+The fixed-anchor score is the unweighted mean of solo declaration rate, `Xp_random`, and `Xp_initial` for the configured counts.
 
 Model checkpoints use version 6 and encoding version 6.
 Trainer state uses version 9.

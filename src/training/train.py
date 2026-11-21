@@ -49,11 +49,11 @@ class TrainConfig:
     recycle_discard: bool = True
     player_counts: tuple[int, ...] = (1, 2, 3, 4)
     round_episodes: int = 32
-    updates_per_episode: int = 2
+    updates_per_episode: int = 1
     batch_size: int = 256
-    replay_capacity: int = 40_000
+    replay_capacity: int = 60_000
     learning_rate: float = 5e-4
-    lr_decay_updates: int = 8_000
+    lr_decay_updates: int = 15_000
     weight_decay: float = 1e-4
     gamma: float = 0.99
     grad_clip: float = 1.0
@@ -128,7 +128,8 @@ class Replay:
         data = torch.frombuffer(bytearray().join(step.features.data for step in kept), dtype=torch.float32)
         actions = torch.tensor([step.action for step in kept], dtype=torch.int64, device="cpu")
         returns = torch.tensor(
-            [utility * self.gamma ** offset for offset in range(len(kept) - 1, -1, -1)],
+            [utility * self.gamma ** offset if utility > 0 else float(utility)
+             for offset in range(len(kept) - 1, -1, -1)],
             dtype=torch.float32, device="cpu",
         )
         start = (self.cursor + length - len(kept)) % self.capacity
@@ -324,6 +325,11 @@ def _validation_job(job: tuple) -> tuple[str, float]:
     if players == 1:
         return key, sum(evaluate_games(online, cfg.game, len(deals), deals[0].seed, seed_stride=2).outcomes)
     results = run_matches(deals, [GreedyPolicy(online), opponent], cfg.game)
+    if key.endswith("_random"):
+        return key, sum(
+            1.0 for deal, result in zip(deals, results)
+            if result.outcome.winner == deal.seats.index(0)
+        )
     return key, sum(
         (1 + result.outcome.margin(deal.seats.index(0), other)) / 2
         for deal, result in zip(deals, results) for other in range(players) if deal.seats[other] != 0
@@ -405,24 +411,25 @@ class Trainer:
         cases = [("solo", 1, None)] if 1 in cfg.player_counts else []
         cases += [("%dp_%s" % (players, name), players, path)
                   for players in cfg.player_counts if players > 1 for name, path in opponents]
-        jobs, state = [], clone_model_state(online.state_dict())
+        jobs, denominators, state = [], {}, clone_model_state(online.state_dict())
         for key, players, opponent in cases:
             seed = VALIDATION_SEED + (2 * players * cfg.validation_games if players > 1 else 0)
             deals = [Deal(seed + 2 * block, tuple(0 if s == seat else 1 for s in range(players)), players)
                      for block in range(cfg.validation_games) for seat in range(players)]
+            denominators[key] = len(deals) * (1 if key == "solo" or key.endswith("_random") else players - 1)
             jobs.extend((cfg, online.spec, state, key, opponent, deals[start:start + 8 * players])
                         for start in range(0, len(deals), 8 * players))
         results = list(map(_validation_job, jobs) if cfg.actors == 1 else self._executor.map(_validation_job, jobs))
         metrics = {key: sum(credit for name, credit in results if name == key)
-                   / (cfg.validation_games * players * max(1, players - 1)) for key, players, _ in cases}
+                   / denominators[key] for key, _, _ in cases}
         anchors = [value for key, value in metrics.items() if not key.endswith("_best")]
         score = sum(anchors) / len(anchors)
         best = [value for key, value in metrics.items() if key.endswith("_best")]
         if best:
             metrics["vs_best"] = sum(best) / len(best)
         promoted = self.best_score < 0 or (
-            metrics.get("vs_best", 0) > 0.51 and score >= self.best_score - 0.02
-        ) or (cfg.player_counts == (1,) and score >= self.best_score)
+            metrics.get("vs_best", 0) > 0.51 and score >= self.best_score - 0.03
+        ) or score > self.best_score + 0.03 or (cfg.player_counts == (1,) and score >= self.best_score)
         if promoted:
             self.best_score = max(self.best_score, score) if best else score
             self.export_model(self.root / "best-model.pt")

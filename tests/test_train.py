@@ -7,13 +7,16 @@ import random
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from src.cli._runtime import MissingTrainingDependency
 from src.cli.train import build_arg_parser, main
+from src.evaluate import HandPenalty
 from src.game.environment import GameConfig, PappluEnv
 from src.game.multiplayer import MultiplayerEnv
+from src.game.outcome import DealOutcome
 from src.model.encoding import unpack
 from src.model.spec import ModelSpec
 
@@ -24,9 +27,9 @@ except ImportError:
 
 if torch is not None:
     from concurrent.futures import ProcessPoolExecutor
-    from src.evaluation.arena import EpsilonPolicy
+    from src.evaluation.arena import Deal, EpsilonPolicy, RandomPolicy, run_matches
     from src.model.network import QNetwork, load_checkpoint, save_checkpoint
-    from src.training.train import TrainConfig, Trainer, collect_round
+    from src.training.train import TrainConfig, Trainer, _validation_job, collect_round
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,7 +111,7 @@ class TestSelfPlayTrainer(unittest.TestCase):
         self.assertEqual(Counter(round(unpack(t.steps[0].features)["context"][12] * 6) for t in opponents),
                          {1: 1, 2: 1, 3: 1, 4: 1})
         self.assertEqual([len(t.steps) for t in trajectories], [2] * 10)
-        self.assertTrue(all(-0.8 <= t.utility < 0 for t in [*trajectories, *opponents]))
+        self.assertTrue(all(-1.0 <= t.utility <= -0.6 for t in [*trajectories, *opponents]))
         self.assertEqual([unpack(t.steps[0].features)["context"][0] for t in trajectories], [1.0] * 10)
 
     def test_solo_and_multiplayer_deals_share_the_same_neural_forward_batch(self):
@@ -232,6 +235,89 @@ class TestSelfPlayTrainer(unittest.TestCase):
                 "solo", "2p_random", "2p_initial", "3p_random", "3p_initial",
             )) / 5)
 
+    def test_validation_jobs_count_only_rotated_declarations_against_random(self):
+        network = QNetwork(ModelSpec(9, 1))
+        config = TrainConfig(**self.overrides)
+        for players in (2, 3, 4):
+            deals, results = [], []
+            for index, (learner, winner) in enumerate(((0, 0), (1, None), (players - 1, players - 1), (players - 1, 0))):
+                deal = Deal(17 + 2 * index, tuple(0 if seat == learner else 1 for seat in range(players)), players)
+                points = [40] * players
+                points[learner] = 0 if winner in (None, learner) else 100
+                if winner is not None:
+                    points[winner] = 0
+                penalties = tuple(HandPenalty(point, (), (0,) * 52) for point in points)
+                deals.append(deal)
+                results.append(SimpleNamespace(outcome=DealOutcome(
+                    winner, "win" if winner is not None else "turns_exhausted", penalties,
+                )))
+            for opponent, expected in (("random", 2.0), ("initial", 3.0 * (players - 1)), ("best", 3.0 * (players - 1))):
+                key = "%dp_%s" % (players, opponent)
+                with self.subTest(key=key), mock.patch("src.training.train.run_matches", return_value=results):
+                    self.assertEqual(_validation_job((
+                        config, network.spec, network.state_dict(), key, RandomPolicy(), deals,
+                    )), (key, expected))
+
+    def test_validation_normalizes_random_wins_by_deals_across_chunks(self):
+        credit_per_deal = {
+            "solo": 0.25,
+            "2p_random": 0.5, "2p_initial": 0.75, "2p_best": 0.25,
+            "3p_random": 0.5, "3p_initial": 1.5, "3p_best": 0.5,
+            "4p_random": 0.5, "4p_initial": 2.25, "4p_best": 0.75,
+        }
+        with tempfile.TemporaryDirectory() as temporary, Trainer.open(Path(temporary), {
+            **self.overrides, "player_counts": (1, 2, 3, 4), "validation_games": 9,
+        }, initial=ModelSpec(9, 1)) as trainer:
+            with mock.patch("src.training.train._validation_job", side_effect=lambda job: (
+                job[3], len(job[5]) * credit_per_deal[job[3]],
+            )):
+                self.assertEqual(trainer.validate(), {
+                    "score": 4 / 7, "solo": 0.25,
+                    "2p_random": 0.5, "2p_initial": 0.75, "2p_best": 0.25,
+                    "3p_random": 0.5, "3p_initial": 0.75, "3p_best": 0.25,
+                    "4p_random": 0.5, "4p_initial": 0.75, "4p_best": 0.25,
+                    "vs_best": 0.25, "promoted": True,
+                })
+
+    def test_non_declaring_campers_score_zero_against_random_in_real_matches(self):
+        random_results = []
+
+        def capture(deals, policies, game):
+            results = run_matches(deals, policies, game)
+            if isinstance(policies[1], RandomPolicy):
+                random_results.extend(zip(deals, results))
+            return results
+
+        with tempfile.TemporaryDirectory() as temporary, Trainer.open(Path(temporary), {
+            **self.overrides, "player_counts": (1, 2, 3, 4), "validation_games": 2,
+        }, initial=ModelSpec(9, 1)) as trainer:
+            with mock.patch("src.game.environment.hand_reward", return_value=0.0), mock.patch(
+                "src.game.multiplayer.hand_reward", return_value=0.0,
+            ), mock.patch("src.training.train.run_matches", side_effect=capture):
+                result = trainer.validate()
+            self.assertEqual(tuple(result[key] for key in ("2p_random", "3p_random", "4p_random")), (0.0, 0.0, 0.0))
+            self.assertAlmostEqual(result["score"], 3 / 14)
+            self.assertTrue(all(match.outcome.winner is None for _, match in random_results))
+            self.assertTrue(any(
+                match.outcome.margin(deal.seats.index(0), other) > 0
+                for deal, match in random_results for other in range(deal.players) if deal.seats[other] != 0
+            ))
+
+    def test_fresh_run_uses_default_update_replay_and_decay_recipe(self):
+        overrides = {key: value for key, value in self.overrides.items()
+                     if key not in ("updates_per_episode", "replay_capacity")}
+        with tempfile.TemporaryDirectory() as temporary, Trainer.open(Path(temporary), {
+            **overrides, "validation_games": 0,
+        }, initial=ModelSpec(9, 1)) as trainer:
+            trainer.run(max_episodes=4)
+            self.assertEqual(trainer.learner.update_count, 4)
+            self.assertEqual(trainer.learner.replay.returns.shape, (60_000,))
+            self.assertAlmostEqual(
+                trainer.learner.optimizer.param_groups[0]["lr"],
+                5e-4 / (1 + 3 / 15_000) ** 0.5,
+                places=12,
+            )
+
     def test_stronger_model_replaces_reigning_best_after_real_head_to_head_games(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -271,11 +357,13 @@ class TestSelfPlayTrainer(unittest.TestCase):
     def test_promotion_thresholds_anchor_floor_and_fresh_snapshot_contents(self):
         cases = (
             (0.80, 0.50, False, "snap", 0.80),
-            (0.77, 0.52, False, "snap", 0.80),
+            (0.76, 0.52, False, "snap", 0.80),
+            (0.77, 0.52, True, "best", 0.80),
             (0.78, 0.51, False, "snap", 0.80),
             (0.78, 0.52, True, "best", 0.80),
             (0.82, 0.50, False, "snap", 0.80),
-            (0.83, 0.44, False, None, 0.80),
+            (0.80 + 0.03, 0.44, False, None, 0.80),
+            (0.84, 0.44, True, "best", 0.84),
             (0.79, 0.45, False, None, 0.80),
             (0.79, 0.46, False, "snap", 0.80),
             (0.85, 0.52, True, "best", 0.85),

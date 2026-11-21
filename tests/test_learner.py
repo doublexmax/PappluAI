@@ -29,11 +29,11 @@ class TestTensorReplay(unittest.TestCase):
     def test_ring_retains_latest_steps_and_precomputed_discounted_returns(self):
         replay = Replay(5, gamma=0.5)
         self.assertEqual(replay.append(self.trajectory((0, 1, 0, 1), -0.5)), 4)
-        self.assertEqual(replay.returns[:4].tolist(), [-0.0625, -0.125, -0.25, -0.5])
+        self.assertEqual(replay.returns[:4].tolist(), [-0.5, -0.5, -0.5, -0.5])
         replay.append(self.trajectory((1, 0, 1), 1.0))
         self.assertEqual((len(replay), replay.cursor), (5, 2))
         self.assertEqual(replay.actions.tolist(), [0, 1, 0, 1, 1])
-        self.assertEqual(replay.returns.tolist(), [0.5, 1.0, -0.25, -0.5, 0.25])
+        self.assertEqual(replay.returns.tolist(), [0.5, 1.0, -0.5, -0.5, 0.25])
         replay.append(self.trajectory((0,) * 8, 1.0))
         self.assertEqual((len(replay), replay.cursor), (5, 0))
         self.assertEqual(replay.returns.tolist(), [0.0625, 0.125, 0.25, 0.5, 1.0])
@@ -43,6 +43,29 @@ class TestTensorReplay(unittest.TestCase):
         self.assertEqual(replay.returns.dtype, torch.float32)
         self.assertTrue(replay.features.is_contiguous())
         self.assertEqual(replay.features[0].tolist(), list(feature_values(self.feature)))
+
+    def test_only_positive_returns_are_discounted(self):
+        for utility, expected in (
+            (1.0, [0.125, 0.25, 0.5, 1.0]),
+            (0.5, [0.0625, 0.125, 0.25, 0.5]),
+            (-0.5, [-0.5, -0.5, -0.5, -0.5]),
+            (0.0, [0.0, 0.0, 0.0, 0.0]),
+        ):
+            with self.subTest(utility=utility):
+                replay = Replay(4, gamma=0.5)
+                replay.append(self.trajectory((0, 1, 0, 1), utility))
+                self.assertEqual(replay.returns.tolist(), expected)
+
+    def test_timeout_penalties_are_constant_for_every_step_at_any_length(self):
+        for length in (1, 4, 120):
+            for utility in (-1.0, -0.22, 0.0):
+                with self.subTest(length=length, utility=utility):
+                    replay = Replay(length, gamma=0.99)
+                    replay.append(self.trajectory((0,) * length, utility))
+                    torch.testing.assert_close(
+                        replay.returns, torch.full((length,), utility, dtype=torch.float32),
+                        rtol=0, atol=0,
+                    )
 
     def test_compressed_raw_bytes_roundtrip_empty_partial_and_wrapped_replays(self):
         for count in (0, 2, 8):

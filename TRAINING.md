@@ -83,14 +83,17 @@ Use a new directory so the smoke cap does not carry into training.
 
 The defaults use three decks, 21 cards, five required pure sequences, and 60 turns per seat.
 The trainer cycles `--players 1 2 3 4`.
-It uses the single default `ModelSpec(80, 3)`, `gamma=0.99`, a 40,000-step replay, and batches of at most 256 steps.
-Each 32-deal round schedules two learner updates per completed deal. Use `--updates-per-episode` to change that count.
-Smooth-L1 fits the chosen action to its discounted terminal utility. There is no margin loss.
+It uses the single default `ModelSpec(80, 3)`, `gamma=0.99`, `replay_capacity=60_000`, and batches of at most 256 steps.
+Each 32-deal round schedules one learner update per completed deal, with `updates_per_episode=1`.
+Use `--updates-per-episode` to change that count.
+Smooth-L1 fits the chosen action to its terminal return. There is no margin loss.
+Positive utility targets `utility * gamma ** (T - 1 - t)` at step `t` of a length-`T` trajectory.
+Non-positive utility stays constant across every step, so delaying termination never weakens a penalty.
 Each learner seat draws a fixed exploration rate for its deal from `(0.01, 0.01, 0.03, 0.08)` using its own RNG.
 Seat index and training progress do not determine exploration.
 AdamW starts at `learning_rate=5e-4`.
 Before each update, the rate is `max(learning_rate * 0.15, learning_rate / sqrt(1 + updates / lr_decay_updates))`.
-`--lr-decay-updates` defaults to 8,000. A nonpositive value disables learning-rate decay.
+`--lr-decay-updates` defaults to 15,000. A nonpositive value disables learning-rate decay.
 
 Every deal starts cold.
 There are no solved-hand warm starts or curriculum stages.
@@ -104,8 +107,10 @@ The rollout batches all active learner seats together, including solo and multip
 No scripted bot or meld heuristic enters the encoder, rollout, or loss.
 
 Declaring earns +1.
-Losing to another declaration earns between -1 and -0.5 according to capped penalty points.
-Exhaustion earns between -0.8 and -0.1 according to qualifying sequences and capped penalty points.
+Losing to another declaration earns `-0.35 - 0.50 * min(p, 100) / 100`, between -0.85 and -0.35.
+Exhaustion earns `-0.80 + 0.20 * seq_frac - 0.20 * min(p, 100) / 100`, between -1.00 and -0.60.
+`p` is the seat's penalty, and `seq_frac` caps qualifying sequences at the required quota.
+When no sequences are required, `seq_frac` is 1.
 The same objective applies to solo and multiplayer. See the [utility formulas](README.md#dmc-learning).
 
 Continue the run with a larger absolute episode limit.
@@ -147,7 +152,7 @@ If the host has a CUDA-capable Torch installation, select the learner device.
 ```
 
 Rollout workers remain on CPU. Replay stays on CPU.
-The default replay allocates about 131 MiB before Python and optimizer overhead.
+The default replay allocates about 196 MiB before Python and optimizer overhead.
 Checkpoint compression reduces saved bytes, not the live replay allocation.
 Use `--replay-capacity` to set the memory budget when starting a run.
 
@@ -180,6 +185,8 @@ Resume restores the recipe rather than changing it.
 The CLI allows `--actors`, `--device`, and `--torch-threads` changes on resume.
 The Python API also allows `checkpoint_every` changes.
 Other changed settings fail before training.
+Start a fresh directory to adopt the updated utility and validation metrics.
+Resume keeps stored replay returns and `best_score`.
 Encoding and checkpoint versions before 6 and trainer state versions before 9 require a fresh run.
 
 ## Inspect validation
@@ -191,11 +198,16 @@ Set it to zero only to disable validation for a bounded diagnostic run.
 Solo validation measures cold greedy declarations when solo is in `--players`.
 For every configured multiplayer count, validation rotates the learner through every seat on every seed.
 It compares against `RandomPolicy`, the frozen `initial-model.pt`, and the reigning `best-model.pt`.
+`Xp_random` is the valid learner declaration count divided by the number of deals.
+Non-declaring players score zero against random opponents, regardless of their deadwood placement.
+`Xp_initial` and `Xp_best` use pairwise placement credit.
 A pairwise placement win earns 1, a tie earns 0.5, and a loss earns 0.
+These metrics divide total credit by the number of deals times `players - 1`.
 Other losing seats still compare their final deadwood penalties after a declaration.
 
-The validation `score` is the unweighted mean of solo, `Xp_random`, and `Xp_initial` rates for the configured counts.
-The default counts produce seven anchor rates, solo and random and initial opponents at two, three, and four players.
+The validation `score` is the unweighted mean of solo declaration rate, `Xp_random`, and `Xp_initial` for the configured counts.
+The default counts produce seven anchor metrics.
+They are solo plus `Xp_random` and `Xp_initial` for two, three, and four players.
 The score lies in `[0, 1]`.
 Training seeds are even and validation seeds are odd, so those deal seeds do not overlap.
 Validation reuses fixed seeds and the same frozen initial model across the run.
@@ -203,8 +215,11 @@ Validation reuses fixed seeds and the same frozen initial model across the run.
 Each `Xp_best` rate measures head-to-head placement credit against the reigning best for that player count.
 `vs_best` is their unweighted mean and does not enter the fixed-anchor `score`.
 With multiplayer enabled, the first validation selects the current network.
-Later validations replace `best-model.pt` when `vs_best > 0.51` and `score >= best_score - 0.02`.
-An anchor gain alone does not promote a multiplayer model.
+Later validations replace `best-model.pt` when either condition holds:
+
+- `vs_best > 0.51` and `score >= best_score - 0.03`.
+- `score > best_score + 0.03`, even without a head-to-head gain.
+
 `best_score` retains the highest fixed-anchor score among promoted models.
 Solo-only runs promote when `score >= best_score`, including equal scores.
 Every validation records `promoted` as a boolean.
@@ -276,7 +291,7 @@ Fresh runs use the defaults described above. Resume restores saved settings unle
 | `--replay-capacity` | Maximum replay steps in memory. |
 | `--learning-rate` | Initial AdamW learning rate. |
 | `--lr-decay-updates` | Update count for smooth learning-rate decay. Nonpositive disables decay. |
-| `--gamma` | Terminal-return discount factor. |
+| `--gamma` | Discount factor for positive terminal returns only. |
 | `--self-play-share` | Probability that every seat uses the learner. |
 | `--validate-every` | Completed-deal interval between validations. |
 | `--validation-games` | Solo games and multiplayer seed blocks per validation. Zero disables validation. |
