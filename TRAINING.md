@@ -6,12 +6,13 @@ No command here provisions Azure resources or spends cloud credit.
 
 ## Browser model
 
-`web/papplu-model.json` contains untrained v6 bootstrap weights with seed 1729.
+`web/papplu-model.json` contains untrained bootstrap weights with v7 encoding and seed 1729.
 Its `source.kind` is `bootstrap` and `source.trained` is `false`.
-The default `ModelSpec(80, 3)` has 342,804 parameters and five-tap SwiGLU card blocks.
-Encoding version 6 contains 854 observable float32 inputs. Model checkpoints use version 6.
+The default `ModelSpec(80, 3)` has 344,084 parameters and five-tap SwiGLU card blocks.
+Encoding version 7 contains 1,380 float32 inputs, including sequence-gated disjoint meld channels and observable unseen-card counts.
+Model checkpoints use version 6.
 The bundle is for compatibility checks. It has no measured playing-strength claim.
-Replace it with a trained v6 checkpoint after a separate held-out evaluation.
+Replace it with a trained checkpoint with v7 encoding after a separate held-out evaluation.
 
 ## Install PyTorch
 
@@ -86,7 +87,13 @@ The trainer cycles `--players 1 2 3 4`.
 It uses the single default `ModelSpec(80, 3)`, `gamma=0.99`, `replay_capacity=60_000`, and batches of at most 256 steps.
 Each 32-deal round schedules one learner update per completed deal, with `updates_per_episode=1`.
 Use `--updates-per-episode` to change that count.
-Smooth-L1 fits the chosen action to its terminal return. There is no margin loss.
+Smooth-L1 fits the chosen action to its terminal return.
+Positive targets also use a 0.10 winning-action margin with `win_margin_weight=0.25`.
+The term compares all legal alternatives with the taken action and penalizes the largest violation.
+Only the learner's own declarations supply positive targets. Opponent trajectories and scripted teacher labels never enter replay.
+Zero and negative targets receive no margin penalty.
+Use `--win-margin-weight 0` to disable the term when starting a fresh run.
+The weight must be finite and nonnegative.
 Positive utility targets `utility * gamma ** (T - 1 - t)` at step `t` of a length-`T` trajectory.
 Non-positive utility stays constant across every step, so delaying termination never weakens a penalty.
 Each learner seat draws a fixed exploration rate for its deal from `(0.01, 0.01, 0.03, 0.08)` using its own RNG.
@@ -104,7 +111,10 @@ Each opponent seat uses `RandomPolicy` with probability 0.15, or a greedy checkp
 Checkpoint selection is uniform over the latest `max_pool` entries.
 Solo deals always use the learner.
 The rollout batches all active learner seats together, including solo and multiplayer deals.
-No scripted bot or meld heuristic enters the encoder, rollout, or loss.
+The encoder derives local and disjoint meld channels from the learner's hand with deterministic packing.
+Candidate swaps prefer the capped pure-sequence count, fewer sequence-gated points, more sequence pairs, and fewer raw meld points.
+Sets do not reduce gated points below the pure-sequence quota.
+No teacher policy supplies the learner's actions or labels.
 
 Declaring earns +1.
 Losing to another declaration earns `-0.35 - 0.50 * min(p, 100) / 100`, between -0.85 and -0.35.
@@ -152,7 +162,7 @@ If the host has a CUDA-capable Torch installation, select the learner device.
 ```
 
 Rollout workers remain on CPU. Replay stays on CPU.
-The default replay allocates about 196 MiB before Python and optimizer overhead.
+The default replay allocates about 317 MiB before Python and optimizer overhead.
 Checkpoint compression reduces saved bytes, not the live replay allocation.
 Use `--replay-capacity` to set the memory budget when starting a run.
 
@@ -163,9 +173,9 @@ The fixed validation workload can cost more than a short training round.
 
 ## Use an initial checkpoint
 
-The default 80-by-3 model has 342,804 parameters.
+The default 80-by-3 model has 344,084 parameters.
 The same architecture supports other widths for compatibility tests and resource constraints.
-The 128-by-3 model has 867,972 parameters.
+The 128-by-3 model has 870,020 parameters.
 Both sizes use the same encoding and browser inference implementation.
 If you omit either `--width` or `--blocks`, the CLI uses 80 or 3 for that dimension.
 
@@ -185,9 +195,9 @@ Resume restores the recipe rather than changing it.
 The CLI allows `--actors`, `--device`, and `--torch-threads` changes on resume.
 The Python API also allows `checkpoint_every` changes.
 Other changed settings fail before training.
-Start a fresh directory to adopt the updated utility and validation metrics.
+Start a fresh directory to adopt v7 encoding and the winning margin.
 Resume keeps stored replay returns and `best_score`.
-Encoding and checkpoint versions before 6 and trainer state versions before 9 require a fresh run.
+Encoding versions before 7, checkpoint versions before 6, and trainer state versions before 10 require a fresh run.
 
 ## Inspect validation
 

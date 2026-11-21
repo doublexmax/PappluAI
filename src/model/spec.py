@@ -26,5 +26,5 @@ class ModelSpec:
     @staticmethod
     def from_dict(data: Mapping[str, object]) -> "ModelSpec":
         if not isinstance(data, Mapping) or set(data) != {"width", "blocks"}:
-            raise ModelSpecError("checkpoint model_spec must contain width and blocks for card_mlp v6")
+            raise ModelSpecError("checkpoint model_spec must contain width and blocks for card_mlp")
         return ModelSpec(**data)

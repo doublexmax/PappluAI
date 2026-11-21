@@ -26,7 +26,7 @@ from src.model.network import ObservationBatch, QNetwork, checkpoint_payload, lo
 from src.model.spec import ModelSpec
 
 
-STATE_VERSION = 9
+STATE_VERSION = 10
 VALIDATION_SEED = 30_000_001
 
 
@@ -57,6 +57,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     gamma: float = 0.99
     grad_clip: float = 1.0
+    win_margin_weight: float = 0.25
     epsilons: tuple[float, ...] = (0.01, 0.01, 0.03, 0.08)
     actors: int = 1
     self_play_share: float = 0.75
@@ -93,7 +94,7 @@ class TrainConfig:
         ):
             raise ValueError("epsilons must contain finite numbers in [0, 1]")
         object.__setattr__(self, "epsilons", tuple(float(value) for value in self.epsilons))
-        for name in ("learning_rate", "weight_decay", "gamma", "grad_clip", "self_play_share"):
+        for name in ("learning_rate", "weight_decay", "gamma", "grad_clip", "win_margin_weight", "self_play_share"):
             value = getattr(self, name)
             high = 1.0 if name in ("gamma", "self_play_share") else math.inf
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= high:
@@ -211,8 +212,19 @@ class Learner:
             fields["top"] = fields["top"].squeeze(-1).long()
             actions = self.replay.actions[idx].to(self.device)
             targets = self.replay.returns[idx].to(self.device)
-            q_taken = self.online(ObservationBatch(**fields)).gather(1, actions[:, None]).squeeze(1)
-            loss = F.smooth_l1_loss(q_taken, targets)
+            q_all = self.online(ObservationBatch(**fields))
+            q_taken = q_all.gather(1, actions[:, None]).squeeze(1)
+            mc_loss = F.smooth_l1_loss(q_taken, targets)
+            if cfg.win_margin_weight > 0:
+                margin = torch.where(fields["legal"] > 0, 0.10, -1e9)
+                margin.scatter_(1, actions[:, None], 0.0)
+                win_mask = (targets > 0).to(q_all.dtype)
+                margin_loss = (
+                    ((q_all + margin).amax(dim=1) - q_taken) * win_mask
+                ).sum() / win_mask.sum().clamp_min(1.0)
+                loss = mc_loss + cfg.win_margin_weight * margin_loss
+            else:
+                loss = mc_loss
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.online.parameters(), self.config.grad_clip, error_if_nonfinite=True)

@@ -186,12 +186,12 @@ def load_checkpoint(
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must be a dict")
     if type(payload.get("checkpoint_version")) is not int or payload["checkpoint_version"] != CHECKPOINT_VERSION:
-        raise ValueError("unsupported checkpoint_version %r; train fresh card_mlp v6 weights"
+        raise ValueError("unsupported checkpoint_version %r; train fresh card_mlp weights"
                          % payload.get("checkpoint_version"))
     if type(payload.get("encoding_version")) is not int or payload["encoding_version"] != ENCODING_VERSION:
-        raise ValueError("incompatible encoding_version; card_mlp v6 requires encoding_version 6")
+        raise ValueError("incompatible encoding_version; card_mlp requires encoding_version %d" % ENCODING_VERSION)
     if payload.get("architecture") != ARCHITECTURE:
-        raise ValueError("unsupported architecture; expected card_mlp v6")
+        raise ValueError("unsupported architecture; expected card_mlp")
     required = {
         "checkpoint_version", "encoding_version", "architecture", "model_spec",
         "num_actions", "game_config", "model_state_dict",

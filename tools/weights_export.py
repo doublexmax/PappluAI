@@ -389,7 +389,7 @@ def export_checkpoint(args, observations, features, golden):
     tensors = {"policy." + name: value.detach().cpu().float().reshape(-1).tolist()
                for name, value in network.policy.state_dict().items()}
     if [("policy." + name, tuple(value.shape)) for name, value in network.policy.state_dict().items()] != list(tensor_shapes(spec)):
-        raise SystemExit("policy tensors do not match the card_mlp v6 export schema")
+        raise SystemExit("policy tensors do not match the card_mlp export schema")
     layers = reference_layers(tensors, spec)
     with torch.inference_mode():
         batch = collate(features, torch.device("cpu"))
@@ -411,7 +411,7 @@ def write_json(path, document):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Export card_mlp v6 policy weights for web/qnet.mjs.")
+    parser = argparse.ArgumentParser(description="Export card_mlp policy weights with v7 encoding for web/qnet.mjs.")
     weights = parser.add_mutually_exclusive_group()
     weights.add_argument("--checkpoint", type=Path, help="export this .pt checkpoint (needs torch)")
     weights.add_argument("--bootstrap", action="store_true", help="seeded untrained weights without torch, the default")

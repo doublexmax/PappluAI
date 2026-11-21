@@ -60,6 +60,12 @@ class TestTrainCli(unittest.TestCase):
         ])
         self.assertEqual((parsed.updates_per_episode, parsed.lr_decay_updates, parsed.torch_threads), (3, 12, 2))
 
+    def test_winning_margin_flag_parses_zero_and_positive_weights_without_training_imports(self):
+        with mock.patch("src.cli.train.load_runtime", side_effect=AssertionError("runtime loaded")):
+            for weight in ("0", "0.25"):
+                parsed = build_arg_parser().parse_args(["--output-dir", "run", "--win-margin-weight", weight])
+                self.assertEqual(parsed.win_margin_weight, float(weight))
+
     def test_missing_dependency_is_reported_without_creating_a_run(self):
         with tempfile.TemporaryDirectory() as temporary, mock.patch(
             "src.cli.train.load_runtime", side_effect=MissingTrainingDependency("PyTorch is missing"),
@@ -496,10 +502,24 @@ class TestSelfPlayTrainer(unittest.TestCase):
             Trainer.open(root, self.overrides, initial=ModelSpec(9, 1))
             with self.assertRaisesRegex(ValueError, "cannot change"):
                 Trainer.open(root, {"gamma": 1.0})
+            with self.assertRaisesRegex(ValueError, "cannot change"):
+                Trainer.open(root, {"win_margin_weight": 0})
             with self.assertRaisesRegex(ValueError, "fresh runs"):
                 Trainer.open(root, initial=ModelSpec(9, 1))
             (root / "initial-model.pt").unlink()
             with self.assertRaisesRegex(ValueError, "missing opponent"):
+                Trainer.open(root)
+
+    def test_resume_rejects_v9_trainer_state_before_loading_old_replay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Trainer.open(root, self.overrides, initial=ModelSpec(9, 1))
+            path = root / "latest-state.pt"
+            state = torch.load(path, weights_only=True)
+            state["version"] = 9
+            del state["config"]["win_margin_weight"]
+            torch.save(state, path)
+            with self.assertRaisesRegex(ValueError, "incompatible trainer state"):
                 Trainer.open(root)
 
     def test_invalid_recipe_and_limits_fail_at_the_boundary(self):
@@ -523,6 +543,7 @@ class TestSelfPlayTrainer(unittest.TestCase):
                 "--batch-size", "2", "--replay-capacity", "32", "--validation-games", "1",
                 "--validate-every", "2", "--width", "9", "--blocks", "1", "--max-episodes", "2",
                 "--updates-per-episode", "3", "--lr-decay-updates", "12", "--torch-threads", "2",
+                "--win-margin-weight", "0.125",
             ]
             fresh = subprocess.run(command + flags, cwd=ROOT, capture_output=True, text=True, timeout=60)
             self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
@@ -531,8 +552,11 @@ class TestSelfPlayTrainer(unittest.TestCase):
             report = json.loads(resumed.stdout)
             self.assertEqual((report["episodes"], report["updates"], report["model_spec"]),
                              (4, 12, {"width": 9, "blocks": 1}))
-            config = TrainConfig(**torch.load(Path(temporary) / "latest-state.pt", weights_only=True)["config"])
-            self.assertEqual((config.updates_per_episode, config.lr_decay_updates, config.torch_threads), (3, 12, 2))
+            state = torch.load(Path(temporary) / "latest-state.pt", weights_only=True)
+            self.assertEqual(state["version"], 10)
+            config = TrainConfig(**state["config"])
+            self.assertEqual((config.updates_per_episode, config.lr_decay_updates, config.torch_threads, config.win_margin_weight),
+                             (3, 12, 2, 0.125))
             self.assertEqual(len((Path(temporary) / "metrics.jsonl").read_text().splitlines()), 2)
 
     def test_cli_uses_the_clean_default_for_each_omitted_model_dimension(self):
