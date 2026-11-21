@@ -16,7 +16,7 @@ CARD_CHANNELS = (
     "own", "own_eq1", "own_eq2", "own_ge3", "pile", "top", "joker", "wild",
     "points", "unseen", "opp_discarded", "next_held", "other_held", "next_passed",
     "adjacent", "set_mates", "natural", "pure", "any_meld",
-    "spare_pure", "spare_meld", "disc_pseq_delta", "disc_gated_saved", "disc_pairs_delta",
+    "spare_pure", "spare_meld", "disc_pseq_delta", "disc_gated_saved", "disc_meld_saved", "disc_pairs_delta",
 )
 SEAT_CHANNELS = (
     "present", "observer", "active", "hand_size", "turns", "next", "takes",
@@ -27,7 +27,7 @@ CONTEXT_CHANNELS = (
     "decks", "hand", "sequences", "recycle", "players", "max_turns",
     "jokers_held", "wilds_held", "raw_points",
     "unavoidable_dw", "disjoint_pseq_frac", "disjoint_gated_pts",
-    "top_gain_pseq", "top_gain_gated", "top_gain_pairs",
+    "top_gain_pseq", "top_gain_gated", "top_gain_meld", "top_gain_pairs",
 )
 CARD_OFFSET = 0
 SEAT_OFFSET = CARD_OFFSET + NUM_FACES * len(CARD_CHANNELS)
@@ -259,7 +259,7 @@ def encode(obs: Observation) -> Features:
             sum(hand[other * 13 + rank] > 0 for other in range(4) if other != suit) / 3,
             natural[face], pure[face], any_meld[face],
             base[5][face] / copies if copies else 0.0,
-            base[4][face] / copies if copies else 0.0, 0.0, 0.0, 0.0,
+            base[4][face] / copies if copies else 0.0, 0.0, 0.0, 0.0, 0.0,
         ))
     for seat in range(NUM_SEAT_SLOTS):
         if seat >= count:
@@ -288,7 +288,7 @@ def encode(obs: Observation) -> Features:
         float(cfg.recycle_discard), count / 6, cfg.max_turns / 60, hand[obs.joker] / decks,
         wild_count / (4 * decks), raw_points / 100,
         unavoidable / (10 * cfg.cards_in_hand), min(base[0], required) / max(1, required),
-        base[1] / 100, 0.0, 0.0, 0.0,
+        base[1] / 100, 0.0, 0.0, 0.0, 0.0,
     ))
     legal = list(legal_action_mask(obs))
     if (
@@ -306,9 +306,10 @@ def encode(obs: Observation) -> Features:
             after[face] -= 1
             packed = disjoint_pack(after, obs.joker, required)
             offset = face * len(CARD_CHANNELS) + CARD_CHANNELS.index("disc_pseq_delta")
-            values[offset:offset + 3] = (
+            values[offset:offset + 4] = (
                 min(packed[0], required) - min(base[0], required),
-                (base[1] - packed[1]) / 10, (packed[3] - base[3]) / 3,
+                (base[1] - packed[1]) / 10, (base[2] - packed[2]) / 10,
+                (packed[3] - base[3]) / 3,
             )
     if to_act and obs.phase is Phase.DRAW and legal[1]:
         plus = list(hand)
@@ -320,14 +321,15 @@ def encode(obs: Observation) -> Features:
             plus[face] -= 1
             packed = disjoint_pack(plus, obs.joker, required)
             plus[face] += 1
-            key = (min(packed[0], required), -packed[1], packed[3], -packed[2])
+            key = (min(packed[0], required), -(0.5 * packed[1] + 0.5 * packed[2]), packed[3], -packed[1])
             if best_key is None or key > best_key:
                 best, best_key = packed, key
         if best is not None:
             offset = CONTEXT_OFFSET + CONTEXT_CHANNELS.index("top_gain_pseq")
-            values[offset:offset + 3] = (
+            values[offset:offset + 4] = (
                 min(best[0], required) - min(base[0], required),
-                (base[1] - best[1]) / 20, (best[3] - base[3]) / 3,
+                (base[1] - best[1]) / 20, (base[2] - best[2]) / 20,
+                (best[3] - base[3]) / 3,
             )
     values.extend(float(allowed and to_act) for allowed in legal)
     values.append(float(NO_TOP if obs.discard_top is None else obs.discard_top))

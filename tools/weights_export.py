@@ -411,7 +411,7 @@ def write_json(path, document):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Export card_mlp policy weights with v7 encoding for web/qnet.mjs.")
+    parser = argparse.ArgumentParser(description="Export card_mlp policy weights with v8 encoding for web/qnet.mjs.")
     weights = parser.add_mutually_exclusive_group()
     weights.add_argument("--checkpoint", type=Path, help="export this .pt checkpoint (needs torch)")
     weights.add_argument("--bootstrap", action="store_true", help="seeded untrained weights without torch, the default")

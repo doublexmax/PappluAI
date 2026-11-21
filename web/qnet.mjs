@@ -40,20 +40,20 @@ export const CHANNELS = Object.freeze({
     "own", "own_eq1", "own_eq2", "own_ge3", "pile", "top", "joker", "wild",
     "points", "unseen", "opp_discarded", "next_held", "other_held", "next_passed",
     "adjacent", "set_mates", "natural", "pure", "any_meld",
-    "spare_pure", "spare_meld", "disc_pseq_delta", "disc_gated_saved", "disc_pairs_delta",
+    "spare_pure", "spare_meld", "disc_pseq_delta", "disc_gated_saved", "disc_meld_saved", "disc_pairs_delta",
   ]),
   seat: Object.freeze(["present", "observer", "active", "hand_size", "turns", "next", "takes", "passes", "held_total"]),
   context: Object.freeze([
     "draw", "discard", "terminal", "to_act", "turns", "stock", "pile", "refills", "decks", "hand",
     "sequences", "recycle", "players", "max_turns", "jokers_held", "wilds_held", "raw_points",
     "unavoidable_dw", "disjoint_pseq_frac", "disjoint_gated_pts",
-    "top_gain_pseq", "top_gain_gated", "top_gain_pairs",
+    "top_gain_pseq", "top_gain_gated", "top_gain_meld", "top_gain_pairs",
   ]),
 });
 export const FEATURE_LAYOUT = Object.freeze([
-  ["card", [52, 24]], ["seat", [6, 9]], ["context", [23]], ["legal", [54]], ["top", [1]],
+  ["card", [52, 25]], ["seat", [6, 9]], ["context", [24]], ["legal", [54]], ["top", [1]],
 ].map(([name, shape]) => Object.freeze([name, Object.freeze(shape)])));
-export const FEATURE_SIZE = 1380;
+export const FEATURE_SIZE = 1433;
 const FIELDS = {};
 let offset = 0;
 for (const [name, shape] of FEATURE_LAYOUT) {
@@ -64,7 +64,7 @@ for (const [name, shape] of FEATURE_LAYOUT) {
 
 const HEADER = Object.freeze({
   format: "papplu-qnet", formatVersion: 2, checkpointVersion: 6,
-  encodingVersion: 7, architecture: "card_mlp", numActions: NUM_ACTIONS,
+  encodingVersion: 8, architecture: "card_mlp", numActions: NUM_ACTIONS,
 });
 const MODEL_KEYS = [...Object.keys(HEADER), "modelSpec", "gameConfig", "source", "tensors"];
 const GAME_CONFIG_KEYS = ["numDecks", "cardsInHand", "requiredSequences", "maxTurns", "recycleDiscard"];
@@ -427,7 +427,7 @@ function encode(obs, path) {
       oppDiscarded[face] / decks, nextHeld / decks, (opponentHeld - nextHeld) / decks, nextPassed[face] / decks,
       (Number(hand[suit * 13 + (rank + 12) % 13] > 0) + Number(hand[suit * 13 + (rank + 1) % 13] > 0)) / 2,
       setMates / 3, natural[face], pure[face], anyMeld[face],
-      copies ? base[5][face] / copies : 0, copies ? base[4][face] / copies : 0, 0, 0, 0,
+      copies ? base[5][face] / copies : 0, copies ? base[4][face] / copies : 0, 0, 0, 0, 0,
     ], FIELDS.card.offset + face * CHANNELS.card.length);
   });
   players.forEach((player, s) => {
@@ -447,7 +447,7 @@ function encode(obs, path) {
     obs.stockRemaining / supply, discardPile.length / supply, Math.min(refills, 3) / 3, decks / 6, cards / 30,
     config.requiredSequences / 10, Number(config.recycleDiscard), players.length / 6, turns / 60,
     hand[joker] / decks, wildCount / (4 * decks), rawPoints / 100,
-    unavoidable / (10 * cards), Math.min(base[0], required) / Math.max(1, required), base[1] / 100, 0, 0, 0,
+    unavoidable / (10 * cards), Math.min(base[0], required) / Math.max(1, required), base[1] / 100, 0, 0, 0, 0,
   ], FIELDS.context.offset);
   if (toAct) {
     if (phase === 0) {
@@ -472,7 +472,7 @@ function encode(obs, path) {
       const packed = disjointPack(after, joker, required);
       values.set([
         Math.min(packed[0], required) - Math.min(base[0], required),
-        (base[1] - packed[1]) / 10, (packed[3] - base[3]) / 3,
+        (base[1] - packed[1]) / 10, (base[2] - packed[2]) / 10, (packed[3] - base[3]) / 3,
       ], FIELDS.card.offset + face * CHANNELS.card.length + CHANNELS.card.indexOf("disc_pseq_delta"));
     });
   }
@@ -486,7 +486,7 @@ function encode(obs, path) {
       plus[face] -= 1;
       const packed = disjointPack(plus, joker, required);
       plus[face] += 1;
-      const key = [Math.min(packed[0], required), -packed[1], packed[3], -packed[2]];
+      const key = [Math.min(packed[0], required), -(0.5 * packed[1] + 0.5 * packed[2]), packed[3], -packed[1]];
       const difference = bestKey === null ? -1 : key.findIndex((value, i) => value !== bestKey[i]);
       if (bestKey === null || difference >= 0 && key[difference] > bestKey[difference]) {
         best = packed;
@@ -496,7 +496,7 @@ function encode(obs, path) {
     if (best !== null) {
       values.set([
         Math.min(best[0], required) - Math.min(base[0], required),
-        (base[1] - best[1]) / 20, (best[3] - base[3]) / 3,
+        (base[1] - best[1]) / 20, (base[2] - best[2]) / 20, (best[3] - base[3]) / 3,
       ], FIELDS.context.offset + CHANNELS.context.indexOf("top_gain_pseq"));
     }
   }

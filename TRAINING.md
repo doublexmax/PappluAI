@@ -6,13 +6,13 @@ No command here provisions Azure resources or spends cloud credit.
 
 ## Browser model
 
-`web/papplu-model.json` contains untrained bootstrap weights with v7 encoding and seed 1729.
+`web/papplu-model.json` contains untrained bootstrap weights with v8 encoding and seed 1729.
 Its `source.kind` is `bootstrap` and `source.trained` is `false`.
-The default `ModelSpec(80, 3)` has 344,084 parameters and five-tap SwiGLU card blocks.
-Encoding version 7 contains 1,380 float32 inputs, including sequence-gated disjoint meld channels and observable unseen-card counts.
+The default `ModelSpec(80, 3)` has 344,244 parameters and five-tap SwiGLU card blocks.
+Encoding version 8 contains 1,433 float32 inputs, including gated and ungated meld-savings channels and observable unseen-card counts.
 Model checkpoints use version 6.
 The bundle is for compatibility checks. It has no measured playing-strength claim.
-Replace it with a trained checkpoint with v7 encoding after a separate held-out evaluation.
+Replace it with a trained checkpoint with v8 encoding after a separate held-out evaluation.
 
 ## Install PyTorch
 
@@ -87,33 +87,29 @@ The trainer cycles `--players 1 2 3 4`.
 It uses the single default `ModelSpec(80, 3)`, `gamma=0.99`, `replay_capacity=60_000`, and batches of at most 256 steps.
 Each 32-deal round schedules one learner update per completed deal, with `updates_per_episode=1`.
 Use `--updates-per-episode` to change that count.
-Smooth-L1 fits the chosen action to its terminal return.
-Positive targets also use a 0.10 winning-action margin with `win_margin_weight=0.25`.
-The term compares all legal alternatives with the taken action and penalizes the largest violation.
+Pure Smooth-L1 fits the chosen action to its terminal return.
 Only the learner's own declarations supply positive targets. Opponent trajectories and scripted teacher labels never enter replay.
-Zero and negative targets receive no margin penalty.
-Use `--win-margin-weight 0` to disable the term when starting a fresh run.
-The weight must be finite and nonnegative.
 Positive utility targets `utility * gamma ** (T - 1 - t)` at step `t` of a length-`T` trajectory.
 Non-positive utility stays constant across every step, so delaying termination never weakens a penalty.
-Each learner seat draws a fixed exploration rate for its deal from `(0.01, 0.01, 0.03, 0.08)` using its own RNG.
+Each learner seat draws a fixed exploration rate for its deal from `(0.01, 0.02, 0.05)` using its own RNG.
 Seat index and training progress do not determine exploration.
-AdamW starts at `learning_rate=5e-4`.
+AdamW starts at `learning_rate=3e-4`.
 Before each update, the rate is `max(learning_rate * 0.15, learning_rate / sqrt(1 + updates / lr_decay_updates))`.
-`--lr-decay-updates` defaults to 15,000. A nonpositive value disables learning-rate decay.
+`--lr-decay-updates` defaults to 20,000. A nonpositive value disables learning-rate decay.
 
 Every deal starts cold.
 There are no solved-hand warm starts or curriculum stages.
-On each multiplayer deal, self-play has probability 0.75.
+On each multiplayer deal, self-play has probability 0.25.
 Every self-play seat contributes its own terminal utility and trajectory.
-Other deals record only one randomly selected learner seat.
-Each opponent seat uses `RandomPolicy` with probability 0.15, or a greedy checkpoint from the active snapshot pool with probability 0.85.
-Checkpoint selection is uniform over the latest `max_pool` entries.
+The remaining 75% of deals record only one randomly selected learner seat.
+Each opponent seat uses the reigning greedy `best-model.pt` with probability 0.55, `RandomPolicy` with probability 0.05, or a greedy snapshot with probability 0.40.
+Snapshot selection is uniform over the latest `max_pool` entries and falls back to the champion when the pool is empty.
 Solo deals always use the learner.
 The rollout batches all active learner seats together, including solo and multiplayer deals.
 The encoder derives local and disjoint meld channels from the learner's hand with deterministic packing.
-Candidate swaps prefer the capped pure-sequence count, fewer sequence-gated points, more sequence pairs, and fewer raw meld points.
+Candidate swaps prefer the capped pure-sequence count, a lower average of gated and ungated meld points, more sequence pairs, and fewer gated points.
 Sets do not reduce gated points below the pure-sequence quota.
+`disc_meld_saved` and `top_gain_meld` expose set preservation and completion independently of that quota.
 No teacher policy supplies the learner's actions or labels.
 
 Declaring earns +1.
@@ -162,7 +158,7 @@ If the host has a CUDA-capable Torch installation, select the learner device.
 ```
 
 Rollout workers remain on CPU. Replay stays on CPU.
-The default replay allocates about 317 MiB before Python and optimizer overhead.
+The default replay allocates about 329 MiB before Python and optimizer overhead.
 Checkpoint compression reduces saved bytes, not the live replay allocation.
 Use `--replay-capacity` to set the memory budget when starting a run.
 
@@ -173,9 +169,9 @@ The fixed validation workload can cost more than a short training round.
 
 ## Use an initial checkpoint
 
-The default 80-by-3 model has 344,084 parameters.
+The default 80-by-3 model has 344,244 parameters.
 The same architecture supports other widths for compatibility tests and resource constraints.
-The 128-by-3 model has 870,020 parameters.
+The 128-by-3 model has 870,276 parameters.
 Both sizes use the same encoding and browser inference implementation.
 If you omit either `--width` or `--blocks`, the CLI uses 80 or 3 for that dimension.
 
@@ -195,9 +191,9 @@ Resume restores the recipe rather than changing it.
 The CLI allows `--actors`, `--device`, and `--torch-threads` changes on resume.
 The Python API also allows `checkpoint_every` changes.
 Other changed settings fail before training.
-Start a fresh directory to adopt v7 encoding and the winning margin.
+Start a fresh directory to adopt v8 encoding and champion-anchored fictitious self-play.
 Resume keeps stored replay returns and `best_score`.
-Encoding versions before 7, checkpoint versions before 6, and trainer state versions before 10 require a fresh run.
+Encoding versions before 8, checkpoint versions before 6, and trainer state versions before 11 require a fresh run.
 
 ## Inspect validation
 
@@ -225,17 +221,18 @@ Validation reuses fixed seeds and the same frozen initial model across the run.
 Each `Xp_best` rate measures head-to-head placement credit against the reigning best for that player count.
 `vs_best` is their unweighted mean and does not enter the fixed-anchor `score`.
 With multiplayer enabled, the first validation selects the current network.
-Later validations replace `best-model.pt` when either condition holds:
+Later multiplayer validations replace `best-model.pt` only when both conditions hold:
 
-- `vs_best > 0.51` and `score >= best_score - 0.03`.
-- `score > best_score + 0.03`, even without a head-to-head gain.
+- `vs_best >= 0.52`.
+- When solo is configured, `solo >= previous_validation_solo - 0.05`.
 
+The fixed-anchor score cannot bypass the head-to-head threshold.
 `best_score` retains the highest fixed-anchor score among promoted models.
 Solo-only runs promote when `score >= best_score`, including equal scores.
 Every validation records `promoted` as a boolean.
 
 On promotion, the trainer copies the best checkpoint to `opponents/best-<episode>.pt`.
-Without promotion, `vs_best >= 0.46` saves the current network as `opponents/snap-<episode>.pt`.
+Without promotion, `vs_best >= 0.48` saves the current network as `opponents/snap-<episode>.pt`.
 Snapshot names pad the episode count to 12 digits.
 The active pool retains the latest eight snapshots by default.
 Older snapshot files remain on disk but no longer enter the active pool.

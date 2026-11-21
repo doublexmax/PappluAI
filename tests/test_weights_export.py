@@ -54,7 +54,7 @@ runpy.run_path('tools/weights_export.py', run_name='__main__')
             document = json.loads(model.read_text())
             fixture = json.loads(golden.read_text())
             self.assertEqual(document["checkpointVersion"], 6)
-            self.assertEqual(document["encodingVersion"], 7)
+            self.assertEqual(document["encodingVersion"], 8)
             self.assertEqual(document["architecture"], "card_mlp")
             self.assertEqual(document["modelSpec"], {"width": 80, "blocks": 3})
             self.assertEqual(document["source"]["kind"], "bootstrap")
@@ -62,12 +62,12 @@ runpy.run_path('tools/weights_export.py', run_name='__main__')
             self.assertEqual(len(fixture["cases"]), 15)
             self.assertTrue(all(name.startswith("policy.") for name in document["tensors"]))
             self.assertEqual(document["source"]["tensorsSha256"], fixture["tensorsSha256"])
-            self.assertEqual(len(fixture["cases"][0]["features"]), 1380)
+            self.assertEqual(len(fixture["cases"][0]["features"]), 1433)
             self.assertEqual(fixture["featureLayout"], [
-                ["card", [52, 24]], ["seat", [6, 9]], ["context", [23]], ["legal", [54]], ["top", [1]],
+                ["card", [52, 25]], ["seat", [6, 9]], ["context", [24]], ["legal", [54]], ["top", [1]],
             ])
             self.assertEqual(
-                sum(len(base64.b64decode(entry["data"])) // 4 for entry in document["tensors"].values()), 344084,
+                sum(len(base64.b64decode(entry["data"])) // 4 for entry in document["tensors"].values()), 344244,
             )
 
     def test_legacy_heads_flag_is_rejected(self):
@@ -104,7 +104,7 @@ class TestReferenceExport(unittest.TestCase):
         obs = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1)).reset(17)
         hand = tuple((5, 5, 7, 20).count(face) for face in range(52))
         features = unpack(encode(replace(obs, hand=hand, joker=7)))
-        card_rows = rows(features["card"], 24)
+        card_rows = rows(features["card"], 25)
         self.assertEqual(card_rows[5][1:4], (0.0, 1.0, 0.0))
         self.assertEqual(card_rows[7][6:9], (1.0, 1.0, 0.0))
         self.assertEqual(card_rows[20][6:9], (0.0, 1.0, 0.0))

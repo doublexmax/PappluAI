@@ -10,7 +10,7 @@ from src.cli._runtime import MissingTrainingDependency, load_runtime
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train card_mlp with v7 encoding and stationary pure self-play DMC. Reuse the output directory to resume.")
+    parser = argparse.ArgumentParser(description="Train card_mlp with v8 encoding and champion-anchored fictitious self-play DMC. Reuse the output directory to resume.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--initial-model", type=Path)
     parser.add_argument("--opponent", type=Path, action="append", default=[])
@@ -26,7 +26,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--lr-decay-updates", type=int)
     parser.add_argument("--gamma", type=float)
-    parser.add_argument("--win-margin-weight", type=float, help="nonnegative winning-action margin weight (default 0.25)")
     parser.add_argument("--self-play-share", type=float)
     parser.add_argument("--validate-every", type=int)
     parser.add_argument("--validation-games", type=int)

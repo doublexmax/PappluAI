@@ -27,7 +27,7 @@ except ImportError:
 
 if torch is not None:
     from concurrent.futures import ProcessPoolExecutor
-    from src.evaluation.arena import Deal, EpsilonPolicy, RandomPolicy, run_matches
+    from src.evaluation.arena import CheckpointPolicy, Deal, EpsilonPolicy, RandomPolicy, run_matches
     from src.model.network import QNetwork, load_checkpoint, save_checkpoint
     from src.training.train import TrainConfig, Trainer, _validation_job, collect_round
 
@@ -40,13 +40,13 @@ class TestTrainCli(unittest.TestCase):
         with mock.patch("src.cli.train.load_runtime", side_effect=AssertionError("runtime loaded")):
             with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
                 self.assertEqual(main(["--help"]), 0)
-                self.assertIn("stationary pure self-play DMC", output.getvalue())
+                self.assertIn("champion-anchored fictitious self-play DMC", " ".join(output.getvalue().split()))
             with mock.patch("sys.stderr", new_callable=io.StringIO) as error:
                 self.assertEqual(main([]), 2)
                 self.assertIn("--output-dir", error.getvalue())
             for flag in ("--warm-start-fraction", "--curriculum-distances", "--pfsp-exponent",
                          "--promote", "--rebase-after-rejections", "--heads", "--target-tau",
-                         "--margin-weight", "--epsilon-start", "--epsilon-end", "--epsilon-decay-episodes"):
+                         "--margin-weight", "--win-margin-weight", "--epsilon-start", "--epsilon-end", "--epsilon-decay-episodes"):
                 with self.subTest(flag=flag), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
                     self.assertEqual(main(["--output-dir", "unused", flag, "1"]), 2)
                     self.assertIn("unrecognized arguments", error.getvalue())
@@ -59,12 +59,6 @@ class TestTrainCli(unittest.TestCase):
             "--lr-decay-updates", "12", "--torch-threads", "2",
         ])
         self.assertEqual((parsed.updates_per_episode, parsed.lr_decay_updates, parsed.torch_threads), (3, 12, 2))
-
-    def test_winning_margin_flag_parses_zero_and_positive_weights_without_training_imports(self):
-        with mock.patch("src.cli.train.load_runtime", side_effect=AssertionError("runtime loaded")):
-            for weight in ("0", "0.25"):
-                parsed = build_arg_parser().parse_args(["--output-dir", "run", "--win-margin-weight", weight])
-                self.assertEqual(parsed.win_margin_weight, float(weight))
 
     def test_missing_dependency_is_reported_without_creating_a_run(self):
         with tempfile.TemporaryDirectory() as temporary, mock.patch(
@@ -102,6 +96,10 @@ class TestSelfPlayTrainer(unittest.TestCase):
             "replay_capacity": 64, "batch_size": 4, "validate_every": 4, "validation_games": 1,
             "checkpoint_every": 4, "self_play_share": 1.0, "max_pool": 2,
         }
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.best_path = str(Path(temporary.name) / "best-model.pt")
+        save_checkpoint(self.best_path, QNetwork(ModelSpec(9, 1)), TrainConfig(**self.overrides).game)
 
     def test_self_play_records_all_seats_but_sparring_records_only_the_learner(self):
         torch.manual_seed(41)
@@ -110,8 +108,8 @@ class TestSelfPlayTrainer(unittest.TestCase):
         with mock.patch("src.game.environment.hand_reward", return_value=0.0), mock.patch(
             "src.game.multiplayer.hand_reward", return_value=0.0,
         ):
-            trajectories = collect_round(config, network, [], 0, 4)
-            opponents = collect_round(TrainConfig(**{**config.__dict__, "self_play_share": 0.0}), network, [], 0, 4)
+            trajectories = collect_round(config, network, self.best_path, [], 0, 4)
+            opponents = collect_round(TrainConfig(**{**config.__dict__, "self_play_share": 0.0}), network, self.best_path, [], 0, 4)
         observed = Counter(round(unpack(t.steps[0].features)["context"][12] * 6) for t in trajectories)
         self.assertEqual(observed, {1: 1, 2: 2, 3: 3, 4: 4})
         self.assertEqual(Counter(round(unpack(t.steps[0].features)["context"][12] * 6) for t in opponents),
@@ -131,7 +129,7 @@ class TestSelfPlayTrainer(unittest.TestCase):
             with mock.patch("src.game.environment.hand_reward", return_value=0.0), mock.patch(
                 "src.game.multiplayer.hand_reward", return_value=0.0,
             ):
-                trajectories = collect_round(config, network, [], 0, 4)
+                trajectories = collect_round(config, network, self.best_path, [], 0, 4)
         finally:
             hook.remove()
         self.assertEqual(batches[0], (1, 2, 3, 4))
@@ -163,18 +161,67 @@ class TestSelfPlayTrainer(unittest.TestCase):
         with mock.patch.object(EpsilonPolicy, "act_features", capture), mock.patch(
             "src.game.multiplayer.hand_reward", return_value=0.0,
         ):
-            trajectories = collect_round(config, network, [], 0, 64)
+            trajectories = collect_round(config, network, self.best_path, [], 0, 64)
         self.assertEqual(len(trajectories), 256)
         for seat_rates in rates:
             self.assertEqual(sum(seat_rates.values()), 64)
-            self.assertEqual(set(seat_rates), {0.01, 0.03, 0.08})
+            self.assertEqual(set(seat_rates), {0.01, 0.02, 0.05})
+
+    def test_champion_anchored_sampling_and_empty_pool_fallback_on_seeded_deals(self):
+        network = QNetwork(ModelSpec(9, 1))
+        config = TrainConfig(**{
+            **{key: value for key, value in self.overrides.items() if key != "self_play_share"},
+            "player_counts": (4,), "max_turns": 1, "epsilons": (1.0,),
+        })
+        save_checkpoint(self.best_path, network, config.game)
+        paths = [str(Path(self.best_path).parent / ("snap-%d.pt" % index)) for index in range(3)]
+        for path in paths:
+            save_checkpoint(path, network, config.game)
+        for share, pool, expected_trajectories, expected_opponents, expected_seats in (
+            (config.self_play_share, paths, 445, {1: 335, 2: 27, 3: 100, 4: 117}, {0: 58, 1: 37, 2: 52, 3: 46}),
+            (0.0, [], 256, {1: 730, 2: 38}, {0: 74, 1: 50, 2: 72, 3: 60}),
+        ):
+            with self.subTest(share=share, pool=pool):
+                deals, checkpoint_paths = [], []
+
+                def capture_deal(*args):
+                    deal = Deal(*args)
+                    deals.append(deal)
+                    return deal
+
+                def checkpoint(path):
+                    checkpoint_paths.append(path)
+                    return CheckpointPolicy(path)
+
+                with mock.patch("src.training.train.Deal", side_effect=capture_deal), mock.patch(
+                    "src.training.train.CheckpointPolicy", side_effect=checkpoint,
+                ), mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
+                    trajectories = collect_round(
+                        TrainConfig(**{**config.__dict__, "self_play_share": share}),
+                        network, self.best_path, pool, 0, 256,
+                    )
+                self.assertEqual(len(deals), 256)
+                self.assertEqual(len(trajectories), expected_trajectories)
+                self.assertEqual([len(t.steps) for t in trajectories], [2] * expected_trajectories)
+                self.assertEqual(checkpoint_paths, [self.best_path, *pool[-2:]])
+                self.assertEqual(Counter(policy for deal in deals for policy in deal.seats if policy != 0),
+                                 expected_opponents)
+                sparring = [deal for deal in deals if len(deal.record_seats) == 1]
+                self.assertEqual(Counter(deal.seats.index(0) for deal in sparring), expected_seats)
+                for deal in deals:
+                    if len(deal.record_seats) == 1:
+                        self.assertEqual(deal.seats.count(0), 1)
+                        self.assertEqual(deal.record_seats, frozenset((deal.seats.index(0),)))
+                    else:
+                        self.assertEqual((deal.seats, deal.record_seats), ((0, 0, 0, 0), frozenset(range(4))))
 
     def test_resume_matches_uninterrupted_weights_replay_optimizer_and_metrics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            whole = Trainer.open(root / "whole", self.overrides, initial=ModelSpec(9, 1))
+            overrides = {**self.overrides, "self_play_share": 0.0}
+            whole = Trainer.open(root / "whole", overrides, initial=ModelSpec(9, 1))
             self.assertEqual(whole.run(max_episodes=8), "max_episodes")
-            partial = Trainer.open(root / "split", self.overrides, initial=ModelSpec(9, 1))
+            partial = Trainer.open(root / "split", overrides, initial=ModelSpec(9, 1))
             partial.run(max_episodes=4)
             resumed = Trainer.open(root / "split")
             resumed.run(max_episodes=8)
@@ -320,7 +367,7 @@ class TestSelfPlayTrainer(unittest.TestCase):
             self.assertEqual(trainer.learner.replay.returns.shape, (60_000,))
             self.assertAlmostEqual(
                 trainer.learner.optimizer.param_groups[0]["lr"],
-                5e-4 / (1 + 3 / 15_000) ** 0.5,
+                3e-4 / (1 + 3 / 20_000) ** 0.5,
                 places=12,
             )
 
@@ -360,18 +407,20 @@ class TestSelfPlayTrainer(unittest.TestCase):
                     torch.testing.assert_close(value, best.state_dict()[name], rtol=0, atol=0)
                 self.assertEqual(trainer.snapshot_pool[-1], "opponents/best-000000000007.pt")
 
-    def test_promotion_thresholds_anchor_floor_and_fresh_snapshot_contents(self):
+    def test_promotion_requires_head_to_head_threshold_and_saves_qualified_snapshots(self):
         cases = (
             (0.80, 0.50, False, "snap", 0.80),
-            (0.76, 0.52, False, "snap", 0.80),
-            (0.77, 0.52, True, "best", 0.80),
+            (0.76, 0.52, True, "best", 0.80),
             (0.78, 0.51, False, "snap", 0.80),
             (0.78, 0.52, True, "best", 0.80),
             (0.82, 0.50, False, "snap", 0.80),
             (0.80 + 0.03, 0.44, False, None, 0.80),
-            (0.84, 0.44, True, "best", 0.84),
-            (0.79, 0.45, False, None, 0.80),
-            (0.79, 0.46, False, "snap", 0.80),
+            (0.84, 0.44, False, None, 0.80),
+            (0.90, 0.4595, False, None, 0.80),
+            (0.79, 0.4799, False, None, 0.80),
+            (0.79, 0.48, False, "snap", 0.80),
+            (0.90, 0.5199, False, "snap", 0.80),
+            (0.20, 0.52, True, "best", 0.80),
             (0.85, 0.52, True, "best", 0.85),
         )
         with tempfile.TemporaryDirectory() as temporary, Trainer.open(Path(temporary), {
@@ -405,6 +454,30 @@ class TestSelfPlayTrainer(unittest.TestCase):
                             torch.testing.assert_close(value, saved.state_dict()[name], rtol=0, atol=0)
                     self.assertTrue((trainer.root / "initial-model.pt").is_file())
 
+    def test_head_to_head_promotion_also_requires_the_previous_solo_floor(self):
+        with tempfile.TemporaryDirectory() as temporary, Trainer.open(Path(temporary), {
+            **self.overrides, "player_counts": (1, 2),
+        }, initial=ModelSpec(9, 1)) as trainer:
+            for episode, (solo, vs_best, promoted) in enumerate((
+                (0.7499, 0.60, False), (0.75, 0.52, True),
+                (0.80, 0.5199, False), (0.90, 0.4595, False),
+            ), 1):
+                with self.subTest(solo=solo, vs_best=vs_best):
+                    trainer.best_score = 0.80
+                    trainer.validation = {"solo": 0.80}
+                    trainer.episodes = episode
+                    selected = (trainer.root / "best-model.pt").read_bytes()
+                    credits = {"solo": solo, "2p_random": 1.8, "2p_initial": 1.8, "2p_best": 2 * vs_best}
+                    with mock.patch("src.training.train._validation_job", side_effect=lambda job: (job[3], credits[job[3]])):
+                        result = trainer.validate()
+                    self.assertEqual((result["solo"], result["vs_best"], result["promoted"]),
+                                     (solo, vs_best, promoted))
+                    if promoted:
+                        _, _, meta = load_checkpoint(str(trainer.root / "best-model.pt"))
+                        self.assertEqual(meta["episodes"], episode)
+                    else:
+                        self.assertEqual((trainer.root / "best-model.pt").read_bytes(), selected)
+
     def test_solo_validation_promotes_equal_scores(self):
         with tempfile.TemporaryDirectory() as temporary, Trainer.open(Path(temporary), {
             **self.overrides, "player_counts": (1,), "max_turns": 1,
@@ -427,7 +500,7 @@ class TestSelfPlayTrainer(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             trainer = Trainer.open(Path(temporary), {
-                **self.overrides, "actors": 2, "round_episodes": 2,
+                **self.overrides, "actors": 2, "round_episodes": 2, "self_play_share": 0.0,
             }, initial=ModelSpec(9, 1))
             before = copy.deepcopy(trainer.learner.online.state_dict())
             with mock.patch("src.training.train.ProcessPoolExecutor", side_effect=create_pool):
@@ -503,24 +576,34 @@ class TestSelfPlayTrainer(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot change"):
                 Trainer.open(root, {"gamma": 1.0})
             with self.assertRaisesRegex(ValueError, "cannot change"):
-                Trainer.open(root, {"win_margin_weight": 0})
+                Trainer.open(root, {"learning_rate": 1e-3})
             with self.assertRaisesRegex(ValueError, "fresh runs"):
                 Trainer.open(root, initial=ModelSpec(9, 1))
             (root / "initial-model.pt").unlink()
             with self.assertRaisesRegex(ValueError, "missing opponent"):
                 Trainer.open(root)
 
-    def test_resume_rejects_v9_trainer_state_before_loading_old_replay(self):
+    def test_resume_requires_the_reigning_champion_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Trainer.open(root, self.overrides, initial=ModelSpec(9, 1))
+            (root / "best-model.pt").unlink()
+            with self.assertRaisesRegex(ValueError, "missing opponent checkpoint best-model.pt"):
+                Trainer.open(root)
+
+    def test_resume_rejects_old_trainer_states_before_loading_old_replay(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             Trainer.open(root, self.overrides, initial=ModelSpec(9, 1))
             path = root / "latest-state.pt"
             state = torch.load(path, weights_only=True)
-            state["version"] = 9
-            del state["config"]["win_margin_weight"]
-            torch.save(state, path)
-            with self.assertRaisesRegex(ValueError, "incompatible trainer state"):
-                Trainer.open(root)
+            state["learner"]["replay"]["features"] = b"old encoding"
+            for version in (9, 10):
+                with self.subTest(version=version):
+                    state["version"] = version
+                    torch.save(state, path)
+                    with self.assertRaisesRegex(ValueError, "incompatible trainer state"):
+                        Trainer.open(root)
 
     def test_invalid_recipe_and_limits_fail_at_the_boundary(self):
         for change in ({"gamma": 0}, {"gamma": float("nan")}, {"actors": 0}, {"player_counts": (1, 1)},
@@ -543,7 +626,7 @@ class TestSelfPlayTrainer(unittest.TestCase):
                 "--batch-size", "2", "--replay-capacity", "32", "--validation-games", "1",
                 "--validate-every", "2", "--width", "9", "--blocks", "1", "--max-episodes", "2",
                 "--updates-per-episode", "3", "--lr-decay-updates", "12", "--torch-threads", "2",
-                "--win-margin-weight", "0.125",
+                "--self-play-share", "0.0",
             ]
             fresh = subprocess.run(command + flags, cwd=ROOT, capture_output=True, text=True, timeout=60)
             self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
@@ -553,10 +636,10 @@ class TestSelfPlayTrainer(unittest.TestCase):
             self.assertEqual((report["episodes"], report["updates"], report["model_spec"]),
                              (4, 12, {"width": 9, "blocks": 1}))
             state = torch.load(Path(temporary) / "latest-state.pt", weights_only=True)
-            self.assertEqual(state["version"], 10)
+            self.assertEqual(state["version"], 11)
             config = TrainConfig(**state["config"])
-            self.assertEqual((config.updates_per_episode, config.lr_decay_updates, config.torch_threads, config.win_margin_weight),
-                             (3, 12, 2, 0.125))
+            self.assertEqual((config.updates_per_episode, config.lr_decay_updates, config.torch_threads, config.self_play_share),
+                             (3, 12, 2, 0.0))
             self.assertEqual(len((Path(temporary) / "metrics.jsonl").read_text().splitlines()), 2)
 
     def test_cli_uses_the_clean_default_for_each_omitted_model_dimension(self):

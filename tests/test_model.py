@@ -85,9 +85,9 @@ class TestCardNetwork(unittest.TestCase):
             torch.set_default_device("meta")
             batch = collate(features, self.device)
             self.assertEqual(batch.card.device.type, "cpu")
-            self.assertEqual(batch.card.shape, (2, 52, 24))
+            self.assertEqual(batch.card.shape, (2, 52, 25))
             self.assertEqual(batch.seat.shape, (2, 6, 9))
-            self.assertEqual(batch.context.shape, (2, 23))
+            self.assertEqual(batch.context.shape, (2, 24))
             torch.testing.assert_close(self.network(batch), expected, rtol=0, atol=0)
         finally:
             torch.set_default_device(previous)
@@ -242,7 +242,7 @@ class TestCardNetwork(unittest.TestCase):
             payload = torch.load(path, weights_only=True)
             self.assertEqual(payload["architecture"], "card_mlp")
             self.assertEqual(payload["checkpoint_version"], 6)
-            self.assertEqual(payload["encoding_version"], 7)
+            self.assertEqual(payload["encoding_version"], 8)
             self.assertEqual(payload["model_spec"], {"width": 32, "blocks": 3})
             self.assertNotIn("state_dim", payload)
 
@@ -254,7 +254,7 @@ class TestCardNetwork(unittest.TestCase):
             {"checkpoint_version": True}, {"checkpoint_version": 6.0},
             {"encoding_version": 1}, {"encoding_version": 2}, {"encoding_version": 3},
             {"encoding_version": 4}, {"encoding_version": 5}, {"encoding_version": 6},
-            {"encoding_version": 7.0},
+            {"encoding_version": 7}, {"encoding_version": 8.0},
             {"architecture": "mlp"}, {"architecture": "axial_table"}, {"state_dim": 164},
             {"model_spec": {"width": 32, "blocks": 2}}, {"num_actions": 12},
             {"model_spec": {"width": 64, "heads": 4, "blocks": 2}},
@@ -303,11 +303,11 @@ class TestCardNetwork(unittest.TestCase):
         torch.testing.assert_close(table, torch.zeros(1, 8), rtol=0, atol=0)
 
     def test_model_sizes_include_observable_and_disjoint_card_and_context_inputs(self):
-        for spec, count in ((ModelSpec(), 344084), (ModelSpec(128, 3), 870020)):
+        for spec, count in ((ModelSpec(), 344244), (ModelSpec(128, 3), 870276)):
             network = QNetwork(spec)
             self.assertEqual(sum(p.numel() for p in network.parameters()), count)
-            self.assertEqual(network.policy.card_embed.in_features, 24)
-            self.assertEqual(network.policy.table_embed.in_features, 77)
+            self.assertEqual(network.policy.card_embed.in_features, 25)
+            self.assertEqual(network.policy.table_embed.in_features, 78)
             self.assertEqual(network(collate_observations([PappluEnv().reset(17)], self.device)).shape, (1, 54))
 
 

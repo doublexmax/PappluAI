@@ -25,9 +25,9 @@ class TestFeatures(unittest.TestCase):
         hand = tuple({0: 1, 5: 2, 18: 3}.get(face, 0) for face in range(52))
         cards = unpack(encode(replace(obs, hand=hand, joker=7)))["card"]
         self.assertEqual(cards[1:4], (1.0, 0.0, 0.0))
-        self.assertAlmostEqual(cards[5 * 24], 2 / 3, places=7)
-        self.assertEqual(cards[5 * 24 + 1:5 * 24 + 4], (0.0, 1.0, 0.0))
-        self.assertEqual(cards[18 * 24:18 * 24 + 4], (1.0, 0.0, 0.0, 1.0))
+        self.assertAlmostEqual(cards[5 * 25], 2 / 3, places=7)
+        self.assertEqual(cards[5 * 25 + 1:5 * 25 + 4], (0.0, 1.0, 0.0))
+        self.assertEqual(cards[18 * 25:18 * 25 + 4], (1.0, 0.0, 0.0, 1.0))
 
     def test_unseen_subtracts_the_indicator_pile_and_every_publicly_held_copy(self):
         cfg = GameConfig(cards_in_hand=3, required_sequences=1)
@@ -41,7 +41,7 @@ class TestFeatures(unittest.TestCase):
                    InformationEvent(EventKind.TAKE_DISCARD, 2, 4, 60, 140, 0, face=8),
                    InformationEvent(EventKind.DISCARD, 1, 3, 59, 140, 2, face=5))
         features = unpack(encode(replace(obs, hand=hand, joker=7, discard_pile=(5,), history=history)))
-        card = lambda face, name: features["card"][face * 24 + CARD_CHANNELS.index(name)]
+        card = lambda face, name: features["card"][face * 25 + CARD_CHANNELS.index(name)]
         self.assertEqual(card(5, "unseen"), 0.0)
         self.assertEqual(card(5, "next_held"), 0.0)
         self.assertAlmostEqual(card(8, "unseen"), 2 / 3, places=7)
@@ -61,8 +61,8 @@ class TestFeatures(unittest.TestCase):
         observations.append(env.observe())
         for obs in observations:
             features = encode(obs)
-            self.assertEqual(len(feature_values(features)), 1380)
-            self.assertEqual(len(features.data), 5520)
+            self.assertEqual(len(feature_values(features)), 1433)
+            self.assertEqual(len(features.data), 5732)
             self.assertTrue(all(math.isfinite(value) for value in feature_values(features)))
         self.assertEqual(legal_actions(encode(observations[-1])), ())
         solo = encode(observations[0])
@@ -87,7 +87,7 @@ class TestFeatures(unittest.TestCase):
         features = encode(after)
         self.assertEqual(legal_actions(features), ())
         self.assertEqual(field_values(features, "context")[CONTEXT_CHANNELS.index("to_act")], 0.0)
-        self.assertEqual(field_values(features, "context")[-3:], (0.0, 0.0, 0.0))
+        self.assertEqual(field_values(features, "context")[-4:], (0.0, 0.0, 0.0, 0.0))
 
     def test_raw_points_and_wild_counts_do_not_require_exact_meld_search(self):
         obs = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1)).reset(17)
@@ -103,8 +103,8 @@ class TestFeatures(unittest.TestCase):
         self.assertEqual(FEATURE_SIZE * 4, len(features.data))
         cards = field_values(features, "card")
         self.assertEqual(cards[CARD_CHANNELS.index("own_eq1")], 1.0)
-        self.assertEqual(cards[7 * 24 + CARD_CHANNELS.index("points")], 0.0)
-        self.assertEqual(cards[20 * 24 + CARD_CHANNELS.index("wild")], 1.0)
+        self.assertEqual(cards[7 * 25 + CARD_CHANNELS.index("points")], 0.0)
+        self.assertEqual(cards[20 * 25 + CARD_CHANNELS.index("wild")], 1.0)
 
     def test_layout_and_metadata_describe_the_encoded_segments(self):
         features = encode(PappluEnv().reset(17))
@@ -112,8 +112,8 @@ class TestFeatures(unittest.TestCase):
         layout = encoding_layout()
         self.assertEqual(
             [(field.name, field.offset, len(segments[field.name])) for field in layout],
-            [("card", 0, 1248), ("seat", 1248, 54), ("context", 1302, 23),
-             ("legal", 1325, 54), ("top", 1379, 1)],
+            [("card", 0, 1300), ("seat", 1300, 54), ("context", 1354, 24),
+             ("legal", 1378, 54), ("top", 1432, 1)],
         )
         self.assertEqual(tuple(value for field in layout for value in segments[field.name]), feature_values(features))
         metadata = encoding_metadata()
@@ -142,7 +142,7 @@ class TestFeatures(unittest.TestCase):
                 action = next(a for a in legal_actions(encode(obs)) if a != discard_action(taken[seat]))
                 env.step(action)
         values = unpack(encode(env.observe()))
-        card = lambda face, channel: values["card"][face * 24 + CARD_CHANNELS.index(channel)]
+        card = lambda face, channel: values["card"][face * 25 + CARD_CHANNELS.index(channel)]
         self.assertEqual(card(taken[1], "next_held"), 1.0)
         self.assertEqual(card(discarded[1], "opp_discarded"), 1.0)
         self.assertEqual(card(taken[1], "other_held"), 0.0)
@@ -210,7 +210,7 @@ class TestDisjointFeatures(unittest.TestCase):
     def test_spare_fractions_distinguish_pure_sequences_from_sets_and_duplicate_copies(self):
         obs = self.observation((1, 1, 2, 3, 6, 19, 32), 51, 2)
         values = unpack(encode(obs))
-        card = lambda face, name: values["card"][face * 24 + CARD_CHANNELS.index(name)]
+        card = lambda face, name: values["card"][face * 25 + CARD_CHANNELS.index(name)]
         self.assertEqual((card(1, "spare_pure"), card(1, "spare_meld")), (0.5, 0.5))
         self.assertEqual((card(6, "spare_pure"), card(6, "spare_meld")), (1.0, 0.0))
         self.assertEqual((card(2, "spare_pure"), card(2, "spare_meld")), (0.0, 0.0))
@@ -223,51 +223,70 @@ class TestDisjointFeatures(unittest.TestCase):
                 obs = self.observation((16, 17, joker_card), 7, 1)
                 values = unpack(encode(obs))
                 for face in (16, 17, joker_card):
-                    row = values["card"][face * 24:(face + 1) * 24]
+                    row = values["card"][face * 25:(face + 1) * 25]
                     self.assertEqual(tuple(row[CARD_CHANNELS.index(name)] for name in ("natural", "pure", "any_meld")),
                                      (0.0, pure, 1.0))
                 self.assertEqual(values["context"][CONTEXT_CHANNELS.index("disjoint_pseq_frac")], pure)
                 self.assertAlmostEqual(values["context"][CONTEXT_CHANNELS.index("disjoint_gated_pts")],
                                        0.0 if pure else 0.09, places=7)
 
-    def test_discard_delta_uses_gated_points_and_zeros_the_just_taken_face(self):
+    def test_discard_delta_keeps_gated_and_meld_points_and_zeros_the_just_taken_face(self):
         obs = self.observation((1, 2, 3, 14, 15, 16, 6, 19, 32, 49), 51, 3, Phase.DISCARD)
-        offset = 6 * 24 + CARD_CHANNELS.index("disc_pseq_delta")
-        deltas = unpack(encode(obs))["card"][offset:offset + 3]
-        self.assertEqual((deltas[0], deltas[2]), (0.0, 0.0))
+        offset = 6 * 25 + CARD_CHANNELS.index("disc_pseq_delta")
+        deltas = unpack(encode(obs))["card"][offset:offset + 4]
+        self.assertEqual((deltas[0], deltas[3]), (0.0, 0.0))
         self.assertAlmostEqual(deltas[1], 0.7, places=7)
+        self.assertAlmostEqual(deltas[2], -1.4, places=7)
         taken = replace(obs, history=(*obs.history[:-1], replace(
             obs.history[-1], kind=EventKind.TAKE_DISCARD, face=6,
         )))
-        self.assertEqual(unpack(encode(taken))["card"][offset:offset + 3], (0.0, 0.0, 0.0))
+        self.assertEqual(unpack(encode(taken))["card"][offset:offset + 4], (0.0, 0.0, 0.0, 0.0))
         terminal = replace(obs, phase=Phase.TERMINAL)
         values = unpack(encode(terminal))
         self.assertTrue(all(
-            values["card"][face * 24 + CARD_CHANNELS.index("disc_pseq_delta"):face * 24 + 24] == (0.0, 0.0, 0.0)
+            values["card"][face * 25 + CARD_CHANNELS.index("disc_pseq_delta"):face * 25 + 25] == (0.0, 0.0, 0.0, 0.0)
             for face in range(52)
         ))
 
-    def test_top_swap_prefers_gated_points_then_sequence_pairs_before_sets(self):
+    def test_king_set_preservation_is_visible_below_five_pure_sequences(self):
+        cards = (1, 14, 27, 40) * 3 + (12, 25, 38, 4, 4, 17, 17, 8, 8, 47)
+        obs = self.observation(cards, 6, 5, Phase.DISCARD)
+        self.assertEqual(disjoint_pack(obs.hand, obs.joker, 5)[:4], (4, 77, 47, 0))
+        values = unpack(encode(obs))["card"]
+        for face, expected in ((12, (0.0, 1.0, -2.0, 0.0)), (47, (0.0, 0.9, 0.9, 0.0))):
+            with self.subTest(face=face):
+                offset = face * 25 + CARD_CHANNELS.index("disc_pseq_delta")
+                for actual, wanted in zip(values[offset:offset + 4], expected):
+                    self.assertAlmostEqual(actual, wanted, places=7)
+
+    def test_top_swap_can_complete_a_set_without_meeting_the_pure_sequence_quota(self):
+        cards = (1, 14, 27, 40) * 3 + (12, 25, 4, 4, 17, 17, 8, 8, 47)
+        obs = self.observation(cards, 6, 5, top=38)
+        self.assertEqual(disjoint_pack(obs.hand, obs.joker, 5)[:4], (4, 67, 67, 0))
+        for actual, wanted in zip(unpack(encode(obs))["context"][-4:], (0.0, -0.05, 1.45, 0.0)):
+            self.assertAlmostEqual(actual, wanted, places=7)
+
+    def test_top_swap_balances_gated_and_meld_points_before_sequence_pairs(self):
         cases = (
             ((3, 7, 10, 11, 16, 18, 23, 26, 28, 29, 31, 32, 33, 35, 36, 37, 40, 41, 46, 47, 50),
-             32, 46, (0.0, 0.3, -1 / 3)),
+             32, 46, (0.0, 0.2, 1.4, -2 / 3)),
             ((1, 5, 6, 10, 13, 15, 20, 21, 24, 27, 28, 30, 33, 35, 37, 39, 41, 44, 48, 49, 51),
-             30, 9, (0.0, 0.0, 1 / 3)),
+             30, 9, (0.0, 0.0, 1.5, 0.0)),
         )
         for cards, joker, top, expected in cases:
             with self.subTest(joker=joker):
                 obs = self.observation(cards, joker, 5, top=top)
-                for actual, wanted in zip(unpack(encode(obs))["context"][-3:], expected):
+                for actual, wanted in zip(unpack(encode(obs))["context"][-4:], expected):
                     self.assertAlmostEqual(actual, wanted, places=7)
                 no_top = replace(obs, discard_pile=())
-                self.assertEqual(unpack(encode(no_top))["context"][-3:], (0.0, 0.0, 0.0))
+                self.assertEqual(unpack(encode(no_top))["context"][-4:], (0.0, 0.0, 0.0, 0.0))
 
     def test_top_swap_zeros_a_blocked_own_discard_but_scores_a_forced_take(self):
         obs = self.observation((0, 1, 9), 7, 1, top=2)
         obs = replace(obs, history=(*obs.history, InformationEvent(
             EventKind.DISCARD, 0, 3, 59, obs.stock_remaining, 0, face=2,
         )))
-        self.assertEqual(unpack(encode(obs))["context"][-3:], (0.0, 0.0, 0.0))
+        self.assertEqual(unpack(encode(obs))["context"][-4:], (0.0, 0.0, 0.0, 0.0))
         forced = encode(replace(obs, stock_remaining=0))
         self.assertEqual(legal_actions(forced), (1,))
         self.assertEqual(unpack(forced)["context"][CONTEXT_CHANNELS.index("top_gain_pseq")], 1.0)

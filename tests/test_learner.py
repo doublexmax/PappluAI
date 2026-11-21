@@ -13,7 +13,7 @@ except ImportError:
     torch = None
 
 if torch is not None:
-    from src.model.network import QNetwork, collate
+    from src.model.network import QNetwork, collate, greedy_actions
     from src.training.train import Learner, Replay, Step, TrainConfig, Trajectory
 
 
@@ -130,13 +130,13 @@ class TestDMCLearner(unittest.TestCase):
             with self.subTest(utility=utility):
                 network = ActionValues(utility)
                 before = network.q.detach().clone()
-                learner = Learner(network, replace(self.config, win_margin_weight=0))
+                learner = Learner(network, self.config)
                 stats = learner.learn([Trajectory((Step(self.features[0], 0),), utility)])
                 self.assertAlmostEqual(stats.loss, 0.125, places=7)
                 self.assertLess(network.q[0].item(), before[0].item())
                 torch.testing.assert_close(network.q[1:], before[1:], rtol=0, atol=0)
 
-    def test_winning_margin_ranks_unchosen_legal_actions_only_on_positive_targets(self):
+    def test_a_winning_exploratory_action_does_not_rerank_greedy_alternatives(self):
         class ActionValues(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -150,31 +150,13 @@ class TestDMCLearner(unittest.TestCase):
         obs = replace(env.step(0), hand=(1, 1, 1, 1) + (0,) * 48, joker=7)
         feature = encode(obs)
         config = replace(self.config, batch_size=1, learning_rate=0.02, lr_decay_updates=0)
-        for utility in (1.0, -1.0, 0.0):
-            with self.subTest(utility=utility):
-                network, control = ActionValues(), ActionValues()
-                before = network.q.detach().clone()
-                learner = Learner(network, config)
-                no_margin = Learner(control, replace(config, win_margin_weight=0))
-                trajectory = Trajectory((Step(feature, 2),), utility)
-                learner.learn([trajectory], updates=32)
-                no_margin.learn([trajectory], updates=32)
-                torch.testing.assert_close(network.q[:2], before[:2], rtol=0, atol=0)
-                torch.testing.assert_close(network.q[6:], before[6:], rtol=0, atol=0)
-                if utility > 0:
-                    self.assertTrue(bool((network.q[3:6] <= network.q[2] - 0.09).all()))
-                    self.assertTrue(bool((network.q[3:6] < control.q[3:6]).all()))
-                else:
-                    torch.testing.assert_close(network.q, control.q, rtol=0, atol=0)
-                    torch.testing.assert_close(network.q[3:6], before[3:6], rtol=0, atol=0)
-                    self.assertLess(network.q[2].item(), before[2].item())
-
-    def test_winning_margin_weight_rejects_negative_and_nonfinite_values(self):
-        for weight in (-0.1, math.inf, math.nan, True, "0.25"):
-            with self.subTest(weight=weight), self.assertRaisesRegex(ValueError, "win_margin_weight"):
-                replace(self.config, win_margin_weight=weight)
-        learner = Learner(self.network, replace(self.config, win_margin_weight=0))
-        self.assertGreater(learner.learn(self.trajectories).loss, 0)
+        network = ActionValues()
+        before = network.q.detach().clone()
+        learner = Learner(network, config)
+        stats = learner.learn([Trajectory((Step(feature, 2),), 1.0)], updates=32)
+        self.assertEqual(stats.loss, 0.0)
+        torch.testing.assert_close(network.q, before, rtol=0, atol=0)
+        self.assertEqual(greedy_actions(network, collate([feature], torch.device("cpu"))).tolist(), [3])
 
     def test_learning_rate_decays_before_updates_and_has_a_fixed_floor(self):
         learner = Learner(self.network, replace(self.config, lr_decay_updates=1))
