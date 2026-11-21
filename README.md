@@ -63,64 +63,12 @@ Neural has no draw lookahead, belief search, or feed-risk adjustment.
 It falls back to Tactical for unavailable weights, incompatible rules, or solo browser play.
 The scoreboard reports the effective tier and any downgrade.
 
-`web/papplu-model.json` contains trained `card_mlp` v5 weights from Azure checkpoint A1, `trackA_p1/best-model.pt`.
-Its `source.kind` is `checkpoint` and `source.trained` is `true`.
-The network has 127,172 parameters, width 64, and two residual blocks.
-It reads the 1,275-float version 5 encoding.
-The checkpoint SHA256 is `094bbe8946fc890e93de7a2ce77f0ad45ad8f8d24a38f2249ffb31fdef39882b`.
-
-### A1 held-out results
-
-A1 was locked before this evaluation.
-These seeds are disjoint from its production training and selection.
-Earlier project models used the same seed ranges, so they are not project-wide unseen deals.
-Multiplayer matches use three decks, 21 cards, five required pure sequences, and 60 turns per seat.
-
-Python cold solo won 243 of 256 deals at seed 850000, or 94.9%.
-Its 95% Wilson interval is 91.5% to 97.0%, with mean terminal penalty 1.50 points.
-Random won 0 of 256.
-The separate warm discard puzzles at seed 860000 yielded 208 of 256 wins, or 81.25%, against Random's 64 of 256.
-Those one-discard puzzles are not full cold games.
-
-The table reports valid declaration wins.
-
-| Players | Random, Python | Heuristic, Python | Casual, browser | Tactical, browser |
-| --- | --- | --- | --- | --- |
-| 2 | 119/120, 99.2% | 54/120, 45.0% | 100/120, 83.3% | 41/96, 42.7% |
-| 3 | 119/120, 99.2% | 38/120, 31.7% | 86/120, 71.7% | 19/60, 31.7% |
-| 4 | 117/120, 97.5% | 20/120, 16.7% | 69/120, 57.5% | 15/60, 25.0% |
-
-Python arena uses seed 870000 and cycles Neural equally through the seats across 120 distinct deals per cell.
-The browser loads the shipped JSON and uses seed 880000 with every seat on every deal.
-Casual uses 60, 40, and 30 deal seeds for two, three, and four players.
-Tactical uses 48, 20, and 15 deal seeds.
-All 576 browser games finished without errors or tier downgrades.
-
-First-place credit assigns the declaration winner first, or ranks terminal penalties at the turn cap.
-It splits one unit across tied first seats.
-Against 2p Casual, Neural won 100/120 by declaration, or 83.3%.
-It finished first in 101/120, or 84.2%, including one turn-cap penalty win.
-
-| Players | Neural credit against Tactical | Equal-seat parity | 95% deal-cluster interval |
-| --- | --- | --- | --- |
-| 2 | 42.7% | 50.0% | 35.4% to 49.0% |
-| 3 | 31.7% | 33.3% | 25.0% to 38.3% |
-| 4 | 25.0% | 25.0% | 18.3% to 31.7% |
-
-The intervals use 2,000 resamples of deal seeds and preserve all seat rotations.
-Neural beats Random and Casual in these cells and has a high cold-solo win rate.
-Its three-player and four-player first-place credit is near Tactical parity, but its two-player credit is below parity.
-The four-player Python Heuristic result is also below parity.
-These results do not establish a rating or equal strength on every scoring measure.
-
-The idle Node v24.19.0 bundle benchmark measured 4.44 ms median and 4.84 ms p95 for `qValues`.
-It used five passes over 1,000 real observations, with per-pass medians from 4.42 to 4.45 ms and no failures.
-The timed call includes validation, encoding, and forward computation, but excludes model loading and `observationFromView`.
-It is not a complete draw-and-discard turn.
-During the 18-worker Tactical matches, mean observation and move-selection time was 30.59 to 43.04 ms for Neural and 4.76 to 4.98 seconds for Tactical.
-Tactical runs exact `minimumPenalty` and `outs1ply` searches.
-Those loaded worker timings are not directly comparable to the idle `qValues` benchmark.
-The browser evaluation took 52.3 minutes, longer than the initial estimate.
+`web/papplu-model.json` contains untrained `card_mlp` v6 bootstrap weights with seed 1729.
+Its `source.kind` is `bootstrap` and `source.trained` is `false`.
+The default model has width 80, three five-tap SwiGLU blocks, and 342,804 parameters.
+It reads 854 observable float32 inputs with encoding version 6 and uses checkpoint version 6.
+These weights verify compatibility, not playing strength.
+Export a trained v6 checkpoint with the [training guide](TRAINING.md) to replace them.
 
 ### Declarations and scoring
 
@@ -224,7 +172,7 @@ The evaluator does not mutate its inputs.
 
 ## Model and training contract
 
-The only architecture is `card_mlp` v5.
+The only architecture is `card_mlp` v6.
 The [training guide](TRAINING.md) covers setup, self-play, resume, evaluation, and browser export.
 
 | Package | Responsibility |
@@ -237,25 +185,24 @@ The [training guide](TRAINING.md) covers setup, self-play, resume, evaluation, a
 
 ### Observation encoding
 
-`encode` returns 1,275 little-endian float32 values, or 5,100 bytes.
-Encoding version 5 uses the following layout.
+`encode` returns 854 little-endian float32 values, or 3,416 bytes.
+Encoding version 6 uses the following layout.
 
 | Field | Shape | Float offset |
 | --- | --- | --- |
-| `card` | 52 by 22 | 0 |
-| `seat` | 6 by 9 | 1144 |
-| `context` | 22 | 1198 |
-| `legal` | 54 | 1220 |
-| `top` | 1 | 1274 |
+| `card` | 52 by 14 | 0 |
+| `seat` | 6 by 9 | 728 |
+| `context` | 17 | 782 |
+| `legal` | 54 | 799 |
+| `top` | 1 | 853 |
 
-The card channels contain own copies, pile copies, top and indicator flags, wild flags, points, and visible opponent activity.
-Five further channels describe `adjacent`, `set_mates`, `natural`, `pure`, and `any_meld`.
-Four disjoint-packing channels add `spare_frac`, `disc_pseq_delta`, `disc_pts_saved`, and `disc_pairs_delta`.
-The context adds `disjoint_pseq_frac`, `disjoint_gated_pts`, `top_gain_pseq`, and `top_gain_pts` alongside `unavoidable_dw`.
-The deterministic pack spends each card and joker at most once.
-It preserves the 2 after Q-K-A and splits six-card runs when possible.
-Packing is a greedy feature estimate, not the exact declaration or penalty search.
-Legal discard and top-card exchange candidates use the same pack.
+The card channels are `own`, `own_eq1`, `own_eq2`, `own_ge3`, `pile`, `top`, `joker`, `wild`,
+`points`, `unseen`, `opp_discarded`, `next_held`, `other_held`, and `next_passed`.
+The copy flags distinguish exactly one, exactly two, and at least three copies.
+`unseen` subtracts own copies, pile copies, the indicator, and all publicly held copies from the deck count, with a floor of zero.
+Seat channels record presence, observer identity, activity, hand size, remaining turns, the next player, takes, passes, and held totals.
+Context channels record phases, turn ownership, supply, rules, table size, exact jokers held, wild cards held, and raw points.
+The encoder performs no meld search, greedy packing, or action lookahead.
 Seats are relative to the observer. Unused seat slots are zero.
 No feature contains hidden opponent hands or stock order.
 
@@ -266,36 +213,39 @@ Training, solo evaluation, arena policies, and browser inference use this encodi
 
 ### Neural network
 
-`PolicyNet` embeds the 22 card channels and 76 table inputs.
-Residual `CardBlock` modules mix neighboring ranks, matching ranks, suits, and table context.
-The rank strip is `[A, 2, ..., K, A]`.
+`PolicyNet` embeds the 14 card channels and 71 table inputs.
+Residual `CardBlock` modules mix five rank taps, matching ranks, suits, and table context.
+The rank strip is `[A_low, 2, ..., K, A_high]`, with zero padding at both ends.
+The network averages the two Ace representations and applies a SwiGLU card feed-forward layer.
 Shared normalization and mean and max pooling update the table representation.
 The draw and face heads produce 54 advantages.
 A value head and legal-action centering produce Q-values.
 There are no auxiliary heads, target network, or meld computations inside the network.
 
-`ModelSpec(64, 2)` has 127,172 parameters.
-`ModelSpec(128, 3)` has 673,412 parameters.
+The default `ModelSpec(80, 3)` has 342,804 parameters.
+`ModelSpec(128, 3)` has 867,972 parameters.
 Python and Node tests compare nonzero exported weights at both sizes within `1e-5` for all 54 actions.
 Browser forward computation uses flat Float32 buffers.
 
 ### DMC learning
 
 The trainer cycles cold deals across one, two, three, and four players by default.
-On 50% of multiplayer deals, every seat uses the current epsilon-greedy network.
-The remaining deals place one learner seat against a feature-only `HeuristicPolicy`, uniform random, and frozen snapshot opponents.
-The heuristic receives at least half the opponent probability.
-Every seat contributes its own outcome and trajectory, including opponent wins and losses.
+On 75% of multiplayer deals, every seat uses the current epsilon-greedy network and contributes its own trajectory.
+Other deals record only one randomly selected learner seat.
+Each opponent is uniform random with probability 15%, or a uniformly selected greedy snapshot with probability 85%.
 Solo deals always use the learner.
 The active snapshot pool holds at most eight checkpoints.
+Each learner seat draws one exploration rate per deal from `(0.01, 0.01, 0.03, 0.08)` using its own RNG.
+Exploration does not depend on seat index or training progress.
+All active learner rows, including solo deals, share one neural forward batch.
 
 Replay stores contiguous float32 features, int64 actions, and float32 discounted returns.
 Replay retains the most recent 40,000 steps.
-For terminal utility `u`, step `t` of a length-`T` trajectory targets `u * 0.98 ** (T - 1 - t)`.
+For terminal utility `u`, step `t` of a length-`T` trajectory targets `u * 0.99 ** (T - 1 - t)`.
 AdamW fits selected-action Q-values with Smooth-L1 loss and gradient clipping.
-Winning trajectories also rank their taken action above other legal actions with a DQfD margin of 0.10 and default weight 0.50.
-`--margin-weight 0` disables the margin term.
-There is no warm-start curriculum, target network, or registry.
+The default round holds 32 deals and schedules two updates per completed deal, with up to 256 replay samples per update.
+The learning rate starts at `5e-4` and decays with `lr / sqrt(1 + updates / 8000)`, with a floor of `7.5e-5`.
+There is no margin loss, scripted opponent, epsilon schedule, warm-start curriculum, target network, or registry.
 
 Solo and multiplayer use the same declaration-first utility.
 A valid declaration earns +1.
@@ -303,10 +253,11 @@ Losing to a declaration earns `-0.5 - 0.5 * min(p, 100) / 100`, where `p` is the
 Without a declaration, utility is `-0.5 + 0.4 * seq_frac - 0.3 * min(p, 100) / 100`.
 `seq_frac` caps qualifying sequences at the required quota and equals 1 when no sequences are required.
 Exhaustion always earns negative utility, even for zero penalty.
-Validation compares against the fixed heuristic and reigning best checkpoint.
+Validation compares against random play, the frozen initial model, and the reigning best checkpoint.
+The fixed-anchor score averages solo, random-opponent, and initial-opponent results.
 
-Model checkpoints use version 5 and encoding version 5.
-Trainer state uses version 8.
+Model checkpoints use version 6 and encoding version 6.
+Trainer state uses version 9.
 Older encodings and trainer states require a fresh run.
 Bootstrap weights and short smoke runs do not establish competitive strength.
 
@@ -328,7 +279,7 @@ CI also runs a bounded train, resume, export, solo evaluation, and arena lifecyc
 Regenerate the portable evaluator fixtures with this command.
 
 ```powershell
-python tools\export_parity_fixtures.py
+.\.venv\Scripts\python tools\export_parity_fixtures.py
 ```
 
 Export a trained checkpoint to update the browser model and its matching Q-value fixture together.
@@ -337,7 +288,7 @@ Export a trained checkpoint to update the browser model and its matching Q-value
 .\.venv\Scripts\python tools\weights_export.py --checkpoint runs\full21\best-model.pt
 ```
 
-`--bootstrap --seed 1729` replaces the trained bundle with untrained compatibility weights.
+`--bootstrap --seed 1729` generates the untrained compatibility bundle.
 Do not use bootstrap results as evidence of playing strength.
 
 `tools/verify_browser.mjs` exercises the real browser through Playwright.

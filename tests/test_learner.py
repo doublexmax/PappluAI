@@ -1,5 +1,6 @@
 import copy
 from dataclasses import replace
+import math
 import unittest
 
 from src.game.environment import GameConfig, PappluEnv
@@ -93,30 +94,39 @@ class TestDMCLearner(unittest.TestCase):
         self.assertGreaterEqual(stats.loss, 0)
         self.assertEqual(learner.replay.features[:8].tolist(), [list(feature_values(f)) for f in self.features])
 
-    def test_winning_margin_ranks_taken_actions_above_only_legal_alternatives(self):
+    def test_monte_carlo_loss_changes_only_the_taken_action_for_every_utility(self):
         class ActionValues(torch.nn.Module):
             def __init__(self, target):
                 super().__init__()
-                self.q = torch.nn.Parameter(torch.tensor([target, target - 0.05] + [100.0] * 52))
+                self.q = torch.nn.Parameter(torch.tensor([target + 0.5, target + 10] + [100.0] * 52))
 
             def forward(self, batch):
                 return self.q.expand(batch.legal.shape[0], -1)
 
         for utility in (1.0, -1.0, 0.0):
-            for weight in (0.0, 0.5):
-                with self.subTest(utility=utility, weight=weight):
-                    network = ActionValues(utility)
-                    before = network.q.detach().clone()
-                    learner = Learner(network, replace(self.config, margin_weight=weight))
-                    stats = learner.learn([Trajectory((Step(self.features[0], 0),), utility)])
-                    expected = 0.05 * weight if utility > 0 else 0.0
-                    self.assertAlmostEqual(stats.loss, expected, places=7)
-                    if expected:
-                        self.assertGreater(network.q[0].item(), utility)
-                        self.assertLess(network.q[1].item(), before[1].item())
-                        torch.testing.assert_close(network.q[2:], before[2:], rtol=0, atol=0)
-                    else:
-                        torch.testing.assert_close(network.q, before, rtol=0, atol=0)
+            with self.subTest(utility=utility):
+                network = ActionValues(utility)
+                before = network.q.detach().clone()
+                learner = Learner(network, self.config)
+                stats = learner.learn([Trajectory((Step(self.features[0], 0),), utility)])
+                self.assertAlmostEqual(stats.loss, 0.125, places=7)
+                self.assertLess(network.q[0].item(), before[0].item())
+                torch.testing.assert_close(network.q[1:], before[1:], rtol=0, atol=0)
+
+    def test_learning_rate_decays_before_updates_and_has_a_fixed_floor(self):
+        learner = Learner(self.network, replace(self.config, lr_decay_updates=1))
+        learner.learn(self.trajectories, updates=0)
+        for update, expected in ((0, 1e-3), (1, 1e-3 / math.sqrt(2)), (10_000, 1.5e-4)):
+            learner.update_count = update
+            learner.update(1)
+            self.assertEqual(learner.update_count, update + 1)
+            for group in learner.optimizer.param_groups:
+                self.assertAlmostEqual(group["lr"], expected)
+        for disabled in (0, -1):
+            learner = Learner(QNetwork(ModelSpec(16, 1)), replace(self.config, lr_decay_updates=disabled))
+            learner.update_count = 10_000
+            learner.learn(self.trajectories)
+            self.assertEqual(learner.optimizer.param_groups[0]["lr"], 1e-3)
 
     def test_state_restores_optimizer_replay_and_sampling_for_exact_continuation(self):
         learner = Learner(self.network, self.config, seed=19)

@@ -69,7 +69,10 @@ def _parse_hand(hand: Sequence[int]) -> Tuple[int, ...]:
 
     counts = []
     for index, raw in enumerate(hand):
-        counts.append(_require_nonnegative_integral(raw, "hand[%d]" % index))
+        if type(raw) is int and raw >= 0:
+            counts.append(raw)
+        else:
+            counts.append(_require_nonnegative_integral(raw, "hand[%d]" % index))
     return tuple(counts)
 
 
@@ -121,8 +124,9 @@ def _iter_allocations(
     counts: Tuple[int, ...],
     represented: Sequence[int],
     joker: int,
+    pure_only: bool = False,
 ) -> Iterator[Tuple[int, ...]]:
-    wilds = _wild_faces(joker)
+    wilds = (joker,) if pure_only else _wild_faces(joker)
     n = len(represented)
     actuals = [0] * n
     pool = list(counts)
@@ -165,9 +169,10 @@ def _meld_from(
 def _iter_sequences(
     counts: Tuple[int, ...],
     joker: int,
+    pure_only: bool = False,
 ) -> Iterator[Meld]:
     total = sum(counts)
-    wilds = _wild_faces(joker)
+    wilds = (joker,) if pure_only else _wild_faces(joker)
     wild_count = sum(counts[face] for face in wilds)
     natural = tuple(count > 0 and face not in wilds for face, count in enumerate(counts))
     for face, count in enumerate(counts):
@@ -179,7 +184,7 @@ def _iter_sequences(
             continue
         if len(represented) - sum(natural[face] for face in represented) > wild_count:
             continue
-        for actuals in _iter_allocations(counts, represented, joker):
+        for actuals in _iter_allocations(counts, represented, joker, pure_only):
             yield _meld_from("sequence", actuals, represented, joker)
 
 
@@ -194,9 +199,14 @@ def _iter_sets(
         (0, 1, 2, 3),
     )
 
+    wilds = _wild_faces(joker)
+    wild_count = sum(counts[face] for face in wilds)
+    natural = tuple(count > 0 and face not in wilds for face, count in enumerate(counts))
     for rank in range(NUM_RANKS):
         for suits in suit_combos:
             represented = tuple(_face(suit, rank) for suit in suits)
+            if len(represented) - sum(natural[face] for face in represented) > wild_count:
+                continue
             for actuals in _iter_allocations(counts, represented, joker):
                 yield _meld_from("set", actuals, represented, joker)
 
@@ -228,6 +238,20 @@ def _search(
         return None
     if pure_needed > 0 and pure_sequence_upper_bound(counts, joker) < pure_needed:
         return None
+    wilds = _wild_faces(joker)
+    wild_count = sum(counts[face] for face in wilds)
+    if wild_count < 2:
+        natural = tuple(count > 0 and face not in wilds for face, count in enumerate(counts))
+        covered = {face for face, count in enumerate(counts) if count >= MIN_MELD or face in wilds}
+        for represented in _IRREDUCIBLE_SEQUENCES:
+            if len(represented) == MIN_MELD and MIN_MELD - sum(natural[face] for face in represented) <= wild_count:
+                covered.update(represented)
+        for rank in range(NUM_RANKS):
+            represented = tuple(_face(suit, rank) for suit in range(NUM_SUITS))
+            if sum(natural[face] for face in represented) + wild_count >= MIN_MELD:
+                covered.update(represented)
+        if any(count and face not in covered for face, count in enumerate(counts)):
+            return None
     faces, options = _compile_meld_options(counts, joker)
     covered = [False] * len(faces)
     for option in chain.from_iterable(options):
@@ -276,6 +300,7 @@ class _MeldOption:
 
 def _compile_meld_options(
     counts: Tuple[int, ...], joker: int,
+    pure_only: bool = False,
 ) -> Tuple[Tuple[int, ...], Tuple[Tuple[_MeldOption, ...], ...]]:
     wilds = _wild_faces(joker)
     faces = tuple(sorted(
@@ -285,7 +310,10 @@ def _compile_meld_options(
     positions = {face: index for index, face in enumerate(faces)}
     best: Dict[Tuple[Tuple[int, int], ...], Meld] = {}
 
-    for meld in chain(_iter_sequences(counts, joker), _iter_sets(counts, joker)):
+    generators = (_iter_sequences(counts, joker, pure_only),) if pure_only else (
+        _iter_sequences(counts, joker), _iter_sets(counts, joker),
+    )
+    for meld in chain.from_iterable(generators):
         used: Dict[int, int] = {}
         for face in meld.cards:
             position = positions[face]
@@ -486,12 +514,13 @@ def minimum_penalty(
     counts = _parse_hand(hand)
     joker_face = _parse_joker(joker)
     quota = _require_nonnegative_integral(required_sequences, "required_sequences")
-    faces, options = _compile_meld_options(counts, joker_face)
+    impossible = quota > 0 and pure_sequence_upper_bound(counts, joker_face) < quota
+    faces, options = _compile_meld_options(counts, joker_face, impossible)
     start = tuple(counts[face] for face in faces)
     points = tuple(_card_points(face, joker_face) for face in faces)
 
     quota_search = _PenaltySearch(points, options)
-    quota_score = quota_search.cost(start, quota)
+    quota_score = _UNREACHABLE if impossible else quota_search.cost(start, quota)
     selected_search, selected_need, best = quota_search, quota, quota_score
     if quota_score:
         qualifying_only_search = _PenaltySearch(points, tuple(

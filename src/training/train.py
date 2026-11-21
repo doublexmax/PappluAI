@@ -16,17 +16,17 @@ import torch.nn.functional as F
 
 from src.checkpoints.io import atomic_copy, atomic_write_json
 from src.checkpoints.tensor import atomic_torch_save, clone_model_state, validate_model_state
-from src.evaluation.arena import CheckpointPolicy, Deal, EpsilonPolicy, GreedyPolicy, HeuristicPolicy, RandomPolicy, run_matches
+from src.evaluation.arena import CheckpointPolicy, Deal, EpsilonPolicy, GreedyPolicy, RandomPolicy, run_matches
 from src.evaluation.benchmark import evaluate_games
 from src.game.environment import GameConfig, PappluEnv
-from src.game.multiplayer import MatchConfig
-from src.game.outcome import solo_outcome
+from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.outcome import DealOutcome, solo_outcome
 from src.model.encoding import FEATURE_SIZE, LAYOUT, Features, encode
 from src.model.network import ObservationBatch, QNetwork, checkpoint_payload, load_checkpoint
 from src.model.spec import ModelSpec
 
 
-STATE_VERSION = 8
+STATE_VERSION = 9
 VALIDATION_SEED = 30_000_001
 
 
@@ -48,20 +48,18 @@ class TrainConfig:
     max_turns: int = 60
     recycle_discard: bool = True
     player_counts: tuple[int, ...] = (1, 2, 3, 4)
-    round_episodes: int = 16
-    updates_per_episode: int = 4
-    batch_size: int = 128
+    round_episodes: int = 32
+    updates_per_episode: int = 2
+    batch_size: int = 256
     replay_capacity: int = 40_000
-    learning_rate: float = 3e-4
+    learning_rate: float = 5e-4
+    lr_decay_updates: int = 8_000
     weight_decay: float = 1e-4
-    gamma: float = 0.98
-    margin_weight: float = 0.50
+    gamma: float = 0.99
     grad_clip: float = 1.0
-    epsilon_start: float = 0.30
-    epsilon_end: float = 0.05
-    epsilon_decay_episodes: int = 10_000
+    epsilons: tuple[float, ...] = (0.01, 0.01, 0.03, 0.08)
     actors: int = 1
-    self_play_share: float = 0.50
+    self_play_share: float = 0.75
     max_pool: int = 8
     validate_every: int = 1_000
     validation_games: int = 64
@@ -81,28 +79,32 @@ class TrainConfig:
                 MatchConfig(game, count)
         for name, low in (
             ("round_episodes", 1), ("updates_per_episode", 0), ("batch_size", 1),
-            ("replay_capacity", 1), ("epsilon_decay_episodes", 0), ("actors", 1),
+            ("replay_capacity", 1), ("actors", 1),
             ("max_pool", 1), ("validate_every", 1), ("validation_games", 0),
             ("checkpoint_every", 1), ("seed", 0), ("torch_threads", 1),
         ):
             if type(getattr(self, name)) is not int or getattr(self, name) < low:
                 raise ValueError("%s must be an integer >= %d" % (name, low))
-        for name in ("learning_rate", "weight_decay", "gamma", "margin_weight", "grad_clip", "epsilon_start", "epsilon_end", "self_play_share"):
+        if type(self.lr_decay_updates) is not int:
+            raise ValueError("lr_decay_updates must be an integer")
+        if not isinstance(self.epsilons, (tuple, list)) or not self.epsilons or any(
+            type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1
+            for value in self.epsilons
+        ):
+            raise ValueError("epsilons must contain finite numbers in [0, 1]")
+        object.__setattr__(self, "epsilons", tuple(float(value) for value in self.epsilons))
+        for name in ("learning_rate", "weight_decay", "gamma", "grad_clip", "self_play_share"):
             value = getattr(self, name)
-            high = 1.0 if name in ("gamma", "epsilon_start", "epsilon_end", "self_play_share") else math.inf
+            high = 1.0 if name in ("gamma", "self_play_share") else math.inf
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= high:
                 raise ValueError("%s is out of range" % name)
-        if min(self.learning_rate, self.gamma, self.grad_clip) <= 0 or self.epsilon_end > self.epsilon_start:
-            raise ValueError("learning_rate, gamma and grad_clip must be positive; epsilon must decay")
+        if min(self.learning_rate, self.gamma, self.grad_clip) <= 0:
+            raise ValueError("learning_rate, gamma and grad_clip must be positive")
         torch.device(self.device)
 
     @property
     def game(self) -> GameConfig:
         return GameConfig(self.num_decks, self.cards_in_hand, self.required_sequences, self.max_turns, self.recycle_discard)
-
-    def epsilon(self, episodes: int) -> float:
-        fraction = min(episodes / self.epsilon_decay_episodes, 1.0) if self.epsilon_decay_episodes else 1.0
-        return self.epsilon_start + fraction * (self.epsilon_end - self.epsilon_start)
 
 
 class Replay:
@@ -189,9 +191,16 @@ class Learner:
             raise ValueError("updates must be a nonnegative integer")
         if not len(self.replay) or not updates:
             return LearnStats()
+        cfg = self.config
         self.online.train()
-        total, count = 0.0, min(self.config.batch_size, len(self.replay))
+        total, count = 0.0, min(cfg.batch_size, len(self.replay))
         for _ in range(updates):
+            learning_rate = max(
+                cfg.learning_rate * 0.15,
+                cfg.learning_rate / math.sqrt(1.0 + self.update_count / cfg.lr_decay_updates),
+            ) if cfg.lr_decay_updates > 0 else cfg.learning_rate
+            for group in self.optimizer.param_groups:
+                group["lr"] = learning_rate
             idx = torch.tensor(self.rng.choices(range(len(self.replay)), k=count), dtype=torch.long, device="cpu")
             data = self.replay.features[idx].to(self.device)
             fields = {
@@ -201,17 +210,8 @@ class Learner:
             fields["top"] = fields["top"].squeeze(-1).long()
             actions = self.replay.actions[idx].to(self.device)
             targets = self.replay.returns[idx].to(self.device)
-            q_all = self.online(ObservationBatch(**fields))
-            q_taken = q_all.gather(1, actions[:, None]).squeeze(1)
-            mc_loss = F.smooth_l1_loss(q_taken, targets)
-            if self.config.margin_weight > 0:
-                margin = torch.where(fields["legal"] > 0, 0.10, -1e9)
-                margin.scatter_(1, actions[:, None], 0.0)
-                win_mask = (targets > 0).to(q_all.dtype)
-                margin_loss = (((q_all + margin).amax(dim=1) - q_taken) * win_mask).sum() / win_mask.sum().clamp_min(1.0)
-                loss = mc_loss + self.config.margin_weight * margin_loss
-            else:
-                loss = mc_loss
+            q_taken = self.online(ObservationBatch(**fields)).gather(1, actions[:, None]).squeeze(1)
+            loss = F.smooth_l1_loss(q_taken, targets)
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.online.parameters(), self.config.grad_clip, error_if_nonfinite=True)
@@ -235,39 +235,73 @@ class Learner:
         self.step_count, self.update_count = state["step_count"], state["update_count"]
 
 
-def collect_round(config: TrainConfig, online: QNetwork, pool: Sequence[str], start: int, count: int, epsilon: float) -> list[Trajectory]:
-    learner = EpsilonPolicy(online, epsilon)
-    policies = [learner, HeuristicPolicy(), RandomPolicy(), *(CheckpointPolicy(path) for path in pool[-config.max_pool:])]
-    solos, deals, trajectories = [], [], []
+class _Rollout(NamedTuple):
+    env: PappluEnv | MultiplayerEnv
+    deal: Deal
+    rngs: tuple[random.Random, ...]
+    epsilons: tuple[float, ...]
+    steps: list[list[Step]]
+
+
+def collect_round(config: TrainConfig, online: QNetwork, pool: Sequence[str], start: int, count: int) -> list[Trajectory]:
+    learner = EpsilonPolicy(online, config.epsilons[0])
+    policies = [learner, RandomPolicy(), *(CheckpointPolicy(path) for path in pool[-config.max_pool:])]
+    rollouts, trajectories = [], []
     for episode in range(start, start + count):
         players = config.player_counts[episode % len(config.player_counts)]
         seed = 2 * (config.seed * 10_000_000 + episode)
         rng = random.Random(seed ^ 0x9E3779B97F4A7C15)
-        if players == 1:
-            env = PappluEnv(config.game)
-            solos.append([env, env.reset(seed), rng, []])
-        elif rng.random() < config.self_play_share:
-            deals.append(Deal(seed, (0,) * players, players, frozenset(range(players))))
+        if players == 1 or rng.random() < config.self_play_share:
+            seats = (0,) * players
         else:
             seat = rng.randrange(players)
-            seats = tuple(0 if s == seat else 1 if rng.random() < 0.5 else rng.randrange(1, len(policies)) for s in range(players))
-            deals.append(Deal(seed, seats, players, frozenset(range(players))))
-    while any(not row[1].done for row in solos):
-        active = [row for row in solos if not row[1].done]
-        features = [encode(row[1]) for row in active]
-        actions = learner.act_features(features, [row[2] for row in active])
-        for row, feature, action in zip(active, features, actions):
-            row[3].append(Step(feature, action))
-            row[1] = row[0].step(action)
-    for _, obs, _, steps in solos:
-        trajectories.append(Trajectory(tuple(steps), solo_outcome(
-            obs.hand, obs.joker, obs.won, config.required_sequences,
-        ).utility))
-    for deal, result in zip(deals, run_matches(deals, policies, config.game)):
+            seats = tuple(
+                0 if other == seat else 1 if len(policies) == 2 or rng.random() < 0.15
+                else rng.randrange(2, len(policies))
+                for other in range(players)
+            )
+        deal = Deal(seed, seats, players, frozenset(seat for seat, policy in enumerate(seats) if policy == 0))
+        rngs = tuple(random.Random(seed ^ ((seat + 1) * 0x9E3779B97F4A7C15)) for seat in range(players))
+        epsilons = tuple(seat_rng.choice(config.epsilons) if policy == 0 else 0.0
+                         for policy, seat_rng in zip(seats, rngs))
+        env = PappluEnv(config.game) if players == 1 else MultiplayerEnv(MatchConfig(config.game, players))
+        env.reset(seed)
+        rollouts.append(_Rollout(env, deal, rngs, epsilons, [[] for _ in range(players)]))
+    while True:
+        groups = {}
+        for rollout in rollouts:
+            obs = rollout.env.observe()
+            if obs.done:
+                continue
+            seat = 0 if rollout.deal.players == 1 else rollout.env.view().current_seat
+            groups.setdefault(rollout.deal.seats[seat], []).append((rollout, seat, encode(obs)))
+        if not groups:
+            break
+        for policy, rows in groups.items():
+            features = [feature for _, _, feature in rows]
+            rngs = [rollout.rngs[seat] for rollout, seat, _ in rows]
+            if policy == 0:
+                actions = learner.act_features(features, rngs, [rollout.epsilons[seat] for rollout, seat, _ in rows])
+            else:
+                actions = policies[policy].act_features(features, rngs)
+            for (rollout, seat, feature), action in zip(rows, actions):
+                if seat in rollout.deal.record_seats:
+                    rollout.steps[seat].append(Step(feature, action))
+                rollout.env.step(action)
+    for rollout in rollouts:
+        deal, env = rollout.deal, rollout.env
+        if deal.players == 1:
+            obs = env.observe()
+            trajectories.append(Trajectory(tuple(rollout.steps[0]), solo_outcome(
+                obs.hand, obs.joker, obs.won, config.required_sequences,
+            ).utility))
+            continue
+        view = env.view()
+        outcome = DealOutcome.score(env.terminal_snapshot(), view.winner, view.terminal_reason, config.required_sequences)
         for seat in sorted(deal.record_seats):
-            steps = tuple(Step(decision.features, decision.action) for decision in result.trajectories[seat])
+            steps = tuple(rollout.steps[seat])
             if steps:
-                trajectories.append(Trajectory(steps, result.outcome.seat(seat).utility))
+                trajectories.append(Trajectory(steps, outcome.seat(seat).utility))
     return trajectories
 
 
@@ -276,10 +310,10 @@ def _actor_init() -> None:
 
 
 def _actor_job(job: tuple) -> list[Trajectory]:
-    config, spec, state, pool, start, count, epsilon = job
+    config, spec, state, pool, start, count = job
     online = QNetwork(spec).eval()
     online.load_state_dict(state)
-    return collect_round(config, online, pool, start, count, epsilon)
+    return collect_round(config, online, pool, start, count)
 
 
 def _validation_job(job: tuple) -> tuple[str, float]:
@@ -363,7 +397,11 @@ class Trainer:
         cfg, online = self.config, self.learner.online.eval()
         if cfg.actors > 1 and self._executor is None:
             self._executor = ProcessPoolExecutor(max_workers=cfg.actors, initializer=_actor_init)
-        opponents = (("heuristic", HeuristicPolicy()), ("best", CheckpointPolicy(str(self.root / "best-model.pt"))))
+        opponents = (
+            ("random", RandomPolicy()),
+            ("initial", CheckpointPolicy(str(self.root / "initial-model.pt"))),
+            ("best", CheckpointPolicy(str(self.root / "best-model.pt"))),
+        )
         cases = [("solo", 1, None)] if 1 in cfg.player_counts else []
         cases += [("%dp_%s" % (players, name), players, path)
                   for players in cfg.player_counts if players > 1 for name, path in opponents]
@@ -383,12 +421,12 @@ class Trainer:
         if best:
             metrics["vs_best"] = sum(best) / len(best)
         promoted = self.best_score < 0 or (
-            metrics.get("vs_best", 0) > 0.50 and score >= self.best_score - 0.02
-        ) or score > self.best_score + 0.02
+            metrics.get("vs_best", 0) > 0.51 and score >= self.best_score - 0.02
+        ) or (cfg.player_counts == (1,) and score >= self.best_score)
         if promoted:
             self.best_score = max(self.best_score, score) if best else score
             self.export_model(self.root / "best-model.pt")
-        if promoted or metrics.get("vs_best", 0) >= 0.45:
+        if promoted or metrics.get("vs_best", 0) >= 0.46:
             name = "opponents/%s-%012d.pt" % ("best" if promoted else "snap", self.episodes)
             if promoted:
                 atomic_copy(self.root / "best-model.pt", self.root / name)
@@ -417,22 +455,22 @@ class Trainer:
                     reason = "budget"
                     break
                 count = min(cfg.round_episodes, max_episodes - self.episodes) if max_episodes is not None else cfg.round_episodes
-                start, epsilon = self.episodes, cfg.epsilon(self.episodes)
+                start = self.episodes
                 pool = [str(self.root / path) for path in self.snapshot_pool]
                 if cfg.actors == 1:
-                    trajectories = collect_round(cfg, self.learner.online, pool, start, count, epsilon)
+                    trajectories = collect_round(cfg, self.learner.online, pool, start, count)
                 else:
                     if self._executor is None:
                         self._executor = ProcessPoolExecutor(max_workers=cfg.actors, initializer=_actor_init)
                     chunk, state = math.ceil(count / cfg.actors), clone_model_state(self.learner.online.state_dict())
-                    jobs = [(cfg, self.learner.online.spec, state, pool, offset, min(chunk, start + count - offset), epsilon)
+                    jobs = [(cfg, self.learner.online.spec, state, pool, offset, min(chunk, start + count - offset))
                             for offset in range(start, start + count, chunk)]
                     trajectories = [t for batch in self._executor.map(_actor_job, jobs) for t in batch]
                 stats = self.learner.learn(trajectories, cfg.updates_per_episode * count)
                 self.episodes += count
                 validation = self.validate() if cfg.validation_games and self.episodes // cfg.validate_every > start // cfg.validate_every else None
                 with (self.root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps({"episodes": self.episodes, "epsilon": epsilon, "trajectories": len(trajectories),
+                    stream.write(json.dumps({"episodes": self.episodes, "epsilons": cfg.epsilons, "trajectories": len(trajectories),
                                              **asdict(stats), "validation": validation}, allow_nan=False) + "\n")
                 if self.episodes // cfg.checkpoint_every > start // cfg.checkpoint_every:
                     self.save("running")

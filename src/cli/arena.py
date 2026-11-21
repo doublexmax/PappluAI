@@ -25,7 +25,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--model",
         action="append",
         required=True,
-        help="checkpoint path, 'random', or 'heuristic'; repeat once per seat",
+        help="checkpoint path or 'random'; repeat once per seat",
     )
     parser.add_argument("--games", type=_positive_int, required=True)
     parser.add_argument("--seed", type=int, default=0)

@@ -51,7 +51,7 @@ function policyModel(view, { draw = [0, 0], preferCopies = false } = {}) {
     return [name, { shape, data: Buffer.from(data.buffer).toString("base64") }];
   }));
   return parseQModel({
-    format: "papplu-qnet", formatVersion: 2, checkpointVersion: 5, encodingVersion: 5,
+    format: "papplu-qnet", formatVersion: 2, checkpointVersion: 6, encodingVersion: 6,
     architecture: "card_mlp", numActions: 54, modelSpec: spec, tensors,
     source: { kind: "bootstrap", trained: false, seed: 0, sha256: "0".repeat(64), tensorsSha256: "0".repeat(64) },
     gameConfig: {
