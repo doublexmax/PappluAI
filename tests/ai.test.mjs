@@ -107,6 +107,26 @@ test("neural draw follows Q-values without the tactical winning-take override", 
   });
 });
 
+test("neural draw cannot retake its own discard unless stock is exhausted", () => {
+  for (const [seat, stockCount, source] of [[0, 1, "stock"], [0, 0, "discard"], [1, 1, "discard"]]) {
+    const view = policyView([0, 1, 9], "draw");
+    view.stockCount = stockCount;
+    view.events[0].stock = stockCount + 1;
+    if (seat === 0) {
+      view.players[1].active = false;
+      view.events.push({ kind: "verdict", seat: 1, valid: false });
+    }
+    view.events.push(
+      { kind: "draw", source: "stock", seat, face: 2, offeredTop: 2, stock: stockCount },
+      { kind: "discard", seat, face: 2, stock: stockCount },
+    );
+    assert.deepEqual(chooseMove(view, "neural", { model: policyModel(view, { draw: [-4, 6] }) }), {
+      move: { type: "draw", source }, tier: "neural", downgrade: null,
+      reason: stockCount === 0 ? "forced" : "greedy",
+    });
+  }
+});
+
 test("neural discard ignores feed risk and one-ply outs when ranking Q-values", () => {
   const view = policyView([0, 5, 30, 0]);
   view.events.splice(1, 0,

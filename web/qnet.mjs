@@ -453,6 +453,9 @@ function encode(obs, path) {
     if (phase === 0) {
       values[FIELDS.legal.offset] = Number(obs.stockRemaining > 0);
       values[FIELDS.legal.offset + 1] = Number(discardPile.length > 0);
+      if (last.kind === DISCARD && last.actor === 0 && values[FIELDS.legal.offset]) {
+        values[FIELDS.legal.offset + 1] = 0;
+      }
     } else {
       hand.forEach((n, face) => { values[FIELDS.legal.offset + 2 + face] = Number(n > 0); });
       if (last.kind === TAKE_DISCARD && last.actor === 0 && last.face !== null &&

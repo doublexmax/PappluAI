@@ -170,6 +170,19 @@ class TestFeatures(unittest.TestCase):
             )))
             self.assertIn(discard_action(taken), legal_actions(encode(from_stock)))
 
+    def test_draw_mask_excludes_previous_own_discard_only_while_stock_remains(self):
+        for players, expected in ((1, (0,)), (2, (0, 1)), (4, (0, 1))):
+            with self.subTest(players=players):
+                game = GameConfig(cards_in_hand=3, required_sequences=1)
+                env = PappluEnv(game) if players == 1 else MultiplayerEnv(MatchConfig(game, players))
+                env.reset(17)
+                env.step(0)
+                env.step(discard_action(next(face for face, copies in enumerate(env.observe().hand) if copies)))
+                obs = env.observe()
+                self.assertIs(obs.phase, Phase.DRAW)
+                self.assertEqual(legal_actions(encode(obs)), expected)
+                self.assertEqual(legal_actions(encode(replace(obs, stock_remaining=0))), (1,))
+
 
 class TestDisjointFeatures(unittest.TestCase):
     @staticmethod
@@ -248,6 +261,16 @@ class TestDisjointFeatures(unittest.TestCase):
                     self.assertAlmostEqual(actual, wanted, places=7)
                 no_top = replace(obs, discard_pile=())
                 self.assertEqual(unpack(encode(no_top))["context"][-3:], (0.0, 0.0, 0.0))
+
+    def test_top_swap_zeros_a_blocked_own_discard_but_scores_a_forced_take(self):
+        obs = self.observation((0, 1, 9), 7, 1, top=2)
+        obs = replace(obs, history=(*obs.history, InformationEvent(
+            EventKind.DISCARD, 0, 3, 59, obs.stock_remaining, 0, face=2,
+        )))
+        self.assertEqual(unpack(encode(obs))["context"][-3:], (0.0, 0.0, 0.0))
+        forced = encode(replace(obs, stock_remaining=0))
+        self.assertEqual(legal_actions(forced), (1,))
+        self.assertEqual(unpack(forced)["context"][CONTEXT_CHANNELS.index("top_gain_pseq")], 1.0)
 
     def test_zero_sequence_quota_exempts_sets_without_dividing_by_zero(self):
         obs = self.observation((6, 19, 32), 51, 0)

@@ -443,6 +443,25 @@ describe("encodeObservation", () => {
     assert.deepEqual(legal(obs), []);
   });
 
+  it("masks a previous own discard only while stock remains and zeros its top gains", () => {
+    const obs = observation([0, 1, 9]);
+    obs.history.push({ ...obs.history[0], kind: 3, face: 2, offeredTop: null, initialHand: [] });
+    const legal = input => Array.from(encodeObservation(input).slice(OFFSETS.legal, OFFSETS.top))
+      .flatMap((allowed, action) => allowed ? [action] : []);
+    assert.deepEqual(legal(obs), [0]);
+    const features = encodeObservation(obs);
+    assert.deepEqual(["top_gain_pseq", "top_gain_gated", "top_gain_pairs"].map(name => context(features, name)),
+      [0, 0, 0]);
+    obs.stockRemaining = 0;
+    assert.deepEqual(legal(obs), [1]);
+    assert.equal(context(encodeObservation(obs), "top_gain_pseq"), 1);
+    obs.stockRemaining = 151;
+    obs.players.push({ ...obs.players[0] });
+    Object.assign(obs.players[0], { nextPlayer: 1, previousPlayer: 1 });
+    obs.history.at(-1).actor = 1;
+    assert.deepEqual(legal(obs), [0, 1]);
+  });
+
   it("zeros the legal mask for terminal states and afterstates awaiting another seat", () => {
     const obs = observation();
     assert.deepEqual(Array.from(encodeObservation(obs).slice(OFFSETS.legal, OFFSETS.top)), [1, 1, ...new Array(52).fill(0)]);

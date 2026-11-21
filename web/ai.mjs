@@ -318,7 +318,9 @@ function casualPolicy(obs, random) {
 
 function neuralPolicy(obs, model) {
   const values = qValues(model, [obs])[0];
-  const actions = obs.phase === 0 ? legalActions(obs) : candidateFaces(obs, true).map(face => face + 2);
+  let actions = obs.phase === 0 ? legalActions(obs) : candidateFaces(obs, true).map(face => face + 2);
+  const last = obs.history.at(-1);
+  if (obs.phase === 0 && last?.actor === 0 && last.kind === DISCARD && obs.stockRemaining > 0) actions = [0];
   const action = actions.reduce((best, candidate) => values[candidate] > values[best] ? candidate : best, actions[0]);
   return { action, reason: "greedy" };
 }

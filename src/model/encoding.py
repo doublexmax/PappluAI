@@ -216,7 +216,7 @@ def encode(obs: Observation) -> Features:
     held = [[0] * NUM_FACES for _ in players]
     takes, passes = [0] * count, [0] * count
     discarded, next_passed, pile = [0] * NUM_FACES, [0] * NUM_FACES, [0] * NUM_FACES
-    next_opp = players[0].next_player if count > 1 else -1
+    next_opp = players[0].next_player if count > 1 and players[0].next_player > 0 else -1
     refills = 0
     for face in obs.discard_pile:
         pile[face] += 1
@@ -296,6 +296,8 @@ def encode(obs: Observation) -> Features:
         and last.actor == 0 and sum(c > 0 for c in hand) > 1
     ):
         legal[2 + last.face] = False
+    if obs.phase is Phase.DRAW and last.kind is EventKind.DISCARD and last.actor == 0 and legal[0]:
+        legal[1] = False
     if to_act and obs.phase is Phase.DISCARD:
         for face, copies in enumerate(hand):
             if not copies or not legal[2 + face]:
