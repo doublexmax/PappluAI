@@ -19,25 +19,57 @@ from src.checkpoints.tensor import atomic_torch_save, clone_model_state, validat
 from src.evaluation.arena import CheckpointPolicy, Deal, EpsilonPolicy, GreedyPolicy, HeuristicPolicy, RandomPolicy, run_matches
 from src.evaluation.benchmark import evaluate_games
 from src.game.environment import GameConfig, PappluEnv
-from src.game.multiplayer import MatchConfig
-from src.game.outcome import solo_outcome
+from src.game.multiplayer import MatchConfig, MultiplayerEnv
+from src.game.outcome import DealOutcome, solo_outcome
 from src.model.encoding import FEATURE_SIZE, LAYOUT, Features, encode
 from src.model.network import ObservationBatch, QNetwork, checkpoint_payload, load_checkpoint
 from src.model.spec import ModelSpec
 
 
-STATE_VERSION = 8
+STATE_VERSION = 12
 VALIDATION_SEED = 30_000_001
+ZLIB_CHUNK = 1 << 26
 
 
 class Step(NamedTuple):
     features: Features
     action: int
+    greedy: bool = True
 
 
 class Trajectory(NamedTuple):
     steps: tuple[Step, ...]
     utility: float
+
+
+def save_rollout_batch(path: Path, episodes: int, trajectories: Sequence[Trajectory]) -> None:
+    atomic_torch_save({
+        "version": STATE_VERSION, "episodes": episodes,
+        "features": zlib.compress(bytearray().join(step.features.data for t in trajectories for step in t.steps), level=1),
+        "records": tuple((tuple(s.action for s in t.steps), tuple(s.greedy for s in t.steps), float(t.utility))
+                         for t in trajectories),
+    }, path)
+
+
+def load_rollout_batch(path: Path) -> tuple[int, list[Trajectory]]:
+    batch = torch.load(path, map_location="cpu", weights_only=True)
+    episodes, records = batch["episodes"], batch["records"]
+    if batch.get("version") != STATE_VERSION or type(episodes) is not int or episodes < 1:
+        raise ValueError("invalid rollout batch version or episode count")
+    if any(len(actions) != len(greedy) for actions, greedy, _ in records):
+        raise ValueError("rollout action and greedy lengths mismatch")
+    try:
+        raw = zlib.decompress(batch["features"])
+    except zlib.error as exc:
+        raise ValueError("corrupted rollout features") from exc
+    size = FEATURE_SIZE * 4
+    if len(raw) != sum(len(actions) for actions, _, _ in records) * size:
+        raise ValueError("rollout byte length mismatch")
+    features = iter(Features(raw[offset:offset + size]) for offset in range(0, len(raw), size))
+    return episodes, [
+        Trajectory(tuple(Step(next(features), action, flag) for action, flag in zip(actions, greedy)), utility)
+        for actions, greedy, utility in records
+    ]
 
 
 @dataclass(frozen=True)
@@ -48,20 +80,19 @@ class TrainConfig:
     max_turns: int = 60
     recycle_discard: bool = True
     player_counts: tuple[int, ...] = (1, 2, 3, 4)
-    round_episodes: int = 16
-    updates_per_episode: int = 4
-    batch_size: int = 128
-    replay_capacity: int = 40_000
-    learning_rate: float = 3e-4
+    round_episodes: int = 32
+    updates_per_episode: int = 2
+    batch_size: int = 256
+    replay_capacity: int = 60_000
+    learning_rate: float = 4e-4
+    lr_decay_updates: int = 20_000
     weight_decay: float = 1e-4
-    gamma: float = 0.98
-    margin_weight: float = 0.50
+    gamma: float = 0.99
+    margin_weight: float = 0.35
     grad_clip: float = 1.0
-    epsilon_start: float = 0.30
-    epsilon_end: float = 0.05
-    epsilon_decay_episodes: int = 10_000
+    epsilons: tuple[float, ...] = (0.01, 0.02, 0.05)
     actors: int = 1
-    self_play_share: float = 0.50
+    self_play_share: float = 0.35
     max_pool: int = 8
     validate_every: int = 1_000
     validation_games: int = 64
@@ -81,28 +112,76 @@ class TrainConfig:
                 MatchConfig(game, count)
         for name, low in (
             ("round_episodes", 1), ("updates_per_episode", 0), ("batch_size", 1),
-            ("replay_capacity", 1), ("epsilon_decay_episodes", 0), ("actors", 1),
+            ("replay_capacity", 1), ("lr_decay_updates", 0), ("actors", 1),
             ("max_pool", 1), ("validate_every", 1), ("validation_games", 0),
             ("checkpoint_every", 1), ("seed", 0), ("torch_threads", 1),
         ):
             if type(getattr(self, name)) is not int or getattr(self, name) < low:
                 raise ValueError("%s must be an integer >= %d" % (name, low))
-        for name in ("learning_rate", "weight_decay", "gamma", "margin_weight", "grad_clip", "epsilon_start", "epsilon_end", "self_play_share"):
+        if not isinstance(self.epsilons, (tuple, list)) or not self.epsilons or any(
+            type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1
+            for value in self.epsilons
+        ):
+            raise ValueError("epsilons must contain finite numbers in [0, 1]")
+        object.__setattr__(self, "epsilons", tuple(float(value) for value in self.epsilons))
+        for name in ("learning_rate", "weight_decay", "gamma", "margin_weight", "grad_clip", "self_play_share"):
             value = getattr(self, name)
-            high = 1.0 if name in ("gamma", "epsilon_start", "epsilon_end", "self_play_share") else math.inf
+            high = 1.0 if name in ("gamma", "self_play_share") else math.inf
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= high:
                 raise ValueError("%s is out of range" % name)
-        if min(self.learning_rate, self.gamma, self.grad_clip) <= 0 or self.epsilon_end > self.epsilon_start:
-            raise ValueError("learning_rate, gamma and grad_clip must be positive; epsilon must decay")
+        if min(self.learning_rate, self.gamma, self.grad_clip) <= 0:
+            raise ValueError("learning_rate, gamma and grad_clip must be positive")
         torch.device(self.device)
 
     @property
     def game(self) -> GameConfig:
         return GameConfig(self.num_decks, self.cards_in_hand, self.required_sequences, self.max_turns, self.recycle_discard)
 
-    def epsilon(self, episodes: int) -> float:
-        fraction = min(episodes / self.epsilon_decay_episodes, 1.0) if self.epsilon_decay_episodes else 1.0
-        return self.epsilon_start + fraction * (self.epsilon_end - self.epsilon_start)
+
+def _compress_tensor(tensor: torch.Tensor) -> bytes:
+    ptr, total = tensor.data_ptr(), tensor.numel() * tensor.element_size()
+    compressor = zlib.compressobj(level=1)
+    chunks = [compressor.compress(ctypes.string_at(ptr + offset, min(ZLIB_CHUNK, total - offset)))
+              for offset in range(0, total, ZLIB_CHUNK)]
+    chunks.append(compressor.flush())
+    return b"".join(chunks)
+
+
+def _decompress_tensor(payload: object, target: torch.Tensor) -> None:
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise ValueError("corrupted replay data")
+    ptr, expected = target.data_ptr(), target.numel() * target.element_size()
+    decompressor = zlib.decompressobj()
+    written = 0
+
+    def write(piece: bytes) -> None:
+        nonlocal written
+        size = len(piece)
+        if written + size > expected:
+            raise ValueError("replay byte length mismatch")
+        if size:
+            ctypes.memmove(ptr + written, piece, size)
+            written += size
+
+    try:
+        data = memoryview(payload).cast("B")
+        for offset in range(0, len(data), ZLIB_CHUNK):
+            if decompressor.eof:
+                raise ValueError("corrupted replay data")
+            chunk: bytes | memoryview = data[offset:offset + ZLIB_CHUNK]
+            while True:
+                piece = decompressor.decompress(chunk, max_length=ZLIB_CHUNK)
+                write(piece)
+                if decompressor.eof or (not decompressor.unconsumed_tail and len(piece) < ZLIB_CHUNK):
+                    break
+                chunk = decompressor.unconsumed_tail
+        write(decompressor.flush(ZLIB_CHUNK))
+    except (TypeError, zlib.error) as exc:
+        raise ValueError("corrupted replay data") from exc
+    if not decompressor.eof or decompressor.unused_data:
+        raise ValueError("corrupted replay data")
+    if written != expected:
+        raise ValueError("replay byte length mismatch")
 
 
 class Replay:
@@ -113,6 +192,7 @@ class Replay:
         self.features = torch.empty((capacity, FEATURE_SIZE), dtype=torch.float32, device="cpu")
         self.actions = torch.empty(capacity, dtype=torch.int64, device="cpu")
         self.returns = torch.empty(capacity, dtype=torch.float32, device="cpu")
+        self.greedy = torch.empty(capacity, dtype=torch.bool, device="cpu")
 
     def __len__(self) -> int:
         return self.size
@@ -126,12 +206,17 @@ class Replay:
         data = torch.frombuffer(bytearray().join(step.features.data for step in kept), dtype=torch.float32)
         actions = torch.tensor([step.action for step in kept], dtype=torch.int64, device="cpu")
         returns = torch.tensor(
-            [utility * self.gamma ** offset for offset in range(len(kept) - 1, -1, -1)],
+            [utility * self.gamma ** offset if utility > 0 else float(utility)
+             for offset in range(len(kept) - 1, -1, -1)],
             dtype=torch.float32, device="cpu",
         )
+        greedy = torch.tensor([step.greedy for step in kept], dtype=torch.bool, device="cpu")
         start = (self.cursor + length - len(kept)) % self.capacity
         first = min(len(kept), self.capacity - start)
-        for target, source in ((self.features, data.reshape(-1, FEATURE_SIZE)), (self.actions, actions), (self.returns, returns)):
+        for target, source in (
+            (self.features, data.reshape(-1, FEATURE_SIZE)), (self.actions, actions),
+            (self.returns, returns), (self.greedy, greedy),
+        ):
             target[start:start + first].copy_(source[:first])
             target[:len(kept) - first].copy_(source[first:])
         self.cursor = (self.cursor + length) % self.capacity
@@ -140,9 +225,8 @@ class Replay:
 
     def state_dict(self) -> dict:
         state = {"capacity": self.capacity, "gamma": self.gamma, "size": self.size, "cursor": self.cursor}
-        for name in ("features", "actions", "returns"):
-            tensor = getattr(self, name)[:self.size]
-            state[name] = zlib.compress(ctypes.string_at(tensor.data_ptr(), tensor.numel() * tensor.element_size()), level=1)
+        for name in ("features", "actions", "returns", "greedy"):
+            state[name] = _compress_tensor(getattr(self, name)[:self.size])
         return state
 
     def load_state_dict(self, state: dict) -> None:
@@ -151,16 +235,8 @@ class Replay:
             raise ValueError("replay configuration mismatch")
         if type(size) is not int or not 0 <= size <= self.capacity or type(cursor) is not int or not 0 <= cursor < self.capacity:
             raise ValueError("invalid replay size or cursor")
-        for name in ("features", "actions", "returns"):
-            target = getattr(self, name)[:size]
-            try:
-                raw = bytearray(zlib.decompress(state[name]))
-            except zlib.error as exc:
-                raise ValueError("corrupted replay data") from exc
-            if len(raw) != target.numel() * target.element_size():
-                raise ValueError("replay byte length mismatch")
-            if size:
-                target.copy_(torch.frombuffer(raw, dtype=target.dtype).reshape(target.shape))
+        for name in ("features", "actions", "returns", "greedy"):
+            _decompress_tensor(state[name], getattr(self, name)[:size])
         self.size, self.cursor = size, cursor
 
 
@@ -192,6 +268,12 @@ class Learner:
         self.online.train()
         total, count = 0.0, min(self.config.batch_size, len(self.replay))
         for _ in range(updates):
+            learning_rate = max(
+                self.config.learning_rate * 0.15,
+                self.config.learning_rate / math.sqrt(1.0 + self.update_count / self.config.lr_decay_updates),
+            ) if self.config.lr_decay_updates else self.config.learning_rate
+            for group in self.optimizer.param_groups:
+                group["lr"] = learning_rate
             idx = torch.tensor(self.rng.choices(range(len(self.replay)), k=count), dtype=torch.long, device="cpu")
             data = self.replay.features[idx].to(self.device)
             fields = {
@@ -201,13 +283,14 @@ class Learner:
             fields["top"] = fields["top"].squeeze(-1).long()
             actions = self.replay.actions[idx].to(self.device)
             targets = self.replay.returns[idx].to(self.device)
+            greedy = self.replay.greedy[idx].to(self.device)
             q_all = self.online(ObservationBatch(**fields))
             q_taken = q_all.gather(1, actions[:, None]).squeeze(1)
             mc_loss = F.smooth_l1_loss(q_taken, targets)
             if self.config.margin_weight > 0:
                 margin = torch.where(fields["legal"] > 0, 0.10, -1e9)
                 margin.scatter_(1, actions[:, None], 0.0)
-                win_mask = (targets > 0).to(q_all.dtype)
+                win_mask = ((targets > 0) & greedy).to(q_all.dtype)
                 margin_loss = (((q_all + margin).amax(dim=1) - q_taken) * win_mask).sum() / win_mask.sum().clamp_min(1.0)
                 loss = mc_loss + self.config.margin_weight * margin_loss
             else:
@@ -235,39 +318,79 @@ class Learner:
         self.step_count, self.update_count = state["step_count"], state["update_count"]
 
 
-def collect_round(config: TrainConfig, online: QNetwork, pool: Sequence[str], start: int, count: int, epsilon: float) -> list[Trajectory]:
-    learner = EpsilonPolicy(online, epsilon)
-    policies = [learner, HeuristicPolicy(), RandomPolicy(), *(CheckpointPolicy(path) for path in pool[-config.max_pool:])]
-    solos, deals, trajectories = [], [], []
+class _Rollout(NamedTuple):
+    env: PappluEnv | MultiplayerEnv
+    deal: Deal
+    rngs: tuple[random.Random, ...]
+    epsilons: tuple[float, ...]
+    steps: list[list[Step]]
+
+
+def collect_round(
+    config: TrainConfig, online: QNetwork, best_path: str, pool: Sequence[str], start: int, count: int,
+) -> list[Trajectory]:
+    learner = EpsilonPolicy(online, config.epsilons[0])
+    policies = [learner, CheckpointPolicy(best_path), HeuristicPolicy(), RandomPolicy(),
+                *(CheckpointPolicy(path) for path in pool[-config.max_pool:])]
+    rollouts, trajectories = [], []
     for episode in range(start, start + count):
         players = config.player_counts[episode % len(config.player_counts)]
         seed = 2 * (config.seed * 10_000_000 + episode)
         rng = random.Random(seed ^ 0x9E3779B97F4A7C15)
-        if players == 1:
-            env = PappluEnv(config.game)
-            solos.append([env, env.reset(seed), rng, []])
-        elif rng.random() < config.self_play_share:
-            deals.append(Deal(seed, (0,) * players, players, frozenset(range(players))))
-        else:
+        seats = [0] * players
+        if players > 1 and rng.random() >= config.self_play_share:
             seat = rng.randrange(players)
-            seats = tuple(0 if s == seat else 1 if rng.random() < 0.5 else rng.randrange(1, len(policies)) for s in range(players))
-            deals.append(Deal(seed, seats, players, frozenset(range(players))))
-    while any(not row[1].done for row in solos):
-        active = [row for row in solos if not row[1].done]
-        features = [encode(row[1]) for row in active]
-        actions = learner.act_features(features, [row[2] for row in active])
-        for row, feature, action in zip(active, features, actions):
-            row[3].append(Step(feature, action))
-            row[1] = row[0].step(action)
-    for _, obs, _, steps in solos:
-        trajectories.append(Trajectory(tuple(steps), solo_outcome(
-            obs.hand, obs.joker, obs.won, config.required_sequences,
-        ).utility))
-    for deal, result in zip(deals, run_matches(deals, policies, config.game)):
+            for other in range(players):
+                if other == seat:
+                    continue
+                draw = rng.random()
+                seats[other] = (
+                    1 if draw < 0.45 else 2 if draw < 0.65 else 3 if draw < 0.70
+                    else rng.randrange(4, len(policies)) if len(policies) > 4 else 1
+                )
+        deal = Deal(seed, tuple(seats), players, frozenset(range(players)))
+        rngs = tuple(random.Random(seed ^ ((seat + 1) * 0x9E3779B97F4A7C15)) for seat in range(players))
+        epsilons = tuple(seat_rng.choice(config.epsilons) if policy == 0 else 0.0
+                         for policy, seat_rng in zip(seats, rngs))
+        env = PappluEnv(config.game) if players == 1 else MultiplayerEnv(MatchConfig(config.game, players))
+        env.reset(seed)
+        rollouts.append(_Rollout(env, deal, rngs, epsilons, [[] for _ in range(players)]))
+    while True:
+        groups = {}
+        for rollout in rollouts:
+            obs = rollout.env.observe()
+            if obs.done:
+                continue
+            seat = 0 if rollout.deal.players == 1 else rollout.env.view().current_seat
+            groups.setdefault(rollout.deal.seats[seat], []).append((rollout, seat, encode(obs)))
+        if not groups:
+            break
+        for policy, rows in groups.items():
+            features = [feature for _, _, feature in rows]
+            rngs = [rollout.rngs[seat] for rollout, seat, _ in rows]
+            if policy == 0:
+                actions = learner.act_features(features, rngs, [rollout.epsilons[seat] for rollout, seat, _ in rows])
+                greedy = learner.last_greedy
+            else:
+                actions = policies[policy].act_features(features, rngs)
+                greedy = [policy != 3] * len(rows)
+            for (rollout, seat, feature), action, was_greedy in zip(rows, actions, greedy):
+                rollout.steps[seat].append(Step(feature, action, was_greedy))
+                rollout.env.step(action)
+    for rollout in rollouts:
+        deal, env = rollout.deal, rollout.env
+        if deal.players == 1:
+            obs = env.observe()
+            trajectories.append(Trajectory(tuple(rollout.steps[0]), solo_outcome(
+                obs.hand, obs.joker, obs.won, config.required_sequences,
+            ).utility))
+            continue
+        view = env.view()
+        outcome = DealOutcome.score(env.terminal_snapshot(), view.winner, view.terminal_reason, config.required_sequences)
         for seat in sorted(deal.record_seats):
-            steps = tuple(Step(decision.features, decision.action) for decision in result.trajectories[seat])
+            steps = tuple(rollout.steps[seat])
             if steps:
-                trajectories.append(Trajectory(steps, result.outcome.seat(seat).utility))
+                trajectories.append(Trajectory(steps, outcome.seat(seat).utility))
     return trajectories
 
 
@@ -276,10 +399,10 @@ def _actor_init() -> None:
 
 
 def _actor_job(job: tuple) -> list[Trajectory]:
-    config, spec, state, pool, start, count, epsilon = job
+    config, spec, state, best_path, pool, start, count = job
     online = QNetwork(spec).eval()
     online.load_state_dict(state)
-    return collect_round(config, online, pool, start, count, epsilon)
+    return collect_round(config, online, best_path, pool, start, count)
 
 
 def _validation_job(job: tuple) -> tuple[str, float]:
@@ -338,7 +461,7 @@ class Trainer:
             trainer.learner.load_state_dict(state["learner"])
             trainer.episodes, trainer.best_score, trainer.validation = state["episodes"], state["best_score"], state["validation"]
             trainer.snapshot_pool = state["snapshot_pool"]
-            for path in ["initial-model.pt", *trainer.snapshot_pool]:
+            for path in ["initial-model.pt", "best-model.pt", *trainer.snapshot_pool]:
                 if not (root / path).is_file():
                     raise ValueError("missing opponent checkpoint " + path)
         else:
@@ -383,8 +506,8 @@ class Trainer:
         if best:
             metrics["vs_best"] = sum(best) / len(best)
         promoted = self.best_score < 0 or (
-            metrics.get("vs_best", 0) > 0.50 and score >= self.best_score - 0.02
-        ) or score > self.best_score + 0.02
+            metrics.get("vs_best", 0) >= 0.51 and score >= self.best_score - 0.02
+        ) or (score > self.best_score + 0.02 and (not best or metrics["vs_best"] >= 0.49))
         if promoted:
             self.best_score = max(self.best_score, score) if best else score
             self.export_model(self.root / "best-model.pt")
@@ -417,22 +540,38 @@ class Trainer:
                     reason = "budget"
                     break
                 count = min(cfg.round_episodes, max_episodes - self.episodes) if max_episodes is not None else cfg.round_episodes
-                start, epsilon = self.episodes, cfg.epsilon(self.episodes)
+                start = self.episodes
+                extra_episodes, extra_trajs = 0, []
+                for path in sorted((self.root / "inbox").glob("batch-*.pt"))[:2]:
+                    episodes, batch = load_rollout_batch(path)
+                    if max_episodes is not None and start + extra_episodes + episodes > max_episodes:
+                        continue
+                    extra_episodes += episodes
+                    extra_trajs.extend(batch)
+                    path.unlink()
+                count = max(0, count - extra_episodes)
+                rollout_start = start + extra_episodes
+                best_path = str(self.root / "best-model.pt")
                 pool = [str(self.root / path) for path in self.snapshot_pool]
-                if cfg.actors == 1:
-                    trajectories = collect_round(cfg, self.learner.online, pool, start, count, epsilon)
+                if not count:
+                    trajectories = []
+                elif cfg.actors == 1:
+                    trajectories = collect_round(cfg, self.learner.online, best_path, pool, rollout_start, count)
                 else:
                     if self._executor is None:
                         self._executor = ProcessPoolExecutor(max_workers=cfg.actors, initializer=_actor_init)
                     chunk, state = math.ceil(count / cfg.actors), clone_model_state(self.learner.online.state_dict())
-                    jobs = [(cfg, self.learner.online.spec, state, pool, offset, min(chunk, start + count - offset), epsilon)
-                            for offset in range(start, start + count, chunk)]
+                    jobs = [(cfg, self.learner.online.spec, state, best_path, pool, offset, min(chunk, rollout_start + count - offset))
+                            for offset in range(rollout_start, rollout_start + count, chunk)]
                     trajectories = [t for batch in self._executor.map(_actor_job, jobs) for t in batch]
+                trajectories = extra_trajs + trajectories
+                count += extra_episodes
                 stats = self.learner.learn(trajectories, cfg.updates_per_episode * count)
                 self.episodes += count
                 validation = self.validate() if cfg.validation_games and self.episodes // cfg.validate_every > start // cfg.validate_every else None
+                self.export_model(self.root / "latest-model.pt")
                 with (self.root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps({"episodes": self.episodes, "epsilon": epsilon, "trajectories": len(trajectories),
+                    stream.write(json.dumps({"episodes": self.episodes, "epsilons": cfg.epsilons, "trajectories": len(trajectories),
                                              **asdict(stats), "validation": validation}, allow_nan=False) + "\n")
                 if self.episodes // cfg.checkpoint_every > start // cfg.checkpoint_every:
                     self.save("running")

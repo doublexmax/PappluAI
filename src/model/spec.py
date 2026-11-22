@@ -11,8 +11,8 @@ class ModelSpecError(ValueError):
 
 @dataclass(frozen=True)
 class ModelSpec:
-    width: int = 64
-    blocks: int = 2
+    width: int = 128
+    blocks: int = 3
 
     def __post_init__(self) -> None:
         if type(self.width) is not int or self.width < 8:

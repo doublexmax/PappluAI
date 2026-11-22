@@ -1,5 +1,6 @@
 import copy
 from dataclasses import replace
+import math
 import unittest
 
 from src.game.environment import GameConfig, PappluEnv
@@ -23,23 +24,27 @@ class TestTensorReplay(unittest.TestCase):
         self.feature = encode(PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1)).reset(17))
 
     def trajectory(self, actions, utility):
-        return Trajectory(tuple(Step(self.feature, action) for action in actions), utility)
+        return Trajectory(tuple(Step(self.feature, action, index % 2 == 0) for index, action in enumerate(actions)), utility)
 
-    def test_ring_retains_latest_steps_and_precomputed_discounted_returns(self):
+    def test_ring_retains_latest_steps_and_discounts_only_positive_returns(self):
         replay = Replay(5, gamma=0.5)
         self.assertEqual(replay.append(self.trajectory((0, 1, 0, 1), -0.5)), 4)
-        self.assertEqual(replay.returns[:4].tolist(), [-0.0625, -0.125, -0.25, -0.5])
+        self.assertEqual(replay.returns[:4].tolist(), [-0.5, -0.5, -0.5, -0.5])
+        self.assertEqual(replay.greedy[:4].tolist(), [True, False, True, False])
         replay.append(self.trajectory((1, 0, 1), 1.0))
         self.assertEqual((len(replay), replay.cursor), (5, 2))
         self.assertEqual(replay.actions.tolist(), [0, 1, 0, 1, 1])
-        self.assertEqual(replay.returns.tolist(), [0.5, 1.0, -0.25, -0.5, 0.25])
+        self.assertEqual(replay.returns.tolist(), [0.5, 1.0, -0.5, -0.5, 0.25])
+        self.assertEqual(replay.greedy.tolist(), [False, True, True, False, True])
         replay.append(self.trajectory((0,) * 8, 1.0))
         self.assertEqual((len(replay), replay.cursor), (5, 0))
         self.assertEqual(replay.returns.tolist(), [0.0625, 0.125, 0.25, 0.5, 1.0])
+        self.assertEqual(replay.greedy.tolist(), [False, True, False, True, False])
         self.assertEqual(replay.features.shape, (5, FEATURE_SIZE))
         self.assertEqual(replay.features.dtype, torch.float32)
         self.assertEqual(replay.actions.dtype, torch.int64)
         self.assertEqual(replay.returns.dtype, torch.float32)
+        self.assertEqual(replay.greedy.dtype, torch.bool)
         self.assertTrue(replay.features.is_contiguous())
         self.assertEqual(replay.features[0].tolist(), list(feature_values(self.feature)))
 
@@ -49,11 +54,11 @@ class TestTensorReplay(unittest.TestCase):
                 replay = Replay(5)
                 replay.append(self.trajectory((0, 1) * count, -0.75))
                 state = replay.state_dict()
-                self.assertTrue(all(isinstance(state[name], bytes) for name in ("features", "actions", "returns")))
+                self.assertTrue(all(isinstance(state[name], bytes) for name in ("features", "actions", "returns", "greedy")))
                 restored = Replay(5)
                 restored.load_state_dict(state)
                 self.assertEqual((len(restored), restored.cursor), (len(replay), replay.cursor))
-                for name in ("features", "actions", "returns"):
+                for name in ("features", "actions", "returns", "greedy"):
                     torch.testing.assert_close(getattr(restored, name)[:len(replay)], getattr(replay, name)[:len(replay)], rtol=0, atol=0)
                 self.assertEqual(restored.state_dict(), state)
 
@@ -62,9 +67,16 @@ class TestTensorReplay(unittest.TestCase):
         replay.append(self.trajectory((0, 1), 1.0))
         state = replay.state_dict()
         for change in ({"capacity": 4}, {"gamma": 0.5}, {"size": 6}, {"cursor": -1},
-                       {"features": b"not compressed"}, {"size": 3}):
+                       {"features": b"not compressed"}, {"greedy": b"not compressed"}, {"size": 3}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 Replay(5).load_state_dict({**state, **change})
+
+    def test_long_losses_and_zero_returns_never_shrink_with_turn_count(self):
+        for utility in (-0.8, 0.0):
+            with self.subTest(utility=utility):
+                replay = Replay(120, gamma=0.5)
+                replay.append(self.trajectory((0,) * 120, utility))
+                torch.testing.assert_close(replay.returns, torch.full((120,), utility), rtol=0, atol=0)
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
@@ -78,7 +90,8 @@ class TestDMCLearner(unittest.TestCase):
         )
         self.network = QNetwork(ModelSpec(16, 1))
         self.features = [encode(PappluEnv(self.config.game).reset(seed)) for seed in range(8)]
-        self.trajectories = [Trajectory((Step(feature, 0),), 0.75) for feature in self.features]
+        self.trajectories = [Trajectory((Step(feature, 0, index % 2 == 0),), 0.75)
+                             for index, feature in enumerate(self.features)]
 
     def test_updates_reduce_selected_action_error_on_real_observations(self):
         learner = Learner(self.network, self.config, seed=19)
@@ -103,20 +116,40 @@ class TestDMCLearner(unittest.TestCase):
                 return self.q.expand(batch.legal.shape[0], -1)
 
         for utility in (1.0, -1.0, 0.0):
-            for weight in (0.0, 0.5):
-                with self.subTest(utility=utility, weight=weight):
-                    network = ActionValues(utility)
-                    before = network.q.detach().clone()
-                    learner = Learner(network, replace(self.config, margin_weight=weight))
-                    stats = learner.learn([Trajectory((Step(self.features[0], 0),), utility)])
-                    expected = 0.05 * weight if utility > 0 else 0.0
-                    self.assertAlmostEqual(stats.loss, expected, places=7)
-                    if expected:
-                        self.assertGreater(network.q[0].item(), utility)
-                        self.assertLess(network.q[1].item(), before[1].item())
-                        torch.testing.assert_close(network.q[2:], before[2:], rtol=0, atol=0)
-                    else:
-                        torch.testing.assert_close(network.q, before, rtol=0, atol=0)
+            for greedy in (True, False):
+                for weight in (0.0, 0.5):
+                    with self.subTest(utility=utility, greedy=greedy, weight=weight):
+                        network = ActionValues(utility)
+                        before = network.q.detach().clone()
+                        learner = Learner(network, replace(self.config, margin_weight=weight))
+                        stats = learner.learn([Trajectory((Step(self.features[0], 0, greedy),), utility)])
+                        expected = 0.05 * weight if utility > 0 and greedy else 0.0
+                        self.assertAlmostEqual(stats.loss, expected, places=7)
+                        if expected:
+                            self.assertGreater(network.q[0].item(), utility)
+                            self.assertLess(network.q[1].item(), before[1].item())
+                            torch.testing.assert_close(network.q[2:], before[2:], rtol=0, atol=0)
+                        else:
+                            torch.testing.assert_close(network.q, before, rtol=0, atol=0)
+
+    def test_inverse_sqrt_learning_rate_uses_completed_updates_and_a_floor(self):
+        config = replace(self.config, learning_rate=0.004, lr_decay_updates=2)
+        learner = Learner(self.network, config)
+        learner.learn(self.trajectories)
+        self.assertEqual(learner.optimizer.param_groups[0]["lr"], 0.004)
+        learner.update()
+        self.assertAlmostEqual(learner.optimizer.param_groups[0]["lr"], 0.004 / math.sqrt(1.5), places=12)
+        learner.update()
+        self.assertAlmostEqual(learner.optimizer.param_groups[0]["lr"], 0.004 / math.sqrt(2.0), places=12)
+        learner.update_count = 100
+        learner.update()
+        self.assertAlmostEqual(learner.optimizer.param_groups[0]["lr"], 0.0006, places=12)
+
+    def test_zero_decay_keeps_learning_rate_fixed_after_many_updates(self):
+        learner = Learner(self.network, replace(self.config, learning_rate=0.004, lr_decay_updates=0))
+        learner.update_count = 100_000
+        learner.learn(self.trajectories)
+        self.assertEqual(learner.optimizer.param_groups[0]["lr"], 0.004)
 
     def test_state_restores_optimizer_replay_and_sampling_for_exact_continuation(self):
         learner = Learner(self.network, self.config, seed=19)

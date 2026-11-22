@@ -182,10 +182,10 @@ describe("parseQModel", () => {
     assert.ok(Object.isFrozen(model) && Object.isFrozen(model.spec) && Object.isFrozen(model.gameConfig) && Object.isFrozen(model.source));
     assert.throws(() => qValues({ ...model }, []), /must come from parseQModel/);
     assert.deepEqual(qValues(model, []), []);
-    assert.deepEqual(MODEL.tensors["policy.card_embed.weight"].shape, [64, 22]);
-    assert.deepEqual(MODEL.tensors["policy.table_embed.weight"].shape, [64, 76]);
+    assert.deepEqual(MODEL.tensors["policy.card_embed.weight"].shape, [128, 22]);
+    assert.deepEqual(MODEL.tensors["policy.table_embed.weight"].shape, [128, 76]);
     assert.equal(Object.values(MODEL.tensors).reduce((sum, tensor) =>
-      sum + tensor.shape.reduce((a, b) => a * b, 1), 0), 127172);
+      sum + tensor.shape.reduce((a, b) => a * b, 1), 0), 673412);
   });
 
   it("accepts bootstrap and checkpoint source identities without registry metadata", () => {
@@ -246,9 +246,12 @@ describe("parseQModel", () => {
     ["a missing tensor", m => { delete m.tensors["policy.face_out.bias"]; }, /model\.tensors\.policy\.face_out\.bias: missing/],
     ["an auxiliary tensor", m => { m.tensors["aux.face_win.bias"] = m.tensors["policy.face_out.bias"]; }, /model\.tensors\.aux\.face_win\.bias: unexpected/],
     ["an extra tensor field", m => { m.tensors["policy.face_out.bias"].dtype = "float32"; }, /model\.tensors\["policy.face_out.bias"\]\.dtype:/],
-    ["a transposed shape", m => { m.tensors["policy.face_out.weight"].shape = [64, 1]; }, /model\.tensors\["policy.face_out.weight"\]\.shape:/],
+    ["a transposed shape", m => { m.tensors["policy.face_out.weight"].shape = [128, 1]; }, /model\.tensors\["policy.face_out.weight"\]\.shape:/],
     ["a string shape", m => { m.tensors["policy.face_out.bias"].shape = "1"; }, /model\.tensors\["policy.face_out.bias"\]\.shape:/],
-    ["truncated data", m => { m.tensors["policy.face_local.bias"].data = m.tensors["policy.face_local.bias"].data.slice(0, -8); }, /expected 256 bytes, got 252/],
+    ["truncated data", m => {
+      const tensor = m.tensors["policy.face_local.bias"];
+      tensor.data = Buffer.from(tensor.data, "base64").subarray(0, -4).toString("base64");
+    }, /expected 512 bytes, got 508/],
     ["invalid base64", m => { m.tensors["policy.face_out.bias"].data = "not base64"; }, /expected base64 text/],
     ["unpadded base64", m => { m.tensors["policy.face_out.bias"].data = "AAAAAA"; }, /expected base64 text/],
     ["numeric tensor data", m => { m.tensors["policy.face_out.bias"].data = 0; }, /expected base64 text/],
@@ -460,6 +463,23 @@ describe("encodeObservation", () => {
     assert.deepEqual(legal(obs), [32]);
     obs.phase = 2;
     assert.deepEqual(legal(obs), []);
+  });
+
+  it("masks solo self-discard pickup only when stock is available", () => {
+    const obs = observation();
+    const legal = input => Array.from(encodeObservation(input).slice(OFFSETS.legal, OFFSETS.top))
+      .flatMap((allowed, action) => allowed ? [action] : []);
+    assert.deepEqual(legal(obs), [0, 1]);
+    obs.history.push({
+      ...obs.history[0], kind: 3, face: 2, offeredTop: null, initialHand: [],
+    });
+    assert.deepEqual(legal(obs), [0]);
+    obs.stockRemaining = 0;
+    assert.deepEqual(legal(obs), [1]);
+    obs.stockRemaining = 151;
+    obs.players.push({ ...obs.players[0] });
+    obs.history.at(-1).actor = 1;
+    assert.deepEqual(legal(obs), [0, 1]);
   });
 
   it("zeros the legal mask for terminal states and afterstates awaiting another seat", () => {

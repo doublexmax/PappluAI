@@ -159,17 +159,26 @@ class EpsilonPolicy(GreedyPolicy):
         self.network = network
         self.epsilon = float(epsilon)
         self.game_config = getattr(network, "game_config", None)
+        self.last_greedy: list[bool] = []
 
     def act(self, observation: Observation, rng: random.Random) -> int:
         return self.act_features([encode(observation)], [rng])[0]
 
-    def act_features(self, features: Sequence[Features], rngs: Sequence[random.Random]) -> list[int]:
+    def act_features(
+        self, features: Sequence[Features], rngs: Sequence[random.Random],
+        epsilons: Sequence[float] | None = None,
+    ) -> list[int]:
         if len(features) != len(rngs):
             raise ValueError("each feature row needs its own RNG")
+        if epsilons is not None and len(epsilons) != len(features):
+            raise ValueError("each feature row needs its own epsilon")
         actions, greedy_rows = [0] * len(features), []
+        self.last_greedy = [True] * len(features)
         for row, (record, rng) in enumerate(zip(features, rngs)):
-            if rng.random() < self.epsilon:
+            epsilon = self.epsilon if epsilons is None else epsilons[row]
+            if rng.random() < epsilon:
                 actions[row] = rng.choice(legal_actions(record))
+                self.last_greedy[row] = False
             else:
                 greedy_rows.append(row)
         if greedy_rows:

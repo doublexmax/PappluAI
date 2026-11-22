@@ -56,7 +56,7 @@ runpy.run_path('tools/weights_export.py', run_name='__main__')
             self.assertEqual(document["checkpointVersion"], 5)
             self.assertEqual(document["encodingVersion"], 5)
             self.assertEqual(document["architecture"], "card_mlp")
-            self.assertEqual(document["modelSpec"], {"width": 64, "blocks": 2})
+            self.assertEqual(document["modelSpec"], {"width": 128, "blocks": 3})
             self.assertEqual(document["source"]["kind"], "bootstrap")
             self.assertEqual(fixture["oracle"], "python-reference")
             self.assertEqual(len(fixture["cases"]), 15)
@@ -67,7 +67,7 @@ runpy.run_path('tools/weights_export.py', run_name='__main__')
                 ["card", [52, 22]], ["seat", [6, 9]], ["context", [22]], ["legal", [54]], ["top", [1]],
             ])
             self.assertEqual(
-                sum(len(base64.b64decode(entry["data"])) // 4 for entry in document["tensors"].values()), 127172,
+                sum(len(base64.b64decode(entry["data"])) // 4 for entry in document["tensors"].values()), 673412,
             )
 
     def test_legacy_heads_flag_is_rejected(self):

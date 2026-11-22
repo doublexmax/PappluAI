@@ -211,6 +211,27 @@ class TestFeatures(unittest.TestCase):
             )))
             self.assertIn(discard_action(taken), legal_actions(encode(from_stock)))
 
+    def test_solo_self_discard_pickup_is_masked_only_when_stock_is_available(self):
+        game = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=4)
+        env = PappluEnv(game)
+        initial = env.reset(17)
+        self.assertEqual(legal_actions(encode(initial)), (0, 1))
+        with mock.patch("src.game.environment.hand_reward", return_value=0.0):
+            drawn = env.step(0)
+            obs = env.step(legal_actions(encode(drawn))[0])
+        self.assertIs(obs.history[-1].kind, EventKind.DISCARD)
+        self.assertEqual(obs.history[-1].actor, 0)
+        self.assertEqual(legal_actions(encode(obs)), (0,))
+        self.assertEqual(legal_actions(encode(replace(obs, stock_remaining=0))), (1,))
+        multiplayer = MultiplayerEnv(MatchConfig(game, 2))
+        multiplayer.reset(17)
+        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
+            multiplayer.step(0)
+            multiplayer.step(legal_actions(encode(multiplayer.observe()))[0])
+        obs = multiplayer.observe()
+        self.assertEqual(obs.history[-1].actor, 1)
+        self.assertEqual(legal_actions(encode(obs)), (0, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

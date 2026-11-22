@@ -48,11 +48,12 @@ export function minimumPenalty(counts, joker, { requiredSequences = 5 } = {}) {
   const hand = parseCounts(counts);
   const jokerFace = parseJoker(joker);
   const quota = requireNonnegative(requiredSequences, "required_sequences");
-  const { faces, options } = compileMeldOptions(hand, jokerFace);
+  const impossible = quota > 0 && pureSequenceUpperBound(hand, jokerFace) < quota;
+  const { faces, options } = compileMeldOptions(hand, jokerFace, impossible);
   const start = faces.map((face) => hand[face]);
   const points = faces.map((face) => cardPoints(face, jokerFace));
   const quotaSearch = new PenaltySearch(points, options);
-  const quotaScore = quotaSearch.cost(start, quota);
+  const quotaScore = impossible ? Infinity : quotaSearch.cost(start, quota);
   let selected = quotaSearch;
   let need = quota;
   let best = quotaScore;
@@ -119,7 +120,9 @@ function parseCounts(counts) {
   if (counts.length !== NUM_FACES) {
     throw new RangeError(`hand must have length ${NUM_FACES}, got ${counts.length}`);
   }
-  return Array.from(counts, (value, index) => requireNonnegative(value, `hand[${index}]`));
+  return Array.from(counts, (value, index) =>
+    typeof value === "number" && Number.isInteger(value) && value >= 0 ?
+      value : requireNonnegative(value, `hand[${index}]`));
 }
 
 function parseJoker(joker) {
@@ -165,8 +168,8 @@ function wildFaces(joker) {
   return Array.from({ length: NUM_SUITS }, (_, suit) => suit * NUM_RANKS + joker % NUM_RANKS);
 }
 
-function* iterAllocations(counts, represented, joker) {
-  const wilds = wildFaces(joker);
+function* iterAllocations(counts, represented, joker, pureOnly = false) {
+  const wilds = pureOnly ? [joker] : wildFaces(joker);
   const actuals = Array(represented.length).fill(0);
   const pool = counts.slice();
   function* place(slot) {
@@ -199,9 +202,9 @@ function meldFrom(kind, actuals, represented, joker) {
   };
 }
 
-function* iterSequences(counts, joker) {
+function* iterSequences(counts, joker, pureOnly = false) {
   const total = sum(counts);
-  const wilds = wildFaces(joker);
+  const wilds = pureOnly ? [joker] : wildFaces(joker);
   const wildCount = sum(wilds.map((face) => counts[face]));
   const natural = counts.map((count, face) => count > 0 && !wilds.includes(face));
   for (let face = 0; face < NUM_FACES; face += 1) {
@@ -215,16 +218,20 @@ function* iterSequences(counts, joker) {
     if (represented.length - sum(represented.map((face) => Number(natural[face]))) > wildCount) {
       continue;
     }
-    for (const actuals of iterAllocations(counts, represented, joker)) {
+    for (const actuals of iterAllocations(counts, represented, joker, pureOnly)) {
       yield meldFrom("sequence", actuals, represented, joker);
     }
   }
 }
 
 function* iterSets(counts, joker) {
+  const wilds = wildFaces(joker);
+  const wildCount = sum(wilds.map((face) => counts[face]));
+  const natural = counts.map((count, face) => count > 0 && !wilds.includes(face));
   for (let rank = 0; rank < NUM_RANKS; rank += 1) {
     for (const suits of SUIT_COMBOS) {
       const represented = suits.map((suit) => suit * NUM_RANKS + rank);
+      if (represented.length - sum(represented.map((face) => Number(natural[face]))) > wildCount) continue;
       for (const actuals of iterAllocations(counts, represented, joker)) {
         yield meldFrom("set", actuals, represented, joker);
       }
@@ -243,13 +250,15 @@ function compareTuple(left, right) {
   return left === right ? 0 : left < right ? -1 : 1;
 }
 
-function compileMeldOptions(counts, joker) {
+function compileMeldOptions(counts, joker, pureOnly = false) {
   const wilds = wildFaces(joker);
   const faces = counts.flatMap((count, face) => count ? [face] : [])
     .sort((left, right) => Number(wilds.includes(left)) - Number(wilds.includes(right)) || left - right);
   const positions = new Map(faces.map((face, index) => [face, index]));
   const best = new Map();
-  for (const melds of [iterSequences(counts, joker), iterSets(counts, joker)]) {
+  const generators = pureOnly ? [iterSequences(counts, joker, true)] :
+    [iterSequences(counts, joker), iterSets(counts, joker)];
+  for (const melds of generators) {
     for (const meld of melds) {
       const used = new Map();
       for (const face of meld.cards) {
@@ -291,6 +300,26 @@ function fits(state, take) {
 function searchMelds(counts, pureNeeded, joker) {
   if (sum(counts) < pureNeeded * MIN_MELD) return null;
   if (pureNeeded > 0 && pureSequenceUpperBound(counts, joker) < pureNeeded) return null;
+  const wilds = wildFaces(joker);
+  const wildCount = sum(wilds.map((face) => counts[face]));
+  if (wildCount < 2) {
+    const natural = counts.map((count, face) => count > 0 && !wilds.includes(face));
+    const covered = new Set(counts.flatMap((count, face) =>
+      count >= MIN_MELD || wilds.includes(face) ? [face] : []));
+    for (const represented of IRREDUCIBLE_SEQUENCES) {
+      if (represented.length === MIN_MELD &&
+          MIN_MELD - sum(represented.map((face) => Number(natural[face]))) <= wildCount) {
+        for (const face of represented) covered.add(face);
+      }
+    }
+    for (let rank = 0; rank < NUM_RANKS; rank += 1) {
+      const represented = Array.from({ length: NUM_SUITS }, (_, suit) => suit * NUM_RANKS + rank);
+      if (sum(represented.map((face) => Number(natural[face]))) + wildCount >= MIN_MELD) {
+        for (const face of represented) covered.add(face);
+      }
+    }
+    if (counts.some((count, face) => count && !covered.has(face))) return null;
+  }
   const { faces, options } = compileMeldOptions(counts, joker);
   const covered = Array(faces.length).fill(false);
   for (const anchored of options) {

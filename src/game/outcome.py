@@ -67,14 +67,14 @@ class DealOutcome:
         if self.winner == seat:
             utility = 1.0
         elif self.winner is not None:
-            utility = -0.5 - 0.5 * points / 100.0
+            utility = -0.35 - 0.50 * points / 100.0
         else:
             required = max(1, self.required_sequences)
             seq_frac = (
                 min(penalty.qualifying_sequences, required) / required
                 if self.required_sequences > 0 else 1.0
             )
-            utility = -0.5 + 0.4 * seq_frac - 0.3 * points / 100.0
+            utility = -0.80 + 0.20 * seq_frac - 0.20 * points / 100.0
         return SeatOutcome(utility, self.winner == seat, penalty.points)
 
 

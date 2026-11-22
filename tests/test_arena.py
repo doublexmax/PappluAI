@@ -446,6 +446,9 @@ class TestArenaCheckpoints(unittest.TestCase):
             with self.subTest(epsilon=epsilon):
                 network = QNetwork()
                 network.train()
+                with torch.no_grad():
+                    for parameter in network.parameters():
+                        parameter.zero_()
                 env = MultiplayerEnv(
                     MatchConfig(
                         game=GameConfig(
@@ -458,14 +461,33 @@ class TestArenaCheckpoints(unittest.TestCase):
                     )
                 )
                 env.reset(seed=901)
-                action = EpsilonPolicy(network, epsilon).act(
+                policy = EpsilonPolicy(network, epsilon)
+                action = policy.act(
                     env.observe(),
                     random.Random(1),
                 )
+                self.assertEqual(action, 0)
+                self.assertEqual(policy.last_greedy, [epsilon == 0.0])
                 self.assertTrue(
                     legal_action_mask(env.observe())[action]
                 )
                 self.assertTrue(network.training)
+
+    def test_per_row_epsilon_flags_follow_the_exploration_branch_even_on_greedy_actions(self):
+        from src.model.network import QNetwork
+
+        network = QNetwork()
+        with torch.no_grad():
+            for parameter in network.parameters():
+                parameter.zero_()
+        feature = encode(PappluEnv().reset(17))
+        policy = EpsilonPolicy(network, 0.99)
+        actions = policy.act_features([feature] * 3, [random.Random(1), random.Random(1), random.Random(2)],
+                                     [0.0, 1.0, 0.5])
+        self.assertEqual(actions, [0, 0, 0])
+        self.assertEqual(policy.last_greedy, [True, False, True])
+        self.assertEqual(policy.act_features([], []), [])
+        self.assertEqual(policy.last_greedy, [])
 
 
 if __name__ == "__main__":

@@ -148,6 +148,26 @@ test("neural keeps a legal single-face discard when it just took that face", () 
   });
 });
 
+test("all tiers avoid solo self-discard pickup without blocking an empty-stock draw", () => {
+  const view = policyView([0, 1, 30], "draw");
+  view.players = [{ handSize: 3, active: true }];
+  view.events.push(
+    { kind: "draw", source: "stock", seat: 0, face: 2, offeredTop: 2, stock: 100 },
+    { kind: "discard", seat: 0, face: 2, stock: 100 },
+  );
+  for (const tier of tiers) {
+    const choice = chooseMove(view, tier, { model: policyModel(view) });
+    assert.deepEqual(choice.move, { type: "draw", source: "stock" }, tier);
+    assert.equal(choice.reason, "forced", tier);
+  }
+  view.stockCount = 0;
+  for (const tier of tiers) {
+    const choice = chooseMove(view, tier, { model: policyModel(view) });
+    assert.deepEqual(choice.move, { type: "draw", source: "discard" }, tier);
+    assert.equal(choice.reason, "forced", tier);
+  }
+});
+
 test("tactical still discards the minimum-penalty face", () => {
   assert.deepEqual(chooseMove(policyView([0, 5, 30, 18]), "tactical"), {
     move: { type: "discard", cardId: 0 }, tier: "tactical", downgrade: null, reason: "min-penalty",

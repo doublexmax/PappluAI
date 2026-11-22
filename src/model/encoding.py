@@ -294,6 +294,8 @@ def encode(obs: Observation) -> Features:
         min(base[0], required) / max(1, required), base[1] / 100.0, 0.0, 0.0,
     ))
     legal = list(legal_action_mask(obs))
+    if obs.phase is Phase.DRAW and last.kind is EventKind.DISCARD and last.actor == 0 and legal[0]:
+        legal[1] = False
     if (
         obs.phase is Phase.DISCARD and last.kind is EventKind.TAKE_DISCARD
         and last.actor == 0 and last.face is not None and sum(c > 0 for c in hand) > 1
