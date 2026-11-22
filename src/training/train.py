@@ -110,7 +110,7 @@ class TrainConfig:
     actor_threads: int = 2
     device: str = "cpu"
     precision: str = "bf16"
-    batch_size: int = 6
+    batch_size: int = 8
     buffer_decisions: int = 400_000
     min_buffer_decisions: int = 20_000
     max_policy_lag: int = 200
@@ -627,17 +627,19 @@ class _LearnerGroup:
     ) -> tuple[_Step, dict[tuple[int, int], int] | None]:
         if self.size == 1:
             return local, None
-        stop_tensor = torch.tensor([local, *(-n for n in sizes.values()), *sizes.values()], dtype=torch.int64)
-        dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
-        outcome, *counts = stop_tensor.tolist()
-        step = _Step(outcome)
+        votes = [int(local == step) for step in _Step]
+        presence = [int(n > 0) for n in sizes.values()]
+        tally = torch.tensor([*votes, *presence, *sizes.values()], dtype=torch.int64)
+        dist.all_reduce(tally, op=dist.ReduceOp.SUM)
+        votes, presence, counts = tally.split((len(_Step), len(sizes), len(sizes)))
+        step = max(step for step, votes in zip(_Step, votes.tolist()) if votes)
         if step != _Step.UPDATE:
             return step, None
-        split = len(sizes)
-        common = {key: -n for key, n in zip(sizes, counts[:split]) if n}
+        pooled = dict(zip(sizes, counts.tolist()))
+        common = {key: pooled[key] for key, ranks in zip(sizes, presence.tolist()) if ranks == self.size}
         if require_common and not common:
             return _Step.WAIT, None
-        return step, common or {key: n for key, n in zip(sizes, counts[split:]) if n}
+        return step, common or {key: n for key, n in pooled.items() if n}
 
     def _average(self, flat: Tensor) -> None:
         dist.all_reduce(flat, op=dist.ReduceOp.AVG if self.use_avg else dist.ReduceOp.SUM)
@@ -730,10 +732,15 @@ class Learner:
         probabilities = log_pi.exp()
         divergence = (probabilities * (log_pi - log_anchor).masked_fill(~legal, 0)).sum(-1)
         entropy = -(probabilities * log_pi.masked_fill(~legal, 0)).sum(-1)
-        kl = divergence[valid].mean()
-        entropy = entropy[valid].mean()
-        policy_loss = -(advantage * taken)[valid].mean()
-        value_loss = 0.5 * (targets - values).square()[valid].mean()
+        lengths = valid.sum(dim=1).clamp_min(1)
+
+        def per_trajectory(x: Tensor) -> Tensor:
+            return (x.masked_fill(~valid, 0).sum(dim=1) / lengths).mean()
+
+        kl = per_trajectory(divergence)
+        entropy = per_trajectory(entropy)
+        policy_loss = -per_trajectory(advantage * taken)
+        value_loss = 0.5 * per_trajectory((targets - values).square())
         loss = policy_loss + config.value_weight * value_loss + config.eta * kl - config.entropy_weight * entropy
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()

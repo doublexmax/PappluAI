@@ -21,7 +21,7 @@ except ImportError:
 
 if torch is not None:
     from src.model.network import GameTransformer, load_checkpoint, save_checkpoint
-    from src.training.train import Learner, Trainer, Trajectories, TrajectoryBatch, _SeatTrajectory
+    from src.training.train import Learner, Trainer, Trajectories, TrajectoryBatch, _SeatTrajectory, _Step
 
 
 def _seat(rank):
@@ -42,6 +42,8 @@ def _train_rank(base):
         "actors": 0, "torch_threads": 1, "batch_size": 1, "min_buffer_decisions": 2,
         "publish_every": 1, "anchor_every": 2, "eval_every": 1, "eval_deals": 1, "precision": "fp32",
     }, initial=seed)
+    step, buckets = trainer.group.step(_Step.UPDATE, {(1, 0): 1 + rank * 4, (1, 14): 5, (2, 0): rank})
+    assert (step, buckets) == (_Step.UPDATE, {(1, 0): 6, (1, 14): 10}), (step, buckets)
     original = load_checkpoint(trainer.model_path, SCHEMA).network
     for model in (trainer.learner.online, trainer.learner.anchor):
         for actual, expected in zip(model.parameters(), original.parameters()):

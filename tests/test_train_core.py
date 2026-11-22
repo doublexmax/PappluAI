@@ -1,3 +1,4 @@
+from collections import Counter
 from dataclasses import replace
 from itertools import islice
 import json
@@ -99,7 +100,7 @@ class TestTrainingCore(unittest.TestCase):
         self.assertFalse(buffer.add(batch, 11))
 
     def test_buckets_keep_short_trajectories_separate_and_only_pad_after_terminal(self):
-        lengths = (2, 3, 120)
+        lengths = (1, 8, 120)
         decisions = sum(lengths)
         batch = Trajectories(
             0, 3, RUN_ID, torch.ones(3, dtype=torch.uint8), torch.tensor([1.0, 0.5, -1.0]),
@@ -115,7 +116,7 @@ class TestTrainingCore(unittest.TestCase):
         for _ in range(12):
             sample = buffer.sample(rng, 4, 0)
             seen = set(sample.valid.sum(dim=1).tolist())
-            self.assertTrue(seen <= {2, 3} or seen == {120}, seen)
+            self.assertTrue(seen <= {1, 8} or seen == {120}, seen)
             observed.update(seen)
             self.assertEqual(sample.action.size(1), max(seen))
             for index, valid in enumerate(sample.valid):
@@ -124,8 +125,13 @@ class TestTrainingCore(unittest.TestCase):
                 torch.testing.assert_close(sample.discount[index, :length - 1], torch.full((length - 1,), .995))
                 self.assertFalse(sample.discount[index, length - 1:].any())
                 self.assertEqual(sample.reward[index].nonzero().flatten().tolist(), [length - 1])
-                self.assertEqual(sample.reward[index, length - 1].item(), {2: 1.0, 3: 0.5, 120: -1.0}[length])
+                self.assertEqual(sample.reward[index, length - 1].item(), {1: 1.0, 8: 0.5, 120: -1.0}[length])
         self.assertEqual(observed, set(lengths))
+
+        frequencies = Counter(int(buffer.sample(rng, 1, 0).valid.sum()) for _ in range(900))
+        for length in lengths:
+            self.assertGreater(frequencies[length], 240, frequencies)
+            self.assertLess(frequencies[length], 360, frequencies)
 
         peer = _Buffer(decisions * 2, 20)
         peer.add(batch, 0)
@@ -140,7 +146,7 @@ class TestTrainingCore(unittest.TestCase):
         self.assertEqual(observed_buckets, {False, True})
 
         fallback = peer.sample(Random(55), 4, 4, seed=41, targets={(2, 14): 1})
-        self.assertLessEqual(fallback.valid.size(1), 3)
+        self.assertLessEqual(fallback.valid.size(1), 8)
 
     def test_published_revision_does_not_change_live_stream_actions(self):
         plan = CollectPlan(player_counts=(1, 2), curriculum_share=0, batch_decisions=1, uniform_mix=0)

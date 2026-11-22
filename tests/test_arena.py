@@ -49,7 +49,8 @@ class TestArena(unittest.TestCase):
         self.assertEqual([result.action_count for result in results], [2, 2, 12])
         self.assertIn(12, actor.batches[2])
         self.assertEqual(actor.finished, {0, 6, 7, 8, 9, 10, 11, 12})
-        self.assertAlmostEqual(sum(results[-1].outcome.utilities()), 0)
+        self.assertEqual(results[-1].outcome.ending, "turns_exhausted")
+        self.assertEqual(results[-1].outcome.utilities(), (-0.5,) * 6)
 
     def test_recorded_uniform_behavior_uses_only_present_legal_actions(self):
         model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
@@ -79,11 +80,11 @@ class TestArena(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "solo discard puzzle"):
             list(run_matches((Deal(19, (0, 0), curriculum=0),), (FirstLegal(),), self.game))
 
-    def test_paired_self_comparison_is_neutral(self):
-        for players in (1, 3):
-            with self.subTest(players=players):
-                result = head_to_head(RandomPolicy(), RandomPolicy(), self.game, players, 3, 10, tables=2)
-                self.assertAlmostEqual(result.advantage, 0)
-                self.assertEqual(result.deals, 3 * max(2, players))
+    def test_paired_solo_comparison_and_multiplayer_timeout_payoff(self):
+        solo = head_to_head(RandomPolicy(), RandomPolicy(), self.game, 1, 3, 10, tables=2)
+        multi = head_to_head(RandomPolicy(), RandomPolicy(), self.game, 3, 3, 10, tables=2)
+        self.assertEqual((solo.advantage, solo.deals), (0.0, 6))
+        self.assertEqual((multi.advantage, multi.deals), (-0.5, 9))
+        self.assertEqual((multi.win_rate, multi.opponent_win_rate), (0.0, 0.0))
         with self.assertRaisesRegex(ValueError, "no longer supported"):
             resolve_policy("heuristic")

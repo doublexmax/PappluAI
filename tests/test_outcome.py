@@ -10,26 +10,38 @@ def hand(*counts):
 
 
 class TestOutcomes(unittest.TestCase):
-    def test_every_point_counts_above_the_old_cap(self):
+    def test_timeout_keeps_exact_deadwood_but_does_not_reward_it(self):
         pairs = tuple((face, 2) for face in (0, 9, 10, 12, 13, 22, 23, 25, 26, 35))
         maximum = hand(*pairs, (36, 1))
         one_less = hand(*pairs, (47, 1))
         self.assertEqual(solo_outcome(maximum, 1, False, 5), SeatOutcome(-1.0, False, 210))
-        self.assertEqual(solo_outcome(one_less, 1, False, 5), SeatOutcome(-209 / 210, False, 209))
+        self.assertEqual(solo_outcome(one_less, 1, False, 5), SeatOutcome(-1.0, False, 209))
         score = DealOutcome.score(TerminalSnapshot((maximum, one_less), 1), None, "turns_exhausted", 5)
         self.assertEqual(score.max_points, 210)
-        self.assertEqual(score.utilities(), (-1 / 420, 1 / 420))
+        self.assertEqual(score.utilities(), (-0.5, -0.5))
         self.assertEqual(score.ranks(), (2, 1))
         self.assertEqual(score.margin(1, 0), 1)
 
     def test_zero_sum_and_placements_on_declaration(self):
         score = DealOutcome(0, "win", tuple(HandPenalty(p, (), ()) for p in (0, 0, 210, 210)), 210)
-        self.assertEqual(score.utilities(), (5 / 6, 1 / 6, -0.5, -0.5))
+        self.assertEqual(score.utilities(), (1.0, -1 / 3, -1 / 3, -1 / 3))
         self.assertAlmostEqual(sum(score.utilities()), 0)
         self.assertEqual(score.ranks(), (1, 2, 3, 3))
         self.assertEqual(score.margin(2, 3), 0)
-        self.assertEqual(score.seat(2), SeatOutcome(-0.5, False, 210))
+        self.assertEqual(score.seat(2), SeatOutcome(-1 / 3, False, 210))
         self.assertEqual(placements((25, 30, 25), None, "turns_exhausted"), (1, 3, 1))
+
+    def test_payoffs_with_different_seat_counts_and_deadwood(self):
+        losses = (-1.0, -0.5, -1 / 3, -0.25, -0.2)
+        for players, loss in enumerate(losses, start=2):
+            with self.subTest(players=players):
+                points = (42,) + (105,) * (players - 2) + (0,)
+                penalties = tuple(HandPenalty(p, (), ()) for p in points)
+                declared = DealOutcome(players - 1, "win", penalties, 210)
+                expired = DealOutcome(None, "turns_exhausted", penalties, 210)
+                self.assertEqual(declared.utilities(), (loss,) * (players - 1) + (1.0,))
+                self.assertAlmostEqual(sum(declared.utilities()), 0)
+                self.assertEqual(expired.utilities(), (-0.5,) * players)
 
     def test_solo_declaration_and_invalid_terminal_hands(self):
         winning = hand((0, 1), (1, 1), (2, 1))

@@ -1,3 +1,4 @@
+import copy
 import math
 import unittest
 from unittest.mock import patch
@@ -52,6 +53,35 @@ class TestLearner(unittest.TestCase):
         torch.testing.assert_close(values, torch.tensor([
             [0.995**3, 0.995**2, 0.995, 1.0], [-0.995, -1.0, 0.0, 0.0],
         ]))
+
+    def test_mixed_length_update_weights_each_complete_trajectory_equally(self):
+        model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
+        config = TrainConfig(precision="fp32", grad_clip=1000)
+        seats = tuple(
+            _SeatTrajectory(
+                torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
+                torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
+                torch.arange(1, n + 1), torch.full((n,), legal), torch.full((n,), 2),
+                torch.full((n,), -math.log(2)), torch.tensor(utility),
+            )
+            for n, legal, utility in ((1, 4, 1.0), (8, 12, -1.0))
+        )
+
+        def update(rows):
+            learner = Learner(copy.deepcopy(model), config)
+            with torch.no_grad():
+                learner.anchor.policy.bias[2] += 1
+            stats = learner.update(TrajectoryBatch.pack(rows))
+            return stats, learner.online.policy.bias.grad, learner.online.value.bias.grad
+
+        mixed, mixed_policy_grad, mixed_value_grad = update(seats)
+        short, short_policy_grad, short_value_grad = update(seats[:1])
+        long, long_policy_grad, long_value_grad = update(seats[1:])
+        for name in ("policy_loss", "value_loss", "kl_anchor", "entropy"):
+            with self.subTest(component=name):
+                self.assertAlmostEqual(getattr(mixed, name), (getattr(short, name) + getattr(long, name)) / 2, places=6)
+        torch.testing.assert_close(mixed_policy_grad, (short_policy_grad + long_policy_grad) / 2)
+        torch.testing.assert_close(mixed_value_grad, (short_value_grad + long_value_grad) / 2)
 
     def test_bf16_updates_fp32_weights_and_refreshes_the_frozen_anchor(self):
         model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)

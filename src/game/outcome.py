@@ -86,16 +86,12 @@ class DealOutcome:
         return SeatOutcome(self.utilities()[seat], self.winner == seat, self.penalties[seat].points)
 
     def utilities(self) -> tuple[float, ...]:
-        scores = tuple(
-            self.max_points if seat == self.winner else -penalty.points
-            for seat, penalty in enumerate(self.penalties)
-        )
-        players = len(scores)
+        players = len(self.penalties)
+        if self.ending == "turns_exhausted":
+            return (-1.0,) if players == 1 else (-0.5,) * players
         if players == 1:
-            return (scores[0] / self.max_points,)
-        total = sum(scores)
-        scale = 2 * (players - 1) * self.max_points
-        return tuple((players * score - total) / scale for score in scores)
+            return (1.0,)
+        return tuple(1.0 if seat == self.winner else -1.0 / (players - 1) for seat in range(players))
 
 
 def solo_outcome(
