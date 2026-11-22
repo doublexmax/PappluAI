@@ -28,6 +28,7 @@ from src.model.spec import ModelSpec
 
 STATE_VERSION = 12
 VALIDATION_SEED = 30_000_001
+ZLIB_CHUNK = 1 << 26
 
 
 class Step(NamedTuple):
@@ -137,6 +138,52 @@ class TrainConfig:
         return GameConfig(self.num_decks, self.cards_in_hand, self.required_sequences, self.max_turns, self.recycle_discard)
 
 
+def _compress_tensor(tensor: torch.Tensor) -> bytes:
+    ptr, total = tensor.data_ptr(), tensor.numel() * tensor.element_size()
+    compressor = zlib.compressobj(level=1)
+    chunks = [compressor.compress(ctypes.string_at(ptr + offset, min(ZLIB_CHUNK, total - offset)))
+              for offset in range(0, total, ZLIB_CHUNK)]
+    chunks.append(compressor.flush())
+    return b"".join(chunks)
+
+
+def _decompress_tensor(payload: object, target: torch.Tensor) -> None:
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise ValueError("corrupted replay data")
+    ptr, expected = target.data_ptr(), target.numel() * target.element_size()
+    decompressor = zlib.decompressobj()
+    written = 0
+
+    def write(piece: bytes) -> None:
+        nonlocal written
+        size = len(piece)
+        if written + size > expected:
+            raise ValueError("replay byte length mismatch")
+        if size:
+            ctypes.memmove(ptr + written, piece, size)
+            written += size
+
+    try:
+        data = memoryview(payload).cast("B")
+        for offset in range(0, len(data), ZLIB_CHUNK):
+            if decompressor.eof:
+                raise ValueError("corrupted replay data")
+            chunk: bytes | memoryview = data[offset:offset + ZLIB_CHUNK]
+            while True:
+                piece = decompressor.decompress(chunk, max_length=ZLIB_CHUNK)
+                write(piece)
+                if decompressor.eof or (not decompressor.unconsumed_tail and len(piece) < ZLIB_CHUNK):
+                    break
+                chunk = decompressor.unconsumed_tail
+        write(decompressor.flush(ZLIB_CHUNK))
+    except (TypeError, zlib.error) as exc:
+        raise ValueError("corrupted replay data") from exc
+    if not decompressor.eof or decompressor.unused_data:
+        raise ValueError("corrupted replay data")
+    if written != expected:
+        raise ValueError("replay byte length mismatch")
+
+
 class Replay:
     def __init__(self, capacity: int, gamma: float = 0.99) -> None:
         if type(capacity) is not int or capacity < 1 or not 0 < gamma <= 1:
@@ -179,8 +226,7 @@ class Replay:
     def state_dict(self) -> dict:
         state = {"capacity": self.capacity, "gamma": self.gamma, "size": self.size, "cursor": self.cursor}
         for name in ("features", "actions", "returns", "greedy"):
-            tensor = getattr(self, name)[:self.size]
-            state[name] = zlib.compress(ctypes.string_at(tensor.data_ptr(), tensor.numel() * tensor.element_size()), level=1)
+            state[name] = _compress_tensor(getattr(self, name)[:self.size])
         return state
 
     def load_state_dict(self, state: dict) -> None:
@@ -190,15 +236,7 @@ class Replay:
         if type(size) is not int or not 0 <= size <= self.capacity or type(cursor) is not int or not 0 <= cursor < self.capacity:
             raise ValueError("invalid replay size or cursor")
         for name in ("features", "actions", "returns", "greedy"):
-            target = getattr(self, name)[:size]
-            try:
-                raw = bytearray(zlib.decompress(state[name]))
-            except zlib.error as exc:
-                raise ValueError("corrupted replay data") from exc
-            if len(raw) != target.numel() * target.element_size():
-                raise ValueError("replay byte length mismatch")
-            if size:
-                target.copy_(torch.frombuffer(raw, dtype=target.dtype).reshape(target.shape))
+            _decompress_tensor(state[name], getattr(self, name)[:size])
         self.size, self.cursor = size, cursor
 
 
@@ -504,7 +542,7 @@ class Trainer:
                 count = min(cfg.round_episodes, max_episodes - self.episodes) if max_episodes is not None else cfg.round_episodes
                 start = self.episodes
                 extra_episodes, extra_trajs = 0, []
-                for path in sorted((self.root / "inbox").glob("batch-*.pt"))[:8]:
+                for path in sorted((self.root / "inbox").glob("batch-*.pt"))[:2]:
                     episodes, batch = load_rollout_batch(path)
                     if max_episodes is not None and start + extra_episodes + episodes > max_episodes:
                         continue
@@ -531,6 +569,7 @@ class Trainer:
                 stats = self.learner.learn(trajectories, cfg.updates_per_episode * count)
                 self.episodes += count
                 validation = self.validate() if cfg.validation_games and self.episodes // cfg.validate_every > start // cfg.validate_every else None
+                self.export_model(self.root / "latest-model.pt")
                 with (self.root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps({"episodes": self.episodes, "epsilons": cfg.epsilons, "trajectories": len(trajectories),
                                              **asdict(stats), "validation": validation}, allow_nan=False) + "\n")

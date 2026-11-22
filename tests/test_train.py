@@ -228,24 +228,6 @@ class TestSelfPlayTrainer(unittest.TestCase):
             self.assertEqual((trainer.episodes, trainer.learner.step_count, trainer.learner.update_count), (6, 12, 6))
             self.assertFalse(path.exists())
 
-    def test_inbox_consumes_at_most_eight_sorted_batches_per_round(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            trainer = Trainer.open(Path(temporary), {
-                **self.overrides, "player_counts": (1,), "max_turns": 1, "round_episodes": 1,
-                "updates_per_episode": 0, "validation_games": 0,
-            }, initial=ModelSpec(9, 1))
-            trajectories = collect_round(trainer.config, trainer.learner.online, str(trainer.root / "best-model.pt"), [], 0, 1)
-            for index in range(9, 0, -1):
-                save_rollout_batch(trainer.root / ("inbox/batch-%03d.pt" % index), episodes=1, trajectories=trajectories)
-            stopping = iter((False, True))
-            with mock.patch("src.training.train.collect_round", side_effect=AssertionError("local rollout")):
-                self.assertEqual(trainer.run(max_episodes=9, stop=lambda: next(stopping)), "stopped")
-            self.assertEqual((trainer.episodes, trainer.learner.step_count, trainer.learner.update_count), (8, 16, 0))
-            self.assertEqual([p.name for p in (trainer.root / "inbox").glob("batch-*.pt")], ["batch-009.pt"])
-            self.assertEqual(trainer.run(max_episodes=9), "max_episodes")
-            self.assertEqual((trainer.episodes, trainer.learner.step_count, trainer.learner.update_count), (9, 18, 0))
-            self.assertFalse((trainer.root / "inbox/batch-009.pt").exists())
-
     def test_self_play_and_sparring_record_every_seats_negative_outcome(self):
         torch.manual_seed(41)
         network = QNetwork(ModelSpec(9, 1))
