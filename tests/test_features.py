@@ -5,7 +5,7 @@ from src.evaluate import is_valid_hand
 from src.game.environment import ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, GameConfig, PappluEnv, discard_action
 from src.game.information import EventKind
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.model.encoding import FIELDS, HEADER_TOKENS, Kind, NONE, PAD, encode, legal_mask
+from src.model.encoding import FIELDS, HEADER_TOKENS, Kind, PAD, encode, legal_mask, validate_game
 
 
 def tokens(data):
@@ -14,27 +14,48 @@ def tokens(data):
 
 class TestByteEncoding(unittest.TestCase):
     def test_header_and_full_hand_snapshots_are_lossless(self):
-        env = PappluEnv(GameConfig(num_decks=6, max_turns=255))
+        env = PappluEnv(GameConfig(num_decks=5, max_turns=254))
         obs = env.reset_warm_start(410)
         row = encode(obs)
         tape, suffix = tokens(row.prefix), tokens(row.suffix)
         self.assertEqual(len(tape), 30)
         self.assertEqual(tape[:7], [
-            bytes((i, value, 0, 0, 0, 0, 0, 0))
-            for i, value in enumerate((6, 21, 5, 255, 1, 1, obs.joker), 1)
+            bytes((Kind.RULE_DECKS, 0, 0, 0, 6, 0, 0, 0)),
+            bytes((Kind.RULE_HAND, 0, 0, 0, 22, 0, 0, 0)),
+            bytes((Kind.RULE_SEQUENCES, 0, 0, 0, 6, 0, 0, 0)),
+            bytes((Kind.RULE_TURNS, 0, 0, 0, 0, 255, 0, 0)),
+            bytes((Kind.RULE_RECYCLE, 0, 0, 0, 2, 0, 0, 0)),
+            bytes((Kind.RULE_PLAYERS, 0, 0, 0, 2, 0, 0, 0)),
+            bytes((Kind.JOKER, 0, obs.joker + 1, 0, 0, 0, 0, 0)),
         ])
         for data, hand, kind in (
             (tape[7:29], obs.history[0].initial_hand, Kind.HAND_INIT),
             (suffix[7:], obs.hand, Kind.HAND),
         ):
-            expected = [bytes((kind, face, n, 0, 0, 0, 0, 0)) for face, n in enumerate(hand) if n]
+            expected = [bytes((kind, 0, face + 1, 0, n + 1, 0, 0, 0)) for face, n in enumerate(hand) if n]
             self.assertEqual(data, expected + [PAD] * (len(data) - len(expected)))
         self.assertEqual(len(suffix), 30)
-        self.assertEqual(suffix[0][:5], bytes((Kind.ACT_DISCARD, 1, NONE, 0, 255)))
-        self.assertGreater(obs.stock_remaining, 255)
-        self.assertEqual(tape[-1][6] + (tape[-1][7] >> 4) * 256, obs.stock_remaining)
-        self.assertEqual(suffix[0][5] + (suffix[0][6] >> 4) * 256, obs.stock_remaining)
-        self.assertEqual(suffix[1], bytes((Kind.SEAT, 1, 0, 1, 22, 255, 0, 0)))
+        self.assertEqual(tape[-1], bytes((Kind.EVENT_INITIAL, 1, 53, 53, 23, 255, obs.stock_remaining + 1, 1)))
+        self.assertEqual(suffix[0], bytes((Kind.ACT_DISCARD, 1, 53, 0, 1, 255, obs.stock_remaining + 1, 1)))
+        self.assertEqual(suffix[1], bytes((Kind.SEAT, 1, 0, 0, 23, 255, 0, 25)))
+
+    def test_schema_rejects_games_where_a_used_counter_could_lose_information(self):
+        validate_game(GameConfig(num_decks=5, cards_in_hand=5, required_sequences=0, max_turns=254))
+        with self.assertRaisesRegex(ValueError, "at most 254 cards"):
+            validate_game(GameConfig(num_decks=5, cards_in_hand=4, required_sequences=0))
+        with self.assertRaisesRegex(ValueError, "at most 254 turns"):
+            validate_game(GameConfig(max_turns=255))
+
+    def test_face_zero_uses_one_byte_in_every_face_slot(self):
+        obs = PappluEnv().reset(410)
+        hand = (1,) + (0,) * 51
+        initial = replace(obs.history[0], initial_hand=hand)
+        discard = replace(initial, kind=EventKind.DISCARD, face=0, offered_top=51)
+        row = encode(replace(obs, hand=hand, joker=0, discard_pile=(0,), history=(initial, discard)))
+        tape, suffix = tokens(row.prefix), tokens(row.suffix)
+        self.assertEqual([token[2] for token in (tape[6], tape[7], tape[-1], suffix[0], suffix[7])], [1] * 5)
+        self.assertEqual(tape[-1][3], 52)
+        self.assertEqual([token[2] for token in (tape[0], tape[-2], suffix[1], suffix[-1])], [0, 53, 0, 0])
 
     def test_multiplayer_deltas_keep_private_draws_redacted_and_seats_relative(self):
         env = MultiplayerEnv(MatchConfig(GameConfig(), 3))
@@ -51,14 +72,14 @@ class TestByteEncoding(unittest.TestCase):
         self.assertEqual(second.cut, HEADER_TOKENS + 2)
         self.assertEqual(encode(drawn, since=second.events).prefix, b"")
         observed = tokens(other_row.prefix)[HEADER_TOKENS + 1]
-        self.assertEqual(observed[:4], bytes((Kind.EVENT_INITIAL + EventKind.DRAW_STOCK, 2, NONE, drawn.discard_top)))
+        self.assertEqual(observed[:4], bytes((Kind.EVENT_INITIAL + EventKind.DRAW_STOCK, 3, 53, drawn.discard_top + 1)))
         for seat, view in enumerate(other.players):
             self.assertEqual(tokens(other_row.suffix)[1 + seat], bytes((
-                Kind.SEAT, 1, seat, int(view.active), view.hand_size, view.turns_remaining,
-                view.next_player, view.previous_player,
+                Kind.SEAT, seat + 1, 0, 0, view.hand_size + 1, view.turns_remaining + 1,
+                0, 17 + 8 * view.active + view.next_player,
             )))
-        self.assertEqual([token[:3] for token in tokens(other_row.suffix)[4:7]],
-                         [bytes((Kind.SEAT, 0, seat)) for seat in (3, 4, 5)])
+        self.assertEqual(tokens(other_row.suffix)[4:7],
+                         [bytes((Kind.SEAT, seat, 0, 0, 0, 0, 0, 1)) for seat in (4, 5, 6)])
 
     def test_restricts_take_back_but_preserves_a_forced_action(self):
         env = PappluEnv()

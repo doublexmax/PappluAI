@@ -45,6 +45,11 @@ class TestTrainingCore(unittest.TestCase):
             self.assertEqual(loaded.suffix.shape, (6, 30, 8))
             for name in ("prefix", "suffix", "decision_end", "cut", "action", "behavior_logp", "utility", "legal"):
                 torch.testing.assert_close(getattr(batch, name), getattr(loaded, name))
+            payload = torch.load(path, weights_only=True)
+            payload["schema"]["version"] = 6
+            torch.save(payload, path)
+            with self.assertRaisesRegex(ValueError, "incompatible rollout token schema"):
+                Trajectories.load(path)
             for changes, text in (
                 ({"cut": batch.cut + 1}, "prefix cuts"),
                 ({"decision_end": batch.decision_end + 1}, "offsets"),

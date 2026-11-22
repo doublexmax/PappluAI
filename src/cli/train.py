@@ -27,7 +27,7 @@ _FLOATS = ("learning_rate", "weight_decay", "grad_clip", "value_weight", "eta", 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train or collect for the GameTransformer V-trace and R-NaD learner.")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--output-dir", type=Path, help="start or resume a learner in this directory")
+    mode.add_argument("--output-dir", type=Path, help="start or resume a learner (supports torchrun on CPU)")
     mode.add_argument("--collect", type=Path, help="write completed batches to this inbox")
     parser.add_argument("--model", type=Path, help="latest-model.pt for collection")
     parser.add_argument("--worker", type=int, help="nonnegative actor ID for collection")
@@ -108,6 +108,8 @@ def main(argv=None) -> int:
                 args.output_dir, overrides, spec=runtime.ModelSpec(**shape) if shape else None, initial=args.initial_model,
             )
             reason = trainer.run(stop=lambda: stopping, max_updates=args.max_updates, max_seconds=args.max_seconds)
+            if trainer.group.rank != 0:
+                return 0
             result = {"status": reason, **trainer.summary()}
         print(json.dumps(result, sort_keys=True, allow_nan=False))
     except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:

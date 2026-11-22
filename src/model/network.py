@@ -128,37 +128,15 @@ class _Block(nn.Module):
     ) -> Tensor:
         q, k, v = self._project(x, rope, readout_only=readout_only)
         rows = keys.size(0)
-        blocks = q.size(0) // rows
-        queries = q.size(-2)
-        span = keys.size(-2)
-        scale = self.head_dim ** -0.5
+        blocks = x.size(0) // rows
 
-        def by_prefix(tensor: Tensor) -> Tensor:
-            return tensor.unflatten(0, (rows, blocks)).transpose(1, 2).flatten(2, 3)
+        def append(prefix: Tensor, suffix: Tensor) -> Tensor:
+            prefix = prefix[:, None].expand(-1, blocks, -1, -1, -1)
+            return torch.cat((prefix, suffix.unflatten(0, (rows, blocks))), dim=-2).flatten(0, 1)
 
-        def by_block(tensor: Tensor) -> Tensor:
-            return tensor.unflatten(2, (blocks, queries)).transpose(1, 2).flatten(0, 1)
-
-        q_pre = by_prefix(q)
-        prefix_valid = prefix_valid.expand(-1, -1, -1, queries, -1).flatten(2, 3)
-        scores_pre = torch.matmul(q_pre, keys.transpose(-2, -1)).float().mul_(scale)
-        scores_pre.masked_fill_(~prefix_valid, -torch.inf)
-        scores_suf = torch.matmul(q, k.transpose(-2, -1)).float().mul_(scale)
-        scores_suf.masked_fill_(~suffix_valid, -torch.inf)
-
-        with torch.no_grad():
-            shift = by_prefix(scores_suf.amax(-1, keepdim=True))
-            if span:
-                shift = torch.maximum(shift, scores_pre.amax(-1, keepdim=True))
-            shift.masked_fill_(shift == -torch.inf, 0)
-        p_pre = scores_pre.sub_(shift).exp_()
-        p_suf = scores_suf.sub_(by_block(shift)).exp_()
-        denom_pre = by_block(p_pre.sum(-1, keepdim=True))
-        denom = (denom_pre + p_suf.sum(-1, keepdim=True)).clamp_min_(1)
-        o_pre = by_block(torch.matmul(p_pre.to(values.dtype), values))
-        o_suf = torch.matmul(p_suf.to(v.dtype), v)
-        attention = (o_pre.float() + o_suf.float()) / denom
-        return self._residual(x[:, :queries], attention.to(q.dtype))
+        mask = torch.cat((prefix_valid, suffix_valid), dim=-1)
+        attention = F.scaled_dot_product_attention(q, append(keys, k), append(values, v), attn_mask=mask)
+        return self._residual(x[:, :q.size(-2)], attention)
 
 
 class GameTransformer(nn.Module):
@@ -177,7 +155,7 @@ class GameTransformer(nn.Module):
         self.register_buffer("frequencies", 10_000 ** (-powers), persistent=False)
 
     def _embed(self, tokens: Tensor) -> Tensor:
-        return self.embedding(tokens.long() + self.field_ids).sum(dim=-2)
+        return (self.embedding(tokens.long() + self.field_ids) * (tokens != 0).unsqueeze(-1)).sum(dim=-2)
 
     def _rope(self, positions: Tensor) -> tuple[Tensor, Tensor]:
         angle = positions[:, None, :, None].float() * self.frequencies
@@ -187,7 +165,7 @@ class GameTransformer(nn.Module):
         self, cut: Tensor, suffix: Tensor, prefix_positions: Tensor,
     ) -> tuple[Tensor, tuple[Tensor, Tensor], Tensor, Tensor]:
         suffix = suffix.flatten(0, 1)
-        prefix_valid = prefix_positions < cut[:, None, :, None, None]
+        prefix_valid = prefix_positions < cut.reshape(-1, 1, 1, 1)
         suffix_valid = (suffix[..., 0] != 0)[:, None, None, :]
         return self._embed(suffix), self._rope(cut.reshape(-1, 1)), prefix_valid, suffix_valid
 

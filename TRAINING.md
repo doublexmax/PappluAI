@@ -30,7 +30,7 @@ python -m src.cli.train --output-dir runs/full21 --max-seconds 3600
 
 By default, the learner uses a four-layer Transformer with width 192, six heads, and a SwiGLU width of 512. Actors play one to four seats in rotation with 64 tables per process. Half of solo starts use the environment curriculum at a random distance of one to six cards. The encoder has no curriculum features. Validation uses only cold deals.
 
-Actors sample from the policy with a 2% uniform mixture over legal actions. They write complete seat trajectories with the actual behavior log probability. The learner drops data that exceeds `--max-policy-lag`. Each update samples 16 complete seat trajectories of similar length and applies V-trace with a discount of 0.995 and no terminal bootstrap. The learning rate is `5e-4`, the anchor weight is `0.05`, and the entropy weight is `0.003`.
+Actors sample from the policy with a 2% uniform mixture over legal actions. They write complete seat trajectories with the actual behavior log probability. The learner drops data that exceeds `--max-policy-lag`. Each rank samples six complete seat trajectories of similar length per update by default. The learner applies V-trace with a discount of 0.995 and no terminal bootstrap. The learning rate is `5e-4`, the anchor weight is `0.05`, and the entropy weight is `0.003`.
 
 The learner regularizes rewards and policy updates against a frozen anchor. It caches the anchor's log probabilities for replayed trajectories until the weights refresh at `--anchor-every`. The default BF16 mode uses FP32 master weights and FP32 loss math. Use `--precision fp32` to disable autocast.
 
@@ -43,6 +43,22 @@ The learner regularizes rewards and policy updates against a frozen anchor. It c
 | `metrics.jsonl` and `status.json` | Update metrics and run status, including collected and trained decisions, throughput, importance ratio, KL, buffer depth, and inbox depth. |
 
 The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox.
+
+Schema 7 gives every face the same field and reserves byte zero for unused fields. Start a fresh run rather than reusing schema 6 weights, state, or rollouts. The encoder supports up to 254 turns and 254 cards outside the initial solo hand and joker indicator, so clock and card counts fit without truncation.
+
+## Run several CPU learners
+
+On a 20-vCPU host, start two Gloo ranks with eight learner threads and two single-threaded actors each:
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m src.cli.train \
+  --output-dir runs/multi --torch-threads 8 --actors 2 --actor-threads 1 \
+  --batch-size 6 --max-seconds 720
+```
+
+For multiple hosts, replace `--standalone` with the same `--nnodes` and private `--rdzv-endpoint` on every host. Use `--rdzv-backend c10d` and the same unique `--rdzv-id`. Use the same model and training flags. Do not expose the Gloo or rendezvous ports to untrusted hosts.
+
+Each rank waits for local replay, then the ranks average gradients before clipping and stepping AdamW. Actors use `rank-N/inbox` and read weights from local disk. Rank 0 writes the canonical checkpoints, status, and metrics and runs evaluation. Other ranks publish only `rank-N/latest-model.pt`. The metrics add decision counts across ranks and report one update per synchronized optimizer step. For resume, keep `latest-state.pt` and `best-model.pt` on rank 0. Rank 0 shares the startup state over Gloo, so no rollout or checkpoint files need to move between hosts during training.
 
 ## Feed a learner from other machines
 
@@ -68,4 +84,4 @@ python -m src.cli.arena --model runs/full21/best-model.pt --model random \
 
 ## Shipped checkpoint
 
-The browser still loads the shipped v5 `card_mlp` from `web/papplu-model.json`. Its checkpoint SHA256 is `a229f90e76ae9da9b8c97d35db10e2d921a3a46780fc54d292ba2bde3df67796`. See the [browser held-out results](README.md#held-out-results). The v6 trainer does not read or export that artifact.
+The browser still loads the shipped v5 `card_mlp` from `web/papplu-model.json`. Its checkpoint SHA256 is `a229f90e76ae9da9b8c97d35db10e2d921a3a46780fc54d292ba2bde3df67796`. See the [browser held-out results](README.md#held-out-results). The GameTransformer trainer does not read or export that artifact.

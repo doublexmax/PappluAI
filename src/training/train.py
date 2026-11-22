@@ -3,6 +3,9 @@ from __future__ import annotations
 from collections import Counter
 import copy
 from dataclasses import asdict, dataclass, field, replace
+from datetime import timedelta
+from enum import IntEnum
+from io import BytesIO
 import json
 import math
 import multiprocessing as mp
@@ -15,6 +18,7 @@ import time
 from uuid import UUID, uuid4
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
@@ -28,7 +32,7 @@ from src.model.network import GameTransformer, TokenBatch, action_mask, load_che
 from src.model.spec import ModelSpec, TokenSchema
 
 
-STATE_VERSION = 14
+STATE_VERSION = 15
 ROLLOUT_FORMAT = 2
 VALIDATION_SEED = 30_000_001
 OUTBOX_LIMIT = 8
@@ -97,7 +101,7 @@ class TrainConfig:
     actor_threads: int = 2
     device: str = "cpu"
     precision: str = "bf16"
-    batch_size: int = 16
+    batch_size: int = 6
     buffer_decisions: int = 400_000
     min_buffer_decisions: int = 20_000
     max_policy_lag: int = 200
@@ -525,17 +529,114 @@ class LearnStats:
     grad_norm: float
 
 
+class _Step(IntEnum):
+    ACTOR_ERROR = 0
+    MAX_UPDATES = 1
+    STOPPED = 2
+    BUDGET = 3
+    WAIT = 4
+    UPDATE = 5
+
+
+@dataclass(frozen=True)
+class _LearnerGroup:
+    rank: int = 0
+    size: int = 1
+    owns_backend: bool = False
+    use_avg: bool = False
+
+    @classmethod
+    def open(cls) -> _LearnerGroup:
+        requested = int(os.environ.get("WORLD_SIZE", "1"))
+        if not dist.is_available():
+            if requested > 1:
+                raise RuntimeError("distributed learning requires PyTorch with Gloo")
+            return cls()
+        owns_backend = requested > 1 and not dist.is_initialized()
+        if owns_backend:
+            if not dist.is_gloo_available():
+                raise RuntimeError("distributed learning requires PyTorch with Gloo")
+            dist.init_process_group(backend="gloo", timeout=timedelta(seconds=180))
+        try:
+            if not dist.is_initialized() or dist.get_world_size() == 1:
+                return cls()
+            if dist.get_backend() != "gloo":
+                raise ValueError("distributed learning requires a Gloo process group")
+            use_avg = True
+            try:
+                dist.all_reduce(torch.zeros(1), op=dist.ReduceOp.AVG)
+            except RuntimeError as exc:
+                if "ReduceOp.AVG" not in str(exc) or "gloo" not in str(exc).lower():
+                    raise
+                use_avg = False
+            return cls(dist.get_rank(), dist.get_world_size(), owns_backend, use_avg)
+        except BaseException:
+            if owns_backend:
+                dist.destroy_process_group()
+            raise
+
+    def close(self) -> None:
+        if self.owns_backend and dist.is_initialized():
+            dist.destroy_process_group()
+
+    def share(self, value: object):
+        if self.size == 1:
+            return value
+        payload = BytesIO()
+        if self.rank == 0:
+            torch.save(value, payload)
+        length = torch.tensor(payload.tell(), dtype=torch.int64)
+        dist.broadcast(length, src=0)
+        data = (torch.frombuffer(payload.getbuffer(), dtype=torch.uint8) if self.rank == 0
+                else torch.empty(length.item(), dtype=torch.uint8))
+        dist.broadcast(data, src=0)
+        if self.rank == 0:
+            return value
+        return torch.load(BytesIO(bytes(data.tolist())), map_location="cpu", weights_only=True)
+
+    def step(self, local: _Step) -> _Step:
+        if self.size == 1:
+            return local
+        vote = torch.tensor(local, dtype=torch.int64)
+        dist.all_reduce(vote, op=dist.ReduceOp.MIN)
+        return _Step(vote.item())
+
+    def average_gradients(self, parameters: tuple[Tensor, ...]) -> None:
+        if self.size == 1:
+            return
+        gradients = [parameter.grad for parameter in parameters]
+        if any(grad is None for grad in gradients):
+            raise RuntimeError("distributed learning requires a gradient for every parameter")
+        flat = torch.cat([grad.reshape(-1) for grad in gradients])
+        dist.all_reduce(flat, op=dist.ReduceOp.AVG if self.use_avg else dist.ReduceOp.SUM)
+        if not self.use_avg:
+            flat.div_(self.size)
+        for parameter, grad in zip(parameters, flat.split([p.numel() for p in parameters])):
+            parameter.grad = grad.view_as(parameter)
+
+
 class Learner:
-    def __init__(self, online: GameTransformer, config: TrainConfig) -> None:
+    def __init__(self, online: GameTransformer, config: TrainConfig, group: _LearnerGroup = _LearnerGroup()) -> None:
         self.config = config
+        self.group = group
         self.device = torch.device(config.device)
+        if group.size > 1 and self.device.type != "cpu":
+            raise ValueError("distributed learning requires a CPU learner")
         self.online = online.to(self.device, dtype=torch.float32)
         self.anchor = copy.deepcopy(self.online).eval().requires_grad_(False)
         self._anchor_version = object()
+        self._parameters = tuple(self.online.parameters())
         self.optimizer = torch.optim.AdamW(
-            self.online.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
+            self._parameters, lr=config.learning_rate, weight_decay=config.weight_decay,
         )
         self.version = 0
+
+    @torch.no_grad()
+    def synchronize(self) -> None:
+        if self.group.size > 1:
+            for model in (self.online, self.anchor):
+                for parameter in model.parameters():
+                    dist.broadcast(parameter, src=0)
 
     @torch.no_grad()
     def _anchor_log_policy(self, batch: TrajectoryBatch, tokens: TokenBatch) -> Tensor:
@@ -581,7 +682,8 @@ class Learner:
         loss = policy_loss + config.value_weight * value_loss + config.eta * kl - config.entropy_weight * entropy
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(self.online.parameters(), config.grad_clip, error_if_nonfinite=True)
+        self.group.average_gradients(self._parameters)
+        norm = torch.nn.utils.clip_grad_norm_(self._parameters, config.grad_clip, error_if_nonfinite=True)
         self.optimizer.step()
         self.version += 1
         if self.version % config.anchor_every == 0:
@@ -613,11 +715,15 @@ class Learner:
 class Trainer:
     def __init__(self, root: Path, config: TrainConfig, learner: Learner, run_id: str) -> None:
         self.root, self.config, self.learner, self.run_id = root, config, learner, run_id
-        self.rng = Random(config.seed)
-        self.inbox = root / "inbox"
-        self.inbox.mkdir(exist_ok=True)
+        self.group = learner.group
+        self.rng = Random(config.seed + self.group.rank)
+        self.actor_root = root / f"rank-{self.group.rank}" if self.group.size > 1 else root
+        self.inbox = self.actor_root / "inbox"
+        self.inbox.mkdir(parents=True, exist_ok=True)
+        self.model_path = (root if self.group.rank == 0 else self.actor_root) / "latest-model.pt"
         self.buffer = _Buffer(config.buffer_decisions, config.max_policy_lag)
         self.episodes, self.decisions, self.trained_decisions, self.dropped_batches = 0, 0, 0, 0
+        self._group_progress: dict[str, int] = {}
         self.validation, self.last_update = {}, {}
         self._start = time.monotonic()
         self._base_version, self._base_decisions = learner.version, 0
@@ -628,13 +734,35 @@ class Trainer:
         cls, root: Path, overrides: Mapping[str, object] | None = None, *,
         spec: ModelSpec | None = None, initial: Path | None = None,
     ) -> Trainer:
-        root = Path(root)
-        root.mkdir(parents=True, exist_ok=True)
+        group = _LearnerGroup.open()
+        try:
+            return cls._open(Path(root), overrides or {}, spec, initial, group)
+        except BaseException:
+            group.close()
+            raise
+
+    @classmethod
+    def _open(
+        cls, root: Path, overrides: Mapping[str, object], spec: ModelSpec | None, initial: Path | None,
+        group: _LearnerGroup,
+    ) -> Trainer:
         path = root / "latest-state.pt"
-        state = torch.load(path, map_location="cpu", weights_only=True) if path.exists() else None
-        overrides = overrides or {}
+        state = checkpoint = None
+        if group.rank == 0:
+            if path.exists():
+                state = torch.load(path, map_location="cpu", weights_only=True)
+            elif initial is not None:
+                checkpoint = load_checkpoint(initial, SCHEMA)
+        bootstrap = None
+        if group.rank == 0:
+            initial_info = (checkpoint.game, checkpoint.network.spec.to_dict()) if checkpoint else None
+            bootstrap = (str(uuid4()), state, initial_info)
+        run, state, initial_info = group.share(bootstrap)
         if state is not None:
-            if not isinstance(state, dict) or state.get("format") != STATE_VERSION:
+            if (
+                not isinstance(state, dict) or state.get("format") != STATE_VERSION
+                or state.get("schema") != SCHEMA.to_dict()
+            ):
                 raise ValueError("incompatible trainer state; start a fresh GameTransformer run")
             if spec is not None or initial is not None:
                 raise ValueError("model shape and initial weights only apply to fresh runs")
@@ -645,34 +773,37 @@ class Trainer:
             spec = ModelSpec.from_dict(state["spec"])
             run = _run_id(state["run_id"])
         else:
-            if spec is not None and initial is not None:
+            if spec is not None and initial_info is not None:
                 raise ValueError("use an initial model or a model shape, not both")
-            run = str(uuid4())
-            if initial is not None:
-                checkpoint = load_checkpoint(initial, SCHEMA)
-                game = GameConfig.from_dict(checkpoint.game)
+            if initial_info is not None:
+                initial_game, initial_spec = initial_info
+                game = GameConfig.from_dict(initial_game)
                 if replace(game, **overrides.get("game", {})) != game:
                     raise ValueError("initial model game config mismatch")
                 overrides = {**overrides, "game": game.to_dict()}
+                spec = ModelSpec.from_dict(initial_spec)
             config = TrainConfig().with_overrides(overrides)
         torch.set_num_threads(config.torch_threads)
         torch.manual_seed(config.seed)
-        online = checkpoint.network if initial is not None else GameTransformer(spec or ModelSpec(), SCHEMA)
-        trainer = cls(root, config, Learner(online, config), run)
+        online = checkpoint.network if checkpoint is not None else GameTransformer(spec or ModelSpec(), SCHEMA)
+        trainer = cls(root, config, Learner(online, config, group), run)
         if state is not None:
             trainer.learner.load_state_dict(state["learner"])
-            trainer.rng.setstate(state["rng"])
-            trainer.episodes, trainer.decisions = state["episodes"], state["decisions"]
-            trainer.trained_decisions = state["trained_decisions"]
-            trainer.dropped_batches, trainer.validation = state["dropped_batches"], state["validation"]
-            trainer._base_version, trainer._base_decisions = trainer.learner.version, trainer.decisions
-            if not (root / "best-model.pt").is_file():
-                raise ValueError("missing best-model.pt on resume")
-        else:
+            if group.rank == 0:
+                if not (root / "best-model.pt").is_file():
+                    raise ValueError("missing best-model.pt on resume")
+                trainer.rng.setstate(state["rng"])
+                trainer.episodes, trainer.decisions = state["episodes"], state["decisions"]
+                trainer.trained_decisions = state["trained_decisions"]
+                trainer.dropped_batches, trainer.validation = state["dropped_batches"], state["validation"]
+        trainer.learner.synchronize()
+        trainer._sync_progress()
+        if state is None and group.rank == 0:
             trainer.export_model(root / "best-model.pt")
             trainer._save()
-        trainer.export_model(root / "latest-model.pt")
-        trainer._status("ready")
+        trainer.export_model(trainer.model_path)
+        if group.rank == 0:
+            trainer._status("ready")
         return trainer
 
     def export_model(self, path: Path) -> None:
@@ -681,12 +812,13 @@ class Trainer:
         })
 
     def _save(self) -> None:
+        progress = self._group_progress or self._local_progress()
         atomic_torch_save({
-            "format": STATE_VERSION, "run_id": self.run_id, "spec": self.learner.online.spec.to_dict(),
+            "format": STATE_VERSION, "schema": SCHEMA.to_dict(), "run_id": self.run_id,
+            "spec": self.learner.online.spec.to_dict(),
             "config": asdict(self.config), "learner": self.learner.state_dict(), "rng": self.rng.getstate(),
-            "episodes": self.episodes, "decisions": self.decisions,
-            "trained_decisions": self.trained_decisions,
-            "dropped_batches": self.dropped_batches, "validation": self.validation,
+            **{name: progress[name] for name in ("episodes", "decisions", "trained_decisions", "dropped_batches")},
+            "validation": self.validation,
         }, self.root / "latest-state.pt")
 
     def evaluate(self, *, stop: Callable[[], bool] = lambda: False) -> dict:
@@ -725,7 +857,7 @@ class Trainer:
                 ):
                     raise ValueError("batch does not belong to this run's collection plan")
             except ValueError:
-                rejected = self.root / "rejected"
+                rejected = self.actor_root / "rejected"
                 rejected.mkdir(exist_ok=True)
                 os.replace(path, rejected / path.name)
                 self.dropped_batches += 1
@@ -737,17 +869,30 @@ class Trainer:
                 self.dropped_batches += 1
             path.unlink()
 
+    def _local_progress(self) -> dict[str, int]:
+        return {
+            "episodes": self.episodes, "decisions": self.decisions, "trained_decisions": self.trained_decisions,
+            "dropped_batches": self.dropped_batches, "buffer_decisions": len(self.buffer),
+            "inbox_files": sum(1 for _ in self.inbox.glob("batch-*.pt")),
+        }
+
+    def _sync_progress(self) -> None:
+        if self.group.size > 1:
+            progress = self._local_progress()
+            totals = torch.tensor(list(progress.values()), dtype=torch.int64)
+            dist.all_reduce(totals)
+            self._group_progress = dict(zip(progress, totals.tolist()))
+
     def summary(self) -> dict:
+        progress = self._group_progress or self._local_progress()
         elapsed = max(time.monotonic() - self._start, 1e-6)
         version = self.learner.version
         return {
-            "version": version, "run_id": self.run_id, "episodes": self.episodes, "decisions": self.decisions,
-            "decisions_per_sec": (self.decisions - self._base_decisions) / elapsed,
-            "trained_decisions": self.trained_decisions,
-            "trained_decisions_per_sec": (self.trained_decisions - self._base_trained_decisions) / elapsed,
+            "version": version, "run_id": self.run_id, **progress,
+            "decisions_per_sec": (progress["decisions"] - self._base_decisions) / elapsed,
+            "trained_decisions_per_sec": (progress["trained_decisions"] - self._base_trained_decisions) / elapsed,
             "updates_per_sec": (version - self._base_version) / elapsed, "elapsed_seconds": elapsed,
-            "buffer_decisions": len(self.buffer), "inbox_files": sum(1 for _ in self.inbox.glob("batch-*.pt")),
-            "dropped_batches": self.dropped_batches, "validation": self.validation,
+            "validation": self.validation, "world_size": self.group.size,
             "actors": self.config.actors, "tables": self.config.tables, "torch_threads": self.config.torch_threads,
             "actor_threads": self.config.actor_threads, "cpu_count": os.cpu_count(),
             "device": self.config.device, "precision": self.config.precision,
@@ -761,69 +906,93 @@ class Trainer:
         self, *, stop: Callable[[], bool] = lambda: False, max_updates: int | None = None,
         max_seconds: float | None = None,
     ) -> str:
+        try:
+            return self._run(stop, max_updates, max_seconds)
+        finally:
+            self.group.close()
+
+    def _run(self, stop: Callable[[], bool], max_updates: int | None, max_seconds: float | None) -> str:
         if max_updates is not None and (type(max_updates) is not int or max_updates < 0):
             raise ValueError("max_updates must be a nonnegative integer")
         if max_seconds is not None and (not math.isfinite(max_seconds) or max_seconds <= 0):
             raise ValueError("max_seconds must be positive and finite")
         cfg = self.config
+        primary = self.group.rank == 0
+        progress = self._group_progress or self._local_progress()
         self._start = time.monotonic()
-        self._base_version, self._base_decisions = self.learner.version, self.decisions
-        self._base_trained_decisions = self.trained_decisions
+        self._base_version, self._base_decisions = self.learner.version, progress["decisions"]
+        self._base_trained_decisions = progress["trained_decisions"]
         deadline = math.inf if max_seconds is None else self._start + max_seconds
         context = mp.get_context("spawn")
         done = context.Event()
         workers = []
+        metrics = None
         reason = "error"
 
         def stopping() -> bool:
             return stop() or time.monotonic() >= deadline
+
+        def next_step() -> _Step:
+            if max_updates is not None and self.learner.version >= max_updates:
+                return _Step.MAX_UPDATES
+            if stop():
+                return _Step.STOPPED
+            if time.monotonic() >= deadline:
+                return _Step.BUDGET
+            if any(worker.exitcode is not None for worker in workers):
+                return _Step.ACTOR_ERROR
+            self._ingest()
+            return _Step.UPDATE if len(self.buffer) >= cfg.min_buffer_decisions else _Step.WAIT
 
         try:
             if not stopping() and (max_updates is None or self.learner.version < max_updates):
                 for worker in range(cfg.actors):
                     process = context.Process(
                         target=_actor_process,
-                        args=(self.root, worker, cfg.tables, cfg.actor_threads, cfg.precision, done),
+                        args=(self.inbox, self.model_path, worker, cfg.tables, cfg.actor_threads, cfg.precision, done),
                     )
                     process.start()
                     workers.append(process)
             heartbeat = 0.0
-            with (self.root / "metrics.jsonl").open("a", encoding="utf-8") as metrics:
-                while not stopping():
-                    if max_updates is not None and self.learner.version >= max_updates:
-                        reason = "max_updates"
-                        break
-                    if any(worker.exitcode is not None for worker in workers):
-                        raise RuntimeError("an actor worker exited before the learner stopped")
-                    self._ingest()
-                    if len(self.buffer) < cfg.min_buffer_decisions:
-                        if time.monotonic() >= heartbeat:
-                            self._status("waiting_for_actors")
-                            heartbeat = time.monotonic() + 1
-                        time.sleep(0.05)
-                        continue
+            if primary:
+                metrics = (self.root / "metrics.jsonl").open("a", encoding="utf-8")
+            while True:
+                step = self.group.step(next_step())
+                if step == _Step.ACTOR_ERROR:
+                    raise RuntimeError("an actor worker exited before the learner stopped")
+                if step < _Step.WAIT:
+                    self._sync_progress()
+                    reason = step.name.lower()
+                    break
+                if step == _Step.UPDATE:
                     batch = self.buffer.sample(self.rng, cfg.batch_size, self.learner.version)
                     self.last_update = asdict(self.learner.update(batch))
                     self.trained_decisions += int(batch.valid.sum())
                     version = self.learner.version
                     self.buffer.prune(version)
-                    if version % cfg.checkpoint_every == 0 or version % cfg.publish_every == 0:
-                        self._save()
+                self._sync_progress()
+                if step == _Step.UPDATE:
                     if version % cfg.publish_every == 0:
-                        self.export_model(self.root / "latest-model.pt")
-                    if cfg.eval_every and version % cfg.eval_every == 0 and not stopping():
-                        self.evaluate(stop=stopping)
-                    metrics.write(json.dumps(self.summary(), allow_nan=False) + "\n")
-                    metrics.flush()
-                    if time.monotonic() >= heartbeat:
-                        self._status("running")
-                        heartbeat = time.monotonic() + 1
-        except InterruptedError:
-            if not stopping():
-                raise
+                        self.export_model(self.model_path)
+                    if primary:
+                        if version % cfg.checkpoint_every == 0 or version % cfg.publish_every == 0:
+                            self._save()
+                        if cfg.eval_every and version % cfg.eval_every == 0 and not stopping():
+                            try:
+                                self.evaluate(stop=stopping)
+                            except InterruptedError:
+                                if not stopping():
+                                    raise
+                        metrics.write(json.dumps(self.summary(), allow_nan=False) + "\n")
+                        metrics.flush()
+                if primary and time.monotonic() >= heartbeat:
+                    self._status("running" if step == _Step.UPDATE else "waiting_for_actors")
+                    heartbeat = time.monotonic() + 1
+                if step == _Step.WAIT:
+                    time.sleep(0.05)
         finally:
-            if reason == "error" and stopping():
-                reason = "stopped" if stop() else "budget"
+            if metrics is not None:
+                metrics.close()
             done.set()
             grace = time.monotonic() + 5.0
             for worker in workers:
@@ -832,14 +1001,18 @@ class Trainer:
                     worker.terminate()
                     worker.join()
                 worker.close()
-            self._save()
-            self.export_model(self.root / "latest-model.pt")
-            self._status(reason)
+            if reason != "error":
+                self.export_model(self.model_path)
+                if primary:
+                    self._save()
+            if primary:
+                self._status(reason)
         return reason
 
 
-def _actor_process(root: Path, worker: int, tables: int, threads: int, precision: str, done: object) -> None:
+def _actor_process(
+    inbox: Path, model: Path, worker: int, tables: int, threads: int, precision: str, done: object,
+) -> None:
     collect(
-        root / "inbox", root / "latest-model.pt", worker=worker, tables=tables,
-        torch_threads=threads, precision=precision, stop=done.is_set,
+        inbox, model, worker=worker, tables=tables, torch_threads=threads, precision=precision, stop=done.is_set,
     )
