@@ -20,6 +20,7 @@ class TokenSchema:
     fields: int
     suffix_tokens: int
     num_actions: int
+    pointer_field: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -28,6 +29,10 @@ class TokenSchema:
             raise ModelSpecError("schema version and dimensions must be positive integers")
         if type(self.num_actions) is not int or not 1 <= self.num_actions <= 63:
             raise ModelSpecError("schema must have 1..63 actions")
+        if self.pointer_field is not None and (
+            type(self.pointer_field) is not int or not 0 <= self.pointer_field < self.fields
+        ):
+            raise ModelSpecError("pointer_field must name a token field or be None")
 
     def to_dict(self) -> dict:
         return asdict(self)

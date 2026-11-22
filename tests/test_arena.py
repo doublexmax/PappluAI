@@ -68,6 +68,17 @@ class TestArena(unittest.TestCase):
                     self.assertTrue(legal & (1 << action))
                     self.assertAlmostEqual(logp, -math.log(legal.bit_count()))
 
+    def test_deal_distinguishes_cold_solo_puzzle_and_multiplayer_curriculum(self):
+        cold = Deal(19, (0,))
+        puzzle = Deal(19, (0,), curriculum=0)
+        multi = Deal(19, (0, 0), curriculum=2)
+        results = {result.deal: result for result in run_matches((cold, puzzle, multi), (FirstLegal(),), self.game)}
+        self.assertEqual((results[cold].action_count, results[puzzle].action_count), (2, 1))
+        self.assertEqual(results[puzzle].telemetry.stock_draws, (0,))
+        self.assertIn(results[multi].action_count, (2, 4))
+        with self.assertRaisesRegex(ValueError, "solo discard puzzle"):
+            list(run_matches((Deal(19, (0, 0), curriculum=0),), (FirstLegal(),), self.game))
+
     def test_paired_self_comparison_is_neutral(self):
         for players in (1, 3):
             with self.subTest(players=players):

@@ -40,8 +40,9 @@ LENGTH_BUCKET = 8
 DISCOUNT = 0.995
 TUNABLE = {
     "actors", "tables", "torch_threads", "actor_threads", "device", "precision", "checkpoint_every",
-    "learning_rate", "eta", "sync_every",
+    "learning_rate", "eta", "sync_every", "plan",
 }
+TUNABLE_PLAN = ("curriculum_share", "curriculum_max_distance")
 
 
 @dataclass(frozen=True)
@@ -73,8 +74,11 @@ class CollectPlan:
         for players in self.player_counts:
             if players > 1:
                 MatchConfig(game, players)
-        if 1 in self.player_counts and self.curriculum_share and self.curriculum_max_distance > game.cards_in_hand:
-            raise ValueError("curriculum_max_distance exceeds the hand size")
+        if self.curriculum_share:
+            if game.cards_in_hand < 3:
+                raise ValueError("curriculum needs at least three cards per hand")
+            if self.curriculum_max_distance > game.cards_in_hand:
+                raise ValueError("curriculum_max_distance exceeds the hand size")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -89,7 +93,9 @@ class CollectPlan:
         rng = Random(nonce)
         while True:
             for players in self.player_counts:
-                start = rng.randint(1, self.curriculum_max_distance) if players == 1 and rng.random() < self.curriculum_share else 0
+                start = None
+                if rng.random() < self.curriculum_share:
+                    start = rng.randint(int(players > 1), self.curriculum_max_distance)
                 yield Deal(rng.getrandbits(63), (0,) * players, start)
 
 
@@ -295,6 +301,8 @@ class Trajectories:
             raise ValueError("invalid rollout legal action")
         if bool((self.suffix[:, 0, 0] == 0).any()):
             raise ValueError("rollout has a padded readout token")
+        if schema.pointer_field is not None and bool((self.suffix[..., schema.pointer_field] > schema.num_actions).any()):
+            raise ValueError("rollout has a pointer outside the action space")
         if not bool(((self.behavior_logp >= -104) & (self.behavior_logp <= 0)).all()):
             raise ValueError("invalid rollout behavior log-probabilities")
         if not bool((self.utility.abs() <= 1).all()):
@@ -819,6 +827,8 @@ class Trainer:
             config = saved.with_overrides(overrides)
             if any(getattr(config, k) != getattr(saved, k) for k in overrides.keys() - TUNABLE):
                 raise ValueError("cannot change training config on resume")
+            if config.plan != replace(saved.plan, **{key: getattr(config.plan, key) for key in TUNABLE_PLAN}):
+                raise ValueError("cannot change the collection plan on resume except curriculum share and distance")
             spec = ModelSpec.from_dict(state["spec"])
             run = _run_id(state["run_id"])
         else:

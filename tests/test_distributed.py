@@ -154,9 +154,21 @@ class TestDistributedLearner(unittest.TestCase):
                     self.assertTrue(torch.equal(value.view(torch.int32), other.view(torch.int32)), name)
             metrics = [json.loads(row) for row in (primary / "metrics.jsonl").read_text().splitlines()]
             self.assertEqual([(row["version"], row["trained_decisions"]) for row in metrics], [(4, 16), (6, 24)])
-            resumed = Trainer.open(primary, {"learning_rate": 2e-4, "eta": 0.02, "sync_every": 1})
+            before = torch.load(primary / "latest-state.pt", weights_only=True)
+            resumed = Trainer.open(primary, {
+                "learning_rate": 2e-4, "eta": 0.02, "sync_every": 1,
+                "plan": {"curriculum_share": 0.25, "curriculum_max_distance": 12},
+            })
             self.assertEqual(resumed.learner.optimizer.param_groups[0]["lr"], 2e-4)
             self.assertEqual((resumed.config.eta, resumed.config.sync_every), (0.02, 1))
+            self.assertEqual((resumed.config.plan.curriculum_share, resumed.config.plan.curriculum_max_distance),
+                             (0.25, 12))
+            self.assertEqual(resumed.run_id, before["run_id"])
+            self.assertEqual(resumed.learner.version, 6)
+            moments = resumed.learner.optimizer.state_dict()["state"]
+            torch.testing.assert_close(moments, before["learner"]["optimizer"]["state"], rtol=0, atol=0)
+            published = load_checkpoint(resumed.model_path, SCHEMA)
+            self.assertEqual(published.meta["plan"], resumed.config.plan.to_dict())
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ class TestBenchmark(unittest.TestCase):
             save_checkpoint(path, model, self.game.to_dict(), {"version": 1})
             report = evaluate_checkpoint(str(path), games=3, warm_games=8, sensitivity=True, tables=2)
         self.assertEqual((report["architecture"], report["checkpoint_version"], report["encoding_version"]),
-                         ("game_transformer", 6, 7))
+                         ("game_transformer", 6, 8))
         self.assertEqual(report["greedy"]["outcomes"], (0, 0, 0))
         self.assertEqual(report["warm_oracle"]["outcomes"], (1,) * 8)
         self.assertEqual(report["warm_random"]["stock_draws"], 0)

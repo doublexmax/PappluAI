@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import Enum
+from functools import cache
 from itertools import combinations
 import math
 import random
@@ -24,7 +25,7 @@ ACTION_TAKE_DISCARD = 1
 NUM_DISCARD_ACTIONS = NUM_FACES
 NUM_ACTIONS = 2 + NUM_DISCARD_ACTIONS
 
-ENCODING_VERSION = 7
+ENCODING_VERSION = 8
 
 
 class Phase(Enum):
@@ -366,35 +367,10 @@ class PappluEnv:
         cfg = self.config
         for _ in range(200):
             winning_hand, joker, remaining = _build_natural_winning_deal(cfg, rng)
-            physical_hand = [
-                face
-                for face, count in enumerate(winning_hand)
-                for _ in range(count)
-            ]
-            removed = [
-                physical_hand[index]
-                for index in rng.sample(range(len(physical_hand)), distance)
-            ]
-            removed_faces = set(removed)
-            candidates = [
-                index
-                for index, face in enumerate(remaining)
-                if face not in removed_faces
-            ]
-            if len(candidates) < distance:
+            swapped = _swap_hand_cards(winning_hand, remaining, distance, rng)
+            if swapped is None:
                 continue
-            replacement_indices = set(rng.sample(candidates, distance))
-            replacements = [
-                face
-                for index, face in enumerate(remaining)
-                if index in replacement_indices
-            ]
-
-            hand = winning_hand.copy()
-            for face in removed:
-                hand[face] -= 1
-            for face in replacements:
-                hand[face] += 1
+            hand, deck = swapped
             if is_valid_hand(
                 hand,
                 joker,
@@ -402,13 +378,6 @@ class PappluEnv:
                 cards_in_hand=cfg.cards_in_hand,
             ):
                 continue
-
-            deck = [
-                face
-                for index, face in enumerate(remaining)
-                if index not in replacement_indices
-            ]
-            deck.extend(removed)
             rng.shuffle(deck)
             discard = [deck.pop()]
 
@@ -548,58 +517,81 @@ def build_warm_start_deal(
 def _build_natural_winning_deal(
     config: GameConfig, rng: random.Random
 ) -> Tuple[List[int], int, List[int]]:
-    if config.cards_in_hand < 3:
+    hands, joker, stock = _build_natural_winning_hands(config, 1, rng)
+    return hands[0], joker, stock
+
+
+@cache
+def _natural_melds(cards_in_hand: int, required_sequences: int) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    if cards_in_hand < 3:
         raise ValueError("constructed starts require at least three cards")
-    lengths = [3] * (config.cards_in_hand // 3)
-    lengths[0] += config.cards_in_hand % 3
+    lengths = [3] * (cards_in_hand // 3)
+    lengths[0] += cards_in_hand % 3
+    groups = []
+    for group_index, size in enumerate(lengths):
+        candidates = [
+            tuple(suit * NUM_RANKS + rank for rank in pattern)
+            for suit in range(NUM_SUITS)
+            for pattern in RANK_PATTERNS
+            if len(pattern) == size
+        ]
+        if group_index >= required_sequences and size <= NUM_SUITS:
+            candidates.extend(
+                tuple(suit * NUM_RANKS + rank for suit in suits)
+                for rank in range(NUM_RANKS)
+                for suits in combinations(range(NUM_SUITS), size)
+            )
+        groups.append(tuple(candidates))
+    return tuple(groups)
+
+
+def _build_natural_winning_hands(
+    config: GameConfig, players: int, rng: random.Random,
+) -> tuple[list[list[int]], int, list[int]]:
+    groups = _natural_melds(config.cards_in_hand, config.required_sequences)
     for _ in range(200):
-        hand = [0] * NUM_FACES
         supply = [config.num_decks] * NUM_FACES
         joker = rng.randrange(NUM_FACES)
         supply[joker] -= 1
-        for group_index, size in enumerate(lengths):
-            candidates = [
-                tuple(suit * NUM_RANKS + rank for rank in pattern)
-                for suit in range(NUM_SUITS)
-                for pattern in RANK_PATTERNS
-                if len(pattern) == size
-            ]
-            if group_index >= config.required_sequences and size <= NUM_SUITS:
-                candidates.extend(
-                    tuple(suit * NUM_RANKS + rank for suit in suits)
-                    for rank in range(NUM_RANKS)
-                    for suits in combinations(range(NUM_SUITS), size)
-                )
-            available = [
-                meld for meld in candidates if all(supply[face] > 0 for face in meld)
-            ]
-            if not available:
+        hands = []
+        for _ in range(players):
+            hand = [0] * NUM_FACES
+            for candidates in groups:
+                available = [meld for meld in candidates if all(supply[face] > 0 for face in meld)]
+                if not available:
+                    break
+                for face in rng.choice(available):
+                    hand[face] += 1
+                    supply[face] -= 1
+            if sum(hand) != config.cards_in_hand:
                 break
-            for face in rng.choice(available):
-                hand[face] += 1
-                supply[face] -= 1
-        if sum(hand) != config.cards_in_hand:
+            if not is_valid_hand(hand, joker, config.required_sequences, config.cards_in_hand):
+                raise RuntimeError("constructed natural melds failed the evaluator")
+            hands.append(hand)
+        if len(hands) != players:
             continue
-        if not is_valid_hand(
-            hand,
-            joker,
-            required_sequences=config.required_sequences,
-            cards_in_hand=config.cards_in_hand,
-        ):
-            raise RuntimeError("constructed natural melds failed the evaluator")
-
-        stock: List[int] = []
-        for face, left in enumerate(supply):
-            stock.extend([face] * left)
+        stock = [face for face, left in enumerate(supply) for _ in range(left)]
         rng.shuffle(stock)
-        return hand, joker, stock
+        return hands, joker, stock
 
     raise ValueError(
-        "could not build natural winning deal for decks=%d hand=%d seq=%d "
-        "after 200 attempts"
-        % (
-            config.num_decks,
-            config.cards_in_hand,
-            config.required_sequences,
-        )
+        f"could not build natural winning deal for {players} seats after 200 attempts: {config}"
     )
+
+
+def _swap_hand_cards(
+    hand: list[int], shoe: list[int], distance: int, rng: random.Random,
+) -> tuple[list[int], list[int]] | None:
+    physical_hand = [face for face, count in enumerate(hand) for _ in range(count)]
+    removed = rng.sample(physical_hand, distance)
+    removed_faces = set(removed)
+    candidates = [i for i, face in enumerate(shoe) if face not in removed_faces]
+    if len(candidates) < distance:
+        return None
+    indices = set(rng.sample(candidates, distance))
+    hand = hand.copy()
+    for face in removed:
+        hand[face] -= 1
+    for i in indices:
+        hand[shoe[i]] += 1
+    return hand, [face for i, face in enumerate(shoe) if i not in indices] + removed

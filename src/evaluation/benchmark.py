@@ -61,7 +61,7 @@ def evaluate_games(
 ) -> PolicyResults:
     if type(games) is not int or games <= 0:
         raise ValueError("games must be a positive integer")
-    deals = (Deal(seed + i, (0,), warm_start=warm_start) for i in range(games))
+    deals = (Deal(seed + i, (0,), curriculum=0 if warm_start else None) for i in range(games))
     results = sorted(run_matches(deals, (policy,), config, tables=tables), key=lambda row: row.deal.seed)
     return PolicyResults(
         tuple(int(row.winner == 0) for row in results),

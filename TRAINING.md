@@ -20,7 +20,7 @@ python -m src.cli.train --output-dir runs/smoke --max-turns 2 \
 python -m src.cli.train --output-dir runs/smoke --max-updates 2 --max-seconds 90
 ```
 
-Check `status.json` for `status: max_updates` and `version: 2`. The update limit is an absolute policy revision, not a count of additional updates. Reuse the directory to resume. You can change the actor count, table count, threads, device, precision, learning rate, and synchronization cadence. A new `--learning-rate` replaces the rate saved with the AdamW state. The game, model, and collection plan stay fixed. Start in a different directory for incompatible checkpoints or trainer state.
+Check `status.json` for `status: max_updates` and `version: 2`. The update limit is an absolute policy revision, not a count of additional updates. Reuse the directory to resume. You can change the actor count, table count, threads, device, precision, learning rate, and synchronization cadence. A new `--learning-rate` replaces the rate saved with the AdamW state without resetting its moments. You can also change `--curriculum-share` and `--curriculum-max-distance`. The game, model, and other collection settings stay fixed. Restart standalone collectors after a curriculum change.
 
 ## Start a full run
 
@@ -28,9 +28,9 @@ Check `status.json` for `status: max_updates` and `version: 2`. The update limit
 python -m src.cli.train --output-dir runs/full21 --max-seconds 3600
 ```
 
-The default `GameTransformer` has 2,175,031 parameters, four layers, width 192, six attention heads, and a SwiGLU width of 512. Schema 7 uses eight bytes per token. Each actor keeps a key and value cache per seat and batches decisions across its live tables.
+The default `GameTransformer` has 2,175,224 parameters, four layers, width 192, six attention heads, and a SwiGLU width of 512. Schema 8 uses eight bytes per token. Each actor keeps a key and value cache per seat and batches decisions across its live tables.
 
-Actors play games with one to four seats in rotation, with 64 tables per process by default. Half of solo starts use the environment curriculum at a random distance of one to six cards. The encoder has no curriculum features. Validation uses only cold deals.
+Actors play games with one to four seats in rotation, with 64 tables per process by default. Half of starts use the environment curriculum. Solo starts sample a distance from zero through six. Distance zero starts with 22 cards and ends after one discard. Multiplayer starts sample one through six and replace that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Validation and the arena default to cold deals.
 
 Actors sample from the policy with a 2% uniform mixture over legal actions. They write complete seat trajectories with the actual behavior log probability. The learner drops data that exceeds `--max-policy-lag`. Each rank samples six complete seat trajectories of similar length per update by default. The learner applies V-trace with a discount of 0.995 and no terminal bootstrap. The learning rate is `5e-4`, the anchor weight is `0.05`, and the entropy weight is `0.003`.
 
@@ -46,7 +46,22 @@ The learner regularizes rewards and policy updates against a frozen anchor. It c
 
 The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox.
 
-Schema 7 gives every face the same field and reserves byte zero for unused fields. Start a fresh run rather than reusing schema 6 weights, state, or rollouts. The encoder supports up to 254 turns and 254 cards outside the initial solo hand and joker indicator, so clock and card counts fit without truncation.
+### Schema 8 tokens
+
+The 30-token snapshot has one `ACT`, one `TABLE_STATE`, six `SEAT` slots, and 22 `HAND` slots. A 21-card hand can reach at most 22 distinct faces after a draw. Duplicate faces share one token with a copy count.
+
+| Byte | Meaning |
+| ---: | --- |
+| 0 | Token kind. |
+| 1 | Relative seat, phase, copies, or rule value. Each role has a separate byte range. |
+| 2, 3, 4 | Face, printed suit, and printed rank. An absent face uses `53`, `5`, and `14`. |
+| 5 | Visible offered face, hand size, next seat with active status, or discard pile size. Pile size caps at 150. |
+| 6 | Remaining turns up to 120, or the remaining stock in two-card buckets. |
+| 7 | `1 + discard_action(face)` on `HAND` tokens. Zero everywhere else. |
+
+Zero means unused in each field. All Transformer layers update all snapshot tokens. The `ACT` representation gives the base policy logits and value. For each nonzero pointer byte, the shared linear pointer head adds that token's score to the named action logit before legal masking. The network has no Papplu imports.
+
+Schema 8 supports up to 21 cards before drawing, four decks, and a configured budget of 235 turns. The header stores the full budget. Start a fresh run in a new directory. Schema 7 weights, trainer state, and rollouts do not use the same byte layout.
 
 ## Run several CPU learners
 
@@ -88,7 +103,7 @@ python -m src.cli.arena --model runs/full21/best-model.pt --model random \
 
 ## Azure checkpoint and held-out results
 
-Stage 2 used five `Standard_D16als_v6` VMs with 80 AMD EPYC Genoa vCPUs and 160 GiB of provisioned RAM. Each VM ran two BF16 ranks. Each rank used seven learner threads and one single-threaded actor with 32 tables.
+Stage 2 used Schema 7 on five `Standard_D16als_v6` VMs with 80 AMD EPYC Genoa vCPUs and 160 GiB of provisioned RAM. Each VM ran two BF16 ranks. Each rank used seven learner threads and one single-threaded actor with 32 tables.
 
 Stage 2a started from Stage 1 at 750 cumulative updates and reached 1,446 with a 22-minute budget. It used batch size 4, learning rate `4e-4`, `eta=0.03`, `anchor_every=480`, and a 50% solo curriculum share up to distance 5. Stage 2b resumed the same run with learning rate `2e-4` and reached 2,158 cumulative updates with a second 22-minute budget. Both stages used `sync_every=8`.
 

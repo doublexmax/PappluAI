@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 
+from src.evaluate import NUM_RANKS, NUM_SUITS
 from src.game.environment import (
     ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, ENCODING_VERSION, NUM_ACTIONS, NUM_DISCARD_ACTIONS,
     GameConfig, Observation, Phase, discard_action,
 )
 from src.game.information import EventKind, InformationEvent
-from src.model.spec import TokenSchema
+from src.model.spec import BYTE_VALUES, TokenSchema
 
 
 class Kind(IntEnum):
@@ -21,8 +22,8 @@ class Kind(IntEnum):
     RULE_PLAYERS = 6
     JOKER = 7
     EVENT_INITIAL = 8
-    ACT_DRAW = 14
-    ACT_DISCARD = 15
+    ACT = 14
+    TABLE_STATE = 15
     HAND_INIT = 16
     SEAT = 17
     HAND = 18
@@ -33,9 +34,13 @@ RULE_TOKENS = 7
 INITIAL_HAND_TOKENS = 22
 HEADER_TOKENS = RULE_TOKENS + INITIAL_HAND_TOKENS
 SEAT_TOKENS = 6
-MAX_FIELD_VALUE = 254
+TABLE_TOKENS = 2
+RULE_OFFSET = 20
+MAX_TURNS = BYTE_VALUES - 1 - RULE_OFFSET
+MAX_DECKS = 4
+NONE_FACE = NUM_DISCARD_ACTIONS + 1
 PAD = bytes(FIELDS)
-SCHEMA = TokenSchema("papplu-events", ENCODING_VERSION, FIELDS, 30, NUM_ACTIONS)
+SCHEMA = TokenSchema("papplu-events", ENCODING_VERSION, FIELDS, 30, NUM_ACTIONS, pointer_field=7)
 
 
 @dataclass(frozen=True)
@@ -51,13 +56,12 @@ class Encoded:
 
 
 def validate_game(config: GameConfig) -> None:
-    if config.cards_in_hand > INITIAL_HAND_TOKENS:
-        raise ValueError(f"token schema supports at most {INITIAL_HAND_TOKENS} cards per hand")
-    if config.max_turns > MAX_FIELD_VALUE:
-        raise ValueError(f"token schema supports at most {MAX_FIELD_VALUE} turns")
-    free_cards = config.num_decks * NUM_DISCARD_ACTIONS - config.cards_in_hand - 1
-    if free_cards > MAX_FIELD_VALUE:
-        raise ValueError(f"token schema supports at most {MAX_FIELD_VALUE} cards outside hands and the indicator")
+    if config.cards_in_hand >= INITIAL_HAND_TOKENS:
+        raise ValueError(f"token schema supports at most {INITIAL_HAND_TOKENS - 1} cards before drawing")
+    if config.max_turns > MAX_TURNS:
+        raise ValueError(f"token schema supports at most {MAX_TURNS} turns")
+    if config.num_decks > MAX_DECKS:
+        raise ValueError(f"token schema supports at most {MAX_DECKS} decks")
 
 
 def legal_mask(obs: Observation) -> int:
@@ -82,28 +86,41 @@ def legal_mask(obs: Observation) -> int:
     return bits
 
 
-def _face(face: int | None) -> int:
-    return NUM_DISCARD_ACTIONS if face is None else face
+def _face_byte(face: int | None) -> int:
+    return NONE_FACE if face is None else face + 1
+
+
+def _card(face: int | None) -> tuple[int, int, int]:
+    if face is None:
+        return NONE_FACE, NUM_SUITS + 1, NUM_RANKS + 1
+    suit, rank = divmod(face, NUM_RANKS)
+    return face + 1, suit + 1, rank + 1
 
 
 def _token(
-    kind: int, *, seat: int = -1, face: int = -1, offered_face: int = -1, count: int = -1,
-    clock: int = -1, stock: int = -1, meta: int = -1,
+    kind: int, *, seat_or_value: int = 0, card: tuple[int, int, int] = (0, 0, 0),
+    offered_or_count: int = 0, clock_or_stock: int = 0, pointer: int = 0,
 ) -> bytes:
-    return bytes((kind, seat + 1, face + 1, offered_face + 1, count + 1, clock + 1, stock + 1, meta + 1))
+    return bytes((kind, seat_or_value, *card, offered_or_count, clock_or_stock, pointer))
+
+
+def _clock(turns: int) -> int:
+    return 1 + min(turns, 120)
 
 
 def _event(event: InformationEvent) -> bytes:
     return _token(
-        Kind.EVENT_INITIAL + event.kind, seat=event.actor, face=_face(event.face),
-        offered_face=_face(event.offered_top), count=event.hand_size,
-        clock=min(event.turns_remaining, MAX_FIELD_VALUE), stock=min(event.stock_remaining, MAX_FIELD_VALUE),
-        meta=event.next_player,
+        Kind.EVENT_INITIAL + event.kind, seat_or_value=1 + event.actor, card=_card(event.face),
+        offered_or_count=_face_byte(event.offered_top), clock_or_stock=_clock(event.turns_remaining),
     )
 
 
 def _hand(kind: Kind, counts: tuple[int, ...], limit: int) -> bytes:
-    cards = b"".join(_token(kind, face=face, count=copies) for face, copies in enumerate(counts) if copies)
+    cards = b"".join(
+        _token(kind, seat_or_value=10 + copies, card=_card(face),
+               pointer=1 + discard_action(face) if kind == Kind.HAND else 0)
+        for face, copies in enumerate(counts) if copies
+    )
     if len(cards) > limit * FIELDS:
         raise ValueError("too many distinct faces for the token schema")
     return cards.ljust(limit * FIELDS, b"\x00")
@@ -121,26 +138,31 @@ def encode(obs: Observation, since: int = 0) -> Encoded:
         validate_game(obs.config)
         config = obs.config
         prefix = b"".join((
-            _token(Kind.RULE_DECKS, count=config.num_decks),
-            _token(Kind.RULE_HAND, count=config.cards_in_hand),
-            _token(Kind.RULE_SEQUENCES, count=config.required_sequences),
-            _token(Kind.RULE_TURNS, clock=config.max_turns),
-            _token(Kind.RULE_RECYCLE, count=int(config.recycle_discard)),
-            _token(Kind.RULE_PLAYERS, count=len(obs.players)),
-            _token(Kind.JOKER, face=obs.joker),
+            _token(Kind.RULE_DECKS, seat_or_value=RULE_OFFSET + config.num_decks),
+            _token(Kind.RULE_HAND, seat_or_value=RULE_OFFSET + config.cards_in_hand),
+            _token(Kind.RULE_SEQUENCES, seat_or_value=RULE_OFFSET + config.required_sequences),
+            _token(Kind.RULE_TURNS, seat_or_value=RULE_OFFSET + config.max_turns),
+            _token(Kind.RULE_RECYCLE, seat_or_value=RULE_OFFSET + int(config.recycle_discard)),
+            _token(Kind.RULE_PLAYERS, seat_or_value=RULE_OFFSET + len(obs.players)),
+            _token(Kind.JOKER, card=_card(obs.joker)),
             _hand(Kind.HAND_INIT, obs.history[0].initial_hand, INITIAL_HAND_TOKENS),
         ))
     prefix += b"".join(_event(event) for event in obs.history[since:])
     suffix = _token(
-        Kind.ACT_DRAW if obs.phase is Phase.DRAW else Kind.ACT_DISCARD, seat=0, face=_face(obs.discard_top),
-        count=min(len(obs.discard_pile), MAX_FIELD_VALUE), clock=min(obs.turns_remaining, MAX_FIELD_VALUE),
-        stock=min(obs.stock_remaining, MAX_FIELD_VALUE), meta=obs.players[0].next_player,
+        Kind.ACT, seat_or_value=1, card=_card(obs.discard_top), offered_or_count=100 + min(len(obs.discard_pile), 150),
+        clock_or_stock=_clock(obs.turns_remaining),
+    )
+    own = obs.players[0]
+    suffix += _token(
+        Kind.TABLE_STATE, seat_or_value=7 + obs.phase.value,
+        offered_or_count=83 + 2 * own.next_player + int(own.active),
+        clock_or_stock=130 + min(obs.stock_remaining // 2, 120),
     )
     suffix += b"".join(
-        _token(Kind.SEAT, seat=seat, count=view.hand_size, clock=min(view.turns_remaining, MAX_FIELD_VALUE),
-               meta=16 + (int(view.active) << 3) + view.next_player)
+        _token(Kind.SEAT, seat_or_value=1 + seat, offered_or_count=60 + view.hand_size,
+               clock_or_stock=_clock(view.turns_remaining))
         for seat, view in enumerate(obs.players)
     )
-    suffix += b"".join(_token(Kind.SEAT, seat=seat, meta=0) for seat in range(len(obs.players), SEAT_TOKENS))
-    suffix += _hand(Kind.HAND, obs.hand, SCHEMA.suffix_tokens - 1 - SEAT_TOKENS)
+    suffix += b"".join(_token(Kind.SEAT, seat_or_value=1 + seat) for seat in range(len(obs.players), SEAT_TOKENS))
+    suffix += _hand(Kind.HAND, obs.hand, SCHEMA.suffix_tokens - TABLE_TOKENS - SEAT_TOKENS)
     return Encoded(prefix, events, suffix, legal)

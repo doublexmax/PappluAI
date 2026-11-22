@@ -192,8 +192,7 @@ class _TransformerActor:
 class Deal:
     seed: int
     seats: tuple[int, ...]
-    curriculum: int = 0
-    warm_start: bool = False
+    curriculum: int | None = None
 
     @property
     def players(self) -> int:
@@ -238,23 +237,21 @@ class _Table:
 
     @staticmethod
     def start(deal: Deal, game: GameConfig, actors: tuple[_Opened, ...], index: int) -> _Table:
-        if type(deal.curriculum) is not int or not 0 <= deal.curriculum <= game.cards_in_hand:
-            raise ValueError("curriculum must be between zero and the hand size")
-        if (deal.curriculum or deal.warm_start) and deal.players != 1:
-            raise ValueError("only solo deals support curriculum or discard puzzles")
-        if deal.curriculum and deal.warm_start:
-            raise ValueError("choose curriculum or a discard puzzle, not both")
+        distance = deal.curriculum
+        if distance is not None and (type(distance) is not int or not 0 <= distance <= game.cards_in_hand):
+            raise ValueError("curriculum must be None or an integer between zero and the hand size")
         if deal.players == 1:
-            env = PappluEnv(game)
-            if deal.curriculum:
-                env.reset_curriculum(deal.curriculum, deal.seed)
-            elif deal.warm_start:
-                env.reset_warm_start(deal.seed)
-            else:
-                env.reset(deal.seed)
+            env: PappluEnv | MultiplayerEnv = PappluEnv(game)
         else:
             env = MultiplayerEnv(MatchConfig(game, deal.players))
+        if distance is None:
             env.reset(deal.seed)
+        elif distance:
+            env.reset_curriculum(distance, deal.seed)
+        elif isinstance(env, PappluEnv):
+            env.reset_warm_start(deal.seed)
+        else:
+            raise ValueError("distance zero is a solo discard puzzle")
         return _Table(
             deal, env, actors, tuple(index * 6 + seat for seat in range(deal.players)),
             tuple(Random(f"{deal.seed}:{seat}") for seat in range(deal.players)),

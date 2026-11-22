@@ -1,4 +1,5 @@
 from dataclasses import replace
+from itertools import islice
 import json
 from pathlib import Path
 from random import Random
@@ -62,6 +63,22 @@ class TestTrainingCore(unittest.TestCase):
             replace(batch, action=torch.full_like(batch.action, 54)).save(path)
             with self.assertRaisesRegex(ValueError, "legal action"):
                 Trajectories.load(path)
+            suffix = batch.suffix.clone()
+            suffix[0, -1, 7] = 55
+            replace(batch, suffix=suffix).save(path)
+            with self.assertRaisesRegex(ValueError, "pointer outside the action space"):
+                Trajectories.load(path)
+
+    def test_collection_ladder_includes_solo_puzzles_but_keeps_cold_deals_separate(self):
+        plan = CollectPlan(curriculum_share=1.0, curriculum_max_distance=6)
+        deals = list(islice(plan.deals("mastery"), 512))
+        self.assertEqual(deals, list(islice(plan.deals("mastery"), 512)))
+        self.assertEqual([deal.players for deal in deals[:8]], [1, 2, 3, 4, 1, 2, 3, 4])
+        self.assertEqual({deal.curriculum for deal in deals if deal.players == 1}, set(range(7)))
+        for players in (2, 3, 4):
+            self.assertEqual({deal.curriculum for deal in deals if deal.players == players}, set(range(1, 7)))
+        cold = list(islice(replace(plan, curriculum_share=0).deals("mastery"), 8))
+        self.assertEqual([deal.curriculum for deal in cold], [None] * 8)
 
     def test_buffer_keeps_terminal_reward_and_rejects_future_or_stale_batches(self):
         model = GameTransformer(TINY, SCHEMA)
@@ -163,7 +180,7 @@ class TestTrainingCore(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             trainer = Trainer.open(root, {
-                "game": self.game.to_dict(), "plan": {"batch_decisions": 6, "curriculum_share": 0.5},
+                "game": self.game.to_dict(), "plan": {"batch_decisions": 6, "curriculum_share": 0.0},
                 "actors": 0, "tables": 2, "torch_threads": 1, "batch_size": 2,
                 "min_buffer_decisions": 2, "eval_every": 1, "eval_deals": 1, "anchor_every": 2,
             }, spec=TINY)
@@ -178,7 +195,7 @@ class TestTrainingCore(unittest.TestCase):
                 self.assertEqual(state["trained_decisions"], version * 4)
                 checkpoint = load_checkpoint(root / "latest-model.pt", SCHEMA)
                 self.assertEqual((checkpoint.version, checkpoint.meta["run_id"]), (version, trainer.run_id))
-                self.assertEqual(checkpoint.meta["plan"]["curriculum_share"], 0.5)
+                self.assertEqual(checkpoint.meta["plan"]["curriculum_share"], 0.0)
                 trainer = Trainer.open(root)
                 self.assertEqual(trainer.learner.version, version)
                 self.assertEqual(trainer.run_id, checkpoint.meta["run_id"])

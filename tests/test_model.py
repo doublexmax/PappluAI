@@ -24,6 +24,16 @@ class TestSpec(unittest.TestCase):
         with self.assertRaises(ModelSpecError):
             ModelSpec.from_dict({"width": 16, "blocks": 1})
 
+    def test_pointer_field_round_trips_and_must_index_a_byte_field(self):
+        for field in (None, 0, 2):
+            with self.subTest(field=field):
+                schema = TokenSchema("other", 1, 3, 5, 7, pointer_field=field)
+                self.assertEqual(schema.to_dict()["pointer_field"], field)
+                self.assertEqual(TokenSchema.from_dict(schema.to_dict()), schema)
+        for field in (-1, 3, True, 1.0):
+            with self.subTest(field=field), self.assertRaisesRegex(ModelSpecError, "pointer_field"):
+                TokenSchema("other", 1, 3, 5, 7, pointer_field=field)
+
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class TestGameTransformer(unittest.TestCase):
@@ -45,11 +55,12 @@ class TestGameTransformer(unittest.TestCase):
         torch.testing.assert_close(table.grad[::256], torch.zeros(3, 32), atol=0, rtol=0)
 
     def test_batched_unroll_matches_step_across_ragged_chunks_and_cache_reuse(self):
-        model = self.model
+        model = GameTransformer(self.model.spec, replace(self.schema, pointer_field=2))
         prefix = torch.randint(1, 256, (2, 41, 3), dtype=torch.uint8)
         prefix[0, 3:6] = 0
         prefix[1, 30:] = 0
         suffix = torch.randint(1, 256, (2, 4, 5, 3), dtype=torch.uint8)
+        suffix[..., 2] %= self.schema.num_actions + 1
         suffix[0, :, -2:] = 0
         suffix[1, :, -1:] = 0
         cuts = torch.tensor([[8, 25, 25, 41], [3, 3, 19, 30]])
@@ -74,6 +85,25 @@ class TestGameTransformer(unittest.TestCase):
         self.assertTrue((reference.log_policy.exp()[~legal] == 0).all())
         torch.testing.assert_close(reference.log_policy.exp().sum(-1), torch.ones(2, 4))
 
+    def test_entities_add_scores_to_the_named_action_before_legal_masking(self):
+        model = GameTransformer(self.model.spec, replace(self.schema, pointer_field=1))
+        with torch.no_grad():
+            for weight in model.parameters():
+                weight.zero_()
+            model.final_norm.weight.fill_(1)
+            model.embedding.weight[1:3].fill_(1)
+            model.pointer.weight[0, 0] = 1
+        prefix = torch.tensor([[[1, 0, 0]]], dtype=torch.uint8)
+        suffix = torch.tensor([[[[1, 0, 0], [2, 3, 0], [2, 3, 0], [2, 4, 0], [2, 5, 0]]]], dtype=torch.uint8)
+        legal = torch.tensor([[[True, True, True, True, False, False, False]]])
+        logp = model.unroll(TokenBatch(prefix, suffix, torch.tensor([[1]]), legal)).log_policy
+        torch.testing.assert_close(
+            logp[0, 0, :4] - logp[0, 0, 0], torch.tensor([0.0, 0.0, 2.0, 1.0]), atol=1e-5, rtol=0,
+        )
+        self.assertEqual(logp.exp()[~legal].tolist(), [0.0, 0.0, 0.0])
+        (-logp[0, 0, 2]).backward()
+        self.assertLess(float(model.pointer.weight.grad[0, 0]), 0)
+
     def test_earlier_readout_is_independent_of_future_prefix_and_other_suffix(self):
         prefix = torch.ones((1, 9, 3), dtype=torch.uint8)
         suffix = torch.ones((1, 2, 5, 3), dtype=torch.uint8)
@@ -86,7 +116,7 @@ class TestGameTransformer(unittest.TestCase):
         torch.testing.assert_close(original.value[:, 0], changed.value[:, 0], atol=1e-6, rtol=0)
         self.assertFalse(torch.allclose(original.log_policy[:, 1], changed.log_policy[:, 1]))
 
-    def test_suffix_attention_matches_joint_softmax_and_readout(self):
+    def test_suffix_attention_matches_joint_softmax_for_every_token(self):
         block = self.model.blocks[-1]
         x = torch.randn(6, 5, 32)
         suffix_valid = torch.arange(5) < torch.tensor([4, 2, 1, 3, 5, 0])[:, None, None, None]
@@ -103,11 +133,8 @@ class TestGameTransformer(unittest.TestCase):
                     torch.cat((v_pre.repeat_interleave(3, dim=0), v), dim=-2), attn_mask=mask,
                 )
                 expected = block._residual(x, attention)
-                for readout_only in (False, True):
-                    actual = block.suffix_blocks(
-                        x, rope, k_pre, v_pre, prefix_valid, suffix_valid, readout_only=readout_only,
-                    )
-                    torch.testing.assert_close(actual, expected[:, :actual.size(1)], atol=1e-5, rtol=0)
+                actual = block.suffix_blocks(x, rope, k_pre, v_pre, prefix_valid, suffix_valid)
+                torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
 
     def test_checkpoints_bind_schema_and_validate_finite_weights(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -118,6 +145,8 @@ class TestGameTransformer(unittest.TestCase):
             torch.testing.assert_close(checkpoint.network.policy.weight, self.model.policy.weight)
             with self.assertRaisesRegex(ValueError, "token schema"):
                 load_checkpoint(path, replace(self.schema, version=2))
+            with self.assertRaisesRegex(ValueError, "token schema"):
+                load_checkpoint(path, replace(self.schema, pointer_field=2))
             payload = torch.load(path, weights_only=True)
             payload["model_state_dict"]["policy.bias"][0] = float("nan")
             torch.save(payload, path)
