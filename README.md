@@ -63,66 +63,40 @@ Neural has no draw lookahead, belief search, or feed-risk adjustment.
 It falls back to Tactical for unavailable weights, incompatible rules, or solo browser play.
 The scoreboard reports the effective tier and any downgrade.
 
-`web/papplu-model.json` temporarily contains untrained `card_mlp` v5 compatibility weights from bootstrap seed 1729.
-Its `source.kind` is `bootstrap` and `source.trained` is `false`.
-The network has 673,412 parameters, width 128, and three residual blocks.
-It reads the 1,275-float version 5 encoding.
-Slice 4 will replace this bundle with the converged Azure 128-by-3 checkpoint.
+`web/papplu-model.json` contains the trained Azure `card_mlp` v5 checkpoint.
+It uses `ModelSpec(128, 3)`, has 673,412 parameters, and reads the 1,275-float version 5 encoding.
+The export records `source.kind` as `checkpoint` and `source.trained` as `true`.
 
-### A1 held-out results
+### Held-out results
 
-These historical results describe Azure checkpoint A1, `trackA_p1/best-model.pt`, not the current bootstrap bundle.
-A1 used `ModelSpec(64, 2)` and checkpoint SHA256 `094bbe8946fc890e93de7a2ce77f0ad45ad8f8d24a38f2249ffb31fdef39882b`.
-A1 was locked before this evaluation.
-These seeds are disjoint from its production training and selection.
-Earlier project models used the same seed ranges, so they are not project-wide unseen deals.
-Multiplayer matches use three decks, 21 cards, five required pure sequences, and 60 turns per seat.
+The evaluation locked the checkpoint before the held-out run. The deal seeds did not enter its training or selection.
+Earlier project models used some of these seed ranges, so the deals are held out for this checkpoint, not for the project as a whole.
+Node ran the browser engine with three decks, 21 cards, five required pure sequences, and a 60-turn cap per seat.
 
-Python cold solo won 243 of 256 deals at seed 850000, or 94.9%.
-Its 95% Wilson interval is 91.5% to 97.0%, with mean terminal penalty 1.50 points.
-Random won 0 of 256.
-The separate warm discard puzzles at seed 860000 yielded 208 of 256 wins, or 81.25%, against Random's 64 of 256.
-Those one-discard puzzles are not full cold games.
+Cold solo won 488 of 500 deals starting at seed `850000`, or 97.60%. The 95% Wilson interval is 95.85% to 98.62%.
+Mean terminal deadwood was 1.148 points. This test calls the browser neural policy directly. The solo UI still downgrades Neural to Tactical.
 
-The table reports valid declaration wins.
+For multiplayer, the candidate played once in every seat on each deal, with the same opponent in all other seats.
+A1 is the 64-by-2 model exported in `a4aa60c`.
+First-place credit goes to the declaration winner, or to the lowest deadwood penalty at the cap. Tied first seats split the credit.
+Pairwise credit gives 1 for placing ahead of an opponent and 0.5 for a tie. Neutral pairwise credit is 50%.
+The first-place intervals use 10,000 resamples of complete deals, preserving their seat rotations.
 
-| Players | Random, Python | Heuristic, Python | Casual, browser | Tactical, browser |
-| --- | --- | --- | --- | --- |
-| 2 | 119/120, 99.2% | 54/120, 45.0% | 100/120, 83.3% | 41/96, 42.7% |
-| 3 | 119/120, 99.2% | 38/120, 31.7% | 86/120, 71.7% | 19/60, 31.7% |
-| 4 | 117/120, 97.5% | 20/120, 16.7% | 69/120, 57.5% | 15/60, 25.0% |
+| Opponent | Players | First seed | Deals | Declaration wins | First-place credit, 95% deal interval | Pairwise credit | Mean penalty |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A1 | 2 | 860000 | 120 | 129/240 | 53.75% (48.75% to 58.75%) | 53.75% | 17.51 |
+| A1 | 3 | 860000 | 80 | 76/240 | 31.67% (26.67% to 36.67%) | 52.08% | 28.18 |
+| A1 | 4 | 860000 | 60 | 64/240 | 26.67% (22.08% to 31.25%) | 54.58% | 32.67 |
+| Casual | 2 | 870000 | 100 | 175/200 | 87.50% (83.00% to 92.00%) | 87.50% | 4.30 |
+| Casual | 3 | 870000 | 60 | 124/180 | 68.89% (62.22% to 75.00%) | 82.50% | 10.25 |
+| Casual | 4 | 870000 | 50 | 118/200 | 59.00% (52.50% to 65.50%) | 81.67% | 15.37 |
+| Tactical | 2 | 880000 | 60 | 68/120 | 56.67% (49.17% to 64.17%) | 56.67% | 17.23 |
+| Tactical | 3 | 880000 | 40 | 41/120 | 34.17% (27.50% to 40.83%) | 49.79% | 27.77 |
+| Tactical | 4 | 880000 | 30 | 37/120 | 30.83% (24.17% to 37.50%) | 55.69% | 28.29 |
 
-Python arena uses seed 870000 and cycles Neural equally through the seats across 120 distinct deals per cell.
-The browser evaluation loaded A1's exported JSON and used seed 880000 with every seat on every deal.
-Casual uses 60, 40, and 30 deal seeds for two, three, and four players.
-Tactical uses 48, 20, and 15 deal seeds.
-All 576 browser games finished without errors or tier downgrades.
-
-First-place credit assigns the declaration winner first, or ranks terminal penalties at the turn cap.
-It splits one unit across tied first seats.
-Against 2p Casual, Neural won 100/120 by declaration, or 83.3%.
-It finished first in 101/120, or 84.2%, including one turn-cap penalty win.
-
-| Players | Neural credit against Tactical | Equal-seat parity | 95% deal-cluster interval |
-| --- | --- | --- | --- |
-| 2 | 42.7% | 50.0% | 35.4% to 49.0% |
-| 3 | 31.7% | 33.3% | 25.0% to 38.3% |
-| 4 | 25.0% | 25.0% | 18.3% to 31.7% |
-
-The intervals use 2,000 resamples of deal seeds and preserve all seat rotations.
-Neural beats Random and Casual in these cells and has a high cold-solo win rate.
-Its three-player and four-player first-place credit is near Tactical parity, but its two-player credit is below parity.
-The four-player Python Heuristic result is also below parity.
-These results do not establish a rating or equal strength on every scoring measure.
-
-The idle Node v24.19.0 bundle benchmark measured 4.44 ms median and 4.84 ms p95 for `qValues`.
-It used five passes over 1,000 real observations, with per-pass medians from 4.42 to 4.45 ms and no failures.
-The timed call includes validation, encoding, and forward computation, but excludes model loading and `observationFromView`.
-It is not a complete draw-and-discard turn.
-During the 18-worker Tactical matches, mean observation and move-selection time was 30.59 to 43.04 ms for Neural and 4.76 to 4.98 seconds for Tactical.
-Tactical runs exact `minimumPenalty` and `outs1ply` searches.
-Those loaded worker timings are not directly comparable to the idle `qValues` benchmark.
-The browser evaluation took 52.3 minutes, longer than the initial estimate.
+All multiplayer games ended in a declaration, so the declaration counts are also the outright first-place counts.
+The model beats equal-seat first-place parity against Casual at each table size. The intervals against A1 and Tactical include parity.
+See the [training guide](TRAINING.md#shipped-checkpoint) for the separate Python arena results and inference timing.
 
 ### Declarations and scoring
 
@@ -298,6 +272,8 @@ The active snapshot pool holds at most eight checkpoints.
 
 Replay stores contiguous float32 features, int64 actions, float32 returns, and boolean greedy flags.
 Replay retains the most recent 60,000 steps.
+The trainer uses 64 MiB zlib chunks to save and restore replay tensors, including tensors larger than 2 GiB.
+For [multi-VM collection](TRAINING.md#feed-a-learner-from-other-machines), actors use `--collect-batch` and the learner reads `inbox/batch-*.pt`.
 For positive terminal utility `u`, step `t` of a length-`T` trajectory targets `u * 0.99 ** (T - 1 - t)`.
 Negative and zero returns remain undiscounted at every step.
 AdamW fits selected-action Q-values with Smooth-L1 loss and gradient clipping.
@@ -352,7 +328,7 @@ Export a trained checkpoint to update the browser model and its matching Q-value
 .\.venv\Scripts\python tools\weights_export.py --checkpoint runs\full21\best-model.pt
 ```
 
-`--bootstrap --seed 1729` regenerates the temporary 128-by-3 compatibility bundle.
+`--bootstrap --seed 1729` generates untrained compatibility weights.
 Do not use bootstrap results as evidence of playing strength.
 
 `tools/verify_browser.mjs` exercises the real browser through Playwright.

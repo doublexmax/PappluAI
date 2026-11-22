@@ -4,47 +4,33 @@ Use this guide to create a resumable self-play run and export its selected check
 The [model contract](README.md#model-and-training-contract) describes the network, encoding, and terminal utility.
 No command here provisions Azure resources or spends cloud credit.
 
-## Browser bootstrap
+## Shipped checkpoint
 
-The browser temporarily ships deterministic untrained weights from bootstrap seed 1729 in `web/papplu-model.json`.
-Its `source.kind` is `bootstrap` and `source.trained` is `false`.
-The default `card_mlp` v5 network has 673,412 parameters at width 128 with three blocks.
-Its version 5 encoding contains 1,275 float32 values.
-Slice 4 will export the converged Azure 128-by-3 checkpoint into this file.
-Do not use the bootstrap bundle to measure playing strength.
-
-`node tools/benchmark_qnet.mjs` measured this bundle on Windows with Node v24.19.0 and an Intel Core i7-12700H.
-Five 1,000-observation passes after 200 warmup calls yielded 22.70355 ms median and 23.77600 ms p95, with zero failures.
-Pass medians ranged from 22.62230 to 22.79365 ms.
-The measurement includes validation, encoding, and forward computation, but excludes model loading and observation conversion.
-A separate CPU profile attributed 95.26% of sampled time to `linear` in `web/qnet.mjs`.
-
-## Historical A1 checkpoint
-
-The prior browser bundle contained Azure checkpoint A1, `trackA_p1/best-model.pt`.
-It used `ModelSpec(64, 2)` with 127,172 parameters.
+The browser loads the locked Azure `seed_22368` checkpoint from `web/papplu-model.json`.
+It uses `ModelSpec(128, 3)` with 673,412 parameters and the 1,275-float version 5 encoding.
+The checkpoint SHA256 is `a229f90e76ae9da9b8c97d35db10e2d921a3a46780fc54d292ba2bde3df67796`.
+Selection used seed `700000` before the [held-out evaluation](README.md#held-out-results).
+A1 is the prior merged `ModelSpec(64, 2)` checkpoint with 127,172 parameters.
 Its checkpoint SHA256 is `094bbe8946fc890e93de7a2ce77f0ad45ad8f8d24a38f2249ffb31fdef39882b`.
-Training used a 16-vCPU Azure VM and repository commit `5d59de7`.
 
-The final held-out evaluation locked A1 before gameplay.
-Cold Python solo won 243 of 256 deals, or 94.9%, with a 95% Wilson interval of 91.5% to 97.0%.
-The separate warm discard puzzles yielded 208 of 256 wins, or 81.25%.
-For two, three, and four players, declaration rates were 99.2%, 99.2%, and 97.5% against Python Random.
-Browser Casual rates were 83.3%, 71.7%, and 57.5%.
-Against 2p Casual, Neural won 100/120 by declaration, or 83.3%.
-It finished first in 101/120, or 84.2%, including one turn-cap penalty win.
-Python Heuristic rates were 45.0%, 31.7%, and 16.7%.
-Browser Tactical rates were 42.7%, 31.7%, and 25.0%.
-Neural beats Random and Casual in these cells.
-It plays near first-place parity against Tactical at three and four players, but trails at two players and against four-player Heuristic.
+The release check compared all 54 Q-values on 600 real Python observations against the exported model in Node.
+The maximum absolute difference was `5.17e-6`, below `1e-5`. The check included 62 solo states after a self-discard with stock available.
 
-A1's idle bundle benchmark measured 4.44 ms median and 4.84 ms p95 per `qValues` call over five 1,000-observation passes.
-That call includes validation, encoding, and one forward pass, not a complete turn.
-In the 18-worker browser run, Tactical's exact `minimumPenalty` and `outs1ply` searches averaged 4.76 to 4.98 seconds per move.
-Neural averaged 30.59 to 43.04 ms under that load.
-Do not compare those loaded move timings directly with the idle network benchmark.
-See the [A1 held-out results](README.md#a1-held-out-results) for counts, seat balancing, and deal-cluster intervals.
-The requested seeds are disjoint from this production run's training and selection, but earlier project models used them.
+The native `src.cli.arena` also compared the checkpoint with A1, starting at seed `860000`.
+The candidate rotated through every seat on each deal. Native and browser shuffles differ.
+
+| Players | Deals | Declaration wins | First-place credit, 95% deal interval | Pairwise credit | Mean penalty |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2 | 120 | 135/240 | 56.25% (50.83% to 61.67%) | 56.25% | 15.24 |
+| 3 | 80 | 100/240 | 41.67% (36.67% to 46.67%) | 57.81% | 23.14 |
+| 4 | 60 | 77/240 | 32.08% (27.08% to 37.50%) | 56.25% | 26.20 |
+
+The Node v24.19.0 benchmark ran on Windows with an Intel Core i7-12700H.
+Each pass timed 500 single-state `qValues` calls after 50 warmup calls.
+The first pass measured 22.31 ms median, 22.63 ms p95, and 22.37 ms mean.
+Five passes had no failures, with medians from 22.29 to 22.31 ms.
+The call includes validation, encoding, and inference, but excludes model loading and observation conversion.
+A separate CPU profile put 87.44% of samples in the `linear` function in `web/qnet.mjs`.
 
 ## Install PyTorch
 
@@ -129,6 +115,8 @@ Use `--lr-decay-updates` to change the update scale. Zero disables decay.
 
 Every deal starts cold.
 There are no solved-hand warm starts or curriculum stages.
+In solo, the policy mask prevents taking its own last discard while stock is available.
+If stock is empty and the discard pile is not, the mask still allows taking the discard.
 On each multiplayer deal, self-play has probability 0.35.
 Other deals place the learner in a random seat against stationary opponents.
 Each opponent seat chooses the reigning `best-model.pt` with probability 0.45, `HeuristicPolicy` with 0.20, `RandomPolicy` with 0.05, and a uniform snapshot with 0.30.
@@ -219,7 +207,7 @@ Repeated `--opponent` flags supply additional snapshots, bounded by `--max-pool`
 Give each actor machine a distinct `--seed` or disjoint episode ranges.
 Use a unique destination filename for every batch and only one trainer per run directory.
 
-Before each round, the trainer loads up to eight `inbox/batch-*.pt` files in filename order.
+Before each round, the trainer considers the first two `inbox/batch-*.pt` files in filename order.
 If their total reaches `--round-episodes`, the trainer skips local collection and only learns.
 Smaller batches reduce the local deal count. An empty inbox uses local rollouts.
 Imported deals drive episode counters, learner updates, validation, and checkpoints.
@@ -295,7 +283,8 @@ The selected validation score is not a rating or proof of strength against unsee
 
 Read `status.json` for the latest saved selection.
 Read `metrics.jsonl` for each round's episode count, `epsilons`, trajectory count, combined learning loss, updates, samples, and optional validation.
-`latest-state.pt` compresses tensor bytes with zlib and restores them without NumPy.
+`latest-state.pt` uses 64 MiB zlib chunks to save and restore replay tensors without NumPy.
+Chunking supports tensors larger than 2 GiB without a full uncompressed copy for the codec.
 With one actor, splitting at the same round boundary preserves model, optimizer, replay, and sampling exactly.
 Changing the actor count can change batch composition and learning order.
 
@@ -322,10 +311,11 @@ node --test tests/qnet.test.mjs tests/ai.test.mjs tests/table.test.mjs
 ```
 
 The exporter writes the model and its matching golden cases together.
+`--checkpoint` marks the export as trained and records the checkpoint and tensor hashes, not the input path.
 It checks the portable forward pass against Torch.
 The full Python suite also exports nonzero 128-by-3 weights and checks all 54 Node Q-values within `1e-5`.
 Keep `web/papplu-model.json` and `tests/fixtures/qnet-golden.json` together.
-`--bootstrap --seed 1729` regenerates the temporary deterministic 128-by-3 browser bundle.
+`--bootstrap --seed 1729` generates deterministic untrained 128-by-3 weights.
 Use that option for compatibility checks, not to publish playing-strength results.
 
 Run the [verification commands](README.md#verification) before accepting a training-code change.
@@ -338,8 +328,11 @@ Fresh runs use the defaults described above. Resume restores saved settings unle
 | Option | Meaning |
 | --- | --- |
 | `-h`, `--help` | Show help without loading Torch. |
-| `--output-dir` | Required run directory. Reuse it to resume. |
+| `--output-dir` | Required run directory unless collecting a batch. Reuse it to resume. |
 | `--initial-model` | Starting checkpoint for a fresh run. |
+| `--collect-batch` | Write one rollout batch without opening a trainer run. |
+| `--best-model` | Reigning opponent checkpoint for batch collection. Defaults to `--initial-model`. |
+| `--start-episode` | First deal index in batch collection. Defaults to zero. |
 | `--opponent` | Imported opponent checkpoint. Repeat for multiple opponents. |
 | `--players` | Player counts, supplied as one or more integers. |
 | `--actors` | Number of rollout and validation actors. |
