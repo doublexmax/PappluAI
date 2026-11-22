@@ -38,12 +38,15 @@ class DealOutcome:
     ending: str
     penalties: tuple[HandPenalty, ...]
     max_points: int
+    required_sequences: int = 5
 
     def __post_init__(self) -> None:
         if not 1 <= len(self.penalties) <= 6 or type(self.max_points) is not int or self.max_points < 1:
             raise ValueError("outcome needs one to six seats and a positive point bound")
         if any(not 0 <= penalty.points <= self.max_points for penalty in self.penalties):
             raise ValueError("penalty exceeds the full hand's point bound")
+        if type(self.required_sequences) is not int or self.required_sequences < 0:
+            raise ValueError("required_sequences must be a nonnegative integer")
         if self.ending == "win":
             if (
                 type(self.winner) is not int
@@ -68,7 +71,7 @@ class DealOutcome:
         return cls(winner, ending, tuple(
             minimum_penalty(hand, snapshot.joker, required_sequences)
             for hand in snapshot.hands
-        ), cards_in_hand * 10)
+        ), cards_in_hand * 10, required_sequences)
 
     def ranks(self) -> tuple[int, ...]:
         if len(self.penalties) == 1:
@@ -87,11 +90,19 @@ class DealOutcome:
 
     def utilities(self) -> tuple[float, ...]:
         players = len(self.penalties)
-        if self.ending == "turns_exhausted":
-            return (-1.0,) if players == 1 else (-0.5,) * players
+        if self.ending == "win":
+            if players == 1:
+                return (1.0,)
+            return tuple(1.0 if seat == self.winner else -1.0 / (players - 1) for seat in range(players))
+        quota = self.required_sequences
+        fractions = tuple(
+            min(penalty.qualifying_sequences, quota) / quota if quota else 1.0
+            for penalty in self.penalties
+        )
         if players == 1:
-            return (1.0,)
-        return tuple(1.0 if seat == self.winner else -1.0 / (players - 1) for seat in range(players))
+            return (-1.0 + 0.60 * fractions[0],)
+        total = sum(fractions)
+        return tuple(-0.50 + 0.30 * (fraction - (total - fraction) / (players - 1)) for fraction in fractions)
 
 
 def solo_outcome(

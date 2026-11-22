@@ -13,19 +13,19 @@ from src.cli._runtime import load_runtime
 
 _SHAPE = ("width", "layers", "heads", "ffn")
 _GAME = ("num_decks", "cards_in_hand", "required_sequences", "max_turns", "recycle_discard")
-_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance", "uniform_mix", "batch_decisions")
+_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance", "uniform_mix", "batch_decisions", "search_ply")
 _HOST = ("tables", "torch_threads", "precision", "device")
 _INTS = (
     "actors", "actor_threads", "batch_size", "min_buffer_decisions", "buffer_decisions",
     "max_policy_lag", "anchor_every", "sync_every", "publish_every", "checkpoint_every", "eval_every",
     "eval_deals", "seed",
 )
-_FLOATS = ("learning_rate", "weight_decay", "grad_clip", "value_weight", "eta", "entropy_weight",
+_FLOATS = ("learning_rate", "weight_decay", "grad_clip", "value_weight", "eta",
            "rho_bar", "c_bar", "promote_margin")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train or collect for the GameTransformer V-trace and R-NaD learner.")
+    parser = argparse.ArgumentParser(description="Train GameTransformer with policy distillation and V-trace values.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--output-dir", type=Path, help="start or resume a learner (supports torchrun on CPU)")
     mode.add_argument("--collect", type=Path, help="write completed batches to this inbox")
@@ -36,6 +36,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recycle-discard", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--device")
     parser.add_argument("--precision", choices=("fp32", "bf16"))
+    parser.add_argument("--search-ply", type=int, choices=(0, 1), help="self-play depth for a fresh learner (default: 1)")
     parser.add_argument("--max-seconds", type=float)
     for name in (
         *_SHAPE, *_INTS, *_GAME[:-1], "tables", "torch_threads",

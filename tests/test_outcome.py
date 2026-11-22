@@ -22,6 +22,21 @@ class TestOutcomes(unittest.TestCase):
         self.assertEqual(score.ranks(), (2, 1))
         self.assertEqual(score.margin(1, 0), 1)
 
+    def test_timeout_rewards_qualifying_sequences_not_card_rank(self):
+        high = hand((11, 1), (12, 1), (0, 1))
+        low = hand((1, 1), (2, 1), (3, 1))
+        unmatched = hand((1, 1), (14, 1), (27, 1))
+        four = hand(*((offset + rank, 1) for offset in range(0, 52, 13) for rank in (1, 2, 3)))
+        self.assertAlmostEqual(solo_outcome(high, 8, False, 5).utility, -0.88)
+        self.assertAlmostEqual(solo_outcome(low, 8, False, 5).utility, -0.88)
+        self.assertAlmostEqual(solo_outcome(unmatched, 8, False, 5).utility, -1.0)
+        self.assertAlmostEqual(solo_outcome(four, 8, False, 5).utility, -0.52)
+        self.assertAlmostEqual(solo_outcome(unmatched, 8, False, 0).utility, -0.40)
+        score = DealOutcome.score(TerminalSnapshot((high, low, unmatched), 8), None, "turns_exhausted", 1)
+        self.assertEqual(score.required_sequences, 1)
+        self.assertEqual(score.utilities(), (-0.35, -0.35, -0.8))
+        self.assertAlmostEqual(sum(score.utilities()), -1.5)
+
     def test_zero_sum_and_placements_on_declaration(self):
         score = DealOutcome(0, "win", tuple(HandPenalty(p, (), ()) for p in (0, 0, 210, 210)), 210)
         self.assertEqual(score.utilities(), (1.0, -1 / 3, -1 / 3, -1 / 3))

@@ -21,6 +21,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warm-seed", type=int, default=600000)
     parser.add_argument("--tables", type=int, default=64)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument("--search-ply", type=int, choices=(0, 1), default=0)
     parser.add_argument("--sensitivity", action="store_true")
     return parser
 
@@ -36,7 +37,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime = load_runtime("src.evaluation.benchmark")
         result = runtime.evaluate_checkpoint(
             args.checkpoint, args.games, args.seed, args.warm_games, args.warm_seed,
-            args.sensitivity, tables=args.tables, precision=args.precision,
+            args.sensitivity, tables=args.tables, precision=args.precision, search_ply=args.search_ply,
         )
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)

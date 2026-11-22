@@ -85,6 +85,37 @@ class TestGameTransformer(unittest.TestCase):
         self.assertTrue((reference.log_policy.exp()[~legal] == 0).all())
         torch.testing.assert_close(reference.log_policy.exp().sum(-1), torch.ones(2, 4))
 
+    def test_candidate_suffixes_match_unroll_without_changing_the_root_cache(self):
+        model = GameTransformer(self.model.spec, replace(self.schema, pointer_field=2))
+        prefix = torch.randint(1, 256, (2, 11, 3), dtype=torch.uint8)
+        suffix = torch.randint(1, 256, (2, 3, 5, 3), dtype=torch.uint8)
+        suffix[..., 2] %= self.schema.num_actions + 1
+        suffix[1, 2, -2:] = 0
+        legal = torch.rand(2, 3, 7) > 0.4
+        legal[..., 0] = True
+        lengths, rows = torch.tensor([4, 11]), torch.tensor([2, 0])
+        cache = model.new_cache()
+        model.step(cache, rows, prefix, suffix[:, 0], legal[:, 0], append_lengths=lengths)
+        before = tuple(t.clone() for t in (cache.length, *cache.keys, *cache.values))
+        reference = model.unroll(TokenBatch(prefix, suffix, lengths[:, None].expand(2, 3), legal))
+        for indices, tokens, mask, shape in (
+            (rows, suffix, legal, (2, 3)),
+            (rows.repeat_interleave(3), suffix.flatten(0, 1), legal.flatten(0, 1), (6,)),
+        ):
+            actual = model.evaluate_candidates(cache, indices, tokens, mask)
+            self.assertEqual(actual.value.shape, shape)
+            torch.testing.assert_close(actual.value.reshape(2, 3), reference.value, rtol=0, atol=1e-5)
+            torch.testing.assert_close(actual.log_policy.reshape_as(legal), reference.log_policy, rtol=0, atol=1e-5)
+        for unchanged, original in zip((cache.length, *cache.keys, *cache.values), before):
+            self.assertTrue(torch.equal(unchanged, original))
+        tail = torch.ones((2, 1, 3), dtype=torch.uint8)
+        continued = model.step(cache, rows, tail, suffix[:, 0], legal[:, 0])
+        fresh = model.new_cache()
+        extended = torch.cat((prefix, tail), dim=1)
+        extended[0, 4] = tail[0, 0]
+        replay = model.step(fresh, rows, extended, suffix[:, 0], legal[:, 0], append_lengths=lengths + 1)
+        torch.testing.assert_close(continued.value, replay.value, rtol=0, atol=1e-5)
+
     def test_entities_add_scores_to_the_named_action_before_legal_masking(self):
         model = GameTransformer(self.model.spec, replace(self.schema, pointer_field=1))
         with torch.no_grad():

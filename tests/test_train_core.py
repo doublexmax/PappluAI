@@ -34,7 +34,7 @@ class TestTrainingCore(unittest.TestCase):
         torch.set_num_threads(1)
         self.game = GameConfig(max_turns=1)
 
-    def test_columnar_roundtrip_rejects_bad_offsets_cuts_logp_and_illegal_actions(self):
+    def test_columnar_roundtrip_rejects_corrupt_rollouts_and_targets(self):
         network = GameTransformer(TINY, SCHEMA)
         policy = TransformerPolicy(network, self.game, sample=True, record=True)
         results = list(run_matches((Deal(9, (0,)), Deal(11, (0, 0))), (policy,), self.game))
@@ -45,8 +45,10 @@ class TestTrainingCore(unittest.TestCase):
             loaded = Trajectories.load(path)
             self.assertEqual((loaded.version, loaded.episodes, loaded.decisions), (4, 2, 6))
             self.assertEqual(loaded.suffix.shape, (6, 30, 8))
-            for name in ("prefix", "suffix", "decision_end", "cut", "action", "behavior_logp", "utility", "legal"):
+            for name in ("prefix", "suffix", "decision_end", "cut", "action", "behavior_logp", "utility", "legal",
+                         "target_probs"):
                 torch.testing.assert_close(getattr(batch, name), getattr(loaded, name))
+            self.assertEqual((loaded.target_probs.dtype, loaded.target_probs.shape), (torch.uint16, (6, 54)))
             payload = torch.load(path, weights_only=True)
             payload["schema"]["version"] = 6
             torch.save(payload, path)
@@ -56,11 +58,18 @@ class TestTrainingCore(unittest.TestCase):
                 ({"cut": batch.cut + 1}, "prefix cuts"),
                 ({"decision_end": batch.decision_end + 1}, "offsets"),
                 ({"behavior_logp": torch.full_like(batch.behavior_logp, float("nan"))}, "behavior"),
+                ({"target_probs": batch.target_probs[:, :53]}, "target_probs"),
+                ({"target_probs": torch.zeros_like(batch.target_probs)}, "probability mass"),
             ):
                 with self.subTest(text=text):
                     replace(batch, **changes).save(path)
                     with self.assertRaisesRegex(ValueError, text):
                         Trajectories.load(path)
+            targets = batch.target_probs.int()
+            targets[0, 2] = 1
+            replace(batch, target_probs=targets.to(torch.uint16)).save(path)
+            with self.assertRaisesRegex(ValueError, "target probability"):
+                Trajectories.load(path)
             replace(batch, action=torch.full_like(batch.action, 54)).save(path)
             with self.assertRaisesRegex(ValueError, "legal action"):
                 Trajectories.load(path)
@@ -95,6 +104,8 @@ class TestTrainingCore(unittest.TestCase):
         self.assertEqual(sample.tokens.cut.tolist(), [[30, 31]])
         self.assertAlmostEqual(sample.reward[0, 1].item(), runs[0].outcome.utilities()[0])
         self.assertEqual(sample.reward[0, 0], 0.0)
+        torch.testing.assert_close(sample.target_probs.sum(-1), torch.ones(1, 2))
+        self.assertEqual(sample.target_probs.masked_select(~sample.tokens.legal).count_nonzero(), 0)
         buffer.prune(11)
         self.assertEqual(len(buffer), 0)
         self.assertFalse(buffer.add(batch, 11))
@@ -102,12 +113,15 @@ class TestTrainingCore(unittest.TestCase):
     def test_buckets_keep_short_trajectories_separate_and_only_pad_after_terminal(self):
         lengths = (1, 8, 120)
         decisions = sum(lengths)
+        targets = torch.zeros(decisions, SCHEMA.num_actions, dtype=torch.int32)
+        targets[:, 1] = 65535
         batch = Trajectories(
             0, 3, RUN_ID, torch.ones(3, dtype=torch.uint8), torch.tensor([1.0, 0.5, -1.0]),
             torch.ones(decisions, SCHEMA.fields, dtype=torch.uint8), torch.tensor(lengths).cumsum(0),
             torch.ones(decisions, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
             torch.tensor(lengths).cumsum(0), torch.cat([torch.arange(1, n + 1) for n in lengths]),
             torch.full((decisions,), 2), torch.ones(decisions, dtype=torch.uint8), torch.zeros(decisions),
+            targets.to(torch.uint16),
         )
         buffer = _Buffer(decisions, 3)
         self.assertTrue(buffer.add(batch, 0))
@@ -149,7 +163,7 @@ class TestTrainingCore(unittest.TestCase):
         self.assertLessEqual(fallback.valid.size(1), 8)
 
     def test_published_revision_does_not_change_live_stream_actions(self):
-        plan = CollectPlan(player_counts=(1, 2), curriculum_share=0, batch_decisions=1, uniform_mix=0)
+        plan = CollectPlan(player_counts=(1, 2), curriculum_share=0, batch_decisions=1, uniform_mix=0, search_ply=0)
         old, new = (GameTransformer(TINY, SCHEMA) for _ in range(2))
         for action, network in enumerate((old, new)):
             with torch.no_grad():

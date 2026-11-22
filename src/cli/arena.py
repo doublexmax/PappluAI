@@ -32,6 +32,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-turns", type=_positive_int)
     parser.add_argument("--tables", type=_positive_int, default=64)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument("--search-ply", type=int, choices=(0, 1), default=0)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -48,7 +49,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         runtime = load_runtime("src.evaluation.arena")
         runtime.torch.set_num_threads(1)
-        policies = tuple(runtime.resolve_policy(value, precision=args.precision) for value in args.model)
+        policies = tuple(
+            runtime.resolve_policy(value, precision=args.precision, search_ply=args.search_ply) for value in args.model
+        )
         labels = [Path(value).stem for value in args.model]
         game = runtime.match_game(policies, args.max_turns)
         deals = (
@@ -82,7 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {"index": index, "label": label, "model": model}
                 for index, (label, model) in enumerate(zip(labels, args.model))
             ],
-            "config": {"players": players, "game": game.to_dict()},
+            "config": {"players": players, "game": game.to_dict(), "search_ply": args.search_ply},
             "games": games,
         }
         args.output.parent.mkdir(parents=True, exist_ok=True)

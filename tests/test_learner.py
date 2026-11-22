@@ -13,7 +13,15 @@ except ImportError:
 
 if torch is not None:
     from src.model.network import GameTransformer
-    from src.training.train import Learner, TrainConfig, TrajectoryBatch, _SeatTrajectory, regularized_reward, vtrace
+    from src.training.train import Learner, TrainConfig, TrajectoryBatch, _SeatTrajectory, vtrace
+
+
+def _expert(n, action=2, mass=65535):
+    row = torch.zeros(n, SCHEMA.num_actions, dtype=torch.int32)
+    row[:, action] = mass
+    if mass != 65535:
+        row[:, 2] = 65535 - mass
+    return row.to(torch.uint16)
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
@@ -36,12 +44,25 @@ class TestLearner(unittest.TestCase):
         )
         torch.testing.assert_close(values, torch.tensor([[1.1]]))
 
-    def test_regularized_rewards_are_fp32_and_detached(self):
-        online = torch.tensor([[-2.0, -0.5]], dtype=torch.bfloat16, requires_grad=True)
-        anchor = torch.tensor([[-1.0, -1.0]], dtype=torch.bfloat16, requires_grad=True)
-        result = regularized_reward(torch.tensor([[0.0, 1.0]]), online, anchor, 0.2)
-        torch.testing.assert_close(result, torch.tensor([[0.2, 0.9]]))
-        self.assertFalse(result.requires_grad)
+    def test_distillation_fits_search_distribution_instead_of_the_sampled_move(self):
+        model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+        learner = Learner(model, TrainConfig(precision="fp32", grad_clip=1000))
+        row = _SeatTrajectory(
+            torch.ones(1, SCHEMA.fields, dtype=torch.uint8),
+            torch.ones(1, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
+            torch.tensor([1]), torch.tensor([12]), torch.tensor([2]),
+            torch.tensor([-math.log(2)]), torch.tensor(1.0), _expert(1, 3, 49151),
+        )
+        stats = learner.update(TrajectoryBatch.pack((row,)))
+        self.assertAlmostEqual(stats.policy_loss, math.log(2), places=6)
+        self.assertAlmostEqual(stats.value_loss, 0.5)
+        self.assertAlmostEqual(stats.loss, math.log(2) + 0.5, places=6)
+        torch.testing.assert_close(model.policy.bias.grad[2:4], torch.tensor([0.25, -0.25]), atol=1e-5, rtol=0)
+        self.assertGreater(float(model.policy.bias[3]), float(model.policy.bias[2]))
+        self.assertGreater(float(model.value.bias), 0.0)
 
     def test_on_policy_terminal_reward_reaches_the_first_decision(self):
         values, _ = vtrace(
@@ -62,7 +83,7 @@ class TestLearner(unittest.TestCase):
                 torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
                 torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
                 torch.arange(1, n + 1), torch.full((n,), legal), torch.full((n,), 2),
-                torch.full((n,), -math.log(2)), torch.tensor(utility),
+                torch.full((n,), -math.log(2)), torch.tensor(utility), _expert(n),
             )
             for n, legal, utility in ((1, 4, 1.0), (8, 12, -1.0))
         )
@@ -91,7 +112,7 @@ class TestLearner(unittest.TestCase):
                 torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
                 torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
                 torch.arange(1, n + 1), torch.full((n,), 12), torch.full((n,), 2),
-                torch.full((n,), -math.log(2)), torch.tensor(1.0),
+                torch.full((n,), -math.log(2)), torch.tensor(1.0), _expert(n),
             )
             for n in (1, 2)
         )

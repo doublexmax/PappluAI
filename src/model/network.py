@@ -217,6 +217,22 @@ class GameTransformer(nn.Module):
         cache.length[rows] = cut
         return self._heads(y, suffix, legal)
 
+    @torch.inference_mode()
+    def evaluate_candidates(
+        self, cache: KVCache, rows: Tensor, candidate_suffix: Tensor, candidate_legal: Tensor,
+    ) -> Heads:
+        cut = cache.length[rows]
+        span = int(cut.max())
+        positions = torch.arange(span, device=rows.device)
+        suffix = candidate_suffix.reshape(-1, *candidate_suffix.shape[-2:])
+        cut = cut.repeat_interleave(suffix.size(0) // rows.numel())
+        y, rope, prefix_valid, suffix_valid = self._readout(cut, suffix, positions)
+        for layer, block in enumerate(self.blocks):
+            keys = cache.keys[layer][:, :span].index_select(0, rows).transpose(1, 2)
+            values = cache.values[layer][:, :span].index_select(0, rows).transpose(1, 2)
+            y = block.suffix_blocks(y, rope, keys, values, prefix_valid, suffix_valid)
+        return self._heads(y, suffix, candidate_legal)
+
 
 @dataclass(frozen=True)
 class Checkpoint:
