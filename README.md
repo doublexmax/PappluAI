@@ -200,7 +200,7 @@ The evaluator does not mutate its inputs.
 
 ## Model and training contract
 
-Python training uses `GameTransformer` v6. The shipped browser model above is a separate v5 artifact. Python training does not export or overwrite it.
+Python training uses `GameTransformer` with checkpoint format 6 and token schema 8. The shipped browser model above is a separate v5 artifact. Python training does not export or overwrite it.
 See the [training guide](TRAINING.md) to start, resume, or evaluate a run on Azure.
 
 | Package | Responsibility |
@@ -213,11 +213,18 @@ See the [training guide](TRAINING.md) to start, resume, or evaluate a run on Azu
 
 The Schema 8 encoder stores eight bytes per token. Its append-only prefix contains the rules, indicator, observer's initial hand, and visible events. Card tokens carry the printed face, suit, and rank in the same three fields. Each decision adds an action token, a table token, six seat slots, and 22 hand slots. No token contains meld estimates, unseen cards, or point features.
 
-The Transformer reads the prefix causally. Each decision reads its own snapshot and the prefix available at that point. All four layers update every snapshot token. The action token supplies the base policy logits and value. Each hand token adds a score to its discard action through the generic `TokenSchema.pointer_field`. The legal mask still decides which actions the policy can take. The default model has 2,175,224 parameters, width 192, six attention heads, and a SwiGLU width of 512. See [CPU training and Gloo synchronization](TRAINING.md#run-several-cpu-learners).
+The default model has 2,175,224 parameters in four RMSNorm Transformer blocks. It uses width 192, six rotary attention heads of width 32, and a SwiGLU width of 512. The prefix is causal. Each decision reads its 30-token snapshot and only the prefix available at that decision. The action token supplies 54 base policy logits and a scalar value. Each hand token adds a score to its discard logit through `TokenSchema.pointer_field` before the legal mask. See [CPU training and Gloo synchronization](TRAINING.md#run-several-cpu-learners).
 
-The raw terminal score is `+1` for the declarer and `-penalty / (10 * cards_in_hand)` for other seats. Solo keeps the raw score. Multiplayer gives each seat half the difference between its score and the other seats' mean, so utilities sum to zero. No deadwood points are clipped.
+The declarer earns `+1`. In a declared multiplayer game, the other seats split `-1` equally. A timeout pays `-1` in solo and `-0.5` per seat in multiplayer, regardless of deadwood. The scoreboard still uses exact deadwood for placement and ties. Each learner update gives every sampled trajectory equal loss weight, regardless of how many decisions it contains.
 
-Stage 2b was the strongest Schema 7 checkpoint by mean utility at seed `600_000`. On the untouched seed `900_000`, it won 2 of 200 cold 21-card solo deals and left 70.25 mean deadwood out of 210. RandomPolicy and Revision 0 each won 1 of 200 on the same deals and left 108.46 and 104.46 mean deadwood, respectively. Stage 2b earned positive mean utility in all nine multiplayer matchups but did not win a game. See the [Schema 7 held-out tables and checkpoint SHA-256](TRAINING.md#azure-checkpoint-and-held-out-results). These results do not describe Schema 8 or the shipped browser model.
+For Schema 8, Check-In #7 won selection at seed `600_000` with a 5.06% mean declaration rate. Check-In #8 reached 4.32% and Final Stage reached 4.39%. The run locked Check-In #7 before evaluating seed `910_000`. The results below are Python training results, not results for the browser model.
+
+| Held-out solo start | Check-In #7 | RandomPolicy | Revision 0 |
+| --- | ---: | ---: | ---: |
+| Warm d=0, 128 deals | 27.34%, -0.4531 | 25.78%, -0.4844 | 22.66%, -0.5469 |
+| Cold 21-card, 256 deals | 0.39%, -0.9922 | 1.17%, -0.9766 | 0.78%, -0.9844 |
+
+Each cell gives the declaration rate and mean utility. Check-In #7 also declared three times in 2,040 cold multiplayer games across nine matchups. The run did not establish a cold-game advantage over either baseline. See the [full Schema 8 tables](TRAINING.md#schema-8-azure-results) and the [historical Schema 7 results](TRAINING.md#azure-checkpoint-and-held-out-results).
 
 ## Verification
 
