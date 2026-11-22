@@ -482,16 +482,29 @@ class _Buffer:
         self.decisions += batch.decisions
         return True
 
-    def sample(self, rng: Random, batch_size: int, version: int) -> TrajectoryBatch:
-        self.prune(version)
-        buckets: dict[tuple[int, int], list[_SeatTrajectory]] = {}
+    def bucket_sizes(self) -> Counter[tuple[int, int]]:
+        sizes: Counter[tuple[int, int]] = Counter()
         for chunk in self.chunks:
-            for key, seats in chunk.buckets.items():
-                buckets.setdefault(key, []).extend(seats)
-        if not buckets:
+            sizes.update({key: len(seats) for key, seats in chunk.buckets.items()})
+        return sizes
+
+    def sample(
+        self, rng: Random, batch_size: int, step_version: int, *,
+        seed: int = 0, targets: Mapping[tuple[int, int], int] | None = None,
+    ) -> TrajectoryBatch:
+        self.prune(step_version)
+        if not self.chunks:
             raise ValueError("cannot sample an empty buffer")
-        groups = list(buckets.values())
-        group = rng.choices(groups, weights=[len(seats) for seats in groups], k=1)[0]
+        if targets is None:
+            targets = self.bucket_sizes()
+            step_rng = rng
+        else:
+            step_rng = Random(((seed + 1) * 0x9E3779B1) ^ step_version)
+        key = step_rng.choices(tuple(targets), weights=tuple(targets.values()), k=1)[0]
+        if not any(key in chunk.buckets for chunk in self.chunks):
+            players, length = key
+            key = min(self.bucket_sizes(), key=lambda k: (abs(k[0] - players), abs(k[1] - length), k))
+        group = [seat for chunk in self.chunks for seat in chunk.buckets.get(key, ())]
         return TrajectoryBatch.pack(tuple(rng.choices(group, k=batch_size)))
 
 
@@ -530,12 +543,13 @@ class LearnStats:
 
 
 class _Step(IntEnum):
-    ACTOR_ERROR = 0
-    MAX_UPDATES = 1
-    STOPPED = 2
-    BUDGET = 3
-    WAIT = 4
-    UPDATE = 5
+    UPDATE = 0
+    WAIT = 1
+    BUDGET = 2
+    STOPPED = 3
+    MAX_UPDATES = 4
+    ACTOR_ERROR = 5
+    EVAL_ERROR = 6
 
 
 @dataclass(frozen=True)
@@ -556,7 +570,7 @@ class _LearnerGroup:
         if owns_backend:
             if not dist.is_gloo_available():
                 raise RuntimeError("distributed learning requires PyTorch with Gloo")
-            dist.init_process_group(backend="gloo", timeout=timedelta(seconds=180))
+            dist.init_process_group(backend="gloo", timeout=timedelta(minutes=20))
         try:
             if not dist.is_initialized() or dist.get_world_size() == 1:
                 return cls()
@@ -594,12 +608,20 @@ class _LearnerGroup:
             return value
         return torch.load(BytesIO(bytes(data.tolist())), map_location="cpu", weights_only=True)
 
-    def step(self, local: _Step) -> _Step:
+    def step(
+        self, local: _Step, sizes: Mapping[tuple[int, int], int],
+    ) -> tuple[_Step, dict[tuple[int, int], int] | None]:
         if self.size == 1:
-            return local
-        vote = torch.tensor(local, dtype=torch.int64)
-        dist.all_reduce(vote, op=dist.ReduceOp.MIN)
-        return _Step(vote.item())
+            return local, None
+        stop_tensor = torch.tensor([local, *(-n for n in sizes.values()), *sizes.values()], dtype=torch.int64)
+        dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
+        outcome, *counts = stop_tensor.tolist()
+        step = _Step(outcome)
+        if step != _Step.UPDATE:
+            return step, None
+        split = len(sizes)
+        common = {key: -n for key, n in zip(sizes, counts[:split]) if n}
+        return step, common or {key: n for key, n in zip(sizes, counts[split:]) if n}
 
     def average_gradients(self, parameters: tuple[Tensor, ...]) -> None:
         if self.size == 1:
@@ -928,11 +950,16 @@ class Trainer:
         workers = []
         metrics = None
         reason = "error"
+        eval_error = None
+        max_bucket = (2 * cfg.game.max_turns - 1) // LENGTH_BUCKET
+        bucket_keys = tuple((players, length) for players in cfg.plan.player_counts for length in range(max_bucket + 1))
 
         def stopping() -> bool:
             return stop() or time.monotonic() >= deadline
 
         def next_step() -> _Step:
+            if eval_error is not None:
+                return _Step.EVAL_ERROR
             if max_updates is not None and self.learner.version >= max_updates:
                 return _Step.MAX_UPDATES
             if stop():
@@ -957,15 +984,27 @@ class Trainer:
             if primary:
                 metrics = (self.root / "metrics.jsonl").open("a", encoding="utf-8")
             while True:
-                step = self.group.step(next_step())
+                local = next_step()
+                sizes = {}
+                if self.group.size > 1:
+                    available = self.buffer.bucket_sizes() if local == _Step.UPDATE else {}
+                    if (available and workers and self.learner.version == self._base_version
+                            and {players for players, _ in available} != set(cfg.plan.player_counts)):
+                        local = _Step.WAIT
+                    sizes = {key: available.get(key, 0) for key in bucket_keys}
+                step, targets = self.group.step(local, sizes)
+                if step == _Step.EVAL_ERROR:
+                    raise RuntimeError("evaluation failed on rank 0") from eval_error
                 if step == _Step.ACTOR_ERROR:
                     raise RuntimeError("an actor worker exited before the learner stopped")
-                if step < _Step.WAIT:
+                if step > _Step.WAIT:
                     self._sync_progress()
                     reason = step.name.lower()
                     break
                 if step == _Step.UPDATE:
-                    batch = self.buffer.sample(self.rng, cfg.batch_size, self.learner.version)
+                    batch = self.buffer.sample(
+                        self.rng, cfg.batch_size, self.learner.version, seed=cfg.seed, targets=targets,
+                    )
                     self.last_update = asdict(self.learner.update(batch))
                     self.trained_decisions += int(batch.valid.sum())
                     version = self.learner.version
@@ -977,12 +1016,18 @@ class Trainer:
                     if primary:
                         if version % cfg.checkpoint_every == 0 or version % cfg.publish_every == 0:
                             self._save()
-                        if cfg.eval_every and version % cfg.eval_every == 0 and not stopping():
+                    if cfg.eval_every and version % cfg.eval_every == 0:
+                        if self.group.size > 1:
+                            dist.barrier()
+                        if primary and not stopping():
                             try:
                                 self.evaluate(stop=stopping)
-                            except InterruptedError:
-                                if not stopping():
-                                    raise
+                            except Exception as exc:
+                                if not isinstance(exc, InterruptedError) or not stopping():
+                                    eval_error = exc
+                        if self.group.size > 1:
+                            dist.barrier()
+                    if primary:
                         metrics.write(json.dumps(self.summary(), allow_nan=False) + "\n")
                         metrics.flush()
                 if primary and time.monotonic() >= heartbeat:

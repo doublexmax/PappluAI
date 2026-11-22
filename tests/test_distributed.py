@@ -39,7 +39,7 @@ def _train_rank(base):
     seed = root / "initial.pt"
     trainer = Trainer.open(root, {
         "actors": 0, "torch_threads": 1, "batch_size": 1, "min_buffer_decisions": 2,
-        "publish_every": 1, "anchor_every": 2, "eval_every": 0, "precision": "fp32",
+        "publish_every": 1, "anchor_every": 2, "eval_every": 1, "eval_deals": 1, "precision": "fp32",
     }, initial=seed)
     original = load_checkpoint(trainer.model_path, SCHEMA).network
     for model in (trainer.learner.online, trainer.learner.anchor):
@@ -56,7 +56,7 @@ def _train_rank(base):
         seat.prefix, torch.tensor([len(seat.prefix)]), seat.suffix, torch.tensor([2]), seat.cut,
         seat.legal, seat.action, seat.behavior_logp,
     ).save(trainer.inbox / "batch-test.pt")
-    assert trainer.run(max_updates=2, max_seconds=20) == "max_updates"
+    assert trainer.run(stop=lambda: rank == 1 and trainer.learner.version == 2, max_updates=3, max_seconds=20) == "stopped"
     assert not dist.is_initialized()
     for actual, expected in zip(trainer.learner.online.parameters(), reference.online.parameters()):
         torch.testing.assert_close(actual, expected, rtol=0, atol=2e-6)
@@ -87,6 +87,8 @@ class TestDistributedLearner(unittest.TestCase):
             self.assertFalse(torch.equal(first.network.policy.weight, seed.policy.weight))
             self.assertEqual(sorted(path.name for path in peer.iterdir()), ["rank-1"])
             self.assertTrue((primary / "rank-0" / "inbox").is_dir())
+            status = json.loads((primary / "status.json").read_text())
+            self.assertEqual((status["status"], status["validation"]["version"]), ("stopped", 2))
             metrics = [json.loads(row) for row in (primary / "metrics.jsonl").read_text().splitlines()]
             self.assertEqual([(row["version"], row["trained_decisions"]) for row in metrics], [(1, 4), (2, 8)])
 

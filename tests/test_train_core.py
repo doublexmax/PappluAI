@@ -110,6 +110,21 @@ class TestTrainingCore(unittest.TestCase):
                 self.assertEqual(sample.reward[index, length - 1].item(), {2: 1.0, 3: 0.5, 120: -1.0}[length])
         self.assertEqual(observed, set(lengths))
 
+        peer = _Buffer(decisions * 2, 20)
+        peer.add(batch, 0)
+        peer.add(replace(batch, players=torch.tensor([2, 2, 1], dtype=torch.uint8)), 0)
+        shared = {(1, 0): 2, (1, 14): 1}
+        observed_buckets = set()
+        for version in range(4):
+            left = buffer.sample(Random(55), 4, version, seed=41, targets=shared)
+            right = peer.sample(Random(73), 4, version, seed=41, targets=shared)
+            self.assertEqual(left.valid.size(1) > 8, right.valid.size(1) > 8)
+            observed_buckets.add(left.valid.size(1) > 8)
+        self.assertEqual(observed_buckets, {False, True})
+
+        fallback = peer.sample(Random(55), 4, 4, seed=41, targets={(2, 14): 1})
+        self.assertLessEqual(fallback.valid.size(1), 3)
+
     def test_published_revision_does_not_change_live_stream_actions(self):
         plan = CollectPlan(player_counts=(1, 2), curriculum_share=0, batch_decisions=1, uniform_mix=0)
         old, new = (GameTransformer(TINY, SCHEMA) for _ in range(2))
