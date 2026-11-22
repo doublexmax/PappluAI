@@ -75,6 +75,29 @@ class TestGameTransformer(unittest.TestCase):
         torch.testing.assert_close(original.value[:, 0], changed.value[:, 0], atol=1e-6, rtol=0)
         self.assertFalse(torch.allclose(original.log_policy[:, 1], changed.log_policy[:, 1]))
 
+    def test_split_suffix_attention_matches_joint_softmax_and_readout(self):
+        block = self.model.blocks[-1]
+        x = torch.randn(6, 5, 32)
+        suffix_valid = torch.arange(5) < torch.tensor([4, 2, 1, 3, 5, 0])[:, None, None, None]
+        for span in (0, 7):
+            with self.subTest(span=span):
+                cuts = torch.tensor([[1, 3, 7], [2, 5, 0]]).clamp_max(span)
+                rope = self.model._rope(cuts.reshape(-1, 1))
+                prefix_valid = torch.arange(span) < cuts[:, None, :, None, None]
+                k_pre, v_pre = (torch.randn(2, 4, span, 8) for _ in range(2))
+                q, k, v = block._project(x, rope)
+                mask = torch.cat((prefix_valid.transpose(1, 2).flatten(0, 1), suffix_valid), dim=-1)
+                attention = torch.nn.functional.scaled_dot_product_attention(
+                    q, torch.cat((k_pre.repeat_interleave(3, dim=0), k), dim=-2),
+                    torch.cat((v_pre.repeat_interleave(3, dim=0), v), dim=-2), attn_mask=mask,
+                )
+                expected = block._residual(x, attention)
+                for readout_only in (False, True):
+                    actual = block.suffix_blocks(
+                        x, rope, k_pre, v_pre, prefix_valid, suffix_valid, readout_only=readout_only,
+                    )
+                    torch.testing.assert_close(actual, expected[:, :actual.size(1)], atol=1e-5, rtol=0)
+
     def test_checkpoints_bind_schema_and_validate_finite_weights(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pt"

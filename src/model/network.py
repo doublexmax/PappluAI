@@ -85,9 +85,18 @@ class _Block(nn.Module):
         self.gate_up = nn.Linear(spec.width, 2 * spec.ffn, bias=False)
         self.down = nn.Linear(spec.ffn, spec.width, bias=False)
 
-    def _project(self, x: Tensor, rope: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
-        packed = self.qkv(self.attn_norm(x)).reshape(*x.shape[:2], 3, self.heads, self.head_dim)
-        q, k, v = packed.permute(2, 0, 3, 1, 4).unbind()
+    def _project(
+        self, x: Tensor, rope: tuple[Tensor, Tensor], *, readout_only: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        norm = self.attn_norm(x)
+        if readout_only:
+            wq, wkv = self.qkv.weight.split((x.size(-1), 2 * x.size(-1)))
+            q = F.linear(norm[:, :1], wq).reshape(x.size(0), 1, self.heads, self.head_dim).transpose(1, 2)
+            kv = F.linear(norm, wkv).reshape(*x.shape[:2], 2, self.heads, self.head_dim)
+            k, v = kv.permute(2, 0, 3, 1, 4).unbind()
+        else:
+            packed = self.qkv(norm).reshape(*x.shape[:2], 3, self.heads, self.head_dim)
+            q, k, v = packed.permute(2, 0, 3, 1, 4).unbind()
         return _rotate(q, rope), _rotate(k, rope), v
 
     def _residual(self, x: Tensor, attention: Tensor) -> Tensor:
@@ -114,22 +123,42 @@ class _Block(nn.Module):
         return x, keys, values
 
     def suffix_blocks(
-        self, x: Tensor, rope: tuple[Tensor, Tensor], keys: Tensor, values: Tensor, mask: Tensor,
+        self, x: Tensor, rope: tuple[Tensor, Tensor], keys: Tensor, values: Tensor,
+        prefix_valid: Tensor, suffix_valid: Tensor, *, readout_only: bool,
     ) -> Tensor:
-        q, k, v = self._project(x, rope)
+        q, k, v = self._project(x, rope, readout_only=readout_only)
         rows = keys.size(0)
         blocks = q.size(0) // rows
+        queries = q.size(-2)
+        span = keys.size(-2)
+        scale = self.head_dim ** -0.5
 
-        def append(prefix: Tensor, suffix: Tensor) -> Tensor:
-            if blocks == 1:
-                return torch.cat((prefix, suffix), dim=-2)
-            own = suffix.reshape(rows, blocks, *suffix.shape[1:])
-            shared = prefix.unsqueeze(1).expand(-1, blocks, -1, -1, -1)
-            return torch.cat((shared, own), dim=-2).flatten(0, 1)
+        def by_prefix(tensor: Tensor) -> Tensor:
+            return tensor.unflatten(0, (rows, blocks)).transpose(1, 2).flatten(2, 3)
 
-        return self._residual(
-            x, F.scaled_dot_product_attention(q, append(keys, k), append(values, v), attn_mask=mask),
-        )
+        def by_block(tensor: Tensor) -> Tensor:
+            return tensor.unflatten(2, (blocks, queries)).transpose(1, 2).flatten(0, 1)
+
+        q_pre = by_prefix(q)
+        prefix_valid = prefix_valid.expand(-1, -1, -1, queries, -1).flatten(2, 3)
+        scores_pre = torch.matmul(q_pre, keys.transpose(-2, -1)).float().mul_(scale)
+        scores_pre.masked_fill_(~prefix_valid, -torch.inf)
+        scores_suf = torch.matmul(q, k.transpose(-2, -1)).float().mul_(scale)
+        scores_suf.masked_fill_(~suffix_valid, -torch.inf)
+
+        with torch.no_grad():
+            shift = by_prefix(scores_suf.amax(-1, keepdim=True))
+            if span:
+                shift = torch.maximum(shift, scores_pre.amax(-1, keepdim=True))
+            shift.masked_fill_(shift == -torch.inf, 0)
+        p_pre = scores_pre.sub_(shift).exp_()
+        p_suf = scores_suf.sub_(by_block(shift)).exp_()
+        denom_pre = by_block(p_pre.sum(-1, keepdim=True))
+        denom = (denom_pre + p_suf.sum(-1, keepdim=True)).clamp_min_(1)
+        o_pre = by_block(torch.matmul(p_pre.to(values.dtype), values))
+        o_suf = torch.matmul(p_suf.to(v.dtype), v)
+        attention = (o_pre.float() + o_suf.float()) / denom
+        return self._residual(x[:, :queries], attention.to(q.dtype))
 
 
 class GameTransformer(nn.Module):
@@ -156,10 +185,11 @@ class GameTransformer(nn.Module):
 
     def _readout(
         self, cut: Tensor, suffix: Tensor, prefix_positions: Tensor,
-    ) -> tuple[Tensor, tuple[Tensor, Tensor], Tensor]:
-        prefix_valid = prefix_positions < cut.unsqueeze(-1)
-        valid = torch.cat((prefix_valid, suffix[..., 0] != 0), dim=-1)
-        return self._embed(suffix.flatten(0, 1)), self._rope(cut.reshape(-1, 1)), valid.flatten(0, 1)[:, None, None, :]
+    ) -> tuple[Tensor, tuple[Tensor, Tensor], Tensor, Tensor]:
+        suffix = suffix.flatten(0, 1)
+        prefix_valid = prefix_positions < cut[:, None, :, None, None]
+        suffix_valid = (suffix[..., 0] != 0)[:, None, None, :]
+        return self._embed(suffix), self._rope(cut.reshape(-1, 1)), prefix_valid, suffix_valid
 
     def _heads(self, suffix: Tensor, legal: Tensor) -> Heads:
         readout = self.final_norm(suffix[:, 0]).reshape(*legal.shape[:-1], self.spec.width)
@@ -170,10 +200,13 @@ class GameTransformer(nn.Module):
         prefix = self._embed(batch.prefix)
         positions = torch.arange(prefix.size(1), device=prefix.device)
         prefix_rope = self._rope(positions[None, :])
-        suffix, suffix_rope, suffix_mask = self._readout(batch.cut, batch.suffix, positions)
-        for block in self.blocks:
+        suffix, suffix_rope, prefix_valid, suffix_valid = self._readout(batch.cut, batch.suffix, positions)
+        for layer, block in enumerate(self.blocks):
             prefix, keys, values = block.prefix_causal(prefix, prefix_rope)
-            suffix = block.suffix_blocks(suffix, suffix_rope, keys, values, suffix_mask)
+            suffix = block.suffix_blocks(
+                suffix, suffix_rope, keys, values, prefix_valid, suffix_valid,
+                readout_only=layer == len(self.blocks) - 1,
+            )
         return self._heads(suffix, batch.legal)
 
     def forward(self, batch: TokenBatch) -> Heads:
@@ -202,12 +235,15 @@ class GameTransformer(nn.Module):
         prefix_mask = (positions <= appended[:, :, None]) & (positions < cut[:, None, None])
         prefix_rope = self._rope(appended)
         x = self._embed(prefix)
-        y, suffix_rope, suffix_mask = self._readout(cut[:, None], suffix[:, None], positions)
+        y, suffix_rope, prefix_valid, suffix_valid = self._readout(cut[:, None], suffix[:, None], positions)
         for layer, block in enumerate(self.blocks):
             x, keys, values = block.prefix_append(
                 x, prefix_rope, cache, layer, rows, writes, valid, prefix_mask[:, None], span,
             )
-            y = block.suffix_blocks(y, suffix_rope, keys, values, suffix_mask)
+            y = block.suffix_blocks(
+                y, suffix_rope, keys, values, prefix_valid, suffix_valid,
+                readout_only=layer == len(self.blocks) - 1,
+            )
         cache.length[rows] = cut
         return self._heads(y, legal)
 

@@ -1,6 +1,6 @@
-from dataclasses import replace
 import math
 import unittest
+from unittest.mock import patch
 
 from src.model.encoding import SCHEMA
 from src.model.spec import ModelSpec
@@ -11,8 +11,8 @@ except ImportError:
     torch = None
 
 if torch is not None:
-    from src.model.network import GameTransformer, TokenBatch
-    from src.training.train import Learner, TrainConfig, WindowBatch, regularized_reward, vtrace
+    from src.model.network import GameTransformer
+    from src.training.train import Learner, TrainConfig, TrajectoryBatch, _SeatTrajectory, regularized_reward, vtrace
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
@@ -42,25 +42,43 @@ class TestLearner(unittest.TestCase):
         torch.testing.assert_close(result, torch.tensor([[0.2, 0.9]]))
         self.assertFalse(result.requires_grad)
 
+    def test_on_policy_terminal_reward_reaches_the_first_decision(self):
+        values, _ = vtrace(
+            torch.zeros((2, 4)), torch.tensor([[0.0, 0.0, 0.0, 1.0], [0.0, -1.0, 0.0, 0.0]]),
+            torch.tensor([[0.995, 0.995, 0.995, 0.0], [0.995, 0.0, 0.0, 0.0]]),
+            torch.tensor([[0.2, 0.4, -0.8, 0.9], [0.3, -0.2, 17.0, -32.0]]),
+            torch.zeros(2), rho_bar=1, c_bar=1,
+        )
+        torch.testing.assert_close(values, torch.tensor([
+            [0.995**3, 0.995**2, 0.995, 1.0], [-0.995, -1.0, 0.0, 0.0],
+        ]))
+
     def test_bf16_updates_fp32_weights_and_refreshes_the_frozen_anchor(self):
         model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
         learner = Learner(model, TrainConfig(anchor_every=2, learning_rate=0.01))
-        legal = torch.zeros((1, 3, SCHEMA.num_actions), dtype=torch.bool)
-        legal[:, :, [2, 3]] = True
-        batch = WindowBatch(
-            TokenBatch(torch.ones(1, 2, 8, dtype=torch.uint8), torch.ones(1, 3, 30, 8, dtype=torch.uint8),
-                       torch.tensor([[1, 2, 2]]), legal),
-            torch.tensor([[2, 3]]), torch.full((1, 2), -math.log(2)), torch.tensor([[1.0, 0.0]]),
-            torch.zeros(1, 2), torch.tensor([[True, False]]),
+        first, second = (
+            _SeatTrajectory(
+                torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
+                torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
+                torch.arange(1, n + 1), torch.full((n,), 12), torch.full((n,), 2),
+                torch.full((n,), -math.log(2)), torch.tensor(1.0),
+            )
+            for n in (1, 2)
         )
+        batch = TrajectoryBatch.pack((first, first, second))
         initial = learner.anchor.policy.weight.clone()
-        stats = learner.update(batch)
-        self.assertAlmostEqual(stats.kl_anchor, 0.0)
-        self.assertTrue(math.isfinite(stats.loss))
-        self.assertFalse(torch.equal(learner.online.policy.weight, initial))
-        torch.testing.assert_close(learner.anchor.policy.weight, initial)
-        stats = learner.update(replace(batch, reward=torch.tensor([[1.0, 1e5]])))
-        self.assertGreater(stats.kl_anchor, 0)
-        self.assertEqual(learner.version, 2)
-        torch.testing.assert_close(learner.online.policy.weight, learner.anchor.policy.weight)
+        with patch.object(learner.anchor, "unroll", wraps=learner.anchor.unroll) as anchor_unroll:
+            stats = learner.update(batch)
+            self.assertAlmostEqual(stats.kl_anchor, 0.0)
+            self.assertTrue(math.isfinite(stats.loss))
+            self.assertFalse(torch.equal(learner.online.policy.weight, initial))
+            torch.testing.assert_close(learner.anchor.policy.weight, initial)
+            self.assertEqual(anchor_unroll.call_args.args[0].prefix.size(0), 2)
+            stats = learner.update(batch)
+            self.assertGreater(stats.kl_anchor, 0)
+            self.assertEqual(anchor_unroll.call_count, 1)
+            self.assertEqual(learner.version, 2)
+            torch.testing.assert_close(learner.online.policy.weight, learner.anchor.policy.weight)
+            self.assertAlmostEqual(learner.update(batch).kl_anchor, 0)
+            self.assertEqual(anchor_unroll.call_count, 2)
         self.assertTrue(all(p.dtype == torch.float32 and not p.requires_grad for p in learner.anchor.parameters()))

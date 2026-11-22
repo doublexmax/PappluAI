@@ -16,7 +16,7 @@ _GAME = ("num_decks", "cards_in_hand", "required_sequences", "max_turns", "recyc
 _PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance", "uniform_mix", "batch_decisions")
 _HOST = ("tables", "torch_threads", "precision", "device")
 _INTS = (
-    "actors", "actor_threads", "batch_size", "unroll", "min_buffer_decisions", "buffer_decisions",
+    "actors", "actor_threads", "batch_size", "min_buffer_decisions", "buffer_decisions",
     "max_policy_lag", "anchor_every", "publish_every", "checkpoint_every", "eval_every",
     "eval_deals", "seed",
 )

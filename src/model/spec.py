@@ -41,10 +41,10 @@ class TokenSchema:
 
 @dataclass(frozen=True)
 class ModelSpec:
-    width: int = 256
-    layers: int = 6
-    heads: int = 8
-    ffn: int = 704
+    width: int = 192
+    layers: int = 4
+    heads: int = 6
+    ffn: int = 512
 
     def __post_init__(self) -> None:
         if any(type(n) is not int or n < 1 for n in (self.width, self.layers, self.heads, self.ffn)):

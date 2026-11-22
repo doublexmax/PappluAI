@@ -28,18 +28,20 @@ from src.model.network import GameTransformer, TokenBatch, action_mask, load_che
 from src.model.spec import ModelSpec, TokenSchema
 
 
-STATE_VERSION = 13
+STATE_VERSION = 14
 ROLLOUT_FORMAT = 2
 VALIDATION_SEED = 30_000_001
 OUTBOX_LIMIT = 8
+LENGTH_BUCKET = 8
+DISCOUNT = 0.995
 TUNABLE = {"actors", "tables", "torch_threads", "actor_threads", "device", "precision", "checkpoint_every"}
 
 
 @dataclass(frozen=True)
 class CollectPlan:
     player_counts: tuple[int, ...] = (1, 2, 3, 4)
-    curriculum_share: float = 0.30
-    curriculum_max_distance: int = 10
+    curriculum_share: float = 0.50
+    curriculum_max_distance: int = 6
     uniform_mix: float = 0.02
     batch_decisions: int = 8192
 
@@ -95,19 +97,18 @@ class TrainConfig:
     actor_threads: int = 2
     device: str = "cpu"
     precision: str = "bf16"
-    batch_size: int = 32
-    unroll: int = 16
+    batch_size: int = 16
     buffer_decisions: int = 400_000
     min_buffer_decisions: int = 20_000
     max_policy_lag: int = 200
-    learning_rate: float = 3e-4
+    learning_rate: float = 5e-4
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     value_weight: float = 0.5
     rho_bar: float = 1.0
     c_bar: float = 1.0
-    eta: float = 0.2
-    entropy_weight: float = 0.01
+    eta: float = 0.05
+    entropy_weight: float = 0.003
     anchor_every: int = 2000
     publish_every: int = 25
     checkpoint_every: int = 500
@@ -118,7 +119,7 @@ class TrainConfig:
     def __post_init__(self) -> None:
         self.plan.validate(self.game)
         for name in (
-            "tables", "torch_threads", "actor_threads", "batch_size", "unroll", "buffer_decisions",
+            "tables", "torch_threads", "actor_threads", "batch_size", "buffer_decisions",
             "min_buffer_decisions", "max_policy_lag", "anchor_every", "publish_every", "checkpoint_every", "eval_deals",
         ):
             value = getattr(self, name)
@@ -388,8 +389,21 @@ def collect(
     return totals
 
 
+@dataclass(eq=False)
+class _SeatTrajectory:
+    prefix: Tensor
+    suffix: Tensor
+    cut: Tensor
+    legal: Tensor
+    action: Tensor
+    behavior_logp: Tensor
+    utility: Tensor
+    anchor: tuple[object, Tensor] | None = field(default=None, init=False)
+
+
 @dataclass(frozen=True)
-class WindowBatch:
+class TrajectoryBatch:
+    seats: tuple[_SeatTrajectory, ...]
     tokens: TokenBatch
     action: Tensor
     behavior_logp: Tensor
@@ -397,38 +411,43 @@ class WindowBatch:
     discount: Tensor
     valid: Tensor
 
+    @classmethod
+    def pack(cls, seats: tuple[_SeatTrajectory, ...]) -> TrajectoryBatch:
+        def pack(name: str) -> Tensor:
+            return pad_sequence([getattr(seat, name) for seat in seats], batch_first=True)
 
-@dataclass
+        action = pack("action").long()
+        lengths = torch.tensor([seat.action.numel() for seat in seats])
+        steps = torch.arange(action.size(1))
+        terminal = lengths[:, None] - 1
+        valid = steps <= terminal
+        reward = (steps == terminal) * torch.stack([seat.utility for seat in seats])[:, None]
+        discount = (steps < terminal).float() * DISCOUNT
+        tokens = TokenBatch(pack("prefix"), pack("suffix"), pack("cut").long(),
+                            action_mask(pack("legal"), SCHEMA.num_actions))
+        return cls(seats, tokens, action, pack("behavior_logp"), reward, discount, valid)
+
+
+@dataclass(frozen=True)
 class _BatchIndex:
-    batch: Trajectories
-    rows: dict[int, list[int]] = field(default_factory=dict)
-    weights: dict[int, list[int]] = field(default_factory=dict)
+    version: int
+    decisions: int
+    buckets: dict[tuple[int, int], list[_SeatTrajectory]]
 
-    def __post_init__(self) -> None:
-        begin = 0
-        for row, (players, end) in enumerate(zip(self.batch.players.tolist(), self.batch.decision_end.tolist())):
-            self.rows.setdefault(players, []).append(row)
-            weights = self.weights.setdefault(players, [])
-            weights.append((weights[-1] if weights else 0) + end - begin)
-            begin = end
-
-    def window(self, players: int, rng: Random, unroll: int) -> tuple[Tensor, ...]:
-        row = rng.choices(self.rows[players], cum_weights=self.weights[players], k=1)[0]
-        batch = self.batch
-        start = int(batch.decision_end[row - 1]) if row else 0
-        end = int(batch.decision_end[row])
-        prefix_start = int(batch.prefix_end[row - 1]) if row else 0
-        first = start + rng.randint(0, max(0, end - start - unroll))
-        steps = torch.arange(first, first + unroll + 1)
-        lookup = steps.clamp(max=end - 1)
-        cut = batch.cut[lookup].long()
-        terminal = steps[:-1] == end - 1
-        return (
-            batch.prefix[prefix_start:prefix_start + int(cut[-1])],
-            batch.suffix[lookup], cut, batch.legal[lookup], batch.action[lookup[:-1]].long(),
-            batch.behavior_logp[lookup[:-1]], terminal * batch.utility[row],
-            (steps[:-1] < end - 1).float(), steps[:-1] < end,
-        )
+    @classmethod
+    def from_batch(cls, batch: Trajectories) -> _BatchIndex:
+        buckets: dict[tuple[int, int], list[_SeatTrajectory]] = {}
+        start = prefix_start = 0
+        offsets = zip(batch.players.tolist(), batch.decision_end.tolist(), batch.prefix_end.tolist())
+        for row, (players, end, prefix_end) in enumerate(offsets):
+            span = slice(start, end)
+            seat = _SeatTrajectory(
+                batch.prefix[prefix_start:prefix_end], batch.suffix[span], batch.cut[span],
+                batch.legal[span], batch.action[span], batch.behavior_logp[span], batch.utility[row],
+            )
+            buckets.setdefault((players, (end - start - 1) // LENGTH_BUCKET), []).append(seat)
+            start, prefix_start = end, prefix_end
+        return cls(batch.version, batch.decisions, buckets)
 
 
 class _Buffer:
@@ -443,10 +462,10 @@ class _Buffer:
     def prune(self, version: int) -> None:
         kept = []
         for chunk in self.chunks:
-            if version - chunk.batch.version <= self.max_policy_lag:
+            if version - chunk.version <= self.max_policy_lag:
                 kept.append(chunk)
             else:
-                self.decisions -= chunk.batch.decisions
+                self.decisions -= chunk.decisions
         self.chunks = kept
 
     def add(self, batch: Trajectories, version: int) -> bool:
@@ -454,29 +473,22 @@ class _Buffer:
         if not 0 <= version - batch.version <= self.max_policy_lag or batch.decisions > self.capacity:
             return False
         while self.decisions + batch.decisions > self.capacity:
-            self.decisions -= self.chunks.pop(0).batch.decisions
-        self.chunks.append(_BatchIndex(batch))
+            self.decisions -= self.chunks.pop(0).decisions
+        self.chunks.append(_BatchIndex.from_batch(batch))
         self.decisions += batch.decisions
         return True
 
-    def sample(self, rng: Random, batch_size: int, unroll: int, version: int) -> WindowBatch:
+    def sample(self, rng: Random, batch_size: int, version: int) -> TrajectoryBatch:
         self.prune(version)
-        groups: dict[int, list[_BatchIndex]] = {}
-        weights: dict[int, list[int]] = {}
+        buckets: dict[tuple[int, int], list[_SeatTrajectory]] = {}
         for chunk in self.chunks:
-            for players, ends in chunk.weights.items():
-                groups.setdefault(players, []).append(chunk)
-                weights.setdefault(players, []).append(ends[-1])
-        if not groups:
+            for key, seats in chunk.buckets.items():
+                buckets.setdefault(key, []).extend(seats)
+        if not buckets:
             raise ValueError("cannot sample an empty buffer")
-        players = rng.choices(list(groups), weights=[sum(w) for w in weights.values()], k=1)[0]
-        chunks = rng.choices(groups[players], weights=weights[players], k=batch_size)
-        prefix, suffix, cut, bits, *decisions = zip(*(chunk.window(players, rng, unroll) for chunk in chunks))
-        tokens = TokenBatch(
-            pad_sequence(prefix, batch_first=True), torch.stack(suffix), torch.stack(cut),
-            action_mask(torch.stack(bits), SCHEMA.num_actions),
-        )
-        return WindowBatch(tokens, *(torch.stack(column) for column in decisions))
+        groups = list(buckets.values())
+        group = rng.choices(groups, weights=[len(seats) for seats in groups], k=1)[0]
+        return TrajectoryBatch.pack(tuple(rng.choices(group, k=batch_size)))
 
 
 def regularized_reward(reward: Tensor, log_pi: Tensor, log_anchor: Tensor, eta: float) -> Tensor:
@@ -519,12 +531,28 @@ class Learner:
         self.device = torch.device(config.device)
         self.online = online.to(self.device, dtype=torch.float32)
         self.anchor = copy.deepcopy(self.online).eval().requires_grad_(False)
+        self._anchor_version = object()
         self.optimizer = torch.optim.AdamW(
             self.online.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
         )
         self.version = 0
 
-    def update(self, batch: WindowBatch) -> LearnStats:
+    @torch.no_grad()
+    def _anchor_log_policy(self, batch: TrajectoryBatch, tokens: TokenBatch) -> Tensor:
+        missing: dict[_SeatTrajectory, int] = {}
+        for i, seat in enumerate(batch.seats):
+            if seat.anchor is None or seat.anchor[0] is not self._anchor_version:
+                missing.setdefault(seat, i)
+        if missing:
+            if len(missing) != len(batch.seats):
+                indices = torch.tensor(list(missing.values()), device=self.device)
+                tokens = TokenBatch(*(column.index_select(0, indices) for column in vars(tokens).values()))
+            ref = self.anchor.unroll(tokens).log_policy
+            for seat, logp in zip(missing, ref):
+                seat.anchor = (self._anchor_version, logp[:seat.action.numel()].clone())
+        return pad_sequence([seat.anchor[1] for seat in batch.seats], batch_first=True)
+
+    def update(self, batch: TrajectoryBatch) -> LearnStats:
         config, device = self.config, self.device
         tokens = TokenBatch(*(tensor.to(device) for tensor in vars(batch.tokens).values()))
         action, behavior, reward, discount, valid = (
@@ -533,17 +561,15 @@ class Learner:
         self.online.train()
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config.precision == "bf16"):
             heads = self.online.unroll(tokens)
-            with torch.no_grad():
-                ref = self.anchor.unroll(tokens)
-        legal = tokens.legal[:, :-1]
-        log_pi, log_anchor = heads.log_policy[:, :-1], ref.log_policy[:, :-1]
+            log_anchor = self._anchor_log_policy(batch, tokens)
+        legal, log_pi = tokens.legal, heads.log_policy
         taken = log_pi.gather(-1, action.unsqueeze(-1)).squeeze(-1)
         anchor_taken = log_anchor.gather(-1, action.unsqueeze(-1)).squeeze(-1)
         ratio = taken.detach() - behavior
-        values = heads.value[:, :-1]
+        values = heads.value
         targets, advantage = vtrace(
             ratio, regularized_reward(reward, taken, anchor_taken, config.eta), discount,
-            values, heads.value[:, -1], rho_bar=config.rho_bar, c_bar=config.c_bar,
+            values, values.new_zeros(values.size(0)), rho_bar=config.rho_bar, c_bar=config.c_bar,
         )
         probabilities = log_pi.exp()
         divergence = (probabilities * (log_pi - log_anchor).masked_fill(~legal, 0)).sum(-1)
@@ -560,6 +586,7 @@ class Learner:
         self.version += 1
         if self.version % config.anchor_every == 0:
             self.anchor.load_state_dict(self.online.state_dict())
+            self._anchor_version = object()
         return LearnStats(
             float(loss.detach()), float(policy_loss.detach()), float(value_loss.detach()),
             float(entropy.detach()), float(ratio[valid].double().exp().mean()), float(kl.detach()), float(norm),
@@ -580,6 +607,7 @@ class Learner:
             model.load_state_dict(validate_model_state(state[name], model.state_dict(), name))
         self.optimizer.load_state_dict(state["optimizer"])
         self.version = state["version"]
+        self._anchor_version = object()
 
 
 class Trainer:
@@ -589,10 +617,11 @@ class Trainer:
         self.inbox = root / "inbox"
         self.inbox.mkdir(exist_ok=True)
         self.buffer = _Buffer(config.buffer_decisions, config.max_policy_lag)
-        self.episodes, self.decisions, self.dropped_batches = 0, 0, 0
+        self.episodes, self.decisions, self.trained_decisions, self.dropped_batches = 0, 0, 0, 0
         self.validation, self.last_update = {}, {}
         self._start = time.monotonic()
         self._base_version, self._base_decisions = learner.version, 0
+        self._base_trained_decisions = 0
 
     @classmethod
     def open(
@@ -634,6 +663,7 @@ class Trainer:
             trainer.learner.load_state_dict(state["learner"])
             trainer.rng.setstate(state["rng"])
             trainer.episodes, trainer.decisions = state["episodes"], state["decisions"]
+            trainer.trained_decisions = state["trained_decisions"]
             trainer.dropped_batches, trainer.validation = state["dropped_batches"], state["validation"]
             trainer._base_version, trainer._base_decisions = trainer.learner.version, trainer.decisions
             if not (root / "best-model.pt").is_file():
@@ -655,6 +685,7 @@ class Trainer:
             "format": STATE_VERSION, "run_id": self.run_id, "spec": self.learner.online.spec.to_dict(),
             "config": asdict(self.config), "learner": self.learner.state_dict(), "rng": self.rng.getstate(),
             "episodes": self.episodes, "decisions": self.decisions,
+            "trained_decisions": self.trained_decisions,
             "dropped_batches": self.dropped_batches, "validation": self.validation,
         }, self.root / "latest-state.pt")
 
@@ -687,8 +718,10 @@ class Trainer:
         for path in files[:max(1, self.config.actors)]:
             try:
                 batch = Trajectories.load(path)
-                if batch.run_id != self.run_id or any(
-                    players not in self.config.plan.player_counts for players in batch.players.unique().tolist()
+                lengths = batch.decision_end.diff(prepend=batch.decision_end.new_zeros(1))
+                if (
+                    batch.run_id != self.run_id or int(lengths.max()) > 2 * self.config.game.max_turns
+                    or any(players not in self.config.plan.player_counts for players in batch.players.unique().tolist())
                 ):
                     raise ValueError("batch does not belong to this run's collection plan")
             except ValueError:
@@ -710,6 +743,8 @@ class Trainer:
         return {
             "version": version, "run_id": self.run_id, "episodes": self.episodes, "decisions": self.decisions,
             "decisions_per_sec": (self.decisions - self._base_decisions) / elapsed,
+            "trained_decisions": self.trained_decisions,
+            "trained_decisions_per_sec": (self.trained_decisions - self._base_trained_decisions) / elapsed,
             "updates_per_sec": (version - self._base_version) / elapsed, "elapsed_seconds": elapsed,
             "buffer_decisions": len(self.buffer), "inbox_files": sum(1 for _ in self.inbox.glob("batch-*.pt")),
             "dropped_batches": self.dropped_batches, "validation": self.validation,
@@ -733,6 +768,7 @@ class Trainer:
         cfg = self.config
         self._start = time.monotonic()
         self._base_version, self._base_decisions = self.learner.version, self.decisions
+        self._base_trained_decisions = self.trained_decisions
         deadline = math.inf if max_seconds is None else self._start + max_seconds
         context = mp.get_context("spawn")
         done = context.Event()
@@ -766,8 +802,9 @@ class Trainer:
                             heartbeat = time.monotonic() + 1
                         time.sleep(0.05)
                         continue
-                    batch = self.buffer.sample(self.rng, cfg.batch_size, cfg.unroll, self.learner.version)
+                    batch = self.buffer.sample(self.rng, cfg.batch_size, self.learner.version)
                     self.last_update = asdict(self.learner.update(batch))
+                    self.trained_decisions += int(batch.valid.sum())
                     version = self.learner.version
                     self.buffer.prune(version)
                     if version % cfg.checkpoint_every == 0 or version % cfg.publish_every == 0:

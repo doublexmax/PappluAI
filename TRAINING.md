@@ -15,7 +15,7 @@ Use the small model below to check training, collection, and resume before start
 ```bash
 python -m src.cli.train --output-dir runs/smoke --max-turns 2 \
   --width 32 --layers 2 --heads 4 --ffn 64 --tables 4 \
-  --batch-size 4 --unroll 4 --batch-decisions 16 --min-buffer-decisions 16 \
+  --batch-size 4 --batch-decisions 16 --min-buffer-decisions 16 \
   --eval-every 1 --eval-deals 1 --max-updates 1 --max-seconds 90
 python -m src.cli.train --output-dir runs/smoke --max-updates 2 --max-seconds 90
 ```
@@ -28,9 +28,11 @@ Check `status.json` for `status: max_updates` and `version: 2`. The update limit
 python -m src.cli.train --output-dir runs/full21 --max-seconds 3600
 ```
 
-By default, the learner uses a six-layer Transformer with width 256, eight heads, and a SwiGLU width of 704. Actors play one to four seats in rotation with 64 tables per process. Thirty percent of solo starts use the environment curriculum at a random distance of one to ten cards. The encoder has no curriculum features. Validation uses only cold deals.
+By default, the learner uses a four-layer Transformer with width 192, six heads, and a SwiGLU width of 512. Actors play one to four seats in rotation with 64 tables per process. Half of solo starts use the environment curriculum at a random distance of one to six cards. The encoder has no curriculum features. Validation uses only cold deals.
 
-Actors sample from the policy with a 2% uniform mixture over legal actions. They write complete seat trajectories with the actual behavior log probability. The learner drops data that exceeds `--max-policy-lag`. It applies V-trace and regularizes rewards and policy updates against a frozen anchor. `--anchor-every` controls when the learner copies the online weights into the anchor. The default BF16 mode uses FP32 master weights and FP32 loss math. Use `--precision fp32` to disable autocast.
+Actors sample from the policy with a 2% uniform mixture over legal actions. They write complete seat trajectories with the actual behavior log probability. The learner drops data that exceeds `--max-policy-lag`. Each update samples 16 complete seat trajectories of similar length and applies V-trace with a discount of 0.995 and no terminal bootstrap. The learning rate is `5e-4`, the anchor weight is `0.05`, and the entropy weight is `0.003`.
+
+The learner regularizes rewards and policy updates against a frozen anchor. It caches the anchor's log probabilities for replayed trajectories until the weights refresh at `--anchor-every`. The default BF16 mode uses FP32 master weights and FP32 loss math. Use `--precision fp32` to disable autocast.
 
 | File | Contents |
 | --- | --- |
@@ -38,7 +40,7 @@ Actors sample from the policy with a 2% uniform mixture over legal actions. They
 | `best-model.pt` | Cold validation selection, or the initial model until promotion. |
 | `latest-state.pt` | Learner and anchor weights, optimizer, progress, and sampler state. |
 | `inbox/batch-*.pt` | Complete byte-token rollout batches awaiting ingestion. |
-| `metrics.jsonl` and `status.json` | Update metrics and run status, including throughput, importance ratio, KL, buffer depth, and inbox depth. |
+| `metrics.jsonl` and `status.json` | Update metrics and run status, including collected and trained decisions, throughput, importance ratio, KL, buffer depth, and inbox depth. |
 
 The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox.
 

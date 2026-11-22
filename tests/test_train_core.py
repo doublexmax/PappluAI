@@ -66,15 +66,44 @@ class TestTrainingCore(unittest.TestCase):
         buffer = _Buffer(4, 3)
         self.assertFalse(buffer.add(batch, 6))
         self.assertTrue(buffer.add(batch, 10))
-        window = buffer.sample(Random(55), 1, 4, 10)
-        self.assertEqual(window.valid.tolist(), [[True, True, False, False]])
-        self.assertEqual(window.discount.tolist(), [[1.0, 0.0, 0.0, 0.0]])
-        self.assertEqual(window.tokens.cut.tolist(), [[30, 31, 31, 31, 31]])
-        self.assertAlmostEqual(window.reward[0, 1].item(), runs[0].outcome.utilities()[0])
-        self.assertEqual(window.reward[0, 0], 0.0)
+        sample = buffer.sample(Random(55), 1, 10)
+        self.assertEqual(sample.valid.tolist(), [[True, True]])
+        torch.testing.assert_close(sample.discount, torch.tensor([[0.995, 0.0]]))
+        self.assertEqual(sample.tokens.cut.tolist(), [[30, 31]])
+        self.assertAlmostEqual(sample.reward[0, 1].item(), runs[0].outcome.utilities()[0])
+        self.assertEqual(sample.reward[0, 0], 0.0)
         buffer.prune(11)
         self.assertEqual(len(buffer), 0)
         self.assertFalse(buffer.add(batch, 11))
+
+    def test_buckets_keep_short_trajectories_separate_and_only_pad_after_terminal(self):
+        lengths = (2, 3, 120)
+        decisions = sum(lengths)
+        batch = Trajectories(
+            0, 3, RUN_ID, torch.ones(3, dtype=torch.uint8), torch.tensor([1.0, 0.5, -1.0]),
+            torch.ones(decisions, SCHEMA.fields, dtype=torch.uint8), torch.tensor(lengths).cumsum(0),
+            torch.ones(decisions, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
+            torch.tensor(lengths).cumsum(0), torch.cat([torch.arange(1, n + 1) for n in lengths]),
+            torch.full((decisions,), 2), torch.ones(decisions, dtype=torch.uint8), torch.zeros(decisions),
+        )
+        buffer = _Buffer(decisions, 3)
+        self.assertTrue(buffer.add(batch, 0))
+        rng = Random(21)
+        observed = set()
+        for _ in range(12):
+            sample = buffer.sample(rng, 4, 0)
+            seen = set(sample.valid.sum(dim=1).tolist())
+            self.assertTrue(seen <= {2, 3} or seen == {120}, seen)
+            observed.update(seen)
+            self.assertEqual(sample.action.size(1), max(seen))
+            for index, valid in enumerate(sample.valid):
+                length = int(valid.sum())
+                torch.testing.assert_close(sample.tokens.cut[index, :length], torch.arange(1, length + 1))
+                torch.testing.assert_close(sample.discount[index, :length - 1], torch.full((length - 1,), .995))
+                self.assertFalse(sample.discount[index, length - 1:].any())
+                self.assertEqual(sample.reward[index].nonzero().flatten().tolist(), [length - 1])
+                self.assertEqual(sample.reward[index, length - 1].item(), {2: 1.0, 3: 0.5, 120: -1.0}[length])
+        self.assertEqual(observed, set(lengths))
 
     def test_published_revision_does_not_change_live_stream_actions(self):
         plan = CollectPlan(player_counts=(1, 2), curriculum_share=0, batch_decisions=1, uniform_mix=0)
@@ -115,7 +144,7 @@ class TestTrainingCore(unittest.TestCase):
             root = Path(directory)
             trainer = Trainer.open(root, {
                 "game": self.game.to_dict(), "plan": {"batch_decisions": 6, "curriculum_share": 0.5},
-                "actors": 0, "tables": 2, "torch_threads": 1, "batch_size": 2, "unroll": 2,
+                "actors": 0, "tables": 2, "torch_threads": 1, "batch_size": 2,
                 "min_buffer_decisions": 2, "eval_every": 1, "eval_deals": 1, "anchor_every": 2,
             }, spec=TINY)
             for version in (1, 2):
@@ -126,6 +155,7 @@ class TestTrainingCore(unittest.TestCase):
                 self.assertEqual((state["status"], state["version"]), ("max_updates", version))
                 self.assertEqual({row["players"] for row in state["validation"]["random"]}, {1, 2, 3, 4})
                 self.assertGreater(state["updates_per_sec"], 0)
+                self.assertEqual(state["trained_decisions"], version * 4)
                 checkpoint = load_checkpoint(root / "latest-model.pt", SCHEMA)
                 self.assertEqual((checkpoint.version, checkpoint.meta["run_id"]), (version, trainer.run_id))
                 self.assertEqual(checkpoint.meta["plan"]["curriculum_share"], 0.5)

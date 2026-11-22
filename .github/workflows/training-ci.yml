@@ -80,7 +80,7 @@ jobs:
       - name: Check bounded GameTransformer lifecycle
         run: |
           run="${RUNNER_TEMP}/transformer"
-          python -m src.cli.train --output-dir "$run" --players 1 2 3 4 --max-turns 2 --width 32 --layers 2 --heads 4 --ffn 64 --tables 4 --batch-size 4 --unroll 4 --batch-decisions 16 --min-buffer-decisions 16 --eval-every 1 --eval-deals 1 --anchor-every 2 --actors 2 --max-updates 1 --max-seconds 90
+          python -m src.cli.train --output-dir "$run" --players 1 2 3 4 --max-turns 2 --width 32 --layers 2 --heads 4 --ffn 64 --tables 4 --batch-size 4 --batch-decisions 16 --min-buffer-decisions 16 --eval-every 1 --eval-deals 1 --anchor-every 2 --actors 2 --max-updates 1 --max-seconds 90
           python -c 'import json, sys; s = json.load(open(sys.argv[1])); assert (s["status"], s["version"]) == ("max_updates", 1), s' "$run/status.json"
           python -m src.cli.train --output-dir "$run" --max-updates 2 --max-seconds 90
           python -c 'import json, sys; s = json.load(open(sys.argv[1])); assert (s["status"], s["version"]) == ("max_updates", 2), s' "$run/status.json"
