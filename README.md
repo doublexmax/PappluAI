@@ -211,11 +211,13 @@ See the [training guide](TRAINING.md) to start, resume, or evaluate a run on Azu
 | `src.evaluation` | One batched arena for collection, solo evaluation, and multiplayer evaluation. |
 | `src.checkpoints` | Atomic files and tensor validation. |
 
-The encoder stores eight bytes per token. Its append-only prefix contains the rules, indicator, observer's initial hand, and visible events. Each decision adds a 30-token snapshot of the current table and the observer's hand. No token contains meld estimates, unseen cards, or point features.
+The Schema 7 encoder stores eight bytes per token. Its append-only prefix contains the rules, indicator, observer's initial hand, and visible events. Each decision adds a 30-token snapshot of the current table and the observer's hand. No token contains meld estimates, unseen cards, or point features.
 
-The Transformer reads the prefix causally. Each decision reads its own snapshot and the prefix available at that point. Actors keep prefix keys and values per seat. The learner computes a shared prefix once per sampled window. The default model has six layers, width 256, eight heads, and a SwiGLU width of 704.
+The Transformer reads the prefix causally. Each decision reads its own snapshot and the prefix available at that point. Actors cache prefix keys and values per seat across live tables. The learner computes a shared prefix once per sampled window. The default model has 2,175,031 parameters, four layers, width 192, six attention heads, and a SwiGLU width of 512. See [CPU training and Gloo synchronization](TRAINING.md#run-several-cpu-learners).
 
 The raw terminal score is `+1` for the declarer and `-penalty / (10 * cards_in_hand)` for other seats. Solo keeps the raw score. Multiplayer gives each seat half the difference between its score and the other seats' mean, so utilities sum to zero. No deadwood points are clipped.
+
+Stage 2b was the strongest `GameTransformer` checkpoint by mean utility at seed `600_000`. On the untouched seed `900_000`, it won 2 of 200 cold 21-card solo deals and left 70.25 mean deadwood out of 210. RandomPolicy and Revision 0 each won 1 of 200 on the same deals and left 108.46 and 104.46 mean deadwood, respectively. Stage 2b earned positive mean utility in all nine multiplayer matchups but did not win a game. See the [full held-out tables and checkpoint SHA-256](TRAINING.md#azure-checkpoint-and-held-out-results). These results do not describe the shipped browser model.
 
 ## Verification
 
