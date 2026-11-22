@@ -38,7 +38,10 @@ VALIDATION_SEED = 30_000_001
 OUTBOX_LIMIT = 8
 LENGTH_BUCKET = 8
 DISCOUNT = 0.995
-TUNABLE = {"actors", "tables", "torch_threads", "actor_threads", "device", "precision", "checkpoint_every"}
+TUNABLE = {
+    "actors", "tables", "torch_threads", "actor_threads", "device", "precision", "checkpoint_every",
+    "learning_rate", "eta", "sync_every",
+}
 
 
 @dataclass(frozen=True)
@@ -114,6 +117,7 @@ class TrainConfig:
     eta: float = 0.05
     entropy_weight: float = 0.003
     anchor_every: int = 2000
+    sync_every: int = 1
     publish_every: int = 25
     checkpoint_every: int = 500
     eval_every: int = 2000
@@ -124,7 +128,8 @@ class TrainConfig:
         self.plan.validate(self.game)
         for name in (
             "tables", "torch_threads", "actor_threads", "batch_size", "buffer_decisions",
-            "min_buffer_decisions", "max_policy_lag", "anchor_every", "publish_every", "checkpoint_every", "eval_deals",
+            "min_buffer_decisions", "max_policy_lag", "anchor_every", "sync_every",
+            "publish_every", "checkpoint_every", "eval_deals",
         ):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -482,10 +487,11 @@ class _Buffer:
         self.decisions += batch.decisions
         return True
 
-    def bucket_sizes(self) -> Counter[tuple[int, int]]:
+    def bucket_sizes(self, min_version: int = 0) -> Counter[tuple[int, int]]:
         sizes: Counter[tuple[int, int]] = Counter()
         for chunk in self.chunks:
-            sizes.update({key: len(seats) for key, seats in chunk.buckets.items()})
+            if chunk.version >= min_version:
+                sizes.update({key: len(seats) for key, seats in chunk.buckets.items()})
         return sizes
 
     def sample(
@@ -609,7 +615,7 @@ class _LearnerGroup:
         return torch.load(BytesIO(bytes(data.tolist())), map_location="cpu", weights_only=True)
 
     def step(
-        self, local: _Step, sizes: Mapping[tuple[int, int], int],
+        self, local: _Step, sizes: Mapping[tuple[int, int], int], *, require_common: bool = False,
     ) -> tuple[_Step, dict[tuple[int, int], int] | None]:
         if self.size == 1:
             return local, None
@@ -621,7 +627,14 @@ class _LearnerGroup:
             return step, None
         split = len(sizes)
         common = {key: -n for key, n in zip(sizes, counts[:split]) if n}
+        if require_common and not common:
+            return _Step.WAIT, None
         return step, common or {key: n for key, n in zip(sizes, counts[split:]) if n}
+
+    def _average(self, flat: Tensor) -> None:
+        dist.all_reduce(flat, op=dist.ReduceOp.AVG if self.use_avg else dist.ReduceOp.SUM)
+        if not self.use_avg:
+            flat.div_(self.size)
 
     def average_gradients(self, parameters: tuple[Tensor, ...]) -> None:
         if self.size == 1:
@@ -630,11 +643,19 @@ class _LearnerGroup:
         if any(grad is None for grad in gradients):
             raise RuntimeError("distributed learning requires a gradient for every parameter")
         flat = torch.cat([grad.reshape(-1) for grad in gradients])
-        dist.all_reduce(flat, op=dist.ReduceOp.AVG if self.use_avg else dist.ReduceOp.SUM)
-        if not self.use_avg:
-            flat.div_(self.size)
+        self._average(flat)
         for parameter, grad in zip(parameters, flat.split([p.numel() for p in parameters])):
             parameter.grad = grad.view_as(parameter)
+
+    @torch.no_grad()
+    def average_parameters(self, model: GameTransformer) -> None:
+        parameters = tuple(model.parameters())
+        flat = torch.cat([parameter.reshape(-1) for parameter in parameters])
+        if flat.dtype != torch.float32:
+            raise RuntimeError("parameter averaging requires fp32 weights")
+        self._average(flat)
+        for parameter, average in zip(parameters, flat.split([p.numel() for p in parameters])):
+            parameter.copy_(average.view_as(parameter))
 
 
 class Learner:
@@ -675,7 +696,11 @@ class Learner:
                 seat.anchor = (self._anchor_version, logp[:seat.action.numel()].clone())
         return pad_sequence([seat.anchor[1] for seat in batch.seats], batch_first=True)
 
-    def update(self, batch: TrajectoryBatch) -> LearnStats:
+    def refresh_anchor(self) -> None:
+        self.anchor.load_state_dict(self.online.state_dict())
+        self._anchor_version = object()
+
+    def update(self, batch: TrajectoryBatch, *, skip_grad_sync: bool = False) -> LearnStats:
         config, device = self.config, self.device
         tokens = TokenBatch(*(tensor.to(device) for tensor in vars(batch.tokens).values()))
         action, behavior, reward, discount, valid = (
@@ -704,13 +729,13 @@ class Learner:
         loss = policy_loss + config.value_weight * value_loss + config.eta * kl - config.entropy_weight * entropy
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        self.group.average_gradients(self._parameters)
+        if not skip_grad_sync:
+            self.group.average_gradients(self._parameters)
         norm = torch.nn.utils.clip_grad_norm_(self._parameters, config.grad_clip, error_if_nonfinite=True)
         self.optimizer.step()
         self.version += 1
-        if self.version % config.anchor_every == 0:
-            self.anchor.load_state_dict(self.online.state_dict())
-            self._anchor_version = object()
+        if not skip_grad_sync and self.version % config.anchor_every == 0:
+            self.refresh_anchor()
         return LearnStats(
             float(loss.detach()), float(policy_loss.detach()), float(value_loss.detach()),
             float(entropy.detach()), float(ratio[valid].double().exp().mean()), float(kl.detach()), float(norm),
@@ -730,6 +755,8 @@ class Learner:
         for name, model in (("online", self.online), ("anchor", self.anchor)):
             model.load_state_dict(validate_model_state(state[name], model.state_dict(), name))
         self.optimizer.load_state_dict(state["optimizer"])
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.config.learning_rate
         self.version = state["version"]
         self._anchor_version = object()
 
@@ -916,7 +943,7 @@ class Trainer:
             "updates_per_sec": (version - self._base_version) / elapsed, "elapsed_seconds": elapsed,
             "validation": self.validation, "world_size": self.group.size,
             "actors": self.config.actors, "tables": self.config.tables, "torch_threads": self.config.torch_threads,
-            "actor_threads": self.config.actor_threads, "cpu_count": os.cpu_count(),
+            "actor_threads": self.config.actor_threads, "cpu_count": os.cpu_count(), "sync_every": self.config.sync_every,
             "device": self.config.device, "precision": self.config.precision,
             "mean_rho": None, "kl_anchor": None, **self.last_update,
         }
@@ -940,6 +967,10 @@ class Trainer:
             raise ValueError("max_seconds must be positive and finite")
         cfg = self.config
         primary = self.group.rank == 0
+        local_steps = cfg.sync_every if self.group.size > 1 else 1
+        post_local = local_steps > 1
+        if local_steps > cfg.max_policy_lag + 1:
+            raise ValueError("sync_every cannot exceed max_policy_lag + 1 for distributed learning")
         progress = self._group_progress or self._local_progress()
         self._start = time.monotonic()
         self._base_version, self._base_decisions = self.learner.version, progress["decisions"]
@@ -985,14 +1016,17 @@ class Trainer:
                 metrics = (self.root / "metrics.jsonl").open("a", encoding="utf-8")
             while True:
                 local = next_step()
+                before = self.learner.version
+                steps = local_steps if max_updates is None else min(local_steps, max_updates - before)
                 sizes = {}
                 if self.group.size > 1:
-                    available = self.buffer.bucket_sizes() if local == _Step.UPDATE else {}
+                    min_version = before + steps - 1 - cfg.max_policy_lag
+                    available = self.buffer.bucket_sizes(min_version) if local == _Step.UPDATE else {}
                     if (available and workers and self.learner.version == self._base_version
                             and {players for players, _ in available} != set(cfg.plan.player_counts)):
                         local = _Step.WAIT
                     sizes = {key: available.get(key, 0) for key in bucket_keys}
-                step, targets = self.group.step(local, sizes)
+                step, targets = self.group.step(local, sizes, require_common=post_local)
                 if step == _Step.EVAL_ERROR:
                     raise RuntimeError("evaluation failed on rank 0") from eval_error
                 if step == _Step.ACTOR_ERROR:
@@ -1002,21 +1036,26 @@ class Trainer:
                     reason = step.name.lower()
                     break
                 if step == _Step.UPDATE:
-                    batch = self.buffer.sample(
-                        self.rng, cfg.batch_size, self.learner.version, seed=cfg.seed, targets=targets,
-                    )
-                    self.last_update = asdict(self.learner.update(batch))
-                    self.trained_decisions += int(batch.valid.sum())
+                    for version in range(before, before + steps):
+                        rng = Random(f"{cfg.seed}:{self.group.rank}:{version}") if post_local else self.rng
+                        batch = self.buffer.sample(rng, cfg.batch_size, version, seed=cfg.seed, targets=targets)
+                        self.last_update = asdict(self.learner.update(batch, skip_grad_sync=post_local))
+                        self.trained_decisions += int(batch.valid.sum())
                     version = self.learner.version
                     self.buffer.prune(version)
+                    if post_local:
+                        self.group.average_parameters(self.learner.online)
+                        if version // cfg.anchor_every > before // cfg.anchor_every:
+                            self.learner.refresh_anchor()
                 self._sync_progress()
                 if step == _Step.UPDATE:
-                    if version % cfg.publish_every == 0:
+                    publish = version // cfg.publish_every > before // cfg.publish_every
+                    if publish:
                         self.export_model(self.model_path)
                     if primary:
-                        if version % cfg.checkpoint_every == 0 or version % cfg.publish_every == 0:
+                        if publish or version // cfg.checkpoint_every > before // cfg.checkpoint_every:
                             self._save()
-                    if cfg.eval_every and version % cfg.eval_every == 0:
+                    if cfg.eval_every and version // cfg.eval_every > before // cfg.eval_every:
                         if self.group.size > 1:
                             dist.barrier()
                         if primary and not stopping():

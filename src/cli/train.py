@@ -17,7 +17,7 @@ _PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance", "unifor
 _HOST = ("tables", "torch_threads", "precision", "device")
 _INTS = (
     "actors", "actor_threads", "batch_size", "min_buffer_decisions", "buffer_decisions",
-    "max_policy_lag", "anchor_every", "publish_every", "checkpoint_every", "eval_every",
+    "max_policy_lag", "anchor_every", "sync_every", "publish_every", "checkpoint_every", "eval_every",
     "eval_deals", "seed",
 )
 _FLOATS = ("learning_rate", "weight_decay", "grad_clip", "value_weight", "eta", "entropy_weight",
