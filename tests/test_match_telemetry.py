@@ -10,7 +10,7 @@ from src.game.environment import (
     discard_action,
 )
 from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.model.encoding import encode, legal_actions
+from src.model.encoding import legal_mask
 
 
 class TestMatchTelemetry(unittest.TestCase):
@@ -29,7 +29,8 @@ class TestMatchTelemetry(unittest.TestCase):
         return env
 
     def discard_first(self, env):
-        return env.step(legal_actions(encode(env.observe()))[0])
+        mask = legal_mask(env.observe())
+        return env.step((mask & -mask).bit_length() - 1)
 
     def test_draw_sources_are_counted_by_seat_without_mutating_snapshots(self):
         env = self.make_match()

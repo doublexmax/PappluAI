@@ -200,138 +200,36 @@ The evaluator does not mutate its inputs.
 
 ## Model and training contract
 
-The only architecture is `card_mlp` v5.
-The [training guide](TRAINING.md) covers setup, self-play, resume, evaluation, and browser export.
+Python training uses `GameTransformer` v6. The shipped browser model above is a separate v5 artifact. Python training does not export or overwrite it.
+See the [training guide](TRAINING.md) to start, resume, or evaluate a run on Azure.
 
 | Package | Responsibility |
 | --- | --- |
 | `src.game` | Environments, public observations, terminal outcomes, and stock handling. |
-| `src.model` | Pure observation encoding, the Q-network, and model checkpoint loading. |
-| `src.training.train` | Tensor replay, DMC updates, self-play actors, snapshots, and fixed validation. |
-| `src.evaluation` | Solo evaluation and shared-deck arena matches. |
+| `src.model` | Byte encoding, the game-independent Transformer, and versioned model checkpoints. |
+| `src.training.train` | Self-play collection, rollout loading, lag-bounded replay, and V-trace updates. |
+| `src.evaluation` | One batched arena for collection, solo evaluation, and multiplayer evaluation. |
 | `src.checkpoints` | Atomic files and tensor validation. |
 
-### Observation encoding
+The encoder stores eight bytes per token. Its append-only prefix contains the rules, indicator, observer's initial hand, and visible events. Each decision adds a 30-token snapshot of the current table and the observer's hand. No token contains meld estimates, unseen cards, or point features.
 
-`encode` returns 1,275 little-endian float32 values, or 5,100 bytes.
-Encoding version 5 uses the following layout.
+The Transformer reads the prefix causally. Each decision reads its own snapshot and the prefix available at that point. Actors keep prefix keys and values per seat. The learner computes a shared prefix once per sampled window. The default model has six layers, width 256, eight heads, and a SwiGLU width of 704.
 
-| Field | Shape | Float offset |
-| --- | --- | --- |
-| `card` | 52 by 22 | 0 |
-| `seat` | 6 by 9 | 1144 |
-| `context` | 22 | 1198 |
-| `legal` | 54 | 1220 |
-| `top` | 1 | 1274 |
-
-The card channels contain own copies, pile copies, top and indicator flags, wild flags, points, and visible opponent activity.
-Five further channels describe `adjacent`, `set_mates`, `natural`, `pure`, and `any_meld`.
-Four disjoint-packing channels add `spare_frac`, `disc_pseq_delta`, `disc_pts_saved`, and `disc_pairs_delta`.
-The context adds `disjoint_pseq_frac`, `disjoint_gated_pts`, `top_gain_pseq`, and `top_gain_pts` alongside `unavoidable_dw`.
-The deterministic pack spends each card and joker at most once.
-It preserves the 2 after Q-K-A and splits six-card runs when possible.
-Packing is a greedy feature estimate, not the exact declaration or penalty search.
-Legal discard and top-card exchange candidates use the same pack.
-Seats are relative to the observer. Unused seat slots are zero.
-No feature contains hidden opponent hands or stock order.
-
-The legal mask excludes returning a just-taken discard when another face is held.
-It retains the action for a single-face hand.
-After a solo self-discard, it also excludes taking that discard when stock is available.
-An empty stock retains the discard draw so play cannot deadlock.
-Terminal observations and afterstates awaiting another seat have no legal actions.
-Training, solo evaluation, arena policies, and browser inference use this encoding.
-
-### Neural network
-
-`PolicyNet` embeds the 22 card channels and 76 table inputs.
-Residual `CardBlock` modules mix neighboring ranks, matching ranks, suits, and table context.
-The rank strip is `[A, 2, ..., K, A]`.
-Shared normalization and mean and max pooling update the table representation.
-The draw and face heads produce 54 advantages.
-A value head and legal-action centering produce Q-values.
-There are no auxiliary heads, target network, or meld computations inside the network.
-
-`ModelSpec(64, 2)` has 127,172 parameters.
-The default `ModelSpec(128, 3)` has 673,412 parameters.
-Python and Node tests compare nonzero exported weights at both sizes within `1e-5` for all 54 actions.
-Browser forward computation uses flat Float32 buffers.
-
-### DMC learning
-
-The trainer cycles cold deals across one, two, three, and four players by default.
-On 35% of multiplayer deals, every seat uses the current epsilon-greedy network.
-Each learner seat keeps one epsilon sampled from `(0.01, 0.02, 0.05)` for the whole deal.
-The remaining deals place one learner in a random seat.
-Each opponent seat samples the reigning `best-model.pt` with probability 0.45, `HeuristicPolicy` with 0.20, `RandomPolicy` with 0.05, and the snapshot pool with 0.30.
-Snapshot selection is uniform and includes imported `--opponent` checkpoints.
-An empty pool falls back to the reigning best.
-Every seat contributes its own outcome and trajectory, including opponent wins and losses.
-Solo deals always use the learner.
-The active snapshot pool holds at most eight checkpoints.
-
-Replay stores contiguous float32 features, int64 actions, float32 returns, and boolean greedy flags.
-Replay retains the most recent 60,000 steps.
-The trainer uses 64 MiB zlib chunks to save and restore replay tensors, including tensors larger than 2 GiB.
-For [multi-VM collection](TRAINING.md#feed-a-learner-from-other-machines), actors use `--collect-batch` and the learner reads `inbox/batch-*.pt`.
-For positive terminal utility `u`, step `t` of a length-`T` trajectory targets `u * 0.99 ** (T - 1 - t)`.
-Negative and zero returns remain undiscounted at every step.
-AdamW fits selected-action Q-values with Smooth-L1 loss and gradient clipping.
-Only greedy winning steps rank their taken action above other legal actions with a DQfD margin of 0.10 and default weight 0.35.
-Exploration and `RandomPolicy` steps never receive the margin, even when they win.
-`--margin-weight 0` disables the margin term.
-The default learning rate is `4e-4`, divided by `sqrt(1 + updates / 20000)` with a `0.15 * learning_rate` floor.
-`--lr-decay-updates` changes the decay length. Zero disables decay.
-The default round contains 32 deals and schedules two updates per deal with batches of up to 256 steps.
-There is no warm-start curriculum, target network, or registry.
-
-Solo and multiplayer use the same declaration-first utility.
-A valid declaration earns +1.
-Losing to a declaration earns `-0.35 - 0.50 * min(p, 100) / 100`, where `p` is the seat's penalty.
-Without a declaration, utility is `-0.80 + 0.20 * seq_frac - 0.20 * min(p, 100) / 100`.
-`seq_frac` caps qualifying sequences at the required quota and equals 1 when no sequences are required.
-Exhaustion always earns at most -0.60, even for zero penalty.
-Validation compares against the fixed heuristic and reigning best checkpoint.
-Its fixed-anchor score is the unweighted mean of solo and configured `Xp_heuristic` rates.
-After the first validation, multiplayer promotion requires `vs_best >= 0.51` and `score >= best_score - 0.02`.
-An improvement above `best_score + 0.02` also promotes when `vs_best >= 0.49`.
-
-Model checkpoints use version 5 and encoding version 5.
-Trainer state uses version 12.
-Older encodings and trainer states require a fresh run.
-Bootstrap weights and short smoke runs do not establish competitive strength.
+The raw terminal score is `+1` for the declarer and `-penalty / (10 * cards_in_hand)` for other seats. Solo keeps the raw score. Multiplayer gives each seat half the difference between its score and the other seats' mean, so utilities sum to zero. No deadwood points are clipped.
 
 ## Verification
 
-Run the complete checks from the repository root.
+Run model verification from the repository root on the Azure compute host.
 
-```powershell
-.\.venv\Scripts\python tools\check_training_architecture.py
-.\.venv\Scripts\python -m unittest discover -s tests -v
+```bash
+python tools/check_training_architecture.py
+python -m unittest discover -s tests -v
 node --test tests/*.test.mjs
 ```
 
 The architecture checker rejects import cycles and function-local imports.
-It also checks optional-dependency boundaries with Torch and NumPy blocked.
-The tests cover exact evaluator witnesses, game conservation, masks, DMC replay, spawned actors, deterministic resume, and browser parity.
-CI also runs a bounded train, resume, export, solo evaluation, and arena lifecycle.
-
-Regenerate the portable evaluator fixtures with this command.
-
-```powershell
-python tools\export_parity_fixtures.py
-```
-
-Export a trained checkpoint to update the browser model and its matching Q-value fixture together.
-
-```powershell
-.\.venv\Scripts\python tools\weights_export.py --checkpoint runs\full21\best-model.pt
-```
-
-`--bootstrap --seed 1729` generates untrained compatibility weights.
-Do not use bootstrap results as evidence of playing strength.
+It checks portable imports with Torch and NumPy blocked.
+CI also exercises training, resume, standalone collection, and both evaluation commands.
 
 `tools/verify_browser.mjs` exercises the real browser through Playwright.
 It checks worker decisions, the Neural label and greedy reason, declarations, privacy, and the main-thread fallback.
-`node tools/benchmark_qnet.mjs` times five passes over 1,000 real draw and discard observations.
-It reports median and p95 latency for validation, encoding, and one forward pass.

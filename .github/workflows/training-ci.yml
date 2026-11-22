@@ -23,6 +23,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - name: Check package boundaries
         run: python tools/check_training_architecture.py
       - name: Check evaluator and information state without training dependencies
@@ -41,8 +44,6 @@ jobs:
           tests.test_reward_cache
           tests.test_training_architecture
           tests.test_train.TestTrainCli
-          tests.test_weights_export.TestPortableExport
-          tests.test_weights_export.TestReferenceExport
       - name: Check browser simulator
         run: >-
           node --test
@@ -70,24 +71,31 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements-training.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - run: python -m pip install -r requirements-training.txt
       - name: Run complete Python regression suite
         run: python -m unittest discover -s tests -v
-      - name: Check bounded DMC lifecycle
+      - name: Check bounded GameTransformer lifecycle
         run: |
-          python -m src.cli.train --output-dir "${RUNNER_TEMP}/dmc" --players 1 2 3 4 --max-turns 2 --round-episodes 4 --batch-size 8 --replay-capacity 128 --validate-every 4 --validation-games 1 --actors 2 --max-episodes 4
-          python -m src.cli.train --output-dir "${RUNNER_TEMP}/dmc" --max-episodes 8
-          python tools/weights_export.py --checkpoint "${RUNNER_TEMP}/dmc/best-model.pt" --output "${RUNNER_TEMP}/dmc/model.json" --golden "${RUNNER_TEMP}/dmc/golden.json"
-          python -m src.cli.evaluate --checkpoint "${RUNNER_TEMP}/dmc/best-model.pt" --games 4 --warm-games 0 --output "${RUNNER_TEMP}/dmc/evaluation.json"
-          python -m src.cli.arena --model "${RUNNER_TEMP}/dmc/best-model.pt" --model random --games 4 --max-turns 2 --output "${RUNNER_TEMP}/dmc/arena.json"
+          run="${RUNNER_TEMP}/transformer"
+          python -m src.cli.train --output-dir "$run" --players 1 2 3 4 --max-turns 2 --width 32 --layers 2 --heads 4 --ffn 64 --tables 4 --batch-size 4 --unroll 4 --batch-decisions 16 --min-buffer-decisions 16 --eval-every 1 --eval-deals 1 --anchor-every 2 --actors 2 --max-updates 1 --max-seconds 90
+          python -c 'import json, sys; s = json.load(open(sys.argv[1])); assert (s["status"], s["version"]) == ("max_updates", 1), s' "$run/status.json"
+          python -m src.cli.train --output-dir "$run" --max-updates 2 --max-seconds 90
+          python -c 'import json, sys; s = json.load(open(sys.argv[1])); assert (s["status"], s["version"]) == ("max_updates", 2), s' "$run/status.json"
+          python -m src.cli.train --collect "$run/collected" --model "$run/latest-model.pt" --worker 100 --tables 4 --max-batches 1 --max-seconds 30
+          python -c 'import pathlib, sys; assert len(list(pathlib.Path(sys.argv[1]).glob("batch-*.pt"))) == 1' "$run/collected"
+          python -m src.cli.evaluate --checkpoint "$run/best-model.pt" --games 4 --warm-games 0 --output "$run/evaluation.json"
+          python -m src.cli.arena --model "$run/best-model.pt" --model random --games 4 --max-turns 2 --output "$run/arena.json"
           node --test tests/*.test.mjs
       - name: Upload lifecycle evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dmc-lifecycle-${{ github.sha }}
+          name: transformer-lifecycle-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/dmc/status.json
-            ${{ runner.temp }}/dmc/metrics.jsonl
-            ${{ runner.temp }}/dmc/evaluation.json
-            ${{ runner.temp }}/dmc/arena.json
+            ${{ runner.temp }}/transformer/status.json
+            ${{ runner.temp }}/transformer/metrics.jsonl
+            ${{ runner.temp }}/transformer/evaluation.json
+            ${{ runner.temp }}/transformer/arena.json

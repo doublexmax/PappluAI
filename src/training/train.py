@@ -1,611 +1,808 @@
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
-import ctypes
-from dataclasses import asdict, dataclass
+from collections import Counter
+import copy
+from dataclasses import asdict, dataclass, field, replace
 import json
 import math
+import multiprocessing as mp
+import os
 from pathlib import Path
-import random
+from pickle import UnpicklingError
+from random import Random
+from typing import Callable, Iterator, Mapping, Sequence
 import time
-from typing import Callable, NamedTuple, Sequence
-import zlib
+from uuid import UUID, uuid4
 
 import torch
-import torch.nn.functional as F
+from torch import Tensor
+from torch.nn.utils.rnn import pad_sequence
 
-from src.checkpoints.io import atomic_copy, atomic_write_json
-from src.checkpoints.tensor import atomic_torch_save, clone_model_state, validate_model_state
-from src.evaluation.arena import CheckpointPolicy, Deal, EpsilonPolicy, GreedyPolicy, HeuristicPolicy, RandomPolicy, run_matches
-from src.evaluation.benchmark import evaluate_games
-from src.game.environment import GameConfig, PappluEnv
-from src.game.multiplayer import MatchConfig, MultiplayerEnv
-from src.game.outcome import DealOutcome, solo_outcome
-from src.model.encoding import FEATURE_SIZE, LAYOUT, Features, encode
-from src.model.network import ObservationBatch, QNetwork, checkpoint_payload, load_checkpoint
-from src.model.spec import ModelSpec
+from src.checkpoints.io import atomic_write_json
+from src.checkpoints.tensor import atomic_torch_save, validate_model_state
+from src.evaluation.arena import Deal, MatchResult, RandomPolicy, TransformerPolicy, head_to_head, run_matches
+from src.game.environment import GameConfig
+from src.game.multiplayer import MatchConfig
+from src.model.encoding import HEADER_TOKENS, SCHEMA, validate_game
+from src.model.network import GameTransformer, TokenBatch, action_mask, load_checkpoint, save_checkpoint
+from src.model.spec import ModelSpec, TokenSchema
 
 
-STATE_VERSION = 12
+STATE_VERSION = 13
+ROLLOUT_FORMAT = 2
 VALIDATION_SEED = 30_000_001
-ZLIB_CHUNK = 1 << 26
+OUTBOX_LIMIT = 8
+TUNABLE = {"actors", "tables", "torch_threads", "actor_threads", "device", "precision", "checkpoint_every"}
 
 
-class Step(NamedTuple):
-    features: Features
-    action: int
-    greedy: bool = True
+@dataclass(frozen=True)
+class CollectPlan:
+    player_counts: tuple[int, ...] = (1, 2, 3, 4)
+    curriculum_share: float = 0.30
+    curriculum_max_distance: int = 10
+    uniform_mix: float = 0.02
+    batch_decisions: int = 8192
 
+    def __post_init__(self) -> None:
+        counts = self.player_counts
+        if (
+            not isinstance(counts, tuple) or not counts
+            or any(type(n) is not int or not 1 <= n <= 6 for n in counts)
+            or len(set(counts)) != len(counts)
+        ):
+            raise ValueError("player_counts must be distinct integers in 1..6")
+        for value in (self.curriculum_share, self.uniform_mix):
+            if type(value) not in (int, float) or not 0 <= value <= 1:
+                raise ValueError("curriculum_share and uniform_mix must be in [0, 1]")
+        if type(self.curriculum_max_distance) is not int or self.curriculum_max_distance < 1:
+            raise ValueError("curriculum_max_distance must be positive")
+        if type(self.batch_decisions) is not int or not 1 <= self.batch_decisions <= 262_144:
+            raise ValueError("batch_decisions must be in 1..262144")
 
-class Trajectory(NamedTuple):
-    steps: tuple[Step, ...]
-    utility: float
+    def validate(self, game: GameConfig) -> None:
+        validate_game(game)
+        for players in self.player_counts:
+            if players > 1:
+                MatchConfig(game, players)
+        if 1 in self.player_counts and self.curriculum_share and self.curriculum_max_distance > game.cards_in_hand:
+            raise ValueError("curriculum_max_distance exceeds the hand size")
 
+    def to_dict(self) -> dict:
+        return asdict(self)
 
-def save_rollout_batch(path: Path, episodes: int, trajectories: Sequence[Trajectory]) -> None:
-    atomic_torch_save({
-        "version": STATE_VERSION, "episodes": episodes,
-        "features": zlib.compress(bytearray().join(step.features.data for t in trajectories for step in t.steps), level=1),
-        "records": tuple((tuple(s.action for s in t.steps), tuple(s.greedy for s in t.steps), float(t.utility))
-                         for t in trajectories),
-    }, path)
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> CollectPlan:
+        if not isinstance(data, Mapping) or data.keys() != cls.__dataclass_fields__.keys():
+            raise ValueError("invalid collection plan fields")
+        return cls(**data)
 
-
-def load_rollout_batch(path: Path) -> tuple[int, list[Trajectory]]:
-    batch = torch.load(path, map_location="cpu", weights_only=True)
-    episodes, records = batch["episodes"], batch["records"]
-    if batch.get("version") != STATE_VERSION or type(episodes) is not int or episodes < 1:
-        raise ValueError("invalid rollout batch version or episode count")
-    if any(len(actions) != len(greedy) for actions, greedy, _ in records):
-        raise ValueError("rollout action and greedy lengths mismatch")
-    try:
-        raw = zlib.decompress(batch["features"])
-    except zlib.error as exc:
-        raise ValueError("corrupted rollout features") from exc
-    size = FEATURE_SIZE * 4
-    if len(raw) != sum(len(actions) for actions, _, _ in records) * size:
-        raise ValueError("rollout byte length mismatch")
-    features = iter(Features(raw[offset:offset + size]) for offset in range(0, len(raw), size))
-    return episodes, [
-        Trajectory(tuple(Step(next(features), action, flag) for action, flag in zip(actions, greedy)), utility)
-        for actions, greedy, utility in records
-    ]
+    def deals(self, nonce: str) -> Iterator[Deal]:
+        rng = Random(nonce)
+        while True:
+            for players in self.player_counts:
+                start = rng.randint(1, self.curriculum_max_distance) if players == 1 and rng.random() < self.curriculum_share else 0
+                yield Deal(rng.getrandbits(63), (0,) * players, start)
 
 
 @dataclass(frozen=True)
 class TrainConfig:
-    num_decks: int = 3
-    cards_in_hand: int = 21
-    required_sequences: int = 5
-    max_turns: int = 60
-    recycle_discard: bool = True
-    player_counts: tuple[int, ...] = (1, 2, 3, 4)
-    round_episodes: int = 32
-    updates_per_episode: int = 2
-    batch_size: int = 256
-    replay_capacity: int = 60_000
-    learning_rate: float = 4e-4
-    lr_decay_updates: int = 20_000
-    weight_decay: float = 1e-4
-    gamma: float = 0.99
-    margin_weight: float = 0.35
-    grad_clip: float = 1.0
-    epsilons: tuple[float, ...] = (0.01, 0.02, 0.05)
-    actors: int = 1
-    self_play_share: float = 0.35
-    max_pool: int = 8
-    validate_every: int = 1_000
-    validation_games: int = 64
-    checkpoint_every: int = 64
+    game: GameConfig = field(default_factory=lambda: GameConfig(max_turns=60))
+    plan: CollectPlan = field(default_factory=CollectPlan)
     seed: int = 41
-    torch_threads: int = 1
+    actors: int = 2
+    tables: int = 64
+    torch_threads: int = 4
+    actor_threads: int = 2
     device: str = "cpu"
+    precision: str = "bf16"
+    batch_size: int = 32
+    unroll: int = 16
+    buffer_decisions: int = 400_000
+    min_buffer_decisions: int = 20_000
+    max_policy_lag: int = 200
+    learning_rate: float = 3e-4
+    weight_decay: float = 1e-4
+    grad_clip: float = 1.0
+    value_weight: float = 0.5
+    rho_bar: float = 1.0
+    c_bar: float = 1.0
+    eta: float = 0.2
+    entropy_weight: float = 0.01
+    anchor_every: int = 2000
+    publish_every: int = 25
+    checkpoint_every: int = 500
+    eval_every: int = 2000
+    eval_deals: int = 64
+    promote_margin: float = 0.02
 
     def __post_init__(self) -> None:
-        game = self.game
-        counts = tuple(self.player_counts)
-        if not counts or len(set(counts)) != len(counts) or any(type(c) is not int or not 1 <= c <= 6 for c in counts):
-            raise ValueError("player_counts must contain distinct integers in 1..6")
-        object.__setattr__(self, "player_counts", counts)
-        for count in counts:
-            if count > 1:
-                MatchConfig(game, count)
-        for name, low in (
-            ("round_episodes", 1), ("updates_per_episode", 0), ("batch_size", 1),
-            ("replay_capacity", 1), ("lr_decay_updates", 0), ("actors", 1),
-            ("max_pool", 1), ("validate_every", 1), ("validation_games", 0),
-            ("checkpoint_every", 1), ("seed", 0), ("torch_threads", 1),
+        self.plan.validate(self.game)
+        for name in (
+            "tables", "torch_threads", "actor_threads", "batch_size", "unroll", "buffer_decisions",
+            "min_buffer_decisions", "max_policy_lag", "anchor_every", "publish_every", "checkpoint_every", "eval_deals",
         ):
-            if type(getattr(self, name)) is not int or getattr(self, name) < low:
-                raise ValueError("%s must be an integer >= %d" % (name, low))
-        if not isinstance(self.epsilons, (tuple, list)) or not self.epsilons or any(
-            type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1
-            for value in self.epsilons
-        ):
-            raise ValueError("epsilons must contain finite numbers in [0, 1]")
-        object.__setattr__(self, "epsilons", tuple(float(value) for value in self.epsilons))
-        for name in ("learning_rate", "weight_decay", "gamma", "margin_weight", "grad_clip", "self_play_share"):
             value = getattr(self, name)
-            high = 1.0 if name in ("gamma", "self_play_share") else math.inf
-            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= high:
-                raise ValueError("%s is out of range" % name)
-        if min(self.learning_rate, self.gamma, self.grad_clip) <= 0:
-            raise ValueError("learning_rate, gamma and grad_clip must be positive")
-        torch.device(self.device)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in ("seed", "actors", "eval_every"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        for name in (
+            "learning_rate", "weight_decay", "grad_clip", "value_weight", "rho_bar",
+            "c_bar", "eta", "entropy_weight", "promote_margin",
+        ):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if not self.learning_rate or not self.grad_clip or not 0 < self.c_bar <= min(1, self.rho_bar):
+            raise ValueError("learning_rate and grad_clip must be positive, with 0 < c_bar <= min(1, rho_bar)")
+        if self.min_buffer_decisions > self.buffer_decisions:
+            raise ValueError("min_buffer_decisions exceeds the buffer's capacity")
+        if self.publish_every > self.max_policy_lag:
+            raise ValueError("publish_every exceeds max_policy_lag")
+        if self.precision not in ("fp32", "bf16"):
+            raise ValueError("precision must be fp32 or bf16")
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TrainConfig:
+        return cls(**{**data, "game": GameConfig.from_dict(data["game"]), "plan": CollectPlan.from_dict(data["plan"])})
+
+    def with_overrides(self, overrides: Mapping[str, object]) -> TrainConfig:
+        changes = dict(overrides)
+        if "game" in changes:
+            changes["game"] = replace(self.game, **changes["game"])
+        if "plan" in changes:
+            changes["plan"] = replace(self.plan, **changes["plan"])
+        return replace(self, **changes)
+
+
+def _run_id(value: object) -> str:
+    if not isinstance(value, str) or str(UUID(value)) != value:
+        raise ValueError("expected a canonical run ID")
+    return value
+
+
+def _bytes_tensor(values: bytes, shape: tuple[int, ...]) -> Tensor:
+    return torch.frombuffer(bytearray(values), dtype=torch.uint8).reshape(shape)
+
+
+@dataclass(frozen=True)
+class Trajectories:
+    version: int
+    episodes: int
+    run_id: str
+    players: Tensor
+    utility: Tensor
+    prefix: Tensor
+    prefix_end: Tensor
+    suffix: Tensor
+    decision_end: Tensor
+    cut: Tensor
+    legal: Tensor
+    action: Tensor
+    behavior_logp: Tensor
 
     @property
-    def game(self) -> GameConfig:
-        return GameConfig(self.num_decks, self.cards_in_hand, self.required_sequences, self.max_turns, self.recycle_discard)
+    def decisions(self) -> int:
+        return self.action.numel()
+
+    @classmethod
+    def from_results(cls, results: Sequence[MatchResult], version: int, run_id: str) -> Trajectories:
+        players, utility, traces = [], [], []
+        for result in results:
+            for trace, score in zip(result.traces, result.outcome.utilities()):
+                if trace is not None:
+                    players.append(result.deal.players)
+                    utility.append(score)
+                    traces.append(trace)
+        if not traces:
+            raise ValueError("a batch needs at least one recorded seat")
+        return cls(
+            version, len(results), run_id, torch.tensor(players, dtype=torch.uint8),
+            torch.tensor(utility, dtype=torch.float32),
+            _bytes_tensor(b"".join(row.prefix for row in traces), (-1, SCHEMA.fields)),
+            torch.tensor([len(row.prefix) // SCHEMA.fields for row in traces]).cumsum(0),
+            _bytes_tensor(b"".join(row.suffix for row in traces), (-1, SCHEMA.suffix_tokens, SCHEMA.fields)),
+            torch.tensor([len(row.action) for row in traces]).cumsum(0),
+            torch.tensor([cut for row in traces for cut in row.cut], dtype=torch.int16),
+            torch.tensor([bits for row in traces for bits in row.legal], dtype=torch.int64),
+            _bytes_tensor(b"".join(row.action for row in traces), (-1,)),
+            torch.tensor([logp for row in traces for logp in row.behavior_logp], dtype=torch.float32),
+        )
+
+    def save(self, path: Path) -> None:
+        atomic_torch_save({"format": ROLLOUT_FORMAT, "schema": SCHEMA.to_dict(), **vars(self)}, Path(path))
+
+    @classmethod
+    def load(cls, path: Path, schema: TokenSchema = SCHEMA) -> Trajectories:
+        path = Path(path)
+        if path.stat().st_size > 256 * 1024**2:
+            raise ValueError("rollout batch exceeds 256 MiB")
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except (RuntimeError, UnpicklingError, EOFError) as exc:
+            raise ValueError("cannot read rollout batch") from exc
+        if not isinstance(payload, dict) or set(payload) != {"format", "schema", *cls.__dataclass_fields__}:
+            raise ValueError("invalid rollout batch fields")
+        if type(payload["format"]) is not int or payload["format"] != ROLLOUT_FORMAT:
+            raise ValueError("incompatible rollout batch format")
+        if TokenSchema.from_dict(payload["schema"]) != schema:
+            raise ValueError("incompatible rollout token schema")
+        payload.pop("format")
+        payload.pop("schema")
+        batch = cls(**payload)
+        batch._validate(schema)
+        return batch
+
+    def _validate(self, schema: TokenSchema) -> None:
+        _run_id(self.run_id)
+        if type(self.version) is not int or self.version < 0 or type(self.episodes) is not int or self.episodes < 1:
+            raise ValueError("invalid rollout revision or episode count")
+        for name, dtype, trailing in (
+            ("players", torch.uint8, ()), ("utility", torch.float32, ()),
+            ("prefix", torch.uint8, (schema.fields,)), ("prefix_end", torch.int64, ()),
+            ("suffix", torch.uint8, (schema.suffix_tokens, schema.fields)), ("decision_end", torch.int64, ()),
+            ("cut", torch.int16, ()), ("legal", torch.int64, ()), ("action", torch.uint8, ()),
+            ("behavior_logp", torch.float32, ()),
+        ):
+            col = getattr(self, name)
+            if (
+                not isinstance(col, Tensor) or col.layout != torch.strided or col.device.type != "cpu"
+                or col.dtype != dtype or col.ndim != len(trailing) + 1 or col.shape[1:] != trailing
+            ):
+                raise ValueError(f"invalid rollout column {name}")
+        streams, decisions = len(self.players), self.decisions
+        if not self.episodes <= streams <= self.episodes * 6 or not bool(((self.players >= 1) & (self.players <= 6)).all()):
+            raise ValueError("invalid rollout player counts")
+        if any(len(col) != streams for col in (self.utility, self.prefix_end, self.decision_end)):
+            raise ValueError("invalid rollout trajectory column lengths")
+        if any(len(col) != decisions for col in (self.suffix, self.cut, self.legal, self.behavior_logp)):
+            raise ValueError("invalid rollout decision column lengths")
+        lengths, prefix_lengths = (
+            ends.diff(prepend=ends.new_zeros(1)) for ends in (self.decision_end, self.prefix_end)
+        )
+        if (
+            int(self.decision_end[-1]) != decisions or int(self.prefix_end[-1]) != len(self.prefix)
+            or bool((lengths < 1).any() or (prefix_lengths <= HEADER_TOKENS).any())
+            or bool((self.decision_end <= 0).any() or (self.prefix_end <= 0).any())
+        ):
+            raise ValueError("invalid rollout offsets")
+        cuts = self.cut.long()
+        interior = torch.ones(decisions, dtype=torch.bool)
+        interior[self.decision_end - 1] = False
+        if (
+            bool((cuts <= HEADER_TOKENS).any())
+            or not torch.equal(cuts[self.decision_end - 1], prefix_lengths)
+            or bool((cuts.diff()[interior[:-1]] < 0).any())
+        ):
+            raise ValueError("invalid rollout prefix cuts")
+        acts = self.action.long()
+        if (
+            bool((self.legal <= 0).any() or (self.legal >= 1 << schema.num_actions).any())
+            or bool((acts >= schema.num_actions).any() or (((self.legal >> acts) & 1) == 0).any())
+        ):
+            raise ValueError("invalid rollout legal action")
+        if bool((self.suffix[:, 0, 0] == 0).any()):
+            raise ValueError("rollout has a padded readout token")
+        if not bool(((self.behavior_logp >= -104) & (self.behavior_logp <= 0)).all()):
+            raise ValueError("invalid rollout behavior log-probabilities")
+        if not bool((self.utility.abs() <= 1).all()):
+            raise ValueError("invalid rollout utilities")
 
 
-def _compress_tensor(tensor: torch.Tensor) -> bytes:
-    ptr, total = tensor.data_ptr(), tensor.numel() * tensor.element_size()
-    compressor = zlib.compressobj(level=1)
-    chunks = [compressor.compress(ctypes.string_at(ptr + offset, min(ZLIB_CHUNK, total - offset)))
-              for offset in range(0, total, ZLIB_CHUNK)]
-    chunks.append(compressor.flush())
-    return b"".join(chunks)
+@dataclass
+class _Completed:
+    deals: list[MatchResult] = field(default_factory=list)
+    decisions: int = 0
 
 
-def _decompress_tensor(payload: object, target: torch.Tensor) -> None:
-    if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise ValueError("corrupted replay data")
-    ptr, expected = target.data_ptr(), target.numel() * target.element_size()
-    decompressor = zlib.decompressobj()
-    written = 0
+def collect(
+    out_dir: Path, model_path: Path, *, worker: int, tables: int = 64, torch_threads: int = 2,
+    precision: str = "bf16", device: str = "cpu", stop: Callable[[], bool] = lambda: False,
+    max_batches: int | None = None,
+) -> dict:
+    if type(worker) is not int or worker < 0:
+        raise ValueError("worker must be a nonnegative integer")
+    if max_batches is not None and (type(max_batches) is not int or max_batches < 1):
+        raise ValueError("max_batches must be a positive integer")
+    if type(torch_threads) is not int or torch_threads < 1:
+        raise ValueError("torch_threads must be a positive integer")
+    torch.set_num_threads(torch_threads)
+    out_dir, model_path = Path(out_dir), Path(model_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    def write(piece: bytes) -> None:
-        nonlocal written
-        size = len(piece)
-        if written + size > expected:
-            raise ValueError("replay byte length mismatch")
-        if size:
-            ctypes.memmove(ptr + written, piece, size)
-            written += size
+    def fingerprint() -> tuple[int, int]:
+        stat = model_path.stat()
+        return stat.st_mtime_ns, stat.st_size
 
-    try:
-        data = memoryview(payload).cast("B")
-        for offset in range(0, len(data), ZLIB_CHUNK):
-            if decompressor.eof:
-                raise ValueError("corrupted replay data")
-            chunk: bytes | memoryview = data[offset:offset + ZLIB_CHUNK]
-            while True:
-                piece = decompressor.decompress(chunk, max_length=ZLIB_CHUNK)
-                write(piece)
-                if decompressor.eof or (not decompressor.unconsumed_tail and len(piece) < ZLIB_CHUNK):
-                    break
-                chunk = decompressor.unconsumed_tail
-        write(decompressor.flush(ZLIB_CHUNK))
-    except (TypeError, zlib.error) as exc:
-        raise ValueError("corrupted replay data") from exc
-    if not decompressor.eof or decompressor.unused_data:
-        raise ValueError("corrupted replay data")
-    if written != expected:
-        raise ValueError("replay byte length mismatch")
+    stamp = fingerprint()
+    checkpoint = load_checkpoint(model_path, SCHEMA, device)
+    game = GameConfig.from_dict(checkpoint.game)
+    plan = CollectPlan.from_dict(checkpoint.meta.get("plan"))
+    plan.validate(game)
+    run = _run_id(checkpoint.meta.get("run_id"))
+    revision = checkpoint.version
+    spec = checkpoint.network.spec
+    policy = TransformerPolicy(checkpoint.network, game, sample=True, uniform_mix=plan.uniform_mix,
+                               precision=precision, record=True)
+    del checkpoint
+    active: Counter[int] = Counter()
+    admitted: dict[int, int] = {}
+    pending: dict[int, _Completed] = {}
+    incarnation = uuid4().hex
+    totals = {"batches": 0, "episodes": 0, "decisions": 0}
+
+    def admit(deal: Deal) -> tuple[TransformerPolicy, ...]:
+        nonlocal stamp, revision, policy
+        if len(active) <= 1:
+            new_stamp = fingerprint()
+            if new_stamp != stamp:
+                snapshot = load_checkpoint(model_path, SCHEMA, device)
+                if (
+                    snapshot.meta.get("run_id") != run or snapshot.game != game.to_dict()
+                    or CollectPlan.from_dict(snapshot.meta.get("plan")) != plan or snapshot.network.spec != spec
+                ):
+                    raise ValueError("collection checkpoint changed run, game, plan, or model shape")
+                if snapshot.version > revision:
+                    revision = snapshot.version
+                    policy = TransformerPolicy(snapshot.network, game, sample=True, uniform_mix=plan.uniform_mix,
+                                               precision=precision, record=True)
+                stamp = new_stamp
+        admitted[deal.seed] = revision
+        active[revision] += 1
+        return (policy,)
+
+    def at_limit() -> bool:
+        return max_batches is not None and totals["batches"] >= max_batches
+
+    def flush(version: int) -> None:
+        if at_limit():
+            return
+        pattern = f"batch-w{worker:04d}-*.pt"
+        while max_batches is None and not stop() and sum(1 for _ in out_dir.glob(pattern)) >= OUTBOX_LIMIT:
+            time.sleep(0.1)
+        chunk = pending.pop(version)
+        filename = f"batch-w{worker:04d}-{time.time_ns()}-{incarnation}-{totals['batches']:08d}.pt"
+        Trajectories.from_results(chunk.deals, version, run).save(out_dir / filename)
+        totals["batches"] += 1
+        totals["episodes"] += len(chunk.deals)
+        totals["decisions"] += chunk.decisions
+
+    queue = plan.deals(f"{run}:{worker}:{incarnation}")
+    stopping = lambda: stop() or at_limit()
+    for result in run_matches(queue, admit, game, tables=tables, stop=stopping):
+        version = admitted.pop(result.deal.seed)
+        active[version] -= 1
+        if not active[version]:
+            del active[version]
+        chunk = pending.setdefault(version, _Completed())
+        chunk.deals.append(result)
+        chunk.decisions += result.action_count
+        if chunk.decisions >= plan.batch_decisions or (version != revision and version not in active):
+            flush(version)
+        if stopping():
+            break
+    for version in tuple(pending):
+        flush(version)
+    return totals
 
 
-class Replay:
-    def __init__(self, capacity: int, gamma: float = 0.99) -> None:
-        if type(capacity) is not int or capacity < 1 or not 0 < gamma <= 1:
-            raise ValueError("replay needs positive capacity and gamma in (0, 1]")
-        self.capacity, self.gamma, self.size, self.cursor = capacity, gamma, 0, 0
-        self.features = torch.empty((capacity, FEATURE_SIZE), dtype=torch.float32, device="cpu")
-        self.actions = torch.empty(capacity, dtype=torch.int64, device="cpu")
-        self.returns = torch.empty(capacity, dtype=torch.float32, device="cpu")
-        self.greedy = torch.empty(capacity, dtype=torch.bool, device="cpu")
+@dataclass(frozen=True)
+class WindowBatch:
+    tokens: TokenBatch
+    action: Tensor
+    behavior_logp: Tensor
+    reward: Tensor
+    discount: Tensor
+    valid: Tensor
+
+
+@dataclass
+class _BatchIndex:
+    batch: Trajectories
+    rows: dict[int, list[int]] = field(default_factory=dict)
+    weights: dict[int, list[int]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        begin = 0
+        for row, (players, end) in enumerate(zip(self.batch.players.tolist(), self.batch.decision_end.tolist())):
+            self.rows.setdefault(players, []).append(row)
+            weights = self.weights.setdefault(players, [])
+            weights.append((weights[-1] if weights else 0) + end - begin)
+            begin = end
+
+    def window(self, players: int, rng: Random, unroll: int) -> tuple[Tensor, ...]:
+        row = rng.choices(self.rows[players], cum_weights=self.weights[players], k=1)[0]
+        batch = self.batch
+        start = int(batch.decision_end[row - 1]) if row else 0
+        end = int(batch.decision_end[row])
+        prefix_start = int(batch.prefix_end[row - 1]) if row else 0
+        first = start + rng.randint(0, max(0, end - start - unroll))
+        steps = torch.arange(first, first + unroll + 1)
+        lookup = steps.clamp(max=end - 1)
+        cut = batch.cut[lookup].long()
+        terminal = steps[:-1] == end - 1
+        return (
+            batch.prefix[prefix_start:prefix_start + int(cut[-1])],
+            batch.suffix[lookup], cut, batch.legal[lookup], batch.action[lookup[:-1]].long(),
+            batch.behavior_logp[lookup[:-1]], terminal * batch.utility[row],
+            (steps[:-1] < end - 1).float(), steps[:-1] < end,
+        )
+
+
+class _Buffer:
+    def __init__(self, capacity: int, max_policy_lag: int) -> None:
+        self.capacity, self.max_policy_lag = capacity, max_policy_lag
+        self.chunks: list[_BatchIndex] = []
+        self.decisions = 0
 
     def __len__(self) -> int:
-        return self.size
+        return self.decisions
 
-    def append(self, trajectory: Trajectory) -> int:
-        steps, utility = trajectory
-        length = len(steps)
-        if not length:
-            return 0
-        kept = steps[-self.capacity:]
-        data = torch.frombuffer(bytearray().join(step.features.data for step in kept), dtype=torch.float32)
-        actions = torch.tensor([step.action for step in kept], dtype=torch.int64, device="cpu")
-        returns = torch.tensor(
-            [utility * self.gamma ** offset if utility > 0 else float(utility)
-             for offset in range(len(kept) - 1, -1, -1)],
-            dtype=torch.float32, device="cpu",
+    def prune(self, version: int) -> None:
+        kept = []
+        for chunk in self.chunks:
+            if version - chunk.batch.version <= self.max_policy_lag:
+                kept.append(chunk)
+            else:
+                self.decisions -= chunk.batch.decisions
+        self.chunks = kept
+
+    def add(self, batch: Trajectories, version: int) -> bool:
+        self.prune(version)
+        if not 0 <= version - batch.version <= self.max_policy_lag or batch.decisions > self.capacity:
+            return False
+        while self.decisions + batch.decisions > self.capacity:
+            self.decisions -= self.chunks.pop(0).batch.decisions
+        self.chunks.append(_BatchIndex(batch))
+        self.decisions += batch.decisions
+        return True
+
+    def sample(self, rng: Random, batch_size: int, unroll: int, version: int) -> WindowBatch:
+        self.prune(version)
+        groups: dict[int, list[_BatchIndex]] = {}
+        weights: dict[int, list[int]] = {}
+        for chunk in self.chunks:
+            for players, ends in chunk.weights.items():
+                groups.setdefault(players, []).append(chunk)
+                weights.setdefault(players, []).append(ends[-1])
+        if not groups:
+            raise ValueError("cannot sample an empty buffer")
+        players = rng.choices(list(groups), weights=[sum(w) for w in weights.values()], k=1)[0]
+        chunks = rng.choices(groups[players], weights=weights[players], k=batch_size)
+        prefix, suffix, cut, bits, *decisions = zip(*(chunk.window(players, rng, unroll) for chunk in chunks))
+        tokens = TokenBatch(
+            pad_sequence(prefix, batch_first=True), torch.stack(suffix), torch.stack(cut),
+            action_mask(torch.stack(bits), SCHEMA.num_actions),
         )
-        greedy = torch.tensor([step.greedy for step in kept], dtype=torch.bool, device="cpu")
-        start = (self.cursor + length - len(kept)) % self.capacity
-        first = min(len(kept), self.capacity - start)
-        for target, source in (
-            (self.features, data.reshape(-1, FEATURE_SIZE)), (self.actions, actions),
-            (self.returns, returns), (self.greedy, greedy),
-        ):
-            target[start:start + first].copy_(source[:first])
-            target[:len(kept) - first].copy_(source[first:])
-        self.cursor = (self.cursor + length) % self.capacity
-        self.size = min(self.capacity, self.size + length)
-        return length
+        return WindowBatch(tokens, *(torch.stack(column) for column in decisions))
 
-    def state_dict(self) -> dict:
-        state = {"capacity": self.capacity, "gamma": self.gamma, "size": self.size, "cursor": self.cursor}
-        for name in ("features", "actions", "returns", "greedy"):
-            state[name] = _compress_tensor(getattr(self, name)[:self.size])
-        return state
 
-    def load_state_dict(self, state: dict) -> None:
-        size, cursor = state["size"], state["cursor"]
-        if state["capacity"] != self.capacity or state["gamma"] != self.gamma:
-            raise ValueError("replay configuration mismatch")
-        if type(size) is not int or not 0 <= size <= self.capacity or type(cursor) is not int or not 0 <= cursor < self.capacity:
-            raise ValueError("invalid replay size or cursor")
-        for name in ("features", "actions", "returns", "greedy"):
-            _decompress_tensor(state[name], getattr(self, name)[:size])
-        self.size, self.cursor = size, cursor
+def regularized_reward(reward: Tensor, log_pi: Tensor, log_anchor: Tensor, eta: float) -> Tensor:
+    return reward.detach().float() - eta * (log_pi.detach().float() - log_anchor.detach().float())
+
+
+@torch.no_grad()
+def vtrace(
+    log_rho: Tensor, reward: Tensor, discount: Tensor, value: Tensor, bootstrap: Tensor, *,
+    rho_bar: float, c_bar: float,
+) -> tuple[Tensor, Tensor]:
+    log_rho, reward, discount, value, bootstrap = (x.float() for x in (log_rho, reward, discount, value, bootstrap))
+    rho = log_rho.clamp(max=math.log(rho_bar)).exp()
+    c = log_rho.clamp(max=math.log(c_bar)).exp()
+    next_value = torch.cat((value[:, 1:], bootstrap[:, None]), dim=1)
+    delta = rho * (reward + discount * next_value - value)
+    correction = torch.zeros_like(bootstrap)
+    vs = torch.empty_like(value)
+    for t in range(value.size(1) - 1, -1, -1):
+        correction = delta[:, t] + discount[:, t] * c[:, t] * correction
+        vs[:, t] = value[:, t] + correction
+    next_vs = torch.cat((vs[:, 1:], bootstrap[:, None]), dim=1)
+    return vs, rho * (reward + discount * next_vs - value)
 
 
 @dataclass(frozen=True)
 class LearnStats:
-    updates: int = 0
-    samples: int = 0
-    loss: float = 0.0
+    loss: float
+    policy_loss: float
+    value_loss: float
+    entropy: float
+    mean_rho: float
+    kl_anchor: float
+    grad_norm: float
 
 
 class Learner:
-    def __init__(self, online: QNetwork, config: TrainConfig, *, seed: int = 0) -> None:
-        self.config, self.device = config, torch.device(config.device)
-        self.online = online.to(self.device)
-        self.optimizer = torch.optim.AdamW(online.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-        self.replay = Replay(config.replay_capacity, config.gamma)
-        self.rng = random.Random(seed)
-        self.step_count = self.update_count = 0
+    def __init__(self, online: GameTransformer, config: TrainConfig) -> None:
+        self.config = config
+        self.device = torch.device(config.device)
+        self.online = online.to(self.device, dtype=torch.float32)
+        self.anchor = copy.deepcopy(self.online).eval().requires_grad_(False)
+        self.optimizer = torch.optim.AdamW(
+            self.online.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
+        )
+        self.version = 0
 
-    def learn(self, trajectories: Sequence[Trajectory], updates: int = 1) -> LearnStats:
-        self.step_count += sum(self.replay.append(trajectory) for trajectory in trajectories)
-        return self.update(updates)
-
-    def update(self, updates: int = 1) -> LearnStats:
-        if type(updates) is not int or updates < 0:
-            raise ValueError("updates must be a nonnegative integer")
-        if not len(self.replay) or not updates:
-            return LearnStats()
+    def update(self, batch: WindowBatch) -> LearnStats:
+        config, device = self.config, self.device
+        tokens = TokenBatch(*(tensor.to(device) for tensor in vars(batch.tokens).values()))
+        action, behavior, reward, discount, valid = (
+            tensor.to(device) for tensor in (batch.action, batch.behavior_logp, batch.reward, batch.discount, batch.valid)
+        )
         self.online.train()
-        total, count = 0.0, min(self.config.batch_size, len(self.replay))
-        for _ in range(updates):
-            learning_rate = max(
-                self.config.learning_rate * 0.15,
-                self.config.learning_rate / math.sqrt(1.0 + self.update_count / self.config.lr_decay_updates),
-            ) if self.config.lr_decay_updates else self.config.learning_rate
-            for group in self.optimizer.param_groups:
-                group["lr"] = learning_rate
-            idx = torch.tensor(self.rng.choices(range(len(self.replay)), k=count), dtype=torch.long, device="cpu")
-            data = self.replay.features[idx].to(self.device)
-            fields = {
-                field.name: data[:, field.offset:field.offset + field.size].reshape(count, *field.shape)
-                for field in LAYOUT
-            }
-            fields["top"] = fields["top"].squeeze(-1).long()
-            actions = self.replay.actions[idx].to(self.device)
-            targets = self.replay.returns[idx].to(self.device)
-            greedy = self.replay.greedy[idx].to(self.device)
-            q_all = self.online(ObservationBatch(**fields))
-            q_taken = q_all.gather(1, actions[:, None]).squeeze(1)
-            mc_loss = F.smooth_l1_loss(q_taken, targets)
-            if self.config.margin_weight > 0:
-                margin = torch.where(fields["legal"] > 0, 0.10, -1e9)
-                margin.scatter_(1, actions[:, None], 0.0)
-                win_mask = ((targets > 0) & greedy).to(q_all.dtype)
-                margin_loss = (((q_all + margin).amax(dim=1) - q_taken) * win_mask).sum() / win_mask.sum().clamp_min(1.0)
-                loss = mc_loss + self.config.margin_weight * margin_loss
-            else:
-                loss = mc_loss
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.online.parameters(), self.config.grad_clip, error_if_nonfinite=True)
-            self.optimizer.step()
-            total += loss.item()
-            self.update_count += 1
-        return LearnStats(updates, updates * count, total / updates)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config.precision == "bf16"):
+            heads = self.online.unroll(tokens)
+            with torch.no_grad():
+                ref = self.anchor.unroll(tokens)
+        legal = tokens.legal[:, :-1]
+        log_pi, log_anchor = heads.log_policy[:, :-1], ref.log_policy[:, :-1]
+        taken = log_pi.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+        anchor_taken = log_anchor.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+        ratio = taken.detach() - behavior
+        values = heads.value[:, :-1]
+        targets, advantage = vtrace(
+            ratio, regularized_reward(reward, taken, anchor_taken, config.eta), discount,
+            values, heads.value[:, -1], rho_bar=config.rho_bar, c_bar=config.c_bar,
+        )
+        probabilities = log_pi.exp()
+        divergence = (probabilities * (log_pi - log_anchor).masked_fill(~legal, 0)).sum(-1)
+        entropy = -(probabilities * log_pi.masked_fill(~legal, 0)).sum(-1)
+        kl = divergence[valid].mean()
+        entropy = entropy[valid].mean()
+        policy_loss = -(advantage * taken)[valid].mean()
+        value_loss = 0.5 * (targets - values).square()[valid].mean()
+        loss = policy_loss + config.value_weight * value_loss + config.eta * kl - config.entropy_weight * entropy
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(self.online.parameters(), config.grad_clip, error_if_nonfinite=True)
+        self.optimizer.step()
+        self.version += 1
+        if self.version % config.anchor_every == 0:
+            self.anchor.load_state_dict(self.online.state_dict())
+        return LearnStats(
+            float(loss.detach()), float(policy_loss.detach()), float(value_loss.detach()),
+            float(entropy.detach()), float(ratio[valid].double().exp().mean()), float(kl.detach()), float(norm),
+        )
 
     def state_dict(self) -> dict:
         return {
-            "online": clone_model_state(self.online.state_dict()), "optimizer": self.optimizer.state_dict(),
-            "replay": self.replay.state_dict(), "rng": self.rng.getstate(),
-            "step_count": self.step_count, "update_count": self.update_count,
+            "version": self.version, "online": self.online.state_dict(),
+            "anchor": self.anchor.state_dict(), "optimizer": self.optimizer.state_dict(),
         }
 
     def load_state_dict(self, state: dict) -> None:
-        self.online.load_state_dict(validate_model_state(state["online"], self.online.state_dict(), "online"))
+        if not isinstance(state, dict) or set(state) != {"version", "online", "anchor", "optimizer"}:
+            raise ValueError("invalid learner state fields")
+        if type(state["version"]) is not int or state["version"] < 0:
+            raise ValueError("invalid learner version")
+        for name, model in (("online", self.online), ("anchor", self.anchor)):
+            model.load_state_dict(validate_model_state(state[name], model.state_dict(), name))
         self.optimizer.load_state_dict(state["optimizer"])
-        self.replay.load_state_dict(state["replay"])
-        self.rng.setstate(state["rng"])
-        self.step_count, self.update_count = state["step_count"], state["update_count"]
-
-
-class _Rollout(NamedTuple):
-    env: PappluEnv | MultiplayerEnv
-    deal: Deal
-    rngs: tuple[random.Random, ...]
-    epsilons: tuple[float, ...]
-    steps: list[list[Step]]
-
-
-def collect_round(
-    config: TrainConfig, online: QNetwork, best_path: str, pool: Sequence[str], start: int, count: int,
-) -> list[Trajectory]:
-    learner = EpsilonPolicy(online, config.epsilons[0])
-    policies = [learner, CheckpointPolicy(best_path), HeuristicPolicy(), RandomPolicy(),
-                *(CheckpointPolicy(path) for path in pool[-config.max_pool:])]
-    rollouts, trajectories = [], []
-    for episode in range(start, start + count):
-        players = config.player_counts[episode % len(config.player_counts)]
-        seed = 2 * (config.seed * 10_000_000 + episode)
-        rng = random.Random(seed ^ 0x9E3779B97F4A7C15)
-        seats = [0] * players
-        if players > 1 and rng.random() >= config.self_play_share:
-            seat = rng.randrange(players)
-            for other in range(players):
-                if other == seat:
-                    continue
-                draw = rng.random()
-                seats[other] = (
-                    1 if draw < 0.45 else 2 if draw < 0.65 else 3 if draw < 0.70
-                    else rng.randrange(4, len(policies)) if len(policies) > 4 else 1
-                )
-        deal = Deal(seed, tuple(seats), players, frozenset(range(players)))
-        rngs = tuple(random.Random(seed ^ ((seat + 1) * 0x9E3779B97F4A7C15)) for seat in range(players))
-        epsilons = tuple(seat_rng.choice(config.epsilons) if policy == 0 else 0.0
-                         for policy, seat_rng in zip(seats, rngs))
-        env = PappluEnv(config.game) if players == 1 else MultiplayerEnv(MatchConfig(config.game, players))
-        env.reset(seed)
-        rollouts.append(_Rollout(env, deal, rngs, epsilons, [[] for _ in range(players)]))
-    while True:
-        groups = {}
-        for rollout in rollouts:
-            obs = rollout.env.observe()
-            if obs.done:
-                continue
-            seat = 0 if rollout.deal.players == 1 else rollout.env.view().current_seat
-            groups.setdefault(rollout.deal.seats[seat], []).append((rollout, seat, encode(obs)))
-        if not groups:
-            break
-        for policy, rows in groups.items():
-            features = [feature for _, _, feature in rows]
-            rngs = [rollout.rngs[seat] for rollout, seat, _ in rows]
-            if policy == 0:
-                actions = learner.act_features(features, rngs, [rollout.epsilons[seat] for rollout, seat, _ in rows])
-                greedy = learner.last_greedy
-            else:
-                actions = policies[policy].act_features(features, rngs)
-                greedy = [policy != 3] * len(rows)
-            for (rollout, seat, feature), action, was_greedy in zip(rows, actions, greedy):
-                rollout.steps[seat].append(Step(feature, action, was_greedy))
-                rollout.env.step(action)
-    for rollout in rollouts:
-        deal, env = rollout.deal, rollout.env
-        if deal.players == 1:
-            obs = env.observe()
-            trajectories.append(Trajectory(tuple(rollout.steps[0]), solo_outcome(
-                obs.hand, obs.joker, obs.won, config.required_sequences,
-            ).utility))
-            continue
-        view = env.view()
-        outcome = DealOutcome.score(env.terminal_snapshot(), view.winner, view.terminal_reason, config.required_sequences)
-        for seat in sorted(deal.record_seats):
-            steps = tuple(rollout.steps[seat])
-            if steps:
-                trajectories.append(Trajectory(steps, outcome.seat(seat).utility))
-    return trajectories
-
-
-def _actor_init() -> None:
-    torch.set_num_threads(1)
-
-
-def _actor_job(job: tuple) -> list[Trajectory]:
-    config, spec, state, best_path, pool, start, count = job
-    online = QNetwork(spec).eval()
-    online.load_state_dict(state)
-    return collect_round(config, online, best_path, pool, start, count)
-
-
-def _validation_job(job: tuple) -> tuple[str, float]:
-    cfg, spec, state, key, opponent, deals = job
-    online = QNetwork(spec).eval()
-    online.load_state_dict(state)
-    players = deals[0].players
-    if players == 1:
-        return key, sum(evaluate_games(online, cfg.game, len(deals), deals[0].seed, seed_stride=2).outcomes)
-    results = run_matches(deals, [GreedyPolicy(online), opponent], cfg.game)
-    return key, sum(
-        (1 + result.outcome.margin(deal.seats.index(0), other)) / 2
-        for deal, result in zip(deals, results) for other in range(players) if deal.seats[other] != 0
-    )
+        self.version = state["version"]
 
 
 class Trainer:
-    def __init__(self, root: Path, config: TrainConfig, online: QNetwork) -> None:
-        self.root, self.config = root, config
-        self.learner = Learner(online, config, seed=config.seed)
-        self.episodes, self.best_score, self.validation = 0, -1.0, {}
-        self.snapshot_pool: list[str] = []
-        self._executor = None
+    def __init__(self, root: Path, config: TrainConfig, learner: Learner, run_id: str) -> None:
+        self.root, self.config, self.learner, self.run_id = root, config, learner, run_id
+        self.rng = Random(config.seed)
+        self.inbox = root / "inbox"
+        self.inbox.mkdir(exist_ok=True)
+        self.buffer = _Buffer(config.buffer_decisions, config.max_policy_lag)
+        self.episodes, self.decisions, self.dropped_batches = 0, 0, 0
+        self.validation, self.last_update = {}, {}
+        self._start = time.monotonic()
+        self._base_version, self._base_decisions = learner.version, 0
 
     @classmethod
-    def open(cls, output_dir: Path, overrides: dict | None = None, *, initial: Path | ModelSpec | None = None, opponents: Sequence[Path] = ()) -> Trainer:
-        root, overrides = Path(output_dir).resolve(), dict(overrides or {})
+    def open(
+        cls, root: Path, overrides: Mapping[str, object] | None = None, *,
+        spec: ModelSpec | None = None, initial: Path | None = None,
+    ) -> Trainer:
+        root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
-        state_path = root / "latest-state.pt"
-        state = torch.load(state_path, map_location="cpu", weights_only=True) if state_path.exists() else None
+        path = root / "latest-state.pt"
+        state = torch.load(path, map_location="cpu", weights_only=True) if path.exists() else None
+        overrides = overrides or {}
         if state is not None:
-            if state.get("version") != STATE_VERSION:
-                raise ValueError("incompatible trainer state; start a fresh DMC run")
-            if initial is not None or opponents:
-                raise ValueError("initial models and opponents only apply to fresh runs")
-            config = TrainConfig(**{**state["config"], **overrides})
-            saved = TrainConfig(**state["config"])
-            tunable = {"actors", "device", "torch_threads", "checkpoint_every"}
-            if any(getattr(config, key) != getattr(saved, key) for key in overrides if key not in tunable):
+            if not isinstance(state, dict) or state.get("format") != STATE_VERSION:
+                raise ValueError("incompatible trainer state; start a fresh GameTransformer run")
+            if spec is not None or initial is not None:
+                raise ValueError("model shape and initial weights only apply to fresh runs")
+            saved = TrainConfig.from_dict(state["config"])
+            config = saved.with_overrides(overrides)
+            if any(getattr(config, k) != getattr(saved, k) for k in overrides.keys() - TUNABLE):
                 raise ValueError("cannot change training config on resume")
             spec = ModelSpec.from_dict(state["spec"])
+            run = _run_id(state["run_id"])
         else:
-            if isinstance(initial, (str, Path)):
-                online, game, _ = load_checkpoint(str(initial))
-                overrides = {**game.to_dict(), **overrides}
-                if TrainConfig(**overrides).game != game:
-                    raise ValueError("initial model game_config mismatch")
-            config = TrainConfig(**overrides)
-            spec = initial if isinstance(initial, ModelSpec) else ModelSpec()
+            if spec is not None and initial is not None:
+                raise ValueError("use an initial model or a model shape, not both")
+            run = str(uuid4())
+            if initial is not None:
+                checkpoint = load_checkpoint(initial, SCHEMA)
+                game = GameConfig.from_dict(checkpoint.game)
+                if replace(game, **overrides.get("game", {})) != game:
+                    raise ValueError("initial model game config mismatch")
+                overrides = {**overrides, "game": game.to_dict()}
+            config = TrainConfig().with_overrides(overrides)
         torch.set_num_threads(config.torch_threads)
         torch.manual_seed(config.seed)
-        if state is not None or not isinstance(initial, (str, Path)):
-            online = QNetwork(spec)
-        trainer = cls(root, config, online)
+        online = checkpoint.network if initial is not None else GameTransformer(spec or ModelSpec(), SCHEMA)
+        trainer = cls(root, config, Learner(online, config), run)
         if state is not None:
             trainer.learner.load_state_dict(state["learner"])
-            trainer.episodes, trainer.best_score, trainer.validation = state["episodes"], state["best_score"], state["validation"]
-            trainer.snapshot_pool = state["snapshot_pool"]
-            for path in ["initial-model.pt", "best-model.pt", *trainer.snapshot_pool]:
-                if not (root / path).is_file():
-                    raise ValueError("missing opponent checkpoint " + path)
+            trainer.rng.setstate(state["rng"])
+            trainer.episodes, trainer.decisions = state["episodes"], state["decisions"]
+            trainer.dropped_batches, trainer.validation = state["dropped_batches"], state["validation"]
+            trainer._base_version, trainer._base_decisions = trainer.learner.version, trainer.decisions
+            if not (root / "best-model.pt").is_file():
+                raise ValueError("missing best-model.pt on resume")
         else:
-            trainer.export_model(root / "initial-model.pt")
             trainer.export_model(root / "best-model.pt")
-            trainer.snapshot_pool = ["initial-model.pt"]
-            for index, path in enumerate(opponents):
-                load_checkpoint(str(path), expected_config=config.game)
-                name = "opponents/seed-%03d.pt" % index
-                atomic_copy(Path(path), root / name)
-                trainer.snapshot_pool.append(name)
-            trainer.snapshot_pool = trainer.snapshot_pool[-config.max_pool:]
-            trainer.save("ready")
+            trainer._save()
+        trainer.export_model(root / "latest-model.pt")
+        trainer._status("ready")
         return trainer
 
     def export_model(self, path: Path) -> None:
-        atomic_torch_save(checkpoint_payload(self.learner.online, self.config.game, {
-            "algorithm": "dmc", "gamma": self.config.gamma, "episodes": self.episodes,
-        }), path)
+        save_checkpoint(path, self.learner.online, self.config.game.to_dict(), {
+            "version": self.learner.version, "plan": self.config.plan.to_dict(), "run_id": self.run_id,
+        })
 
-    def validate(self) -> dict:
-        cfg, online = self.config, self.learner.online.eval()
-        if cfg.actors > 1 and self._executor is None:
-            self._executor = ProcessPoolExecutor(max_workers=cfg.actors, initializer=_actor_init)
-        opponents = (("heuristic", HeuristicPolicy()), ("best", CheckpointPolicy(str(self.root / "best-model.pt"))))
-        cases = [("solo", 1, None)] if 1 in cfg.player_counts else []
-        cases += [("%dp_%s" % (players, name), players, path)
-                  for players in cfg.player_counts if players > 1 for name, path in opponents]
-        jobs, state = [], clone_model_state(online.state_dict())
-        for key, players, opponent in cases:
-            seed = VALIDATION_SEED + (2 * players * cfg.validation_games if players > 1 else 0)
-            deals = [Deal(seed + 2 * block, tuple(0 if s == seat else 1 for s in range(players)), players)
-                     for block in range(cfg.validation_games) for seat in range(players)]
-            jobs.extend((cfg, online.spec, state, key, opponent, deals[start:start + 8 * players])
-                        for start in range(0, len(deals), 8 * players))
-        results = list(map(_validation_job, jobs) if cfg.actors == 1 else self._executor.map(_validation_job, jobs))
-        metrics = {key: sum(credit for name, credit in results if name == key)
-                   / (cfg.validation_games * players * max(1, players - 1)) for key, players, _ in cases}
-        anchors = [value for key, value in metrics.items() if not key.endswith("_best")]
-        score = sum(anchors) / len(anchors)
-        best = [value for key, value in metrics.items() if key.endswith("_best")]
-        if best:
-            metrics["vs_best"] = sum(best) / len(best)
-        promoted = self.best_score < 0 or (
-            metrics.get("vs_best", 0) >= 0.51 and score >= self.best_score - 0.02
-        ) or (score > self.best_score + 0.02 and (not best or metrics["vs_best"] >= 0.49))
-        if promoted:
-            self.best_score = max(self.best_score, score) if best else score
+    def _save(self) -> None:
+        atomic_torch_save({
+            "format": STATE_VERSION, "run_id": self.run_id, "spec": self.learner.online.spec.to_dict(),
+            "config": asdict(self.config), "learner": self.learner.state_dict(), "rng": self.rng.getstate(),
+            "episodes": self.episodes, "decisions": self.decisions,
+            "dropped_batches": self.dropped_batches, "validation": self.validation,
+        }, self.root / "latest-state.pt")
+
+    def evaluate(self, *, stop: Callable[[], bool] = lambda: False) -> dict:
+        cfg = self.config
+        candidate = TransformerPolicy(self.learner.online, cfg.game, precision=cfg.precision)
+        checkpoint = load_checkpoint(self.root / "best-model.pt", SCHEMA, self.learner.device)
+        best = TransformerPolicy(checkpoint.network, GameConfig.from_dict(checkpoint.game), precision=cfg.precision)
+        validation = {}
+        for name, opponent in (("best", best), ("random", RandomPolicy())):
+            validation[name] = [
+                asdict(head_to_head(
+                    candidate, opponent, cfg.game, players, cfg.eval_deals, VALIDATION_SEED + players * cfg.eval_deals,
+                    tables=cfg.tables, stop=stop,
+                ))
+                for players in cfg.plan.player_counts
+            ]
+        scores = [row["advantage"] for row in validation["best"]]
+        promote = sum(scores) / len(scores) >= cfg.promote_margin and min(scores) >= -cfg.promote_margin
+        self.validation = {**validation, "promoted": promote, "version": self.learner.version}
+        if promote:
+            self._save()
             self.export_model(self.root / "best-model.pt")
-        if promoted or metrics.get("vs_best", 0) >= 0.45:
-            name = "opponents/%s-%012d.pt" % ("best" if promoted else "snap", self.episodes)
-            if promoted:
-                atomic_copy(self.root / "best-model.pt", self.root / name)
-            else:
-                self.export_model(self.root / name)
-            self.snapshot_pool = [*self.snapshot_pool, name][-cfg.max_pool:]
-        self.validation = {"score": score, **metrics, "promoted": promoted}
         return self.validation
 
-    def run(self, *, max_episodes: int | None = None, max_seconds: float | None = None, stop: Callable[[], bool] = lambda: False) -> str:
-        if max_episodes is not None and (type(max_episodes) is not int or max_episodes < 0):
-            raise ValueError("max_episodes must be a nonnegative integer")
-        if max_seconds is not None and (not math.isfinite(max_seconds) or max_seconds <= 0):
-            raise ValueError("max_seconds must be positive and finite")
-        cfg, reason = self.config, "error"
-        deadline = math.inf if max_seconds is None else time.monotonic() + max_seconds
-        try:
-            while True:
-                if stop():
-                    reason = "stopped"
-                    break
-                if max_episodes is not None and self.episodes >= max_episodes:
-                    reason = "max_episodes"
-                    break
-                if time.monotonic() >= deadline:
-                    reason = "budget"
-                    break
-                count = min(cfg.round_episodes, max_episodes - self.episodes) if max_episodes is not None else cfg.round_episodes
-                start = self.episodes
-                extra_episodes, extra_trajs = 0, []
-                for path in sorted((self.root / "inbox").glob("batch-*.pt"))[:2]:
-                    episodes, batch = load_rollout_batch(path)
-                    if max_episodes is not None and start + extra_episodes + episodes > max_episodes:
-                        continue
-                    extra_episodes += episodes
-                    extra_trajs.extend(batch)
-                    path.unlink()
-                count = max(0, count - extra_episodes)
-                rollout_start = start + extra_episodes
-                best_path = str(self.root / "best-model.pt")
-                pool = [str(self.root / path) for path in self.snapshot_pool]
-                if not count:
-                    trajectories = []
-                elif cfg.actors == 1:
-                    trajectories = collect_round(cfg, self.learner.online, best_path, pool, rollout_start, count)
-                else:
-                    if self._executor is None:
-                        self._executor = ProcessPoolExecutor(max_workers=cfg.actors, initializer=_actor_init)
-                    chunk, state = math.ceil(count / cfg.actors), clone_model_state(self.learner.online.state_dict())
-                    jobs = [(cfg, self.learner.online.spec, state, best_path, pool, offset, min(chunk, rollout_start + count - offset))
-                            for offset in range(rollout_start, rollout_start + count, chunk)]
-                    trajectories = [t for batch in self._executor.map(_actor_job, jobs) for t in batch]
-                trajectories = extra_trajs + trajectories
-                count += extra_episodes
-                stats = self.learner.learn(trajectories, cfg.updates_per_episode * count)
-                self.episodes += count
-                validation = self.validate() if cfg.validation_games and self.episodes // cfg.validate_every > start // cfg.validate_every else None
-                self.export_model(self.root / "latest-model.pt")
-                with (self.root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps({"episodes": self.episodes, "epsilons": cfg.epsilons, "trajectories": len(trajectories),
-                                             **asdict(stats), "validation": validation}, allow_nan=False) + "\n")
-                if self.episodes // cfg.checkpoint_every > start // cfg.checkpoint_every:
-                    self.save("running")
-        finally:
+    def _ingest(self) -> None:
+        version = self.learner.version
+        self.buffer.prune(version)
+        files = sorted(self.inbox.glob("batch-*.pt"), key=lambda path: path.stat().st_mtime_ns)
+        for path in files[:max(1, self.config.actors)]:
             try:
-                self.save(reason)
-            finally:
-                self.close()
-        return reason
+                batch = Trajectories.load(path)
+                if batch.run_id != self.run_id or any(
+                    players not in self.config.plan.player_counts for players in batch.players.unique().tolist()
+                ):
+                    raise ValueError("batch does not belong to this run's collection plan")
+            except ValueError:
+                rejected = self.root / "rejected"
+                rejected.mkdir(exist_ok=True)
+                os.replace(path, rejected / path.name)
+                self.dropped_batches += 1
+                continue
+            if self.buffer.add(batch, version):
+                self.episodes += batch.episodes
+                self.decisions += batch.decisions
+            else:
+                self.dropped_batches += 1
+            path.unlink()
 
     def summary(self) -> dict:
+        elapsed = max(time.monotonic() - self._start, 1e-6)
+        version = self.learner.version
         return {
-            "episodes": self.episodes, "updates": self.learner.update_count, "steps": self.learner.step_count,
-            "replay_size": len(self.learner.replay), "best_score": None if self.best_score < 0 else self.best_score,
-            "model_spec": self.learner.online.spec.to_dict(), "validation": self.validation,
-            "snapshot_pool": self.snapshot_pool,
+            "version": version, "run_id": self.run_id, "episodes": self.episodes, "decisions": self.decisions,
+            "decisions_per_sec": (self.decisions - self._base_decisions) / elapsed,
+            "updates_per_sec": (version - self._base_version) / elapsed, "elapsed_seconds": elapsed,
+            "buffer_decisions": len(self.buffer), "inbox_files": sum(1 for _ in self.inbox.glob("batch-*.pt")),
+            "dropped_batches": self.dropped_batches, "validation": self.validation,
+            "actors": self.config.actors, "tables": self.config.tables, "torch_threads": self.config.torch_threads,
+            "actor_threads": self.config.actor_threads, "cpu_count": os.cpu_count(),
+            "device": self.config.device, "precision": self.config.precision,
+            "mean_rho": None, "kl_anchor": None, **self.last_update,
         }
 
-    def save(self, status: str) -> None:
-        self.export_model(self.root / "latest-model.pt")
-        atomic_torch_save({
-            "version": STATE_VERSION, "config": asdict(self.config), "spec": self.learner.online.spec.to_dict(),
-            "learner": self.learner.state_dict(), "episodes": self.episodes, "best_score": self.best_score,
-            "validation": self.validation, "snapshot_pool": self.snapshot_pool,
-        }, self.root / "latest-state.pt")
+    def _status(self, status: str) -> None:
         atomic_write_json({"status": status, **self.summary()}, self.root / "status.json")
 
-    def close(self) -> None:
-        if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-            self._executor = None
+    def run(
+        self, *, stop: Callable[[], bool] = lambda: False, max_updates: int | None = None,
+        max_seconds: float | None = None,
+    ) -> str:
+        if max_updates is not None and (type(max_updates) is not int or max_updates < 0):
+            raise ValueError("max_updates must be a nonnegative integer")
+        if max_seconds is not None and (not math.isfinite(max_seconds) or max_seconds <= 0):
+            raise ValueError("max_seconds must be positive and finite")
+        cfg = self.config
+        self._start = time.monotonic()
+        self._base_version, self._base_decisions = self.learner.version, self.decisions
+        deadline = math.inf if max_seconds is None else self._start + max_seconds
+        context = mp.get_context("spawn")
+        done = context.Event()
+        workers = []
+        reason = "error"
 
-    def __enter__(self) -> Trainer:
-        return self
+        def stopping() -> bool:
+            return stop() or time.monotonic() >= deadline
 
-    def __exit__(self, *_exc) -> None:
-        self.close()
+        try:
+            if not stopping() and (max_updates is None or self.learner.version < max_updates):
+                for worker in range(cfg.actors):
+                    process = context.Process(
+                        target=_actor_process,
+                        args=(self.root, worker, cfg.tables, cfg.actor_threads, cfg.precision, done),
+                    )
+                    process.start()
+                    workers.append(process)
+            heartbeat = 0.0
+            with (self.root / "metrics.jsonl").open("a", encoding="utf-8") as metrics:
+                while not stopping():
+                    if max_updates is not None and self.learner.version >= max_updates:
+                        reason = "max_updates"
+                        break
+                    if any(worker.exitcode is not None for worker in workers):
+                        raise RuntimeError("an actor worker exited before the learner stopped")
+                    self._ingest()
+                    if len(self.buffer) < cfg.min_buffer_decisions:
+                        if time.monotonic() >= heartbeat:
+                            self._status("waiting_for_actors")
+                            heartbeat = time.monotonic() + 1
+                        time.sleep(0.05)
+                        continue
+                    batch = self.buffer.sample(self.rng, cfg.batch_size, cfg.unroll, self.learner.version)
+                    self.last_update = asdict(self.learner.update(batch))
+                    version = self.learner.version
+                    self.buffer.prune(version)
+                    if version % cfg.checkpoint_every == 0 or version % cfg.publish_every == 0:
+                        self._save()
+                    if version % cfg.publish_every == 0:
+                        self.export_model(self.root / "latest-model.pt")
+                    if cfg.eval_every and version % cfg.eval_every == 0 and not stopping():
+                        self.evaluate(stop=stopping)
+                    metrics.write(json.dumps(self.summary(), allow_nan=False) + "\n")
+                    metrics.flush()
+                    if time.monotonic() >= heartbeat:
+                        self._status("running")
+                        heartbeat = time.monotonic() + 1
+        except InterruptedError:
+            if not stopping():
+                raise
+        finally:
+            if reason == "error" and stopping():
+                reason = "stopped" if stop() else "budget"
+            done.set()
+            grace = time.monotonic() + 5.0
+            for worker in workers:
+                worker.join(max(0.0, grace - time.monotonic()))
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join()
+                worker.close()
+            self._save()
+            self.export_model(self.root / "latest-model.pt")
+            self._status(reason)
+        return reason
+
+
+def _actor_process(root: Path, worker: int, tables: int, threads: int, precision: str, done: object) -> None:
+    collect(
+        root / "inbox", root / "latest-model.pt", worker=worker, tables=tables,
+        torch_threads=threads, precision=precision, stop=done.is_set,
+    )

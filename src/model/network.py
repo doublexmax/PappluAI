@@ -2,215 +2,267 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from pickle import UnpicklingError
+from typing import Mapping
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
-from src.checkpoints.tensor import validate_model_state
-from src.game.environment import ENCODING_VERSION, NUM_ACTIONS, NUM_FACES, GameConfig, Observation
-from src.model.encoding import (
-    CARD_CHANNELS, CONTEXT_CHANNELS, FEATURE_SIZE, LAYOUT,
-    NUM_SEAT_SLOTS, SEAT_CHANNELS, Features, encode,
-)
-from src.model.spec import ARCHITECTURE, CHECKPOINT_VERSION, ModelSpec
+from src.checkpoints.tensor import atomic_torch_save, validate_model_state
+from src.model.spec import ARCHITECTURE, BYTE_VALUES, CHECKPOINT_VERSION, ModelSpec, TokenSchema
 
 
 @dataclass(frozen=True)
-class ObservationBatch:
-    card: Tensor
-    seat: Tensor
-    context: Tensor
+class TokenBatch:
+    prefix: Tensor
+    suffix: Tensor
+    cut: Tensor
     legal: Tensor
-    top: Tensor
 
 
-def collate(features: Sequence[Features], device: torch.device) -> ObservationBatch:
-    if not features:
-        raise ValueError("model input needs at least one feature record")
-    size = len(features)
-    data = torch.frombuffer(
-        bytearray().join(feature.data for feature in features), dtype=torch.float32,
-    ).reshape(size, FEATURE_SIZE).to(device)
-    fields = {
-        field.name: data[:, field.offset:field.offset + field.size].reshape(size, *field.shape)
-        for field in LAYOUT
-    }
-    fields["top"] = fields["top"].squeeze(-1).to(torch.long)
-    return ObservationBatch(**fields)
+@dataclass(frozen=True)
+class Heads:
+    log_policy: Tensor
+    value: Tensor
 
 
-def collate_observations(
-    observations: Sequence[Observation], device: torch.device,
-) -> ObservationBatch:
-    return collate([encode(obs) for obs in observations], device)
+def action_mask(bits: Tensor, actions: int) -> Tensor:
+    return ((bits.unsqueeze(-1) >> torch.arange(actions, device=bits.device)) & 1).bool()
 
 
-class CardBlock(nn.Module):
+class KVCache:
+    def __init__(self, spec: ModelSpec, rows: int, dtype: torch.dtype, device: torch.device) -> None:
+        self.length = torch.zeros(rows, dtype=torch.long, device=device)
+        shape = (rows, 0, spec.heads, spec.head_dim)
+        self.keys = [torch.empty(shape, dtype=dtype, device=device) for _ in range(spec.layers)]
+        self.values = [torch.empty_like(key) for key in self.keys]
+
+    def reserve(self, rows: int, tokens: int) -> None:
+        old_rows, old_tokens, heads, dim = self.keys[0].shape
+        if rows > old_rows:
+            length = self.length.new_zeros(max(rows, 2 * old_rows))
+            length[:old_rows] = self.length
+            self.length = length
+        capacity = max(tokens, 2 * old_tokens) if tokens > old_tokens else old_tokens
+        if len(self.length) == old_rows and capacity == old_tokens:
+            return
+        for storage in (self.keys, self.values):
+            for layer, tensor in enumerate(storage):
+                grown = tensor.new_zeros(len(self.length), capacity, heads, dim)
+                grown[:old_rows, :old_tokens] = tensor
+                storage[layer] = grown
+
+    @torch.inference_mode()
+    def reset(self, row: int) -> None:
+        self.length[row] = 0
+
+
+class _RMSNorm(nn.Module):
     def __init__(self, width: int) -> None:
         super().__init__()
-        self.card_norm = nn.LayerNorm(width)
-        self.table_norm = nn.LayerNorm(width)
-        self.w_seq = nn.Linear(width, width * 3)
-        self.w_rank_set = nn.Linear(width, width, bias=False)
-        self.w_suit_run = nn.Linear(width, width, bias=False)
-        self.w_table = nn.Linear(width, width, bias=False)
-        self.card_out = nn.Linear(width, width)
-        self.table_fc1 = nn.Linear(width * 3, width)
-        self.table_fc2 = nn.Linear(width, width)
+        self.weight = nn.Parameter(torch.ones(width))
 
-    def forward(self, cards: Tensor, table: Tensor) -> tuple[Tensor, Tensor]:
-        c, t = self.card_norm(cards), self.table_norm(table)
-        c14 = torch.cat((c, c[:, :, :1, :]), dim=2)
-        u_self, u_left, u_right = self.w_seq(c14).chunk(3, dim=-1)
-        zeros = torch.zeros_like(u_self[:, :, :1, :])
-        left14 = torch.cat((zeros, u_left[:, :, :-1, :]), dim=2)
-        right14 = torch.cat((u_right[:, :, 1:, :], zeros), dim=2)
-        seq14 = u_self + left14 + right14
-        seq = torch.cat((
-            (seq14[:, :, :1, :] + seq14[:, :, 13:, :]) * 0.5,
-            seq14[:, :, 1:13, :],
-        ), dim=2)
-        rank_ctx = self.w_rank_set(c.mean(dim=1))[:, None, :, :]
-        suit_ctx = self.w_suit_run(c.mean(dim=2))[:, :, None, :]
-        tbl_ctx = self.w_table(t)[:, None, None, :]
-        cards = cards + self.card_out(F.silu(seq + rank_ctx + suit_ctx + tbl_ctx))
-        c_post = self.card_norm(cards)
-        t_in = torch.cat((t, c_post.mean(dim=(1, 2)), c_post.amax(dim=(1, 2))), dim=-1)
-        table = table + self.table_fc2(F.silu(self.table_fc1(t_in)))
-        return cards, table
+    def forward(self, x: Tensor) -> Tensor:
+        y = x.float()
+        return (y * torch.rsqrt(y.square().mean(dim=-1, keepdim=True) + 1e-6) * self.weight).to(x.dtype)
 
 
-class PolicyNet(nn.Module):
+def _rotate(x: Tensor, rope: tuple[Tensor, Tensor]) -> Tensor:
+    cos, sin = rope
+    x1, x2 = x.float().chunk(2, dim=-1)
+    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1).to(x.dtype)
+
+
+class _Block(nn.Module):
     def __init__(self, spec: ModelSpec) -> None:
         super().__init__()
-        width = spec.width
-        self.card_embed = nn.Linear(len(CARD_CHANNELS), width)
-        self.table_embed = nn.Linear(NUM_SEAT_SLOTS * len(SEAT_CHANNELS) + len(CONTEXT_CHANNELS), width)
-        self.blocks = nn.ModuleList(CardBlock(width) for _ in range(spec.blocks))
-        self.card_final = nn.LayerNorm(width)
-        self.table_final = nn.LayerNorm(width)
-        self.face_local = nn.Linear(width, width)
-        self.face_set = nn.Linear(width, width, bias=False)
-        self.face_table = nn.Linear(width, width, bias=False)
-        self.face_out = nn.Linear(width, 1)
-        self.draw_table = nn.Linear(width, width)
-        self.draw_top = nn.Linear(width, width, bias=False)
-        self.draw_set = nn.Linear(width, width, bias=False)
-        self.draw_out = nn.Linear(width, 2)
-        self.value_hidden = nn.Linear(width, width)
-        self.value_out = nn.Linear(width, 1)
+        self.heads, self.head_dim = spec.heads, spec.head_dim
+        self.attn_norm = _RMSNorm(spec.width)
+        self.ffn_norm = _RMSNorm(spec.width)
+        self.qkv = nn.Linear(spec.width, 3 * spec.width, bias=False)
+        self.out = nn.Linear(spec.width, spec.width, bias=False)
+        self.gate_up = nn.Linear(spec.width, 2 * spec.ffn, bias=False)
+        self.down = nn.Linear(spec.ffn, spec.width, bias=False)
 
-    def forward(self, batch: ObservationBatch) -> Tensor:
-        size = batch.card.shape[0]
-        cards = self.card_embed(batch.card.reshape(size, 4, 13, len(CARD_CHANNELS)))
-        width = cards.shape[-1]
-        table = self.table_embed(torch.cat((batch.seat.flatten(1), batch.context), dim=-1))
-        for block in self.blocks:
-            cards, table = block(cards, table)
-        cards, table = self.card_final(cards), self.table_final(table)
-        sets = cards.mean(dim=1)
-        faces = F.silu(
-            self.face_local(cards) + self.face_set(sets)[:, None] + self.face_table(table)[:, None, None],
+    def _project(self, x: Tensor, rope: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        packed = self.qkv(self.attn_norm(x)).reshape(*x.shape[:2], 3, self.heads, self.head_dim)
+        q, k, v = packed.permute(2, 0, 3, 1, 4).unbind()
+        return _rotate(q, rope), _rotate(k, rope), v
+
+    def _residual(self, x: Tensor, attention: Tensor) -> Tensor:
+        x = x + self.out(attention.transpose(1, 2).reshape_as(x))
+        gate, up = self.gate_up(self.ffn_norm(x)).chunk(2, dim=-1)
+        return x + self.down(F.silu(gate) * up)
+
+    def prefix_causal(self, x: Tensor, rope: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        q, k, v = self._project(x, rope)
+        return self._residual(x, F.scaled_dot_product_attention(q, k, v, is_causal=True)), k, v
+
+    def prefix_append(
+        self, x: Tensor, rope: tuple[Tensor, Tensor], cache: KVCache, layer: int,
+        rows: Tensor, writes: tuple[Tensor, Tensor], valid: Tensor, mask: Tensor, span: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if x.size(1):
+            q, k, v = self._project(x, rope)
+            cache.keys[layer][writes] = k.transpose(1, 2)[valid]
+            cache.values[layer][writes] = v.transpose(1, 2)[valid]
+        keys = cache.keys[layer][:, :span].index_select(0, rows).transpose(1, 2)
+        values = cache.values[layer][:, :span].index_select(0, rows).transpose(1, 2)
+        if x.size(1):
+            x = self._residual(x, F.scaled_dot_product_attention(q, keys, values, attn_mask=mask))
+        return x, keys, values
+
+    def suffix_blocks(
+        self, x: Tensor, rope: tuple[Tensor, Tensor], keys: Tensor, values: Tensor, mask: Tensor,
+    ) -> Tensor:
+        q, k, v = self._project(x, rope)
+        rows = keys.size(0)
+        blocks = q.size(0) // rows
+
+        def append(prefix: Tensor, suffix: Tensor) -> Tensor:
+            if blocks == 1:
+                return torch.cat((prefix, suffix), dim=-2)
+            own = suffix.reshape(rows, blocks, *suffix.shape[1:])
+            shared = prefix.unsqueeze(1).expand(-1, blocks, -1, -1, -1)
+            return torch.cat((shared, own), dim=-2).flatten(0, 1)
+
+        return self._residual(
+            x, F.scaled_dot_product_attention(q, append(keys, k), append(values, v), attn_mask=mask),
         )
-        index = batch.top.clamp(0, NUM_FACES - 1)
-        rows = torch.arange(size, device=cards.device)
-        has_top = ((batch.top >= 0) & (batch.top < NUM_FACES)).to(cards.dtype)[:, None]
-        top_card = cards.reshape(size, NUM_FACES, width)[rows, index] * has_top
-        top_set = sets[rows, index % 13] * has_top
-        draw = F.silu(self.draw_table(table) + self.draw_top(top_card) + self.draw_set(top_set))
-        advantage = torch.cat((self.draw_out(draw), self.face_out(faces).reshape(size, NUM_FACES)), dim=1)
-        mean = (advantage * batch.legal).sum(dim=1, keepdim=True) / batch.legal.sum(
-            dim=1, keepdim=True,
-        ).clamp_min(1.0)
-        return self.value_out(F.silu(self.value_hidden(table))) + advantage - mean
 
 
-class QNetwork(nn.Module):
+class GameTransformer(nn.Module):
     architecture = ARCHITECTURE
-    num_actions = NUM_ACTIONS
 
-    def __init__(self, spec: ModelSpec = ModelSpec()) -> None:
+    def __init__(self, spec: ModelSpec, schema: TokenSchema) -> None:
         super().__init__()
-        self.spec = spec
-        self.policy = PolicyNet(spec)
+        self.spec, self.schema = spec, schema
+        self.embedding = nn.Embedding(schema.fields * BYTE_VALUES, spec.width)
+        self.blocks = nn.ModuleList(_Block(spec) for _ in range(spec.layers))
+        self.final_norm = _RMSNorm(spec.width)
+        self.policy = nn.Linear(spec.width, schema.num_actions)
+        self.value = nn.Linear(spec.width, 1)
+        self.register_buffer("field_ids", torch.arange(schema.fields) * BYTE_VALUES, persistent=False)
+        powers = torch.arange(0, spec.head_dim, 2, dtype=torch.float32) / spec.head_dim
+        self.register_buffer("frequencies", 10_000 ** (-powers), persistent=False)
 
-    def forward(self, batch: ObservationBatch) -> Tensor:
-        return self.policy(batch)
+    def _embed(self, tokens: Tensor) -> Tensor:
+        return self.embedding(tokens.long() + self.field_ids).sum(dim=-2)
+
+    def _rope(self, positions: Tensor) -> tuple[Tensor, Tensor]:
+        angle = positions[:, None, :, None].float() * self.frequencies
+        return angle.cos(), angle.sin()
+
+    def _readout(
+        self, cut: Tensor, suffix: Tensor, prefix_positions: Tensor,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor], Tensor]:
+        prefix_valid = prefix_positions < cut.unsqueeze(-1)
+        valid = torch.cat((prefix_valid, suffix[..., 0] != 0), dim=-1)
+        return self._embed(suffix.flatten(0, 1)), self._rope(cut.reshape(-1, 1)), valid.flatten(0, 1)[:, None, None, :]
+
+    def _heads(self, suffix: Tensor, legal: Tensor) -> Heads:
+        readout = self.final_norm(suffix[:, 0]).reshape(*legal.shape[:-1], self.spec.width)
+        logits = self.policy(readout).float().masked_fill(~legal, torch.finfo(torch.float32).min)
+        return Heads(F.log_softmax(logits, dim=-1), self.value(readout).squeeze(-1).float())
+
+    def unroll(self, batch: TokenBatch) -> Heads:
+        prefix = self._embed(batch.prefix)
+        positions = torch.arange(prefix.size(1), device=prefix.device)
+        prefix_rope = self._rope(positions[None, :])
+        suffix, suffix_rope, suffix_mask = self._readout(batch.cut, batch.suffix, positions)
+        for block in self.blocks:
+            prefix, keys, values = block.prefix_causal(prefix, prefix_rope)
+            suffix = block.suffix_blocks(suffix, suffix_rope, keys, values, suffix_mask)
+        return self._heads(suffix, batch.legal)
+
+    def forward(self, batch: TokenBatch) -> Heads:
+        return self.unroll(batch)
+
+    def new_cache(self, rows: int = 0, dtype: torch.dtype = torch.float32) -> KVCache:
+        return KVCache(self.spec, rows, dtype, self.field_ids.device)
+
+    @torch.inference_mode()
+    def step(
+        self, cache: KVCache, rows: Tensor, prefix: Tensor, suffix: Tensor, legal: Tensor, *,
+        append_lengths: Tensor | None = None,
+    ) -> Heads:
+        if append_lengths is None:
+            append_lengths = torch.full_like(rows, prefix.size(1))
+        cache.reserve(int(rows.max()) + 1, 0)
+        start = cache.length[rows]
+        cut = start + append_lengths
+        span = int(cut.max())
+        cache.reserve(len(cache.length), span)
+        positions = torch.arange(span, device=rows.device)
+        offsets = torch.arange(prefix.size(1), device=rows.device)
+        appended = start[:, None] + offsets
+        valid = offsets < append_lengths[:, None]
+        writes = rows[:, None].expand_as(appended)[valid], appended[valid]
+        prefix_mask = (positions <= appended[:, :, None]) & (positions < cut[:, None, None])
+        prefix_rope = self._rope(appended)
+        x = self._embed(prefix)
+        y, suffix_rope, suffix_mask = self._readout(cut[:, None], suffix[:, None], positions)
+        for layer, block in enumerate(self.blocks):
+            x, keys, values = block.prefix_append(
+                x, prefix_rope, cache, layer, rows, writes, valid, prefix_mask[:, None], span,
+            )
+            y = block.suffix_blocks(y, suffix_rope, keys, values, suffix_mask)
+        cache.length[rows] = cut
+        return self._heads(y, legal)
 
 
-@torch.inference_mode()
-def greedy_actions(network: QNetwork, batch: ObservationBatch) -> Tensor:
-    if not bool(batch.legal.any(dim=1).all()):
-        raise ValueError("no legal actions")
-    return network(batch).masked_fill(batch.legal == 0, -torch.inf).argmax(dim=1)
+@dataclass(frozen=True)
+class Checkpoint:
+    network: GameTransformer
+    game: dict
+    meta: dict
+
+    @property
+    def version(self) -> int:
+        return self.meta["version"]
 
 
-def checkpoint_payload(
-    network: QNetwork, config: GameConfig, meta: Optional[Mapping[str, Any]] = None,
-) -> dict:
-    payload = {
-        "checkpoint_version": CHECKPOINT_VERSION,
-        "encoding_version": ENCODING_VERSION,
-        "architecture": ARCHITECTURE,
-        "model_spec": network.spec.to_dict(),
-        "num_actions": NUM_ACTIONS,
-        "game_config": config.to_dict(),
-        "model_state_dict": network.state_dict(),
-    }
-    if meta:
-        payload["meta"] = dict(meta)
-    return payload
+def _validate_metadata(game: object, meta: object) -> None:
+    if not isinstance(game, dict) or not isinstance(meta, dict):
+        raise ValueError("checkpoint needs game and metadata dictionaries")
+    if type(meta.get("version")) is not int or meta["version"] < 0:
+        raise ValueError("checkpoint policy version must be a nonnegative integer")
 
 
 def save_checkpoint(
-    path: str, network: QNetwork, config: GameConfig, meta: Optional[Mapping[str, Any]] = None,
+    path: Path, network: GameTransformer, game: Mapping[str, object], meta: Mapping[str, object],
 ) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(checkpoint_payload(network, config, meta), path)
+    game, meta = dict(game), dict(meta)
+    _validate_metadata(game, meta)
+    atomic_torch_save({
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "architecture": ARCHITECTURE,
+        "model_spec": network.spec.to_dict(),
+        "schema": network.schema.to_dict(),
+        "game": game,
+        "meta": meta,
+        "model_state_dict": {
+            key: tensor.detach().cpu().float() for key, tensor in network.state_dict().items()
+        },
+    }, Path(path))
 
 
-def load_checkpoint(
-    path: str, device: Optional[torch.device] = None, expected_config: Optional[GameConfig] = None,
-    network: Optional[QNetwork] = None,
-) -> tuple[QNetwork, GameConfig, dict]:
-    if device is None:
-        device = torch.device("cpu")
-    payload = torch.load(path, map_location=device, weights_only=True)
-    if not isinstance(payload, dict):
-        raise ValueError("checkpoint must be a dict")
-    if type(payload.get("checkpoint_version")) is not int or payload["checkpoint_version"] != CHECKPOINT_VERSION:
-        raise ValueError("unsupported checkpoint_version %r; train fresh card_mlp v5 weights"
-                         % payload.get("checkpoint_version"))
-    if type(payload.get("encoding_version")) is not int or payload["encoding_version"] != ENCODING_VERSION:
-        raise ValueError("incompatible encoding_version; card_mlp v5 requires encoding_version 5")
-    if payload.get("architecture") != ARCHITECTURE:
-        raise ValueError("unsupported architecture; expected card_mlp v5")
-    required = {
-        "checkpoint_version", "encoding_version", "architecture", "model_spec",
-        "num_actions", "game_config", "model_state_dict",
-    }
-    if set(payload) not in (required, required | {"meta"}):
-        raise ValueError("checkpoint fields do not match the current model schema")
-    if type(payload["num_actions"]) is not int or payload["num_actions"] != NUM_ACTIONS:
-        raise ValueError("checkpoint uses an incompatible model input/action schema")
-    spec = ModelSpec.from_dict(payload.get("model_spec"))
-    config = GameConfig.from_dict(payload.get("game_config"))
-    if expected_config is not None and config != expected_config:
-        raise ValueError("checkpoint game_config does not match expected game_config")
-    meta = payload.get("meta", {})
-    if not isinstance(meta, dict):
-        raise ValueError("checkpoint meta must be a dict")
-    if network is None:
-        network = QNetwork(spec)
-    elif network.spec != spec:
-        raise ValueError("checkpoint model_spec does not match network")
-    model_state = validate_model_state(
-        payload.get("model_state_dict"), network.state_dict(), "checkpoint model_state_dict",
-    )
-    network.load_state_dict(model_state)
-    network.to(device)
-    network.eval()
-    return network, config, meta
+def load_checkpoint(path: Path, schema: TokenSchema, device: str | torch.device = "cpu") -> Checkpoint:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except (RuntimeError, UnpicklingError, EOFError) as exc:
+        raise ValueError(f"cannot read model checkpoint {path}") from exc
+    if (
+        not isinstance(payload, dict) or type(payload.get("checkpoint_version")) is not int
+        or payload["checkpoint_version"] != CHECKPOINT_VERSION or payload.get("architecture") != ARCHITECTURE
+    ):
+        raise ValueError("incompatible checkpoint; train a fresh GameTransformer")
+    if set(payload) != {"checkpoint_version", "architecture", "model_spec", "schema", "game", "meta", "model_state_dict"}:
+        raise ValueError("invalid checkpoint fields")
+    if TokenSchema.from_dict(payload["schema"]) != schema:
+        raise ValueError("checkpoint token schema does not match the requested schema")
+    _validate_metadata(payload["game"], payload["meta"])
+    network = GameTransformer(ModelSpec.from_dict(payload["model_spec"]), schema)
+    network.load_state_dict(validate_model_state(payload["model_state_dict"], network.state_dict(), "model"))
+    return Checkpoint(network.to(device).eval(), payload["game"], payload["meta"])

@@ -1,8 +1,12 @@
-from dataclasses import dataclass
-from typing import Mapping
+from __future__ import annotations
 
-CHECKPOINT_VERSION = 5
-ARCHITECTURE = "card_mlp"
+from dataclasses import asdict, dataclass
+from typing import Mapping, Self
+
+
+CHECKPOINT_VERSION = 6
+ARCHITECTURE = "game_transformer"
+BYTE_VALUES = 256
 
 
 class ModelSpecError(ValueError):
@@ -10,21 +14,53 @@ class ModelSpecError(ValueError):
 
 
 @dataclass(frozen=True)
-class ModelSpec:
-    width: int = 128
-    blocks: int = 3
+class TokenSchema:
+    name: str
+    version: int
+    fields: int
+    suffix_tokens: int
+    num_actions: int
 
     def __post_init__(self) -> None:
-        if type(self.width) is not int or self.width < 8:
-            raise ModelSpecError("model width must be an integer of at least 8")
-        if type(self.blocks) is not int or self.blocks < 1:
-            raise ModelSpecError("model blocks must be a positive integer")
+        if not isinstance(self.name, str) or not self.name:
+            raise ModelSpecError("schema needs a name")
+        if any(type(n) is not int or n < 1 for n in (self.version, self.fields, self.suffix_tokens)):
+            raise ModelSpecError("schema version and dimensions must be positive integers")
+        if type(self.num_actions) is not int or not 1 <= self.num_actions <= 63:
+            raise ModelSpecError("schema must have 1..63 actions")
 
     def to_dict(self) -> dict:
-        return {"width": self.width, "blocks": self.blocks}
+        return asdict(self)
 
-    @staticmethod
-    def from_dict(data: Mapping[str, object]) -> "ModelSpec":
-        if not isinstance(data, Mapping) or set(data) != {"width", "blocks"}:
-            raise ModelSpecError("checkpoint model_spec must contain width and blocks for card_mlp v5")
-        return ModelSpec(**data)
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> Self:
+        if not isinstance(data, Mapping) or data.keys() != cls.__dataclass_fields__.keys():
+            raise ModelSpecError("invalid token schema fields")
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    width: int = 256
+    layers: int = 6
+    heads: int = 8
+    ffn: int = 704
+
+    def __post_init__(self) -> None:
+        if any(type(n) is not int or n < 1 for n in (self.width, self.layers, self.heads, self.ffn)):
+            raise ModelSpecError("model dimensions must be positive integers")
+        if self.width % (2 * self.heads):
+            raise ModelSpecError("width must divide into an even number of channels per head")
+
+    @property
+    def head_dim(self) -> int:
+        return self.width // self.heads
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> Self:
+        if not isinstance(data, Mapping) or data.keys() != cls.__dataclass_fields__.keys():
+            raise ModelSpecError("invalid model spec fields")
+        return cls(**data)

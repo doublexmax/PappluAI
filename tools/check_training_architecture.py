@@ -252,6 +252,16 @@ def check_evaluation_boundaries(
                     )
 
 
+def check_network_boundary(trees: dict[Path, ast.Module], errors: list[str]) -> None:
+    path = SRC / "model/network.py"
+    for node in ast.walk(trees[path]):
+        names = imported_names(node)
+        if isinstance(node, ast.ImportFrom) and node.module == "src":
+            names.extend(f"src.{alias.name}" for alias in node.names)
+        if any(name == "src.game" or name.startswith("src.game.") for name in names):
+            errors.append(f"generic network imports game code at {path.relative_to(ROOT)}:{node.lineno}")
+
+
 def pure_modules(trees: dict[Path, ast.Module]) -> list[str]:
     modules = set()
     for path in trees:
@@ -303,6 +313,7 @@ def main() -> int:
     deferred_imports = check_import_placement(trees, errors)
     check_cli_boundaries(trees, errors)
     check_evaluation_boundaries(trees, errors)
+    check_network_boundary(trees, errors)
     check_cycles(trees, errors)
     check_pure_imports(trees, errors)
     if errors:

@@ -1,494 +1,78 @@
-from __future__ import annotations
-
-from dataclasses import replace
-import json
-import os
-import random
-import tempfile
+import math
 import unittest
-from unittest import mock
 
-from src.evaluation.arena import (
-    CheckpointPolicy,
-    EpsilonPolicy,
-    HeuristicPolicy,
-    MatchInterrupted,
-    MatchResult,
-    RandomPolicy,
-    play_match,
-    rotated_matches,
-    resolve_policy,
-    run_matches,
-)
-from src.cli.arena import main
-from src.game.environment import (
-    GameConfig,
-    PappluEnv,
-    legal_action_mask,
-)
-from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv
-from src.model.encoding import encode, legal_actions
+from src.game.environment import GameConfig
+from src.model.encoding import HEADER_TOKENS, SCHEMA
+from src.model.spec import ModelSpec
 
 try:
     import torch
 except ImportError:
     torch = None
 
-
-class FirstLegalPolicy:
-    def __init__(self, game_config=None):
-        self.game_config = game_config
-        self.observations = []
-        self.calls = 0
-
-    def act(self, observation, rng):
-        del rng
-        self.calls += 1
-        self.observations.append(observation)
-        return legal_actions(encode(observation))[0]
+if torch is not None:
+    from src.evaluation.arena import Deal, RandomPolicy, TransformerPolicy, head_to_head, resolve_policy, run_matches
+    from src.model.network import GameTransformer
 
 
-class RandomLegalPolicy:
-    def act(self, observation, rng):
-        return rng.choice(legal_actions(encode(observation)))
+class FirstLegal:
+    game = None
 
+    def __init__(self):
+        self.batches = []
+        self.finished = set()
 
-class TestArenaMatches(unittest.TestCase):
-    def setUp(self):
-        self.game = GameConfig(
-            num_decks=1,
-            cards_in_hand=3,
-            required_sequences=1,
-            max_turns=2,
-        )
+    def open(self):
+        return self
 
-    def test_draw_records_complete_cached_decisions(self):
-        config = MatchConfig(game=self.game, players=3)
-        policies = [FirstLegalPolicy() for _ in range(3)]
-        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
-            result = play_match(
-                policies,
-                config,
-                seed=70,
-                record_trajectories=True,
-            )
-        self.assertIsNone(result.winner)
-        self.assertEqual(result.terminal_reason, "turns_exhausted")
-        self.assertEqual(result.seat_turns, (2, 2, 2))
-        self.assertEqual(result.action_count, 12)
-        self.assertEqual(result.telemetry.stock_draws, (2, 2, 2))
-        self.assertEqual(result.telemetry.discard_draws, (0, 0, 0))
-        self.assertEqual(result.telemetry.refill_turns, ())
-        self.assertEqual(tuple(map(len, result.trajectories)), (4, 4, 4))
-        for trajectory in result.trajectories:
-            for decision in trajectory:
-                state, action = decision.observation, decision.action
-                self.assertEqual(len(state.players), 3)
-                self.assertEqual(state.history[0].initial_hand, trajectory[0].observation.hand)
-                self.assertTrue(legal_action_mask(state)[action])
-                self.assertEqual(decision.features, encode(state))
-                self.assertFalse(hasattr(decision, "hidden_hands"))
-        for policy, trajectory in zip(policies, result.trajectories):
-            self.assertEqual(policy.observations, [step.observation for step in trajectory])
+    def act(self, turns):
+        self.batches.append(tuple(turn.stream for turn in turns))
+        return [(turn.legal & -turn.legal).bit_length() - 1 for turn in turns]
 
-    def test_winning_discard_stops_recording_before_the_other_seat_acts(self):
-        config = MatchConfig(game=self.game, players=2)
-        with mock.patch("src.game.multiplayer.hand_reward", return_value=1.0):
-            result = play_match(
-                [FirstLegalPolicy(), FirstLegalPolicy()],
-                config,
-                seed=71,
-                record_trajectories=True,
-            )
-        self.assertEqual(result.winner, 0)
-        self.assertEqual(result.terminal_reason, "win")
-        self.assertEqual(result.action_count, 2)
-        self.assertEqual(result.trajectories[0][0].action, 0)
-        self.assertGreaterEqual(result.trajectories[0][1].action, 2)
-        self.assertEqual(result.outcome.winner, 0)
-        self.assertEqual(result.trajectories[1], ())
-        self.assertIsNone(result.terminal_snapshot)
-
-    def test_terminal_capture_is_opt_in_and_keeps_every_hand(self):
-        config = MatchConfig(game=self.game, players=2)
-        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
-            result = play_match(
-                [FirstLegalPolicy(), FirstLegalPolicy()],
-                config, seed=711, record_terminal=True,
-            )
-        self.assertIsNotNone(result.terminal_snapshot)
-        self.assertEqual(len(result.terminal_snapshot.hands), 2)
-        self.assertEqual(tuple(sum(hand) for hand in result.terminal_snapshot.hands), (3, 3))
-
-    def test_policies_receive_only_their_own_hand_and_public_state(self):
-        game = GameConfig(
-            num_decks=1,
-            cards_in_hand=3,
-            required_sequences=1,
-            max_turns=1,
-        )
-        config = MatchConfig(game=game, players=2)
-        policies = [FirstLegalPolicy(), FirstLegalPolicy()]
-        expected = MultiplayerEnv(config)
-        expected.reset(seed=72)
-        expected_hands = tuple(
-            tuple(hand) for hand in expected._hands
-        )
-
-        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
-            play_match(policies, config, seed=72)
-
-        for seat, policy in enumerate(policies):
-            self.assertEqual(policy.observations[0].hand, expected_hands[seat])
-            for observation in policy.observations:
-                self.assertFalse(hasattr(observation, "opponent_hands"))
-                self.assertFalse(hasattr(observation, "stock"))
-                self.assertIsInstance(observation.hand, tuple)
-                self.assertIsInstance(observation.discard_pile, tuple)
-
-    def test_seed_repeats_deck_policy_rng_and_trajectories(self):
-        config = MatchConfig(game=self.game, players=2)
-        with mock.patch("src.game.multiplayer.hand_reward", return_value=0.0):
-            first = play_match(
-                [RandomLegalPolicy(), RandomLegalPolicy()],
-                config,
-                seed=73,
-                record_trajectories=True,
-            )
-            second = play_match(
-                [RandomLegalPolicy(), RandomLegalPolicy()],
-                config,
-                seed=73,
-                record_trajectories=True,
-            )
-        self.assertEqual(first, second)
-
-    def test_deadline_after_policy_does_not_create_a_false_verdict(self):
-        policy = FirstLegalPolicy()
-        config = MatchConfig(game=self.game, players=2)
-        with mock.patch(
-            "src.evaluation.arena.time.monotonic",
-            side_effect=(0.0, 2.0),
-        ), mock.patch("src.game.multiplayer.hand_reward") as evaluator:
-            with self.assertRaises(MatchInterrupted):
-                play_match(
-                    [policy, FirstLegalPolicy()],
-                    config,
-                    seed=74,
-                    deadline=1.0,
-                )
-        self.assertEqual(policy.calls, 1)
-        evaluator.assert_not_called()
-
-    def test_policy_errors_propagate(self):
-        class BrokenPolicy:
-            def act(self, observation, rng):
-                del observation, rng
-                raise RuntimeError("policy failed")
-
-        with self.assertRaisesRegex(RuntimeError, "policy failed"):
-            play_match(
-                [BrokenPolicy(), FirstLegalPolicy()],
-                MatchConfig(game=self.game, players=2),
-                seed=75,
-            )
-
-    def test_mismatched_policy_rules_reject_before_first_action(self):
-        policy = FirstLegalPolicy(
-            GameConfig(
-                num_decks=1,
-                cards_in_hand=6,
-                required_sequences=1,
-                max_turns=2,
-            )
-        )
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            play_match(
-                [policy, FirstLegalPolicy()],
-                MatchConfig(game=self.game, players=2),
-                seed=76,
-            )
-        self.assertEqual(policy.calls, 0)
-
-    def test_checkpoint_max_turn_difference_is_compatible(self):
-        policy_config = GameConfig(
-            num_decks=1,
-            cards_in_hand=3,
-            required_sequences=1,
-            max_turns=99,
-        )
-        policy = FirstLegalPolicy(policy_config)
-        config = MatchConfig(game=self.game, players=2)
-        with mock.patch("src.game.multiplayer.hand_reward", return_value=1.0):
-            result = play_match(
-                [policy, FirstLegalPolicy(policy_config)],
-                config,
-                seed=77,
-            )
-        self.assertEqual(result.winner, 0)
-        self.assertEqual(policy.observations[0].config.max_turns, 2)
-
-    def test_rotations_keep_seed_and_have_explicit_seat_order(self):
-        policies = tuple(FirstLegalPolicy() for _ in range(3))
-        result = MatchResult(
-            seed=78,
-            winner=None,
-            terminal_reason="turns_exhausted",
-            seat_turns=(2, 2, 2),
-            action_count=12,
-            stock_remaining=30,
-            telemetry=MatchTelemetry((2, 2, 2), (0, 0, 0), ()),
-            trajectories=((), (), ()),
-        )
-        with mock.patch("src.evaluation.arena.run_matches", return_value=[result] * 3) as play:
-            results = rotated_matches(
-                policies,
-                MatchConfig(game=self.game, players=3),
-                seed=78,
-            )
-        self.assertEqual(results, [result, result, result])
-        self.assertEqual(
-            [deal.seats for deal in play.call_args.args[0]],
-            [(0, 1, 2), (1, 2, 0), (2, 0, 1)],
-        )
-        self.assertEqual(
-            [deal.seed for deal in play.call_args.args[0]],
-            [78, 78, 78],
-        )
-
-
-class TestArenaPolicies(unittest.TestCase):
-    def test_heuristic_uses_cached_gains_to_take_sequences_and_discard_spares(self):
-        env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1))
-        obs = env.reset(17)
-        hand = tuple(int(face in (0, 1, 30)) for face in range(52))
-        helpful = replace(obs, hand=hand, joker=7, discard_pile=(2,))
-        unhelpful = replace(helpful, discard_pile=(45,))
-        discard = replace(
-            env.reset_warm_start(17), joker=7,
-            hand=tuple(int(face in (0, 1, 2, 9)) for face in range(52)),
-        )
-        features = [encode(row) for row in (helpful, unhelpful, discard)]
-        policy, rngs = HeuristicPolicy(), [random.Random(1) for _ in features]
-        with mock.patch("src.evaluation.arena.encode", side_effect=AssertionError("re-encoding")), mock.patch(
-            "src.evaluate.minimum_penalty", side_effect=AssertionError("backtracking"),
-        ):
-            self.assertEqual(policy.act_features(features, rngs), [1, 0, 11])
-        self.assertEqual(policy.act(helpful, rngs[0]), 1)
-        self.assertEqual(policy.act(replace(unhelpful, stock_remaining=0), rngs[0]), 1)
-        self.assertEqual(policy.act_features([], []), [])
-        with self.assertRaises(ValueError):
-            policy.act_features(features, [])
-
-    def test_heuristic_never_discards_the_just_taken_face(self):
-        env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1))
-        env.reset(17)
-        obs = env.step(1)
-        obs = replace(
-            obs, joker=7, hand=tuple(int(face in (0, 1, 2, 9)) for face in range(52)),
-            history=(*obs.history[:-1], replace(obs.history[-1], face=9)),
-        )
-        self.assertEqual(HeuristicPolicy().act(obs, random.Random(1)), 2)
-
-    def test_model_resolver_keeps_named_sparring_policies_and_checkpoint_paths(self):
-        obs = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1)).reset(17)
-        obs = replace(
-            obs, joker=7, discard_pile=(2,),
-            hand=tuple(int(face in (0, 1, 30)) for face in range(52)),
-        )
-        self.assertEqual(resolve_policy("heuristic").act(obs, random.Random(1)), 1)
-        self.assertEqual(resolve_policy("random").act(obs, random.Random(0)), 1)
-        checkpoint = resolve_policy("unopened-model.pt")
-        self.assertEqual(checkpoint.path, "unopened-model.pt")
-        self.assertIsNone(checkpoint._network)
-
-    def test_invalid_epsilon_is_rejected(self):
-        network = object()
-        for epsilon in (-0.01, 1.01, float("nan"), True, "0.5"):
-            with self.subTest(epsilon=epsilon), self.assertRaises(ValueError):
-                EpsilonPolicy(network, epsilon)
-
-
-class TestArenaCli(unittest.TestCase):
-    def test_cli_runs_heuristic_against_random_without_a_checkpoint(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = os.path.join(temporary, "matches.json")
-            self.assertEqual(main([
-                "--model", "heuristic", "--model", "random", "--games", "2",
-                "--seed", "800", "--max-turns", "1", "--output", output,
-            ]), 0)
-            with open(output, encoding="utf-8") as handle:
-                report = json.load(handle)
-        self.assertEqual([agent["label"] for agent in report["agents"]], ["heuristic", "random"])
-        self.assertEqual([game["seat_order"] for game in report["games"]], [[0, 1], [1, 0]])
-        self.assertEqual([game["action_count"] for game in report["games"]], [4, 4])
-
-    def test_cli_infers_players_rotates_seats_and_omits_trajectories(self):
-        fake = MatchResult(
-            seed=0,
-            winner=0,
-            terminal_reason="win",
-            seat_turns=(1, 0),
-            action_count=2,
-            stock_remaining=110,
-            telemetry=MatchTelemetry((1, 0), (0, 0), ()),
-            trajectories=((), ()),
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            output = os.path.join(tmp, "matches.json")
-            with mock.patch(
-                "src.evaluation.arena.run_matches",
-                side_effect=lambda deals, *_args, **_kwargs: [replace(fake, seed=deal.seed) for deal in deals],
-            ) as play:
-                code = main(
-                    [
-                        "--model",
-                        "random",
-                        "--model",
-                        "random",
-                        "--games",
-                        "2",
-                        "--seed",
-                        "800",
-                        "--max-turns",
-                        "7",
-                        "--output",
-                        output,
-                    ]
-                )
-            with open(output, encoding="utf-8") as handle:
-                report = json.load(handle)
-        self.assertEqual(code, 0)
-        self.assertEqual(report["config"]["players"], 2)
-        self.assertEqual(report["config"]["game"]["max_turns"], 7)
-        self.assertEqual(
-            [game["seat_order"] for game in report["games"]],
-            [[0, 1], [1, 0]],
-        )
-        self.assertEqual(
-            [game["winner_agent"] for game in report["games"]],
-            [0, 1],
-        )
-        self.assertNotIn("trajectories", report["games"][0])
-        self.assertEqual(
-            [deal.seed for deal in play.call_args.args[0]],
-            [800, 801],
-        )
-        self.assertEqual([game["seed"] for game in report["games"]], [800, 801])
-        self.assertFalse(play.call_args.kwargs["score_outcome"])
-
-    def test_cli_batches_across_the_chunk_boundary_without_scoring_unused_outcomes(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = os.path.join(temporary, "matches.json")
-            with mock.patch("src.evaluation.arena.run_matches", wraps=run_matches) as runner, mock.patch(
-                "src.evaluation.arena.DealOutcome.score", side_effect=AssertionError("unused outcome scoring"),
-            ):
-                code = main([
-                    "--model", "random", "--model", "random", "--games", "33",
-                    "--seed", "800", "--max-turns", "1", "--output", output,
-                ])
-            with open(output, encoding="utf-8") as handle:
-                report = json.load(handle)
-        self.assertEqual(code, 0)
-        self.assertEqual([len(call.args[0]) for call in runner.call_args_list], [32, 1])
-        self.assertEqual([game["seed"] for game in report["games"]], list(range(800, 833)))
-        self.assertEqual(
-            [game["seat_order"] for game in report["games"]],
-            [[0, 1] if index % 2 == 0 else [1, 0] for index in range(33)],
-        )
-        self.assertEqual([game["action_count"] for game in report["games"]], [4] * 33)
+    def finish(self, stream):
+        if stream in self.finished:
+            raise AssertionError("stream was finished twice")
+        self.finished.add(stream)
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
-class TestArenaCheckpoints(unittest.TestCase):
-    def test_current_checkpoint_loads_lazily_in_eval_mode(self):
-        from src.model.network import QNetwork, save_checkpoint
+class TestArena(unittest.TestCase):
+    def setUp(self):
+        torch.set_num_threads(1)
+        self.game = GameConfig(max_turns=1)
 
-        checkpoint_config = GameConfig(max_turns=40)
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "current.pt")
-            save_checkpoint(path, QNetwork(), checkpoint_config)
-            policy = CheckpointPolicy(path)
-            self.assertIsNone(policy._network)
-            self.assertEqual(policy.game_config, checkpoint_config)
-            self.assertEqual(policy.network.architecture, "card_mlp")
-            self.assertFalse(policy.network.training)
+    def test_refills_a_fast_solo_slot_before_a_six_seat_table_ends(self):
+        actor = FirstLegal()
+        solo, large, next_solo = Deal(5, (0,)), Deal(17, (0,) * 6), Deal(21, (0,))
+        results = list(run_matches((solo, large, next_solo), (actor,), self.game, tables=2))
+        self.assertEqual([result.deal for result in results], [solo, next_solo, large])
+        self.assertEqual([result.action_count for result in results], [2, 2, 12])
+        self.assertIn(12, actor.batches[2])
+        self.assertEqual(actor.finished, {0, 6, 7, 8, 9, 10, 11, 12})
+        self.assertAlmostEqual(sum(results[-1].outcome.utilities()), 0)
 
-    def test_current_checkpoint_plays_all_supported_full21_tables(self):
-        from src.model.network import QNetwork, save_checkpoint
+    def test_recorded_uniform_behavior_uses_only_present_legal_actions(self):
+        model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
+        policy = TransformerPolicy(model, self.game, sample=True, uniform_mix=1, record=True, precision="bf16")
+        deals = (Deal(19, (0,), curriculum=1), Deal(37, (0, 0)))
+        results = list(run_matches(deals, (policy,), self.game, tables=2))
+        self.assertEqual(sum(results[0].telemetry.stock_draws + results[0].telemetry.discard_draws), 1)
+        for result in results:
+            traces = [trace for trace in result.traces if trace is not None]
+            self.assertEqual(sum(len(trace.action) for trace in traces), result.action_count)
+            for trace in traces:
+                self.assertEqual(len(trace.prefix) // 8, trace.cut[-1])
+                self.assertGreater(trace.cut[0], HEADER_TOKENS)
+                self.assertEqual(len(trace.suffix), 240 * len(trace.action))
+                for action, legal, logp in zip(trace.action, trace.legal, trace.behavior_logp):
+                    self.assertTrue(legal & (1 << action))
+                    self.assertAlmostEqual(logp, -math.log(legal.bit_count()))
 
-        checkpoint_config = GameConfig(max_turns=40)
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "current.pt")
-            save_checkpoint(path, QNetwork(), checkpoint_config)
-            for players in (2, 3, 4):
-                with self.subTest(players=players):
-                    with mock.patch(
-                        "src.game.multiplayer.hand_reward",
-                        side_effect=[0.0] * (players - 1) + [1.0],
-                    ):
-                        result = play_match(
-                            [RandomPolicy()] * (players - 1) + [CheckpointPolicy(path)],
-                            MatchConfig(GameConfig(max_turns=60), players),
-                            seed=900,
-                            record_trajectories=True,
-                        )
-                    self.assertEqual(result.winner, players - 1)
-                    self.assertEqual(result.action_count, players * 2)
-                    observation = result.trajectories[-1][0].observation
-                    self.assertEqual(len(observation.players), players)
-                    self.assertEqual(len(observation.history), 2 * players - 1)
-
-    def test_epsilon_boundaries_select_legal_actions_without_changing_mode(self):
-        from src.model.network import QNetwork
-
-        for epsilon in (0.0, 1.0):
-            with self.subTest(epsilon=epsilon):
-                network = QNetwork()
-                network.train()
-                with torch.no_grad():
-                    for parameter in network.parameters():
-                        parameter.zero_()
-                env = MultiplayerEnv(
-                    MatchConfig(
-                        game=GameConfig(
-                            num_decks=1,
-                            cards_in_hand=3,
-                            required_sequences=1,
-                            max_turns=1,
-                        ),
-                        players=2,
-                    )
-                )
-                env.reset(seed=901)
-                policy = EpsilonPolicy(network, epsilon)
-                action = policy.act(
-                    env.observe(),
-                    random.Random(1),
-                )
-                self.assertEqual(action, 0)
-                self.assertEqual(policy.last_greedy, [epsilon == 0.0])
-                self.assertTrue(
-                    legal_action_mask(env.observe())[action]
-                )
-                self.assertTrue(network.training)
-
-    def test_per_row_epsilon_flags_follow_the_exploration_branch_even_on_greedy_actions(self):
-        from src.model.network import QNetwork
-
-        network = QNetwork()
-        with torch.no_grad():
-            for parameter in network.parameters():
-                parameter.zero_()
-        feature = encode(PappluEnv().reset(17))
-        policy = EpsilonPolicy(network, 0.99)
-        actions = policy.act_features([feature] * 3, [random.Random(1), random.Random(1), random.Random(2)],
-                                     [0.0, 1.0, 0.5])
-        self.assertEqual(actions, [0, 0, 0])
-        self.assertEqual(policy.last_greedy, [True, False, True])
-        self.assertEqual(policy.act_features([], []), [])
-        self.assertEqual(policy.last_greedy, [])
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_paired_self_comparison_is_neutral(self):
+        for players in (1, 3):
+            with self.subTest(players=players):
+                result = head_to_head(RandomPolicy(), RandomPolicy(), self.game, players, 3, 10, tables=2)
+                self.assertAlmostEqual(result.advantage, 0)
+                self.assertEqual(result.deals, 3 * max(2, players))
+        with self.assertRaisesRegex(ValueError, "no longer supported"):
+            resolve_policy("heuristic")

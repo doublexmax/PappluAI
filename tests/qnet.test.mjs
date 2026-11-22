@@ -95,17 +95,9 @@ describe("qnet golden parity", () => {
     });
   });
 
-  it("binds the golden oracle to the model bytes and current Python sources", () => {
+  it("binds the golden oracle to the frozen browser model bytes", () => {
     assert.equal(GOLDEN.modelSha256, MODEL.source.sha256);
     assert.equal(GOLDEN.tensorsSha256, MODEL.source.tensorsSha256);
-    assert.deepEqual(Object.keys(GOLDEN.sources).sort(), [
-      "src/evaluate.py", "src/game/environment.py", "src/game/information.py",
-      "src/model/encoding.py", "src/model/network.py", "src/model/spec.py", "tools/weights_export.py",
-    ]);
-    for (const [path, digest] of Object.entries(GOLDEN.sources)) {
-      const text = readFileSync(new URL(path, ROOT), "utf8").replace(/\r\n?/g, "\n");
-      assert.equal(createHash("sha256").update(text).digest("hex"), digest, `${path} changed; rerun tools/weights_export.py`);
-    }
     const shapes = tensorShapes(MODEL.modelSpec);
     assert.deepEqual(Object.keys(MODEL.tensors), shapes.map(([name]) => name));
     const hash = createHash("sha256");

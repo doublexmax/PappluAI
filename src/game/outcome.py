@@ -37,17 +37,38 @@ class DealOutcome:
     winner: Optional[int]
     ending: str
     penalties: tuple[HandPenalty, ...]
-    required_sequences: int = 5
+    max_points: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.penalties) <= 6 or type(self.max_points) is not int or self.max_points < 1:
+            raise ValueError("outcome needs one to six seats and a positive point bound")
+        if any(not 0 <= penalty.points <= self.max_points for penalty in self.penalties):
+            raise ValueError("penalty exceeds the full hand's point bound")
+        if self.ending == "win":
+            if (
+                type(self.winner) is not int
+                or not 0 <= self.winner < len(self.penalties)
+                or self.penalties[self.winner].points != 0
+            ):
+                raise ValueError("a declaration needs a winning seat with zero penalty")
+        elif self.ending != "turns_exhausted" or self.winner is not None:
+            raise ValueError("outcome needs a declaration or expiry")
 
     @classmethod
     def score(
         cls, snapshot: TerminalSnapshot, winner: Optional[int], ending: str,
-        required_sequences: int,
+        required_sequences: int, cards_in_hand: Optional[int] = None,
     ) -> "DealOutcome":
+        if not snapshot.hands:
+            raise ValueError("outcome needs at least one hand")
+        if cards_in_hand is None:
+            cards_in_hand = sum(snapshot.hands[0])
+        if type(cards_in_hand) is not int or any(sum(hand) != cards_in_hand for hand in snapshot.hands):
+            raise ValueError("final hands must match cards_in_hand")
         return cls(winner, ending, tuple(
             minimum_penalty(hand, snapshot.joker, required_sequences)
             for hand in snapshot.hands
-        ), required_sequences)
+        ), cards_in_hand * 10)
 
     def ranks(self) -> tuple[int, ...]:
         if len(self.penalties) == 1:
@@ -62,20 +83,19 @@ class DealOutcome:
         return int(ranks[seat] < ranks[other]) - int(ranks[seat] > ranks[other])
 
     def seat(self, seat: int) -> SeatOutcome:
-        penalty = self.penalties[seat]
-        points = min(penalty.points, 100)
-        if self.winner == seat:
-            utility = 1.0
-        elif self.winner is not None:
-            utility = -0.35 - 0.50 * points / 100.0
-        else:
-            required = max(1, self.required_sequences)
-            seq_frac = (
-                min(penalty.qualifying_sequences, required) / required
-                if self.required_sequences > 0 else 1.0
-            )
-            utility = -0.80 + 0.20 * seq_frac - 0.20 * points / 100.0
-        return SeatOutcome(utility, self.winner == seat, penalty.points)
+        return SeatOutcome(self.utilities()[seat], self.winner == seat, self.penalties[seat].points)
+
+    def utilities(self) -> tuple[float, ...]:
+        scores = tuple(
+            self.max_points if seat == self.winner else -penalty.points
+            for seat, penalty in enumerate(self.penalties)
+        )
+        players = len(scores)
+        if players == 1:
+            return (scores[0] / self.max_points,)
+        total = sum(scores)
+        scale = 2 * (players - 1) * self.max_points
+        return tuple((players * score - total) / scale for score in scores)
 
 
 def solo_outcome(

@@ -1,398 +1,399 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import math
-from numbers import Real
-import random
-import time
-from typing import List, Optional, Protocol, Sequence, Tuple
+from pathlib import Path
+from random import Random
+from typing import Callable, Iterable, Iterator, Protocol, Sequence
+
 import torch
 
-from src.game.environment import GameConfig, Observation, legal_action_mask
+from src.game.environment import GameConfig, Observation, PappluEnv, Phase
 from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv, TerminalSnapshot
 from src.game.outcome import DealOutcome
-from src.model.encoding import CARD_CHANNELS, CONTEXT_OFFSET, Features, encode, feature_values, legal_actions
-from src.model.network import collate, greedy_actions, load_checkpoint
+from src.model.encoding import FIELDS, SCHEMA, encode, legal_mask, validate_game
+from src.model.network import GameTransformer, action_mask, load_checkpoint
 
 
 @dataclass(frozen=True)
-class Decision:
-    observation: Observation
-    features: Features
-    action: int
+class SeatTrace:
+    prefix: bytes
+    suffix: bytes
+    cut: tuple[int, ...]
+    legal: tuple[int, ...]
+    action: bytes
+    behavior_logp: tuple[float, ...]
 
-    def __post_init__(self) -> None:
-        if type(self.action) is not int or self.action not in legal_actions(self.features):
-            raise ValueError("decision must choose a legal action")
-        if not legal_action_mask(self.observation)[self.action]:
-            raise ValueError("decision action does not match its observation")
+
+@dataclass(frozen=True)
+class Turn:
+    stream: int
+    observation: Observation
+    rng: Random
+    legal: int
+
+
+class Actor(Protocol):
+    def act(self, turns: Sequence[Turn]) -> Sequence[int]: ...
+    def finish(self, stream: int) -> SeatTrace | None: ...
 
 
 class Policy(Protocol):
-    def act(self, observation: Observation, rng: random.Random) -> int:
-        ...
+    game: GameConfig | None
+
+    def open(self) -> Actor: ...
 
 
-class MatchInterrupted(RuntimeError):
-    """Raised when a match reaches its caller-owned monotonic deadline."""
+class _RandomActor:
+    def act(self, turns: Sequence[Turn]) -> list[int]:
+        return [
+            turn.rng.choice([a for a in range(SCHEMA.num_actions) if turn.legal & (1 << a)])
+            for turn in turns
+        ]
+
+    def finish(self, stream: int) -> None:
+        return None
 
 
 class RandomPolicy:
-    def act(self, observation: Observation, rng: random.Random) -> int:
-        return self.act_features([encode(observation)], [rng])[0]
+    game = None
 
-    def act_features(self, features: Sequence[Features], rngs: Sequence[random.Random]) -> list[int]:
-        if len(features) != len(rngs):
-            raise ValueError("each feature row needs its own RNG")
-        return [rng.choice(legal_actions(row)) for row, rng in zip(features, rngs)]
+    def open(self) -> Actor:
+        return _RandomActor()
 
 
-_CARD_WIDTH = len(CARD_CHANNELS)
+class TransformerPolicy:
+    def __init__(
+        self, network: GameTransformer, game: GameConfig, *, sample: bool = False,
+        uniform_mix: float = 0.0, precision: str = "fp32", record: bool = False,
+    ) -> None:
+        if network.schema != SCHEMA:
+            raise ValueError("policy needs the Papplu token schema")
+        if precision not in ("fp32", "bf16"):
+            raise ValueError("precision must be fp32 or bf16")
+        if not 0 <= uniform_mix <= 1 or (uniform_mix and not sample):
+            raise ValueError("uniform_mix must be in [0, 1] and requires sampling")
+        self.network, self.game = network, game
+        self.sample, self.uniform_mix, self.record, self.precision = sample, uniform_mix, record, precision
+
+    def open(self) -> Actor:
+        return _TransformerActor(self)
 
 
-def _next_wanted(values: Sequence[float], face: int, held: Sequence[int]) -> float:
-    if values[face * _CARD_WIDTH + 12]:
-        return 0.0
-    rank, suit, wanted = face % 13, face // 13, 0.0
-    for known in held:
-        other_rank = known % 13
-        if face == known or values[face * _CARD_WIDTH + 7] or values[known * _CARD_WIDTH + 7]:
-            weight = 1.0
-        elif suit == known // 13:
-            distance = abs(rank - other_rank)
-            if rank == 0 or other_rank == 0:
-                distance = min(distance, 13 - distance)
-            weight = 0.6 if distance == 1 else 0.3 if distance == 2 else 0.0
+class CheckpointPolicy(TransformerPolicy):
+    def __init__(
+        self, path: str | Path, *, device: str = "cpu", sample: bool = False,
+        uniform_mix: float = 0.0, precision: str = "fp32", record: bool = False,
+    ) -> None:
+        checkpoint = load_checkpoint(Path(path), SCHEMA, device)
+        super().__init__(
+            checkpoint.network, GameConfig.from_dict(checkpoint.game), sample=sample,
+            uniform_mix=uniform_mix, precision=precision, record=record,
+        )
+        self.meta = checkpoint.meta
+        self.version = checkpoint.version
+
+
+@dataclass
+class _TraceDraft:
+    prefix: bytearray = field(default_factory=bytearray)
+    suffix: bytearray = field(default_factory=bytearray)
+    cut: list[int] = field(default_factory=list)
+    legal: list[int] = field(default_factory=list)
+    action: bytearray = field(default_factory=bytearray)
+    logp: list[float] = field(default_factory=list)
+
+    def seal(self) -> SeatTrace:
+        return SeatTrace(
+            bytes(self.prefix), bytes(self.suffix), tuple(self.cut), tuple(self.legal),
+            bytes(self.action), tuple(self.logp),
+        )
+
+
+@dataclass
+class _Stream:
+    row: int
+    trace: _TraceDraft | None
+    events: int = 0
+
+
+class _TransformerActor:
+    def __init__(self, policy: TransformerPolicy) -> None:
+        self.policy = policy
+        self.device = next(policy.network.parameters()).device
+        self.bf16 = policy.precision == "bf16"
+        self.cache = policy.network.new_cache(dtype=torch.bfloat16 if self.bf16 else torch.float32)
+        self.streams: dict[int, _Stream] = {}
+        self.free_rows: list[int] = []
+        self.next_row = 0
+
+    def _stream(self, key: int) -> _Stream:
+        if key not in self.streams:
+            if self.free_rows:
+                row = self.free_rows.pop()
+            else:
+                row = self.next_row
+                self.next_row += 1
+            self.streams[key] = _Stream(row, _TraceDraft() if self.policy.record else None)
+        return self.streams[key]
+
+    def act(self, turns: Sequence[Turn]) -> list[int]:
+        streams = [self._stream(turn.stream) for turn in turns]
+        encoded = [encode(turn.observation, stream.events) for turn, stream in zip(turns, streams)]
+        width = max(len(row.prefix) for row in encoded)
+        if width:
+            data = bytearray(b"".join(row.prefix.ljust(width, b"\x00") for row in encoded))
+            prefix = torch.frombuffer(data, dtype=torch.uint8).reshape(len(turns), -1, FIELDS).to(self.device)
         else:
-            weight = 0.5 if rank == other_rank else 0.0
-        wanted = max(wanted, weight)
-    return wanted
-
-
-class HeuristicPolicy:
-    def act(self, observation: Observation, rng: random.Random) -> int:
-        return self.act_features([encode(observation)], [rng])[0]
-
-    def act_features(self, features: Sequence[Features], rngs: Sequence[random.Random]) -> list[int]:
-        if len(features) != len(rngs):
-            raise ValueError("each feature row needs its own RNG")
-        result = []
-        for row in features:
-            values, legal = feature_values(row), legal_actions(row)
-            if values[CONTEXT_OFFSET]:
-                gain, points = values[CONTEXT_OFFSET + 20:CONTEXT_OFFSET + 22]
-                take = gain >= 1.0 or gain >= 0.0 and points >= 0.30
-                result.append(1 if take and 1 in legal else 0 if 0 in legal else 1)
-            else:
-                held = [face for face in range(52) if values[face * _CARD_WIDTH + 10] > 0]
-                result.append(max(legal, key=lambda action: (
-                    values[(action - 2) * _CARD_WIDTH + 19],
-                    values[(action - 2) * _CARD_WIDTH + 20]
-                    + 0.35 * values[(action - 2) * _CARD_WIDTH + 21]
-                    - 0.4 * _next_wanted(values, action - 2, held),
-                )))
-        return result
-
-
-class GreedyPolicy:
-    def __init__(self, network) -> None:
-        self.network = network
-        self.game_config = getattr(network, "game_config", None)
-
-    def act(self, observation: Observation, rng: random.Random) -> int:
-        return self.act_features([encode(observation)], [rng])[0]
-
-    def act_features(self, features: Sequence[Features], rngs: Sequence[random.Random]) -> list[int]:
-        if len(features) != len(rngs):
-            raise ValueError("each feature row needs its own RNG")
-        if not features:
-            return []
-        device = next(self.network.parameters()).device
-        return greedy_actions(self.network, collate(features, device)).tolist()
-
-
-class CheckpointPolicy(GreedyPolicy):
-    def __init__(self, path: str) -> None:
-        if not isinstance(path, str):
-            raise TypeError("path must be a str")
-        if not path:
-            raise ValueError("path must not be empty")
-        self.path = path
-        self._network = None
-        self._game_config: Optional[GameConfig] = None
-
-    @property
-    def network(self):
-        self._load()
-        return self._network
-
-    @property
-    def game_config(self) -> GameConfig:
-        self._load()
-        if self._game_config is None:
-            raise RuntimeError("checkpoint did not provide a game config")
-        return self._game_config
-
-    def _load(self) -> None:
-        if self._network is not None:
-            return
-        network, game_config, _ = load_checkpoint(self.path)
-        network.eval()
-        self._network = network
-        self._game_config = game_config
-
-
-def resolve_policy(model: str) -> Policy:
-    builtins = {"random": RandomPolicy, "heuristic": HeuristicPolicy}
-    return builtins[model]() if model in builtins else CheckpointPolicy(model)
-
-
-class EpsilonPolicy(GreedyPolicy):
-    def __init__(self, network, epsilon: float) -> None:
-        if (
-            isinstance(epsilon, bool)
-            or not isinstance(epsilon, Real)
-            or not math.isfinite(float(epsilon))
-            or not 0.0 <= float(epsilon) <= 1.0
-        ):
-            raise ValueError("epsilon must be a finite number in [0, 1]")
-        self.network = network
-        self.epsilon = float(epsilon)
-        self.game_config = getattr(network, "game_config", None)
-        self.last_greedy: list[bool] = []
-
-    def act(self, observation: Observation, rng: random.Random) -> int:
-        return self.act_features([encode(observation)], [rng])[0]
-
-    def act_features(
-        self, features: Sequence[Features], rngs: Sequence[random.Random],
-        epsilons: Sequence[float] | None = None,
-    ) -> list[int]:
-        if len(features) != len(rngs):
-            raise ValueError("each feature row needs its own RNG")
-        if epsilons is not None and len(epsilons) != len(features):
-            raise ValueError("each feature row needs its own epsilon")
-        actions, greedy_rows = [0] * len(features), []
-        self.last_greedy = [True] * len(features)
-        for row, (record, rng) in enumerate(zip(features, rngs)):
-            epsilon = self.epsilon if epsilons is None else epsilons[row]
-            if rng.random() < epsilon:
-                actions[row] = rng.choice(legal_actions(record))
-                self.last_greedy[row] = False
-            else:
-                greedy_rows.append(row)
-        if greedy_rows:
-            device = next(self.network.parameters()).device
-            selected = greedy_actions(
-                self.network, collate([features[row] for row in greedy_rows], device),
-            ).tolist()
-            for row, action in zip(greedy_rows, selected):
-                actions[row] = action
+            prefix = torch.empty((len(turns), 0, FIELDS), dtype=torch.uint8, device=self.device)
+        suffix = torch.frombuffer(bytearray(b"".join(row.suffix for row in encoded)), dtype=torch.uint8)
+        bits = torch.tensor([row.legal for row in encoded], device=self.device)
+        legal = action_mask(bits, SCHEMA.num_actions)
+        with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.bf16):
+            heads = self.policy.network.step(
+                self.cache, torch.tensor([stream.row for stream in streams], device=self.device),
+                prefix, suffix.reshape(len(turns), SCHEMA.suffix_tokens, FIELDS).to(self.device),
+                legal, append_lengths=torch.tensor([len(row.prefix) // FIELDS for row in encoded], device=self.device),
+            )
+        actions, logps = [], []
+        if self.policy.sample:
+            mix = self.policy.uniform_mix
+            probabilities = ((1 - mix) * heads.log_policy.exp() + mix * legal / legal.sum(-1, keepdim=True)).tolist()
+            for turn, row in zip(turns, probabilities):
+                choices = [a for a, p in enumerate(row) if p > 0]
+                weights = [row[a] for a in choices]
+                action = turn.rng.choices(choices, weights=weights, k=1)[0]
+                actions.append(action)
+                logps.append(math.log(row[action] / sum(weights)))
+        else:
+            actions = heads.log_policy.argmax(-1).tolist()
+            logps = [0.0] * len(actions)
+        for stream, row, action, logp in zip(streams, encoded, actions, logps):
+            stream.events = row.events
+            if stream.trace is not None:
+                stream.trace.prefix.extend(row.prefix)
+                stream.trace.suffix.extend(row.suffix)
+                stream.trace.cut.append(row.cut)
+                stream.trace.legal.append(row.legal)
+                stream.trace.action.append(action)
+                stream.trace.logp.append(logp)
         return actions
+
+    def finish(self, stream: int) -> SeatTrace | None:
+        state = self.streams.pop(stream, None)
+        if state is None:
+            return None
+        self.cache.reset(state.row)
+        self.free_rows.append(state.row)
+        return state.trace.seal() if state.trace is not None else None
 
 
 @dataclass(frozen=True)
 class Deal:
     seed: int
     seats: tuple[int, ...]
-    players: int
-    record_seats: frozenset[int] = frozenset()
+    curriculum: int = 0
+    warm_start: bool = False
 
-
-@dataclass
-class _Match:
-    env: MultiplayerEnv
-    rngs: tuple[random.Random, ...]
-    decisions: list[list[Decision]]
-    action_count: int = 0
+    @property
+    def players(self) -> int:
+        return len(self.seats)
 
 
 @dataclass(frozen=True)
 class MatchResult:
-    seed: int
-    winner: Optional[int]
-    terminal_reason: str
-    seat_turns: Tuple[int, ...]
+    deal: Deal
     action_count: int
+    seat_turns: tuple[int, ...]
     stock_remaining: int
     telemetry: MatchTelemetry
-    trajectories: Tuple[Tuple[Decision, ...], ...]
-    terminal_snapshot: Optional[TerminalSnapshot] = None
-    outcome: Optional[DealOutcome] = None
+    outcome: DealOutcome
+    traces: tuple[SeatTrace | None, ...]
+
+    @property
+    def winner(self) -> int | None:
+        return self.outcome.winner
+
+    @property
+    def terminal_reason(self) -> str:
+        return self.outcome.ending
+
+
+@dataclass
+class _Opened:
+    policy: Policy
+    actor: Actor
+    streams: int = 0
+
+
+@dataclass
+class _Table:
+    deal: Deal
+    env: PappluEnv | MultiplayerEnv
+    actors: tuple[_Opened, ...]
+    streams: tuple[int, ...]
+    rngs: tuple[Random, ...]
+    action_count: int = 0
+    solo_draws: list[int] = field(default_factory=lambda: [0, 0])
+
+    @staticmethod
+    def start(deal: Deal, game: GameConfig, actors: tuple[_Opened, ...], index: int) -> _Table:
+        if type(deal.curriculum) is not int or not 0 <= deal.curriculum <= game.cards_in_hand:
+            raise ValueError("curriculum must be between zero and the hand size")
+        if (deal.curriculum or deal.warm_start) and deal.players != 1:
+            raise ValueError("only solo deals support curriculum or discard puzzles")
+        if deal.curriculum and deal.warm_start:
+            raise ValueError("choose curriculum or a discard puzzle, not both")
+        if deal.players == 1:
+            env = PappluEnv(game)
+            if deal.curriculum:
+                env.reset_curriculum(deal.curriculum, deal.seed)
+            elif deal.warm_start:
+                env.reset_warm_start(deal.seed)
+            else:
+                env.reset(deal.seed)
+        else:
+            env = MultiplayerEnv(MatchConfig(game, deal.players))
+            env.reset(deal.seed)
+        return _Table(
+            deal, env, actors, tuple(index * 6 + seat for seat in range(deal.players)),
+            tuple(Random(f"{deal.seed}:{seat}") for seat in range(deal.players)),
+        )
+
+    def turn(self) -> tuple[_Opened, Turn]:
+        seat = self.env.view().current_seat if isinstance(self.env, MultiplayerEnv) else 0
+        observation = self.env.observe()
+        return self.actors[seat], Turn(self.streams[seat], observation, self.rngs[seat], legal_mask(observation))
+
+    def step(self, turn: Turn, action: int, game: GameConfig) -> MatchResult | None:
+        self.action_count += 1
+        state = self.env.step(action)
+        if isinstance(state, Observation) and turn.observation.phase is Phase.DRAW:
+            self.solo_draws[action] += 1
+        if not state.done:
+            return None
+        if isinstance(state, Observation):
+            winner = 0 if state.won else None
+            ending = "win" if state.won else "turns_exhausted"
+            snapshot = TerminalSnapshot((state.hand,), state.joker)
+            remaining = state.turns_remaining,
+            telemetry = MatchTelemetry((self.solo_draws[0],), (self.solo_draws[1],), ())
+        else:
+            winner, ending = state.winner, state.terminal_reason
+            snapshot = self.env.terminal_snapshot()
+            remaining, telemetry = state.turns_remaining, self.env.telemetry()
+        outcome = DealOutcome.score(snapshot, winner, ending, game.required_sequences, game.cards_in_hand)
+        traces = tuple(actor.actor.finish(stream) for actor, stream in zip(self.actors, self.streams))
+        turns = tuple(game.max_turns - count for count in remaining)
+        return MatchResult(self.deal, self.action_count, turns, state.stock_remaining, telemetry, outcome, traces)
 
 
 def run_matches(
-    deals: Sequence[Deal], policies: Sequence[Policy], game: GameConfig,
-    deadline: Optional[float] = None, *, record_terminal: bool = False, score_outcome: bool = True,
-) -> list[MatchResult]:
-    if not isinstance(game, GameConfig):
-        raise TypeError("game must be a GameConfig")
-    if type(record_terminal) is not bool:
-        raise TypeError("record_terminal must be a boolean")
-    if type(score_outcome) is not bool:
-        raise TypeError("score_outcome must be a boolean")
-    if deadline is not None and (
-        isinstance(deadline, bool) or not isinstance(deadline, Real) or not math.isfinite(float(deadline))
-    ):
-        raise ValueError("deadline must be a finite monotonic timestamp")
-    matches = []
-    for deal in deals:
-        if type(deal.seed) is not int:
-            raise TypeError("seed must be an int")
-        config = MatchConfig(game=game, players=deal.players)
-        if len(deal.seats) != deal.players or any(
-            type(index) is not int or not 0 <= index < len(policies) for index in deal.seats
-        ):
-            raise ValueError("deal seats must select one policy per player")
-        if not isinstance(deal.record_seats, frozenset) or any(
-            type(seat) is not int or not 0 <= seat < deal.players for seat in deal.record_seats
-        ):
-            raise ValueError("record_seats must name seats in the deal")
-        lineup = [policies[index] for index in deal.seats]
-        for policy in lineup:
-            if not callable(getattr(policy, "act", None)):
-                raise TypeError("policies must define act")
-        _validate_policy_configs(lineup, game)
-        env = MultiplayerEnv(config)
-        env.reset(deal.seed)
-        matches.append(_Match(
-            env, tuple(
-                random.Random(deal.seed ^ ((seat + 1) * 0x9E3779B97F4A7C15))
-                for seat in range(deal.players)
-            ), [[] for _ in range(deal.players)],
-        ))
-    while any(not match.env.view().done for match in matches):
-        _check_deadline(deadline)
-        groups = {}
-        for index, (deal, match) in enumerate(zip(deals, matches)):
-            view = match.env.view()
-            if view.done:
+    deals: Iterable[Deal], policies: Sequence[Policy] | Callable[[Deal], Sequence[Policy]],
+    game: GameConfig, *, tables: int = 64, stop: Callable[[], bool] = lambda: False,
+) -> Iterator[MatchResult]:
+    if type(tables) is not int or tables < 1:
+        raise ValueError("tables must be a positive integer")
+    validate_game(game)
+    queue = iter(enumerate(deals))
+    opened: dict[int, _Opened] = {}
+    live: list[_Table] = []
+    while not stop():
+        while len(live) < tables and not stop():
+            item = next(queue, None)
+            if item is None:
+                break
+            index, deal = item
+            options = policies(deal) if callable(policies) else policies
+            if not 1 <= deal.players <= 6 or any(type(i) is not int or not 0 <= i < len(options) for i in deal.seats):
+                raise ValueError("invalid deal seating")
+            actors = []
+            for seat in deal.seats:
+                policy = options[seat]
+                key = id(policy)
+                if key not in opened:
+                    if policy.game is not None and policy.game != game:
+                        raise ValueError("policy game config does not match the deal")
+                    opened[key] = _Opened(policy, policy.open())
+                actor = opened[key]
+                actor.streams += 1
+                actors.append(actor)
+            live.append(_Table.start(deal, game, tuple(actors), index))
+        if not live or stop():
+            return
+        groups: dict[int, list[tuple[_Table, Turn]]] = {}
+        for table in live:
+            actor, turn = table.turn()
+            groups.setdefault(id(actor.policy), []).append((table, turn))
+        decisions = []
+        for key, group in groups.items():
+            turns = [turn for _, turn in group]
+            actions = opened[key].actor.act(turns)
+            if len(actions) != len(turns):
+                raise ValueError("policy must return one action per decision")
+            for (table, turn), action in zip(group, actions):
+                if type(action) is not int or not 0 <= action < SCHEMA.num_actions or not turn.legal & (1 << action):
+                    raise ValueError("policy chose an illegal action")
+                decisions.append((table, turn, action))
+        live = []
+        for table, turn, action in decisions:
+            result = table.step(turn, action, game)
+            if result is None:
+                live.append(table)
                 continue
-            seat = view.current_seat
-            obs = match.env.observe()
-            features = encode(obs)
-            policy = policies[deal.seats[seat]]
-            groups.setdefault(id(policy), (policy, []))[1].append((index, seat, obs, features))
-        chosen = []
-        for policy, rows in groups.values():
-            rngs = [matches[index].rngs[seat] for index, seat, _, _ in rows]
-            if callable(getattr(policy, "act_features", None)):
-                actions = policy.act_features([row[3] for row in rows], rngs)
-            else:
-                actions = [policy.act(row[2], rng) for row, rng in zip(rows, rngs)]
-            if len(actions) != len(rows):
-                raise ValueError("batched policy returned the wrong number of actions")
-            chosen.extend((*row, action) for row, action in zip(rows, actions))
-        _check_deadline(deadline)
-        for index, seat, obs, features, action in chosen:
-            match, deal = matches[index], deals[index]
-            if seat in deal.record_seats:
-                match.decisions[seat].append(Decision(obs, features, action))
-            match.env.step(action)
-            match.action_count += 1
-    results = []
-    for deal, match in zip(deals, matches):
-        _check_deadline(deadline)
-        view = match.env.view()
-        if view.terminal_reason is None:
-            raise RuntimeError("terminal match has no reason")
-        snapshot = match.env.terminal_snapshot() if record_terminal or score_outcome else None
-        outcome = (
-            DealOutcome.score(snapshot, view.winner, view.terminal_reason, game.required_sequences)
-            if score_outcome else None
+            for actor in table.actors:
+                actor.streams -= 1
+                if not actor.streams:
+                    del opened[id(actor.policy)]
+            yield result
+
+
+@dataclass(frozen=True)
+class HeadToHead:
+    players: int
+    deals: int
+    advantage: float
+    win_rate: float
+    opponent_win_rate: float
+
+
+def head_to_head(
+    candidate: Policy, opponent: Policy, game: GameConfig, players: int, deals: int, seed: int, *,
+    tables: int = 64, stop: Callable[[], bool] = lambda: False,
+) -> HeadToHead:
+    if type(players) is not int or not 1 <= players <= 6 or type(deals) is not int or deals < 1:
+        raise ValueError("head-to-head needs a positive deal count and 1..6 players")
+    if players == 1:
+        queue = (Deal(seed + i, (policy,)) for i in range(deals) for policy in (0, 1))
+    else:
+        queue = (
+            Deal(seed + i, tuple(int(seat != candidate_seat) for seat in range(players)))
+            for i in range(deals) for candidate_seat in range(players)
         )
-        _check_deadline(deadline)
-        results.append(MatchResult(
-            seed=deal.seed, winner=view.winner, terminal_reason=view.terminal_reason,
-            seat_turns=tuple(game.max_turns - remaining for remaining in view.turns_remaining),
-            action_count=match.action_count, stock_remaining=view.stock_remaining,
-            telemetry=match.env.telemetry(),
-            trajectories=tuple(tuple(decisions) for decisions in match.decisions),
-            terminal_snapshot=snapshot if record_terminal else None,
-            outcome=outcome,
-        ))
-    return results
+    wins, totals, utility = [0, 0], [0, 0], [0.0, 0.0]
+    count = 0
+    for result in run_matches(queue, (candidate, opponent), game, tables=tables, stop=stop):
+        count += 1
+        for seat, (policy, score) in enumerate(zip(result.deal.seats, result.outcome.utilities())):
+            totals[policy] += 1
+            wins[policy] += int(result.winner == seat)
+            utility[policy] += score
+    if count != deals * max(2, players):
+        raise InterruptedError("head-to-head stopped before completing the paired deals")
+    advantage = utility[0] / totals[0]
+    if players == 1:
+        advantage -= utility[1] / totals[1]
+    return HeadToHead(players, count, advantage, wins[0] / totals[0], wins[1] / totals[1])
 
 
-def play_match(
-    policies: Sequence[Policy],
-    config: MatchConfig,
-    seed: int,
-    record_trajectories: bool = False,
-    deadline: Optional[float] = None,
-    *,
-    record_terminal: bool = False,
-    score_outcome: bool = True,
-) -> MatchResult:
-    if not isinstance(config, MatchConfig):
-        raise TypeError("config must be a MatchConfig")
-    if len(policies) != config.players:
-        raise ValueError(
-            "expected %d policies, got %d" % (config.players, len(policies))
-        )
-    if type(record_trajectories) is not bool:
-        raise TypeError("record_trajectories must be a boolean")
-    return run_matches(
-        [Deal(seed, tuple(range(config.players)), config.players,
-              frozenset(range(config.players)) if record_trajectories else frozenset())],
-        policies, config.game, deadline, record_terminal=record_terminal, score_outcome=score_outcome,
-    )[0]
+def resolve_policy(model: str | Path, *, precision: str = "fp32") -> Policy:
+    if model == "random":
+        return RandomPolicy()
+    if model == "heuristic":
+        raise ValueError("heuristic policy is no longer supported; use random or a checkpoint")
+    return CheckpointPolicy(model, precision=precision)
 
 
-def rotated_matches(
-    policies: Sequence[Policy],
-    config: MatchConfig,
-    seed: int,
-    record_trajectories: bool = False,
-) -> List[MatchResult]:
-    """Run one shared seed per cyclic seating.
-
-    Result index ``r`` seats original policy ``(r + seat) % players`` at
-    ``seat``. A winning seat maps back to ``(r + winner) % players``.
-    """
-    lineup = tuple(policies)
-    if len(lineup) != config.players:
-        raise ValueError(
-            "expected %d policies, got %d" % (config.players, len(lineup))
-        )
-    return run_matches([
-        Deal(
-            seed, tuple((rotation + seat) % config.players for seat in range(config.players)),
-            config.players, frozenset(range(config.players)) if record_trajectories else frozenset(),
-        )
-        for rotation in range(config.players)
-    ], lineup, config.game)
-
-
-def _validate_policy_configs(
-    policies: Sequence[Policy], match_game: GameConfig
-) -> None:
-    for seat, policy in enumerate(policies):
-        policy_config = getattr(policy, "game_config", None)
-        if policy_config is None:
-            network = getattr(policy, "network", None)
-            policy_config = getattr(network, "game_config", None)
-        if policy_config is None:
-            continue
-        if not isinstance(policy_config, GameConfig):
-            raise TypeError("policy %d game_config must be a GameConfig" % seat)
-        expected = (
-            match_game.num_decks,
-            match_game.cards_in_hand,
-            match_game.required_sequences,
-        )
-        actual = (
-            policy_config.num_decks,
-            policy_config.cards_in_hand,
-            policy_config.required_sequences,
-        )
-        if actual != expected:
-            raise ValueError(
-                "policy %d game config %r does not match match config %r"
-                % (seat, actual, expected)
-            )
-
-
-def _check_deadline(deadline: Optional[float]) -> None:
-    if deadline is not None and time.monotonic() >= deadline:
-        raise MatchInterrupted("match deadline reached")
+def match_game(policies: Sequence[Policy], max_turns: int | None) -> GameConfig:
+    game = next((policy.game for policy in policies if policy.game is not None), GameConfig(max_turns=60))
+    return game if max_turns is None else replace(game, max_turns=max_turns)
