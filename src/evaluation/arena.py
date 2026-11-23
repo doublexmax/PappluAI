@@ -12,18 +12,14 @@ from torch import Tensor
 
 from src.evaluate import is_valid_hand, pure_sequence_upper_bound
 from src.game.environment import (
-    ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, GameConfig, Observation, PappluEnv, Phase, discard_action,
+    ACTION_TAKE_DISCARD, GameConfig, Observation, PappluEnv, Phase, discard_action,
 )
-from src.game.information import EventKind, InformationEvent
 from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv, TerminalSnapshot
 from src.game.outcome import DealOutcome
-from src.model.encoding import FIELDS, SCHEMA, Encoded, encode, legal_mask, validate_game
-from src.model.network import GameTransformer, Heads, action_mask, load_checkpoint
+from src.model.encoding import FIELDS, SCHEMA, encode, legal_mask, validate_game
+from src.model.network import GameTransformer, action_mask, load_checkpoint
 
 
-_DISCARD_CANDIDATES = 6
-_VALUE_WEIGHT = 3.0
-_UNSEARCHED_PENALTY = 0.15
 _QUANTIZED_POLICY = Struct(f"={SCHEMA.num_actions}H")
 
 
@@ -36,6 +32,7 @@ class SeatTrace:
     action: bytes
     behavior_logp: tuple[float, ...]
     target_probs: bytes
+    forced: bytes
 
 
 @dataclass(frozen=True)
@@ -119,11 +116,12 @@ class _TraceDraft:
     action: bytearray = field(default_factory=bytearray)
     logp: list[float] = field(default_factory=list)
     target_probs: bytearray = field(default_factory=bytearray)
+    forced: bytearray = field(default_factory=bytearray)
 
     def seal(self) -> SeatTrace:
         return SeatTrace(
             bytes(self.prefix), bytes(self.suffix), tuple(self.cut), tuple(self.legal),
-            bytes(self.action), tuple(self.logp), bytes(self.target_probs),
+            bytes(self.action), tuple(self.logp), bytes(self.target_probs), bytes(self.forced),
         )
 
 
@@ -149,24 +147,6 @@ def _winning_discards(obs: Observation, hand: tuple[int, ...], legal: int) -> It
             yield discard_action(face)
 
 
-def _afterstate(obs: Observation, action: int) -> Encoded:
-    if obs.phase is Phase.DRAW:
-        face = obs.discard_pile[-1]
-        hand, pile = _edit_hand(obs.hand, face, 1), obs.discard_pile[:-1]
-        phase, kind, remaining = Phase.DISCARD, EventKind.TAKE_DISCARD, obs.turns_remaining
-        size = obs.config.cards_in_hand + 1
-    else:
-        face = action - discard_action(0)
-        hand, pile = _edit_hand(obs.hand, face, -1), (*obs.discard_pile, face)
-        phase, kind, remaining = Phase.DRAW, EventKind.DISCARD, obs.turns_remaining - 1
-        size = obs.config.cards_in_hand
-    own = replace(obs.players[0], hand_size=size, turns_remaining=remaining)
-    event = InformationEvent(kind, 0, size, remaining, obs.stock_remaining, 0, face, obs.discard_top)
-    view = replace(obs, hand=hand, discard_pile=pile, phase=phase, turns_remaining=remaining,
-                   players=(own, *obs.players[1:]), history=(event,))
-    return encode(view, since=1)
-
-
 class _TransformerActor:
     def __init__(self, policy: TransformerPolicy) -> None:
         self.policy = policy
@@ -187,49 +167,30 @@ class _TransformerActor:
             self.streams[key] = _Stream(row, _TraceDraft() if self.policy.record else None)
         return self.streams[key]
 
-    def _search(self, turns: Sequence[Turn], rows: Tensor, legal: Tensor, heads: Heads) -> tuple[Tensor, list[int]]:
-        prior = heads.log_policy
-        logits = prior.clone()
-        top = prior.topk(_DISCARD_CANDIDATES, dim=-1).indices.tolist()
-        candidates: list[tuple[int, int, Encoded]] = []
-        forced = []
+    def _search(self, turns: Sequence[Turn], prior: Tensor) -> tuple[Tensor, set[int]]:
+        log_policy = prior
+        forced: set[int] = set()
         for i, turn in enumerate(turns):
             obs = turn.observation
             if obs.phase is Phase.DISCARD:
                 wins = list(_winning_discards(obs, obs.hand, turn.legal))
-                if wins:
-                    logits[i].fill_(-torch.inf)
-                    logits[i, wins] = 0
-                    forced.append(i)
-                    continue
-                logits[i] += _VALUE_WEIGHT * (heads.value[i] - _UNSEARCHED_PENALTY)
-                candidates.extend(
-                    (i, action, _afterstate(obs, action)) for action in top[i] if turn.legal & (1 << action)
-                )
-            elif turn.legal == ((1 << ACTION_DRAW_STOCK) | (1 << ACTION_TAKE_DISCARD)):
+            elif obs.phase is Phase.DRAW and turn.legal & (1 << ACTION_TAKE_DISCARD):
                 face = obs.discard_pile[-1]
                 hand = _edit_hand(obs.hand, face, 1)
                 discards = sum(1 << discard_action(face) for face, count in enumerate(hand) if count)
                 retake = 1 << discard_action(face)
                 if discards & ~retake:
                     discards &= ~retake
-                if next(_winning_discards(obs, hand, discards), None) is not None:
-                    logits[i, ACTION_DRAW_STOCK] = math.log(0.01)
-                    logits[i, ACTION_TAKE_DISCARD] = math.log(0.99)
-                    continue
-                logits[i, ACTION_DRAW_STOCK] += _VALUE_WEIGHT * heads.value[i]
-                candidates.append((i, ACTION_TAKE_DISCARD, _afterstate(obs, ACTION_TAKE_DISCARD)))
-        if candidates:
-            indices, actions, encoded = zip(*candidates)
-            index = torch.tensor(indices, device=self.device)
-            action = torch.tensor(actions, device=self.device)
-            suffix = torch.frombuffer(bytearray(b"".join(row.suffix for row in encoded)), dtype=torch.uint8)
-            mask = action_mask(torch.tensor([row.legal for row in encoded], device=self.device), SCHEMA.num_actions)
-            scored = self.policy.network.evaluate_candidates(
-                self.cache, rows[index], suffix.reshape(-1, SCHEMA.suffix_tokens, FIELDS).to(self.device), mask,
-            )
-            logits[index, action] = prior[index, action] + _VALUE_WEIGHT * scored.value
-        return logits.masked_fill(~legal, -torch.inf).log_softmax(-1), forced
+                wins = [ACTION_TAKE_DISCARD] if next(_winning_discards(obs, hand, discards), None) is not None else []
+            else:
+                continue
+            if wins:
+                if not forced:
+                    log_policy = prior.clone()
+                log_policy[i].fill_(-torch.inf)
+                log_policy[i, wins] = -math.log(len(wins))
+                forced.add(i)
+        return log_policy, forced
 
     @torch.inference_mode()
     def act(self, turns: Sequence[Turn]) -> list[int]:
@@ -250,14 +211,15 @@ class _TransformerActor:
                 self.cache, rows, prefix, suffix.reshape(len(turns), SCHEMA.suffix_tokens, FIELDS).to(self.device),
                 legal, append_lengths=torch.tensor([len(row.prefix) // FIELDS for row in encoded], device=self.device),
             )
-            log_policy, forced = self._search(turns, rows, legal, heads) if self.policy.search_ply else (heads.log_policy, [])
+        log_policy, forced = self._search(turns, heads.log_policy) if self.policy.search_ply else (heads.log_policy, set())
         target = log_policy.exp() if self.policy.sample or self.policy.record else None
         actions, logps = [], []
         if self.policy.sample:
             mix = self.policy.uniform_mix
             probabilities = (1 - mix) * target + mix * legal / legal.sum(-1, keepdim=True)
             if forced:
-                probabilities[forced] = target[forced]
+                indices = list(forced)
+                probabilities[indices] = target[indices]
             for turn, row in zip(turns, probabilities.tolist()):
                 choices = [a for a, p in enumerate(row) if p > 0]
                 weights = [row[a] for a in choices]
@@ -278,6 +240,7 @@ class _TransformerActor:
                 stream.trace.action.append(action)
                 stream.trace.logp.append(logp)
                 stream.trace.target_probs.extend(_QUANTIZED_POLICY.pack(*targets[i]))
+                stream.trace.forced.append(i in forced)
         return actions
 
     def finish(self, stream: int) -> SeatTrace | None:

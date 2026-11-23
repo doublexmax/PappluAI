@@ -33,7 +33,7 @@ from src.model.spec import ModelSpec, TokenSchema
 
 
 STATE_VERSION = 16
-ROLLOUT_FORMAT = 3
+ROLLOUT_FORMAT = 4
 VALIDATION_SEED = 30_000_001
 OUTBOX_LIMIT = 8
 LENGTH_BUCKET = 8
@@ -42,7 +42,7 @@ TUNABLE = {
     "actors", "tables", "torch_threads", "actor_threads", "device", "precision", "checkpoint_every",
     "learning_rate", "eta", "sync_every", "plan",
 }
-TUNABLE_PLAN = ("curriculum_share", "curriculum_max_distance")
+TUNABLE_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance")
 
 
 @dataclass(frozen=True)
@@ -99,6 +99,8 @@ class CollectPlan:
                 start = None
                 if rng.random() < self.curriculum_share:
                     start = rng.randint(int(players > 1), self.curriculum_max_distance)
+                    if players == 1:
+                        start = min(start, rng.randint(0, self.curriculum_max_distance))
                 yield Deal(rng.getrandbits(63), (0,) * players, start)
 
 
@@ -124,6 +126,7 @@ class TrainConfig:
     rho_bar: float = 1.0
     c_bar: float = 1.0
     eta: float = 0.01
+    entropy_weight: float = 0.0
     anchor_every: int = 2000
     sync_every: int = 1
     publish_every: int = 25
@@ -148,7 +151,7 @@ class TrainConfig:
                 raise ValueError(f"{name} must be a nonnegative integer")
         for name in (
             "learning_rate", "weight_decay", "grad_clip", "value_weight", "rho_bar",
-            "c_bar", "eta", "promote_margin",
+            "c_bar", "eta", "entropy_weight", "promote_margin",
         ):
             value = getattr(self, name)
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
@@ -201,6 +204,7 @@ class Trajectories:
     action: Tensor
     behavior_logp: Tensor
     target_probs: Tensor
+    forced: Tensor
 
     @property
     def decisions(self) -> int:
@@ -229,6 +233,7 @@ class Trajectories:
             _bytes_tensor(b"".join(row.action for row in traces), (-1,)),
             torch.tensor([logp for row in traces for logp in row.behavior_logp], dtype=torch.float32),
             _bytes_tensor(b"".join(row.target_probs for row in traces), (-1, SCHEMA.num_actions), torch.uint16),
+            _bytes_tensor(b"".join(row.forced for row in traces), (-1,)),
         )
 
     def save(self, path: Path) -> None:
@@ -272,6 +277,7 @@ class Trajectories:
             ("suffix", torch.uint8, (schema.suffix_tokens, schema.fields)), ("decision_end", torch.int64, ()),
             ("cut", torch.int16, ()), ("legal", torch.int64, ()), ("action", torch.uint8, ()),
             ("behavior_logp", torch.float32, ()), ("target_probs", torch.uint16, (schema.num_actions,)),
+            ("forced", torch.uint8, ()),
         ):
             col = getattr(self, name)
             if (
@@ -284,8 +290,12 @@ class Trajectories:
             raise ValueError("invalid rollout player counts")
         if any(len(col) != streams for col in (self.utility, self.prefix_end, self.decision_end)):
             raise ValueError("invalid rollout trajectory column lengths")
-        if any(len(col) != decisions for col in (self.suffix, self.cut, self.legal, self.behavior_logp, self.target_probs)):
+        if any(len(col) != decisions for col in (
+            self.suffix, self.cut, self.legal, self.behavior_logp, self.target_probs, self.forced,
+        )):
             raise ValueError("invalid rollout decision column lengths")
+        if bool((self.forced > 1).any()):
+            raise ValueError("invalid rollout forced flags")
         lengths, prefix_lengths = (
             ends.diff(prepend=ends.new_zeros(1)) for ends in (self.decision_end, self.prefix_end)
         )
@@ -434,6 +444,7 @@ class _SeatTrajectory:
     behavior_logp: Tensor
     utility: Tensor
     target_probs: Tensor
+    forced: Tensor
     anchor: tuple[object, Tensor] | None = field(default=None, init=False)
 
 
@@ -447,6 +458,7 @@ class TrajectoryBatch:
     discount: Tensor
     valid: Tensor
     target_probs: Tensor
+    forced: Tensor
 
     @classmethod
     def pack(cls, seats: tuple[_SeatTrajectory, ...]) -> TrajectoryBatch:
@@ -464,7 +476,7 @@ class TrajectoryBatch:
                             action_mask(pack("legal"), SCHEMA.num_actions))
         targets = pad_sequence([seat.target_probs.float() for seat in seats], batch_first=True)
         targets /= targets.sum(-1, keepdim=True).clamp_min(1)
-        return cls(seats, tokens, action, pack("behavior_logp"), reward, discount, valid, targets)
+        return cls(seats, tokens, action, pack("behavior_logp"), reward, discount, valid, targets, pack("forced").bool())
 
 
 @dataclass(frozen=True)
@@ -483,7 +495,7 @@ class _BatchIndex:
             seat = _SeatTrajectory(
                 batch.prefix[prefix_start:prefix_end], batch.suffix[span], batch.cut[span],
                 batch.legal[span], batch.action[span], batch.behavior_logp[span], batch.utility[row],
-                batch.target_probs[span],
+                batch.target_probs[span], batch.forced[span],
             )
             buckets.setdefault((players, (end - start - 1) // LENGTH_BUCKET), []).append(seat)
             start, prefix_start = end, prefix_end
@@ -737,7 +749,7 @@ class Learner:
         taken = log_pi.gather(-1, action.unsqueeze(-1)).squeeze(-1)
         ratio = taken.detach() - behavior
         values = heads.value
-        targets, _ = vtrace(
+        targets, advantage = vtrace(
             ratio, reward, discount,
             values, values.new_zeros(values.size(0)), rho_bar=config.rho_bar, c_bar=config.c_bar,
         )
@@ -752,9 +764,12 @@ class Learner:
 
         kl = per_trajectory(divergence)
         entropy = per_trajectory(entropy)
-        policy_loss = -per_trajectory((batch.target_probs.to(device) * masked_log_pi).sum(-1))
+        ce_step = -(batch.target_probs.to(device) * masked_log_pi).sum(-1)
+        pg_step = -(advantage * taken)
+        step_policy_loss = torch.where(batch.forced.to(device), ce_step, pg_step)
+        policy_loss = per_trajectory(step_policy_loss)
         value_loss = 0.5 * per_trajectory((targets - values).square())
-        loss = policy_loss + config.value_weight * value_loss + config.eta * kl
+        loss = policy_loss + config.value_weight * value_loss + config.eta * kl - config.entropy_weight * entropy
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if not skip_grad_sync:
@@ -848,7 +863,7 @@ class Trainer:
             if any(getattr(config, k) != getattr(saved, k) for k in overrides.keys() - TUNABLE):
                 raise ValueError("cannot change training config on resume")
             if config.plan != replace(saved.plan, **{key: getattr(config.plan, key) for key in TUNABLE_PLAN}):
-                raise ValueError("cannot change the collection plan on resume except curriculum share and distance")
+                raise ValueError("cannot change the collection plan on resume except players, curriculum share, and distance")
             spec = ModelSpec.from_dict(state["spec"])
             run = _run_id(state["run_id"])
         else:

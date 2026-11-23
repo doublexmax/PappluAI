@@ -21,11 +21,11 @@ _INTS = (
     "eval_deals", "seed",
 )
 _FLOATS = ("learning_rate", "weight_decay", "grad_clip", "value_weight", "eta",
-           "rho_bar", "c_bar", "promote_margin")
+           "entropy_weight", "rho_bar", "c_bar", "promote_margin")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train GameTransformer with policy distillation and V-trace values.")
+    parser = argparse.ArgumentParser(description="Train GameTransformer with terminal-win distillation and V-trace.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--output-dir", type=Path, help="start or resume a learner (supports torchrun on CPU)")
     mode.add_argument("--collect", type=Path, help="write completed batches to this inbox")

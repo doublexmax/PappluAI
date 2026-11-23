@@ -33,6 +33,7 @@ def _seat(rank):
         torch.tensor([HEADER_TOKENS + 1, HEADER_TOKENS + 2], dtype=torch.int16), torch.full((2,), 12),
         torch.full((2,), 2 + rank, dtype=torch.uint8), torch.full((2,), -math.log(2)),
         torch.tensor(1.0 if rank == 0 else -0.5), targets.to(torch.uint16),
+        torch.tensor([0, 1], dtype=torch.uint8),
     )
 
 
@@ -59,7 +60,7 @@ def _train_rank(base):
     Trajectories(
         0, 1, trainer.run_id, torch.ones(1, dtype=torch.uint8), seat.utility[None],
         seat.prefix, torch.tensor([len(seat.prefix)]), seat.suffix, torch.tensor([2]), seat.cut,
-        seat.legal, seat.action, seat.behavior_logp, seat.target_probs,
+        seat.legal, seat.action, seat.behavior_logp, seat.target_probs, seat.forced,
     ).save(trainer.inbox / "batch-test.pt")
     assert trainer.run(stop=lambda: rank == 1 and trainer.learner.version == 2, max_updates=3, max_seconds=20) == "stopped"
     assert not dist.is_initialized()
@@ -73,12 +74,13 @@ def _train_post_local_rank(base):
     trainer = Trainer.open(root, {
         "actors": 0, "torch_threads": 1, "batch_size": 1, "min_buffer_decisions": 2,
         "sync_every": 4, "publish_every": 3, "anchor_every": 3, "eval_every": 0, "precision": "fp32",
+        "plan": {"player_counts": (1, 2)},
     }, initial=root / "initial.pt")
     seat = _seat(rank)
     Trajectories(
         0, 1, trainer.run_id, torch.ones(1, dtype=torch.uint8), seat.utility[None],
         seat.prefix, torch.tensor([len(seat.prefix)]), seat.suffix, torch.tensor([2]), seat.cut,
-        seat.legal, seat.action, seat.behavior_logp, seat.target_probs,
+        seat.legal, seat.action, seat.behavior_logp, seat.target_probs, seat.forced,
     ).save(trainer.inbox / "batch-test.pt")
     references = [
         Learner(copy.deepcopy(trainer.learner.online), replace(trainer.config, anchor_every=100))
@@ -159,14 +161,16 @@ class TestDistributedLearner(unittest.TestCase):
             metrics = [json.loads(row) for row in (primary / "metrics.jsonl").read_text().splitlines()]
             self.assertEqual([(row["version"], row["trained_decisions"]) for row in metrics], [(4, 16), (6, 24)])
             before = torch.load(primary / "latest-state.pt", weights_only=True)
+            self.assertEqual(before["config"]["plan"]["player_counts"], (1, 2))
             resumed = Trainer.open(primary, {
                 "learning_rate": 2e-4, "eta": 0.02, "sync_every": 1,
-                "plan": {"curriculum_share": 0.25, "curriculum_max_distance": 12},
+                "plan": {"player_counts": (1, 2, 3, 4), "curriculum_share": 0.25, "curriculum_max_distance": 12},
             })
             self.assertEqual(resumed.learner.optimizer.param_groups[0]["lr"], 2e-4)
             self.assertEqual((resumed.config.eta, resumed.config.sync_every), (0.02, 1))
             self.assertEqual((resumed.config.plan.curriculum_share, resumed.config.plan.curriculum_max_distance),
                              (0.25, 12))
+            self.assertEqual(resumed.config.plan.player_counts, (1, 2, 3, 4))
             self.assertEqual(resumed.run_id, before["run_id"])
             self.assertEqual(resumed.learner.version, 6)
             moments = resumed.learner.optimizer.state_dict()["state"]

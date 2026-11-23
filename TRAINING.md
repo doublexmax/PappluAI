@@ -20,7 +20,7 @@ python -m src.cli.train --output-dir runs/smoke --max-turns 2 \
 python -m src.cli.train --output-dir runs/smoke --max-updates 2 --max-seconds 90
 ```
 
-Check `status.json` for `status: max_updates` and `version: 2`. The update limit is an absolute policy revision, not a count of additional updates. Reuse the directory to resume. You can change the actor count, table count, threads, device, precision, learning rate, and synchronization cadence. A new `--learning-rate` replaces the rate saved with the AdamW state without resetting its moments. You can also change `--curriculum-share` and `--curriculum-max-distance`. The game, model, and other collection settings stay fixed. Restart standalone collectors after a curriculum change.
+Check `status.json` for `status: max_updates` and `version: 2`. The update limit is an absolute policy revision, not a count of additional updates. Reuse the directory to resume. You can change the actor count, table count, threads, device, precision, learning rate, and synchronization cadence. A new `--learning-rate` replaces the rate saved with the AdamW state without resetting its moments. You can also change `--players`, `--curriculum-share`, and `--curriculum-max-distance`. The game, model, and other collection settings stay fixed. Restart standalone collectors after changing the collection plan.
 
 ## Start a full run
 
@@ -30,13 +30,11 @@ python -m src.cli.train --output-dir runs/full21 --max-seconds 3600
 
 The default `GameTransformer` has 2,175,224 parameters. Its four blocks use width 192, six rotary attention heads of width 32, RMSNorm, and a SwiGLU width of 512. It stores weights in checkpoint format 6 and uses the eight-byte Schema 8 tokens. Each actor keeps a key and value cache per seat and batches decisions across its live tables.
 
-Actors play games with one to four seats in rotation, with 64 tables per process by default. Half of starts use the environment curriculum. Solo starts sample a distance from zero through six. Distance zero starts with 22 cards and ends after one discard. Multiplayer starts sample one through six and replace that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Validation and the arena default to cold deals.
+Actors play games with one to four seats in rotation, with 64 tables per process by default. Half of starts use the environment curriculum. Solo starts take the smaller of two uniform draws from zero through six, so short puzzles remain common when the maximum distance increases. Distance zero starts with 22 cards and ends after one discard. Multiplayer starts sample one through six uniformly and replace that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Validation and the arena default to cold deals.
 
-Self-play defaults to `--search-ply 1`. The actor runs the model once at the decision, then scores candidate afterstates against the existing KV cache. It never writes a candidate back to the cache. Papplu rules stay in the actor. The encoder, byte layout, and model weights have the same shape as before.
+Self-play defaults to `--search-ply 1`. The actor uses a pure sequence upper bound to skip declaration checks when the hand cannot meet the quota. It gives equal probability to every legal winning discard. If taking the top discard permits a legal winning discard that turn, it takes the card with probability one. On other decisions it uses the masked neural policy without scoring candidates. At `--search-ply 0` it skips the declaration checks.
 
-On a discard, search checks every legal discard for a declaration. It selects uniformly among winning discards if any exist. Otherwise it scores the six highest-prior legal discards by the sum of log prior and three times the candidate value. Other legal discards use the root value minus `0.15` in place of the candidate value. On a draw with two legal actions, a known pickup that permits a declaration gets `0.99` probability. Otherwise the known pickup uses its afterstate value and the unknown stock draw uses the root value.
-
-Actors sample with a 2% uniform mixture over legal actions, except when a discard wins immediately. Each decision stores the search target before exploration as 54 unsigned 16-bit integers and records the actual behavior log probability. The learner validates target mass and legality on load and normalizes the targets before applying policy cross-entropy.
+Actors sample with a 2% uniform mixture over legal actions, except on forced wins. The rollout records one `uint8` forced flag and the actual behavior log probability for each decision. It stores the policy target as 54 unsigned 16-bit integers before exploration. The learner validates target mass and legality on load. It applies cross-entropy only to forced decisions and uses a V-trace policy gradient on ordinary decisions. `--entropy-weight` adds an entropy bonus and defaults to zero.
 
 The value head uses V-trace with a discount of 0.995 and no terminal bootstrap. A declaration pays the winner `+1`. In multiplayer the other seats split `-1` equally. On a timeout let `f` be the share of the pure sequence quota recorded by `HandPenalty.qualifying_sequences`, capped at 1. A zero quota gives `f = 1`. Solo pays `-1 + 0.60 * f`. Multiplayer pays each seat `-0.50 + 0.30 * (f - mean_of_other_seats)`. The relative term sums to zero, while every seat still gets a negative payoff. The scoreboard still uses exact deadwood.
 
@@ -50,7 +48,7 @@ The learner drops data that exceeds `--max-policy-lag`. By default, each rank sa
 | `inbox/batch-*.pt` | Complete byte-token rollout batches with quantized policy targets awaiting ingestion. |
 | `metrics.jsonl` and `status.json` | Update metrics and run status, including collected and trained decisions, throughput, importance ratio, KL, buffer depth, and inbox depth. |
 
-The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Trainer state and rollouts from before policy distillation are incompatible. To use earlier Schema 8 weights, start a fresh run with `--initial-model` rather than resuming the old state.
+The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Rollout format 4 requires forced flags, so older rollout batches do not load. The model checkpoint format and token schema did not change.
 
 ### Schema 8 tokens
 
@@ -168,7 +166,7 @@ The locked checkpoint played every seat once per deal. All other seats used the 
 
 ## Schema 8 search distillation results
 
-Slice 4k used one `Standard_D16als_v6` in West US 2. Two localhost Gloo ranks used BF16, seven learner threads, and one single-threaded actor with 32 tables per rank. Each rank sampled eight trajectories per update. The run started a new optimizer from the Slice 4j Check-In #7 weights at revision 283 and used `eta=0.01` throughout.
+Slice 4k evaluated the earlier 1-ply policy, which scored candidate afterstates. It used one `Standard_D16als_v6` in West US 2. Two localhost Gloo ranks used BF16, seven learner threads, and one single-threaded actor with 32 tables per rank. Each rank sampled eight trajectories per update. The run started a new optimizer from the Slice 4j Check-In #7 weights at revision 283 and used `eta=0.01` throughout.
 
 | Stage | Budget | Curriculum share | Maximum distance | Learning rate | Revision | Updates | Collected decisions/s | Trained decisions/s | Mean CPU | Mean / peak RAM GiB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

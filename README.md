@@ -207,7 +207,7 @@ See the [training guide](TRAINING.md) to start, resume, or evaluate a run on Azu
 | --- | --- |
 | `src.game` | Environments, public observations, terminal outcomes, and stock handling. |
 | `src.model` | Byte encoding, the game-independent Transformer, and versioned model checkpoints. |
-| `src.training.train` | Self-play collection, lag-bounded replay, policy distillation, and V-trace value updates. |
+| `src.training.train` | Self-play collection, lag-bounded replay, terminal-win distillation, and V-trace policy and value updates. |
 | `src.evaluation` | One batched arena for collection, solo evaluation, and multiplayer evaluation. |
 | `src.checkpoints` | Atomic files and tensor validation. |
 
@@ -215,11 +215,13 @@ The Schema 8 encoder stores eight bytes per token. Its append-only prefix contai
 
 The default model has 2,175,224 parameters in four RMSNorm Transformer blocks. It uses width 192, six rotary attention heads of width 32, and a SwiGLU width of 512. The prefix is causal. Each decision reads its 30-token snapshot and only the prefix available at that decision. The action token supplies 54 base policy logits and a scalar value. Each hand token adds a score to its discard logit through `TokenSchema.pointer_field` before the legal mask. See [CPU training and Gloo synchronization](TRAINING.md#run-several-cpu-learners).
 
-Self-play uses 1-ply search to generate policy targets. The actor checks for immediate declarations and scores known afterstates against the cached prefix. The model learns the search distribution by cross-entropy. At 0-ply it still chooses from a single neural forward pass with a legal-action mask and no declaration check or lookahead.
+Self-play uses 1-ply search only to find immediate winning discards and discard pickups that permit a win that turn. The learner uses cross-entropy on those forced decisions and a V-trace policy gradient on ordinary decisions. The 0-ply policy uses only the neural policy and a legal-action mask. It does not check for declarations before choosing a move.
 
 The declarer earns `+1`. In a declared multiplayer game, the other seats split `-1` equally. Timeout payoffs are negative and depend on progress toward the pure sequence quota, not directly on card points. The scoreboard still uses exact deadwood for placement and ties. Each learner update gives every sampled trajectory equal weight regardless of length.
 
-Seed `600_000` selected Check-In #10 at revision 826 before the run opened held-out seed `920_000`. The tables show valid declarations per game for the Python model, not the browser model.
+### Slice 4k held-out results
+
+Seed `600_000` selected Check-In #10 at revision 826 before the run opened held-out seed `920_000`. These historical tables use the earlier 1-ply policy, which scored candidate afterstates. They show valid declarations per game for the Python model, not the browser model.
 
 | Held-out solo start | Trained 0-ply | Trained 1-ply | RandomPolicy | Rev 0, 0-ply | Rev 0, 1-ply |
 | --- | ---: | ---: | ---: | ---: | ---: |

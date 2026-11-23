@@ -4,7 +4,7 @@ from struct import unpack
 import unittest
 from unittest.mock import patch
 
-from src.game.environment import GameConfig, PappluEnv, Phase, discard_action
+from src.game.environment import ACTION_DRAW_STOCK, ACTION_TAKE_DISCARD, GameConfig, PappluEnv, Phase, discard_action
 from src.model.encoding import HEADER_TOKENS, SCHEMA, legal_mask
 from src.model.spec import ModelSpec
 
@@ -15,7 +15,7 @@ except ImportError:
 
 if torch is not None:
     from src.evaluation.arena import Deal, RandomPolicy, TransformerPolicy, Turn, head_to_head, resolve_policy, run_matches
-    from src.model.network import GameTransformer, Heads
+    from src.model.network import GameTransformer
 
 
 class FirstLegal:
@@ -56,23 +56,26 @@ class TestArena(unittest.TestCase):
             for parameter in model.parameters():
                 parameter.zero_()
             model.policy.bias[[0, discard_action(1)]] = 10
-        blind = TransformerPolicy(model, game).open()
-        search = TransformerPolicy(model, game, search_ply=1, record=True).open()
+        blind = TransformerPolicy(model, game, record=True).open()
+        search = TransformerPolicy(model, game, search_ply=1, record=True, sample=True, uniform_mix=1).open()
         obs = env.observe()
         draw = Turn(0, obs, Random(0), legal_mask(obs))
         with patch("src.evaluation.arena.is_valid_hand", side_effect=AssertionError("0-ply checked the rules")):
             self.assertEqual(blind.act([draw]), [0])
-        self.assertEqual(search.act([draw]), [1])
-        obs = env.step(1)
+        self.assertEqual(search.act([draw]), [ACTION_TAKE_DISCARD])
+        obs = env.step(ACTION_TAKE_DISCARD)
         discard = Turn(0, obs, Random(0), legal_mask(obs))
         self.assertEqual(blind.act([discard]), [discard_action(1)])
         self.assertEqual(search.act([discard]), [discard_action(25)])
         self.assertTrue(env.step(discard_action(25)).won)
         trace = search.finish(0)
         mass = unpack("=108H", trace.target_probs)
-        self.assertEqual(mass[:2], (655, 64880))
+        self.assertEqual(mass[:2], (0, 65535))
         self.assertEqual(sum(mass[54:]), 65535)
         self.assertEqual(mass[54 + discard_action(25)], 65535)
+        self.assertEqual(trace.behavior_logp, (0.0, 0.0))
+        self.assertEqual(trace.forced, bytes((1, 1)))
+        self.assertEqual(blind.finish(0).forced, bytes(2))
 
     def test_search_records_uniform_winning_discards_even_with_exploration(self):
         game = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=1)
@@ -89,8 +92,9 @@ class TestArena(unittest.TestCase):
         self.assertTrue(env.step(action).won)
         self.assertEqual(unpack("=54H", trace.target_probs)[2:6], (32768, 0, 0, 32768))
         self.assertAlmostEqual(trace.behavior_logp[0], -math.log(2))
+        self.assertEqual(trace.forced, bytes((1,)))
 
-    def test_search_uses_afterstate_value_for_nonwinning_actions(self):
+    def test_search_preserves_prior_for_nonwinning_actions(self):
         game = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=2)
         env = PappluEnv(game)
         env._hand = [int(face in (1, 6, 14)) for face in range(52)]
@@ -103,20 +107,17 @@ class TestArena(unittest.TestCase):
                 parameter.zero_()
             model.policy.bias[[0, discard_action(1)]] = 0.5
 
-        def score(cache, rows, suffix, legal):
-            self.assertTrue((cache.length[rows] > HEADER_TOKENS).all())
-            values = torch.where(
-                (suffix[:, 1, 1] == 8) | (suffix[:, 0, 2] == 15), 1.0, -1.0,
-            )
-            return Heads(torch.zeros_like(legal, dtype=torch.float32), values)
-
-        search = TransformerPolicy(model, game, search_ply=1).open()
+        blind = TransformerPolicy(model, game, record=True).open()
+        search = TransformerPolicy(model, game, search_ply=1, record=True).open()
         obs = env.observe()
-        with patch.object(model, "evaluate_candidates", side_effect=score):
-            self.assertEqual(search.act([Turn(0, obs, Random(0), legal_mask(obs))]), [1])
-            obs = env.step(1)
-            self.assertEqual(search.act([Turn(0, obs, Random(0), legal_mask(obs))]), [discard_action(14)])
-        self.assertFalse(env.step(discard_action(14)).won)
+        with patch.object(model, "evaluate_candidates", side_effect=AssertionError("search evaluated afterstates")):
+            for expected in (ACTION_DRAW_STOCK, discard_action(1)):
+                turn = Turn(0, obs, Random(0), legal_mask(obs))
+                self.assertEqual(blind.act([turn]), [expected])
+                self.assertEqual(search.act([turn]), [expected])
+                obs = env.step(expected)
+        self.assertFalse(obs.won)
+        self.assertEqual(search.finish(0), blind.finish(0))
 
     def test_refills_a_fast_solo_slot_before_a_six_seat_table_ends(self):
         actor = FirstLegal()
@@ -143,6 +144,7 @@ class TestArena(unittest.TestCase):
                 self.assertEqual(len(trace.prefix) // 8, trace.cut[-1])
                 self.assertGreater(trace.cut[0], HEADER_TOKENS)
                 self.assertEqual(len(trace.suffix), 240 * len(trace.action))
+                self.assertEqual(trace.forced, bytes(len(trace.action)))
                 for action, legal, logp in zip(trace.action, trace.legal, trace.behavior_logp):
                     self.assertTrue(legal & (1 << action))
                     self.assertAlmostEqual(logp, -math.log(legal.bit_count()))

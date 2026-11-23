@@ -55,6 +55,7 @@ class TestLearner(unittest.TestCase):
             torch.ones(1, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
             torch.tensor([1]), torch.tensor([12]), torch.tensor([2]),
             torch.tensor([-math.log(2)]), torch.tensor(1.0), _expert(1, 3, 49151),
+            torch.ones(1, dtype=torch.uint8),
         )
         stats = learner.update(TrajectoryBatch.pack((row,)))
         self.assertAlmostEqual(stats.policy_loss, math.log(2), places=6)
@@ -63,6 +64,29 @@ class TestLearner(unittest.TestCase):
         torch.testing.assert_close(model.policy.bias.grad[2:4], torch.tensor([0.25, -0.25]), atol=1e-5, rtol=0)
         self.assertGreater(float(model.policy.bias[3]), float(model.policy.bias[2]))
         self.assertGreater(float(model.value.bias), 0.0)
+
+    def test_unforced_action_gets_credit_for_a_later_forced_win(self):
+        model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+        learner = Learner(model, TrainConfig(precision="fp32", entropy_weight=0.002, grad_clip=1000))
+        targets = torch.zeros(2, SCHEMA.num_actions, dtype=torch.int32)
+        targets[0, 3] = targets[1, 5] = 65535
+        row = _SeatTrajectory(
+            torch.ones(2, SCHEMA.fields, dtype=torch.uint8),
+            torch.ones(2, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
+            torch.tensor([1, 2]), torch.tensor([12, 48]), torch.tensor([2, 5]),
+            torch.tensor([-math.log(2), 0]), torch.tensor(1.0), targets.to(torch.uint16),
+            torch.tensor([0, 1], dtype=torch.uint8),
+        )
+        stats = learner.update(TrajectoryBatch.pack((row,)))
+        credit = 0.995 * 0.5
+        self.assertAlmostEqual(stats.policy_loss, (credit + 1) * math.log(2) / 2, places=6)
+        self.assertAlmostEqual(stats.loss, stats.policy_loss + stats.value_loss - 0.002 * math.log(2), places=6)
+        torch.testing.assert_close(
+            model.policy.bias.grad[2:6], torch.tensor([-credit, credit, 1.0, -1.0]) / 4,
+        )
 
     def test_on_policy_terminal_reward_reaches_the_first_decision(self):
         values, _ = vtrace(
@@ -84,6 +108,7 @@ class TestLearner(unittest.TestCase):
                 torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
                 torch.arange(1, n + 1), torch.full((n,), legal), torch.full((n,), 2),
                 torch.full((n,), -math.log(2)), torch.tensor(utility), _expert(n),
+                torch.zeros(n, dtype=torch.uint8),
             )
             for n, legal, utility in ((1, 4, 1.0), (8, 12, -1.0))
         )
@@ -113,6 +138,7 @@ class TestLearner(unittest.TestCase):
                 torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
                 torch.arange(1, n + 1), torch.full((n,), 12), torch.full((n,), 2),
                 torch.full((n,), -math.log(2)), torch.tensor(1.0), _expert(n),
+                torch.ones(n, dtype=torch.uint8),
             )
             for n in (1, 2)
         )

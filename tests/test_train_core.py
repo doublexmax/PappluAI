@@ -46,9 +46,10 @@ class TestTrainingCore(unittest.TestCase):
             self.assertEqual((loaded.version, loaded.episodes, loaded.decisions), (4, 2, 6))
             self.assertEqual(loaded.suffix.shape, (6, 30, 8))
             for name in ("prefix", "suffix", "decision_end", "cut", "action", "behavior_logp", "utility", "legal",
-                         "target_probs"):
+                         "target_probs", "forced"):
                 torch.testing.assert_close(getattr(batch, name), getattr(loaded, name))
             self.assertEqual((loaded.target_probs.dtype, loaded.target_probs.shape), (torch.uint16, (6, 54)))
+            torch.testing.assert_close(loaded.forced, torch.zeros(6, dtype=torch.uint8))
             payload = torch.load(path, weights_only=True)
             payload["schema"]["version"] = 6
             torch.save(payload, path)
@@ -60,6 +61,8 @@ class TestTrainingCore(unittest.TestCase):
                 ({"behavior_logp": torch.full_like(batch.behavior_logp, float("nan"))}, "behavior"),
                 ({"target_probs": batch.target_probs[:, :53]}, "target_probs"),
                 ({"target_probs": torch.zeros_like(batch.target_probs)}, "probability mass"),
+                ({"forced": torch.full_like(batch.forced, 2)}, "forced flags"),
+                ({"forced": batch.forced[:-1]}, "decision column lengths"),
             ):
                 with self.subTest(text=text):
                     replace(batch, **changes).save(path)
@@ -79,12 +82,29 @@ class TestTrainingCore(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "pointer outside the action space"):
                 Trajectories.load(path)
 
+    def test_terminal_win_flag_survives_rollout_and_replay(self):
+        model = GameTransformer(TINY, SCHEMA)
+        policy = TransformerPolicy(model, self.game, search_ply=1, sample=True, record=True)
+        runs = list(run_matches((Deal(9, (0,), curriculum=0),), (policy,), self.game))
+        self.assertEqual((runs[0].winner, runs[0].action_count), (0, 1))
+        batch = Trajectories.from_results(runs, 0, RUN_ID)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "batch-win.pt"
+            batch.save(path)
+            batch = Trajectories.load(path)
+        self.assertEqual(batch.forced.tolist(), [1])
+        buffer = _Buffer(4, 3)
+        self.assertTrue(buffer.add(batch, 0))
+        sample = buffer.sample(Random(55), 1, 0)
+        self.assertEqual((sample.forced.tolist(), sample.reward.tolist()), ([[True]], [[1.0]]))
+
     def test_collection_ladder_includes_solo_puzzles_but_keeps_cold_deals_separate(self):
         plan = CollectPlan(curriculum_share=1.0, curriculum_max_distance=6)
-        deals = list(islice(plan.deals("mastery"), 512))
-        self.assertEqual(deals, list(islice(plan.deals("mastery"), 512)))
+        deals = list(islice(plan.deals("mastery"), 4096))
+        self.assertEqual(deals, list(islice(plan.deals("mastery"), 4096)))
         self.assertEqual([deal.players for deal in deals[:8]], [1, 2, 3, 4, 1, 2, 3, 4])
         self.assertEqual({deal.curriculum for deal in deals if deal.players == 1}, set(range(7)))
+        self.assertGreater(sum(deal.players == 1 and deal.curriculum <= 1 for deal in deals), 420)
         for players in (2, 3, 4):
             self.assertEqual({deal.curriculum for deal in deals if deal.players == players}, set(range(1, 7)))
         cold = list(islice(replace(plan, curriculum_share=0).deals("mastery"), 8))
@@ -106,6 +126,7 @@ class TestTrainingCore(unittest.TestCase):
         self.assertEqual(sample.reward[0, 0], 0.0)
         torch.testing.assert_close(sample.target_probs.sum(-1), torch.ones(1, 2))
         self.assertEqual(sample.target_probs.masked_select(~sample.tokens.legal).count_nonzero(), 0)
+        self.assertEqual(sample.forced.tolist(), [[False, False]])
         buffer.prune(11)
         self.assertEqual(len(buffer), 0)
         self.assertFalse(buffer.add(batch, 11))
@@ -121,7 +142,7 @@ class TestTrainingCore(unittest.TestCase):
             torch.ones(decisions, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
             torch.tensor(lengths).cumsum(0), torch.cat([torch.arange(1, n + 1) for n in lengths]),
             torch.full((decisions,), 2), torch.ones(decisions, dtype=torch.uint8), torch.zeros(decisions),
-            targets.to(torch.uint16),
+            targets.to(torch.uint16), torch.zeros(decisions, dtype=torch.uint8),
         )
         buffer = _Buffer(decisions, 3)
         self.assertTrue(buffer.add(batch, 0))
