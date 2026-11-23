@@ -1,12 +1,10 @@
 import { evaluateHand, minimumPenalty, pureSequenceUpperBound } from "./evaluate.mjs";
-import { qValues } from "./qnet.mjs";
 
 const INITIAL = 0;
 const DRAW_STOCK = 1;
 const TAKE_DISCARD = 2;
 const DISCARD = 3;
 const REFILL = 4;
-const DEFAULT_MAX_TURNS = 60;
 const BEAM = 4;
 
 function countsOf(faces) {
@@ -15,74 +13,33 @@ function countsOf(faces) {
   return counts;
 }
 
-export function observationFromView(view, maxTurns = DEFAULT_MAX_TURNS) {
-  const count = view.players.length;
-  const relative = (seat) => (seat - view.seat + count) % count;
-  const sizes = Array(count).fill(view.rules.cardsInHand);
-  const discards = Array(count).fill(0);
-  const active = Array(count).fill(true);
-  const turns = (seat) => active[seat] ? Math.max(1, maxTurns - discards[seat]) : 0;
-  const neighbour = (seat, direction) => {
-    for (let offset = 1; offset <= count; offset += 1) {
-      const candidate = (seat + direction * offset + count) % count;
-      if (active[candidate]) return candidate;
-    }
-    return seat;
-  };
+export function observationFromView(view) {
+  const playerCount = view.players.length;
   const history = [];
   for (const event of view.events) {
-    if (event.kind === "declare") {
-      sizes[event.seat] -= 1;
-      continue;
-    }
-    if (event.kind === "verdict") {
-      if (!event.valid) active[event.seat] = false;
-      continue;
-    }
-    if (event.kind === "finish") continue;
     let kind;
     const seat = event.kind === "deal" ? view.seat : event.seat;
     if (event.kind === "deal") kind = INITIAL;
-    else if (event.kind === "draw") {
-      kind = event.source === "stock" ? DRAW_STOCK : TAKE_DISCARD;
-      sizes[seat] += 1;
-    } else if (event.kind === "discard") {
-      kind = DISCARD;
-      sizes[seat] -= 1;
-      discards[seat] += 1;
-    } else if (event.kind === "refill") kind = REFILL;
+    else if (event.kind === "draw") kind = event.source === "stock" ? DRAW_STOCK : TAKE_DISCARD;
+    else if (event.kind === "discard") kind = DISCARD;
+    else if (event.kind === "refill") kind = REFILL;
     else continue;
     history.push({
-      kind, actor: relative(seat), handSize: sizes[seat], turnsRemaining: turns(seat),
-      stockRemaining: event.stock, nextPlayer: relative(neighbour(seat, 1)),
+      kind, actor: (seat - view.seat + playerCount) % playerCount,
       face: event.kind === "draw" || event.kind === "discard" ? event.face : null,
       offeredTop: event.kind === "deal" ? event.top : event.kind === "draw" ? event.offeredTop : null,
-      initialHand: event.kind === "deal" ? countsOf(event.hand) : [],
     });
   }
-  const players = Array.from({ length: count }, (_, index) => {
-    const seat = (view.seat + index) % count;
-    active[seat] = view.players[seat].active;
-    return seat;
-  }).map((seat) => ({
-    handSize: view.players[seat].handSize,
-    turnsRemaining: turns(seat),
-    nextPlayer: relative(neighbour(seat, 1)),
-    previousPlayer: relative(neighbour(seat, -1)),
-    active: active[seat],
-  }));
   return {
     hand: countsOf(view.hand.map((card) => card.face)),
     discardPile: [...view.pile], joker: view.joker,
     phase: view.phase === "draw" ? 0 : view.phase === "discard" ? 1 : 2,
-    turnsRemaining: players[0].turnsRemaining,
     stockRemaining: view.stockCount,
     config: {
       numDecks: view.rules.decks, cardsInHand: view.rules.cardsInHand,
-      requiredSequences: view.rules.requiredSequences, maxTurns,
-      recycleDiscard: view.rules.recycleDiscard,
+      requiredSequences: view.rules.requiredSequences,
     },
-    players, history,
+    playerCount, history,
   };
 }
 
@@ -106,7 +63,7 @@ export function winningDiscard(hand, joker, { requiredSequences = 5, cardsInHand
 
 export class BeliefState {
   constructor(obs) {
-    const count = obs.players.length;
+    const count = obs.playerCount;
     this.knownHeld = Array.from({ length: count }, () => Array(52).fill(0));
     this.oppSafe = Array.from({ length: count }, () => Array(52).fill(0));
     const takes = Array(count).fill(0);
@@ -193,37 +150,25 @@ export function outs1ply(hand, belief, rules) {
   return probability;
 }
 
-export function chooseMove(view, tier, { model = null, random = Math.random } = {}) {
-  if (!["neural", "tactical", "casual"].includes(tier)) throw new TypeError("unknown AI tier");
+export function chooseMove(view, tier, { random = Math.random } = {}) {
+  if (!["tactical", "casual"].includes(tier)) throw new TypeError("unknown AI tier");
   if (view.seat !== view.currentPlayer || !["draw", "discard"].includes(view.phase) ||
       !view.players[view.seat].active) throw new Error("seat cannot act");
-  let effective = tier;
-  let downgrade = null;
-  if (tier === "neural") {
-    if (!model) downgrade = "no-model";
-    else if (model.gameConfig.numDecks !== view.rules.decks ||
-             model.gameConfig.cardsInHand !== view.rules.cardsInHand ||
-             model.gameConfig.requiredSequences !== view.rules.requiredSequences ||
-             model.gameConfig.recycleDiscard !== view.rules.recycleDiscard) downgrade = "rules-mismatch";
-    else if (view.players.length < 2 || view.players.length > 6) downgrade = "seat-count";
-    if (downgrade) effective = "tactical";
-  }
-  const obs = observationFromView(view, model?.gameConfig.maxTurns ?? DEFAULT_MAX_TURNS);
+  const obs = observationFromView(view);
   if (obs.phase === 1) {
     const win = winningDiscard(obs.hand, obs.joker, view.rules);
     if (win) return {
       move: { type: "declare", cardId: cardIdForFace(view, win.face), evaluation: win.evaluation },
-      tier: effective, downgrade, reason: "exact-win",
+      tier, reason: "exact-win",
     };
   }
   const legal = legalActions(obs);
   if (!legal.length) throw new Error("no legal move");
   const result = legal.length === 1 ? { action: legal[0], reason: "forced" } :
-    effective === "neural" ? neuralPolicy(obs, model) :
-    effective === "tactical" ? tacticalPolicy(obs) : casualPolicy(obs, random);
+    tier === "tactical" ? tacticalPolicy(obs) : casualPolicy(obs, random);
   const move = result.action < 2 ? { type: "draw", source: result.action === 0 ? "stock" : "discard" } :
     { type: "discard", cardId: cardIdForFace(view, result.action - 2) };
-  return { move, tier: effective, downgrade, reason: result.reason };
+  return { move, tier, reason: result.reason };
 }
 
 function cardIdForFace(view, face) {
@@ -238,13 +183,8 @@ function legalActions(obs) {
     obs.hand.flatMap((copies, face) => copies > 0 ? [face + 2] : []);
 }
 
-function candidateFaces(obs, excludeTaken = false) {
-  let faces = legalActions(obs).map((action) => action - 2);
-  const last = obs.history.at(-1);
-  if (excludeTaken && faces.length > 1 && last?.actor === 0 && last.kind === TAKE_DISCARD) {
-    faces = faces.filter((face) => face !== last.face);
-  }
-  return faces;
+function candidateFaces(obs) {
+  return legalActions(obs).map((action) => action - 2);
 }
 
 function bestFace(faces, values) {
@@ -316,11 +256,4 @@ function casualPolicy(obs, random) {
   const lowest = Math.min(...faces.map(partners));
   const tied = faces.filter((face) => partners(face) === lowest);
   return { action: tied[Math.floor(random() * tied.length)] + 2, reason: "greedy" };
-}
-
-function neuralPolicy(obs, model) {
-  const values = qValues(model, [obs])[0];
-  const actions = obs.phase === 0 ? legalActions(obs) : candidateFaces(obs, true).map(face => face + 2);
-  const action = actions.reduce((best, candidate) => values[candidate] > values[best] ? candidate : best, actions[0]);
-  return { action, reason: "greedy" };
 }

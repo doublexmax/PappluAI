@@ -1,8 +1,9 @@
 # PappluAI
 
-Papplu hand evaluation, shared-deck play, and a Q-network trained by self-play.
+Papplu hand evaluation, shared-deck play, and a GameTransformer trained by self-play.
 The evaluator implements this project's house rules, not a universal rummy ruleset.
-The browser runs without a build or a remote API. Training needs PyTorch.
+The browser simulator has no third-party dependencies and runs without a build or a remote API.
+Training needs PyTorch.
 
 ## Run the simulator
 
@@ -35,14 +36,12 @@ The current round keeps its original settings.
 
 Draw from the stock or the top discard, then discard from the enlarged hand.
 Humans can return either drawn card immediately.
-Neural policies keep a discard-pile pickup when another face can be discarded.
-That policy restriction prevents repeated pickup-and-return cycles.
-The underlying game still allows the move.
 
 Pass & Play covers hands between turns.
 With one human, that hand stays visible during AI turns.
 AI Watch reveals hands to spectators, but each AI receives only its own hand and public events.
 Opponent stock faces and face-down declarations stay hidden.
+The vs AI preset pairs you with a Tactical AI. AI Watch has two Tactical seats and one Casual seat.
 
 The speed settings are Instant, Normal, and Slow.
 Pause and Resume control AI play. AI Watch pauses after 200 completed turns.
@@ -54,49 +53,11 @@ The selected joker indicator stays outside the playable piles.
 
 ### AI tiers
 
-- **Neural** chooses the legal action with the highest Q-value. Its reported reason is `greedy`.
 - **Tactical** minimizes exact deadwood penalty and uses public-card beliefs, feed risk, and one-ply outs.
 - **Casual** keeps wild cards and favors nearby ranks and matching cards.
 
-Every tier first declares an exact winning discard when one exists.
-Neural has no draw lookahead, belief search, or feed-risk adjustment.
-It falls back to Tactical for unavailable weights, incompatible rules, or solo browser play.
-The scoreboard reports the effective tier and any downgrade.
-
-`web/papplu-model.json` contains the trained Azure `card_mlp` v5 checkpoint.
-It uses `ModelSpec(128, 3)`, has 673,412 parameters, and reads the 1,275-float version 5 encoding.
-The export records `source.kind` as `checkpoint` and `source.trained` as `true`.
-
-### Held-out results
-
-The evaluation locked the checkpoint before the held-out run. The deal seeds did not enter its training or selection.
-Earlier project models used some of these seed ranges, so the deals are held out for this checkpoint, not for the project as a whole.
-Node ran the browser engine with three decks, 21 cards, five required pure sequences, and a 60-turn cap per seat.
-
-Cold solo won 488 of 500 deals starting at seed `850000`, or 97.60%. The 95% Wilson interval is 95.85% to 98.62%.
-Mean terminal deadwood was 1.148 points. This test calls the browser neural policy directly. The solo UI still downgrades Neural to Tactical.
-
-For multiplayer, the candidate played once in every seat on each deal, with the same opponent in all other seats.
-A1 is the 64-by-2 model exported in `a4aa60c`.
-First-place credit goes to the declaration winner, or to the lowest deadwood penalty at the cap. Tied first seats split the credit.
-Pairwise credit gives 1 for placing ahead of an opponent and 0.5 for a tie. Neutral pairwise credit is 50%.
-The first-place intervals use 10,000 resamples of complete deals, preserving their seat rotations.
-
-| Opponent | Players | First seed | Deals | Declaration wins | First-place credit, 95% deal interval | Pairwise credit | Mean penalty |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| A1 | 2 | 860000 | 120 | 129/240 | 53.75% (48.75% to 58.75%) | 53.75% | 17.51 |
-| A1 | 3 | 860000 | 80 | 76/240 | 31.67% (26.67% to 36.67%) | 52.08% | 28.18 |
-| A1 | 4 | 860000 | 60 | 64/240 | 26.67% (22.08% to 31.25%) | 54.58% | 32.67 |
-| Casual | 2 | 870000 | 100 | 175/200 | 87.50% (83.00% to 92.00%) | 87.50% | 4.30 |
-| Casual | 3 | 870000 | 60 | 124/180 | 68.89% (62.22% to 75.00%) | 82.50% | 10.25 |
-| Casual | 4 | 870000 | 50 | 118/200 | 59.00% (52.50% to 65.50%) | 81.67% | 15.37 |
-| Tactical | 2 | 880000 | 60 | 68/120 | 56.67% (49.17% to 64.17%) | 56.67% | 17.23 |
-| Tactical | 3 | 880000 | 40 | 41/120 | 34.17% (27.50% to 40.83%) | 49.79% | 27.77 |
-| Tactical | 4 | 880000 | 30 | 37/120 | 30.83% (24.17% to 37.50%) | 55.69% | 28.29 |
-
-All multiplayer games ended in a declaration, so the declaration counts are also the outright first-place counts.
-The model beats equal-seat first-place parity against Casual at each table size. The intervals against A1 and Tactical include parity.
-See the [training guide](TRAINING.md#shipped-checkpoint) for the separate Python arena results and inference timing.
+Both tiers declare an exact win when a discard leaves a valid hand.
+The scoreboard shows the seat's tier and the reason for its last decision.
 
 ### Declarations and scoring
 
@@ -200,7 +161,7 @@ The evaluator does not mutate its inputs.
 
 ## Model and training contract
 
-The Python trainer uses `GameTransformer` with checkpoint format 6 and token schema 8. The default model has 2,175,224 parameters and is separate from the browser checkpoint. Self-play uses 1-ply search to find wins on the current turn. The learner uses cross-entropy on forced moves and a V-trace policy gradient on other moves. See the [training guide](TRAINING.md) for run commands, defaults, and the token layout.
+`GameTransformer` in [`src/model/`](src/model/) is the repository's only neural model. It uses checkpoint format 6 and token schema 8. The default model has 2,175,224 parameters. Self-play uses 1-ply search to find wins on the current turn. The learner uses cross-entropy on forced moves and a V-trace policy gradient on other moves. See the [training guide](TRAINING.md) for run commands, defaults, and the token layout.
 
 The run selected and locked Final at revision 1,184 using seed `600_000`. On held-out seed `930_000`, the locked 0-ply model declared on the first discard in 44 of 128 distance-zero solo deals. The untrained 0-ply model declared on the first discard in 30 of the same 128 deals. On 256 cold solo deals, the locked model declared zero times at 0-ply and once at 1-ply. See the [Azure results](TRAINING.md#azure-results) for the lock and full solo and multiplayer tables.
 
@@ -219,4 +180,4 @@ It checks portable imports with Torch and NumPy blocked.
 CI also exercises training, resume, standalone collection, and both evaluation commands.
 
 `tools/verify_browser.mjs` exercises the real browser through Playwright.
-It checks worker decisions, the Neural label and greedy reason, declarations, privacy, and the main-thread fallback.
+It checks a full Tactical turn in the module worker, scoring, declarations, pass-and-play privacy, AI Watch, and the main-thread fallback.

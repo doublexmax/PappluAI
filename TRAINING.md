@@ -1,5 +1,7 @@
 # Train a Papplu model
 
+`GameTransformer` in [`src/model/`](src/model/) is the repository's only neural model. The [browser simulator](README.md#ai-tiers) uses the Tactical and Casual tiers without model weights or third-party dependencies.
+
 Run the commands in this guide on the Azure compute host. Use Python 3.11 or newer and install the training dependencies in a virtual environment.
 
 ```bash
@@ -230,7 +232,3 @@ In both multiplayer tables, the trained policy plays each seat once per deal. Al
 | Cold | 4 | RandomPolicy | 1/240 | 0 | 73.0000/240 (30.42%) | -0.503917 |
 | Cold | 4 | Rev 0, 0-ply | 0/240 | 0 | 58.5000/240 (24.38%) | -0.489917 |
 | Cold | 4 | Rev 0, 1-ply | 0/240 | 3 | 58.5000/240 (24.38%) | -0.488417 |
-
-## Shipped checkpoint
-
-The browser loads the separate v5 `card_mlp` from `web/papplu-model.json`. See the [browser held-out results](README.md#held-out-results) for that checkpoint. The [Azure results](#azure-results) cover the Python GameTransformer and report end-to-end evaluation time, not per-call inference latency.

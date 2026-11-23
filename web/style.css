@@ -106,7 +106,7 @@ input, select { min-width: 0; width: 100%; min-height: 42px; padding: 8px 10px; 
 }
 .toggle-field { display: flex; align-items: center; gap: 10px; margin: 18px 0; }
 .toggle-field input { width: 18px; min-height: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
-.model-note { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.ai-note { color: var(--muted); font-size: 12px; line-height: 1.6; }
 .seat-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 18px 0; }
 .seat { display: grid; gap: 8px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); font-size: 13px; }
 .seat.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }

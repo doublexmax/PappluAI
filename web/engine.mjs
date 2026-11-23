@@ -1,6 +1,5 @@
 import { evaluateHand, minimumPenalty } from "./evaluate.mjs";
 import { chooseMove } from "./ai.mjs";
-import { parseQModel } from "./qnet.mjs";
 
 export class EngineTimeout extends Error {
   constructor(op, timeoutMs) {
@@ -17,9 +16,8 @@ export class EngineDisposed extends Error {
   }
 }
 
-export function createEngine({ modelUrl = null, timeoutMs = 10_000 } = {}) {
+export function createEngine({ timeoutMs = 10_000 } = {}) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError("timeoutMs must be positive");
-  const href = modelUrl === null ? null : new URL(modelUrl, import.meta.url).href;
   let worker;
   let disposed = false;
   let lastId = 0;
@@ -52,7 +50,6 @@ export function createEngine({ modelUrl = null, timeoutMs = 10_000 } = {}) {
       worker.terminate();
       worker = null;
     };
-    worker.postMessage({ id: 0, op: "init", modelUrl: href });
   }
   function call(op, args) {
     if (disposed) return Promise.reject(new EngineDisposed());
@@ -90,13 +87,12 @@ export function createEngine({ modelUrl = null, timeoutMs = 10_000 } = {}) {
   };
 }
 
-export function createLocalEngine({ model = null } = {}) {
+export function createLocalEngine() {
   let disposed = false;
-  const state = { model };
   const call = (request) => Promise.resolve().then(() => {
     if (disposed) throw new EngineDisposed();
     validateRequest(request);
-    return handleRequest(state, request);
+    return handleRequest(request);
   });
   return {
     evaluate: (counts, rules) => call({ id: 1, op: "evaluate", counts, ...rules }),
@@ -107,24 +103,10 @@ export function createLocalEngine({ model = null } = {}) {
 }
 
 export function serveEngine(scope) {
-  const state = { model: null };
   scope.addEventListener("message", ({ data }) => {
     try {
       validateRequest(data);
-      if (data.op === "init") {
-        state.model = null;
-        if (data.modelUrl !== null) {
-          Promise.resolve().then(() => fetch(data.modelUrl))
-            .then((response) => {
-              if (!response.ok) throw new Error("model download failed");
-              return response.json();
-            })
-            .then((json) => { state.model = parseQModel(json); })
-            .catch(() => { state.model = null; });
-        }
-        return;
-      }
-      scope.postMessage({ id: data.id, ok: true, value: handleRequest(state, data) });
+      scope.postMessage({ id: data.id, ok: true, value: handleRequest(data) });
     } catch (error) {
       scope.postMessage({
         id: Number.isInteger(data?.id) ? data.id : -1,
@@ -141,21 +123,17 @@ function validateRequest(data) {
     throw new TypeError("engine request needs an integer id");
   }
   const fields = {
-    init: ["modelUrl"], evaluate: ["counts", "joker", "requiredSequences", "cardsInHand"],
+    evaluate: ["counts", "joker", "requiredSequences", "cardsInHand"],
     penalties: ["reveal"], chooseMove: ["view", "tier", "seed"],
   }[data.op];
   if (!fields) throw new TypeError("unknown engine operation");
   if (fields.some((field) => !(field in data))) throw new TypeError("engine request has missing fields");
-  if (data.op === "init" && data.modelUrl !== null && typeof data.modelUrl !== "string") {
-    throw new TypeError("modelUrl must be a string or null");
-  }
   if (data.op === "chooseMove" && (
-    !["neural", "tactical", "casual"].includes(data.tier) ||
     !Number.isInteger(data.seed) || data.seed < 0 || data.seed > 0xffffffff
-  )) throw new TypeError("chooseMove needs a tier and uint32 seed");
+  )) throw new TypeError("chooseMove needs a uint32 seed");
 }
 
-function handleRequest(state, request) {
+function handleRequest(request) {
   if (request.op === "evaluate") {
     return evaluateHand(request.counts, request.joker, request);
   }
@@ -167,7 +145,7 @@ function handleRequest(state, request) {
       return minimumPenalty(counts, reveal.joker, reveal);
     });
   }
-  return chooseMove(request.view, request.tier, { model: state.model, random: mulberry32(request.seed) });
+  return chooseMove(request.view, request.tier, { random: mulberry32(request.seed) });
 }
 
 function mulberry32(seed) {
