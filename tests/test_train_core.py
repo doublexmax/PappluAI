@@ -250,11 +250,11 @@ class TestTrainingCore(unittest.TestCase):
                 with patch("src.training.train.run_matches", play):
                     return trainer.evaluate()["curriculum"]
 
-            missed = evaluate(21)
-            self.assertEqual((missed["next_distance"], missed["next_share"]), (1, 0.92))
-            passed = evaluate(22)
+            missed = evaluate(3)
+            self.assertEqual((missed["next_distance"], missed["next_share"]), (1, 0.88))
+            passed = evaluate(4)
             self.assertEqual((passed["next_distance"], passed["next_share"], passed["mean_qualifying_sequences"]),
-                             (2, 0.85, 4))
+                             (2, 0.82, 4))
             self.assertEqual(trainer.curriculum_history, [passed])
             winner = load_checkpoint(root / "best-model.pt", SCHEMA)
             self.assertEqual(winner.meta["plan"]["curriculum_max_distance"], 2)
@@ -302,19 +302,20 @@ class TestTrainingCore(unittest.TestCase):
                 "actors": 0, "tables": 2, "torch_threads": 1, "batch_size": 2,
                 "min_buffer_decisions": 2, "eval_every": 1, "eval_deals": 1, "anchor_every": 2,
             }, spec=TINY)
-            for version in (1, 2):
+            for version, last_eval in ((1, 1), (2, 1), (3, 3)):
                 result = collect(trainer.inbox, root / "latest-model.pt", worker=35, tables=2, max_batches=1)
                 self.assertEqual(result["batches"], 1)
                 self.assertEqual(trainer.run(max_updates=version, max_seconds=15), "max_updates")
                 state = json.loads((root / "status.json").read_text())
                 self.assertEqual((state["status"], state["version"]), ("max_updates", version))
+                self.assertEqual(state["validation"]["version"], last_eval)
                 self.assertEqual({row["players"] for row in state["validation"]["random"]}, {1, 2, 3, 4})
                 self.assertGreater(state["updates_per_sec"], 0)
                 self.assertEqual(state["trained_decisions"], version * 4)
                 checkpoint = load_checkpoint(root / "latest-model.pt", SCHEMA)
                 self.assertEqual((checkpoint.version, checkpoint.meta["run_id"]), (version, trainer.run_id))
                 self.assertEqual(checkpoint.meta["plan"]["curriculum_share"], 0.0)
-                trainer = Trainer.open(root)
+                trainer = Trainer.open(root, {"eval_every": 3} if version == 1 else {})
                 self.assertEqual(trainer.learner.version, version)
                 self.assertEqual(trainer.run_id, checkpoint.meta["run_id"])
             with self.assertRaisesRegex(ValueError, "cannot change"):

@@ -40,12 +40,12 @@ LENGTH_BUCKET = 8
 DISCOUNT = 0.995
 TUNABLE = {
     "actors", "tables", "torch_threads", "actor_threads", "device", "precision", "checkpoint_every",
-    "learning_rate", "eta", "sync_every", "plan",
+    "learning_rate", "eta", "sync_every", "eval_every", "plan",
 }
 TUNABLE_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance")
 MASTERY_LADDER = {
-    1: (0.92, 0.45), 2: (0.85, 0.30), 3: (0.75, 0.20), 4: (0.75, 0.20),
-    6: (0.60, 0.12), 9: (0.60, 0.12), 14: (0.45, 0.12),
+    1: (0.88, 0.08), 2: (0.82, 0.06), 3: (0.75, 0.05), 4: (0.70, 0.04),
+    6: (0.60, 0.02), 9: (0.50, 0.02), 14: (0.40, 0.02),
 }
 
 
