@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from random import Random
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import UUID
@@ -46,11 +47,16 @@ class TestTrainingCore(unittest.TestCase):
             self.assertEqual((loaded.version, loaded.episodes, loaded.decisions), (4, 2, 6))
             self.assertEqual(loaded.suffix.shape, (6, 30, 8))
             for name in ("prefix", "suffix", "decision_end", "cut", "action", "behavior_logp", "utility", "legal",
-                         "target_probs", "forced"):
+                         "target_probs", "forced", "potential", "behavior_value"):
                 torch.testing.assert_close(getattr(batch, name), getattr(loaded, name))
             self.assertEqual((loaded.target_probs.dtype, loaded.target_probs.shape), (torch.uint16, (6, 54)))
             torch.testing.assert_close(loaded.forced, torch.zeros(6, dtype=torch.uint8))
             payload = torch.load(path, weights_only=True)
+            payload["format"] = 4
+            torch.save(payload, path)
+            with self.assertRaisesRegex(ValueError, "incompatible rollout batch format"):
+                Trajectories.load(path)
+            payload["format"] = 5
             payload["schema"]["version"] = 6
             torch.save(payload, path)
             with self.assertRaisesRegex(ValueError, "incompatible rollout token schema"):
@@ -59,6 +65,8 @@ class TestTrainingCore(unittest.TestCase):
                 ({"cut": batch.cut + 1}, "prefix cuts"),
                 ({"decision_end": batch.decision_end + 1}, "offsets"),
                 ({"behavior_logp": torch.full_like(batch.behavior_logp, float("nan"))}, "behavior"),
+                ({"behavior_value": torch.full_like(batch.behavior_value, float("inf"))}, "behavior values"),
+                ({"potential": torch.full_like(batch.potential, 0.76)}, "rollout potential"),
                 ({"target_probs": batch.target_probs[:, :53]}, "target_probs"),
                 ({"target_probs": torch.zeros_like(batch.target_probs)}, "probability mass"),
                 ({"forced": torch.full_like(batch.forced, 2)}, "forced flags"),
@@ -84,6 +92,9 @@ class TestTrainingCore(unittest.TestCase):
 
     def test_terminal_win_flag_survives_rollout_and_replay(self):
         model = GameTransformer(TINY, SCHEMA)
+        with torch.no_grad():
+            model.value.weight.zero_()
+            model.value.bias.fill_(0.375)
         policy = TransformerPolicy(model, self.game, search_ply=1, sample=True, record=True)
         runs = list(run_matches((Deal(9, (0,), curriculum=0),), (policy,), self.game))
         self.assertEqual((runs[0].winner, runs[0].action_count), (0, 1))
@@ -93,10 +104,11 @@ class TestTrainingCore(unittest.TestCase):
             batch.save(path)
             batch = Trajectories.load(path)
         self.assertEqual(batch.forced.tolist(), [1])
+        self.assertEqual((batch.potential.tolist(), batch.behavior_value.tolist()), ([0.75], [0.375]))
         buffer = _Buffer(4, 3)
         self.assertTrue(buffer.add(batch, 0))
         sample = buffer.sample(Random(55), 1, 0)
-        self.assertEqual((sample.forced.tolist(), sample.reward.tolist()), ([[True]], [[1.0]]))
+        self.assertEqual((sample.forced.tolist(), sample.reward.tolist()), ([[True]], [[0.25]]))
 
     def test_collection_ladder_includes_solo_puzzles_but_keeps_cold_deals_separate(self):
         plan = CollectPlan(curriculum_share=1.0, curriculum_max_distance=6)
@@ -110,7 +122,7 @@ class TestTrainingCore(unittest.TestCase):
         cold = list(islice(replace(plan, curriculum_share=0).deals("mastery"), 8))
         self.assertEqual([deal.curriculum for deal in cold], [None] * 8)
 
-    def test_buffer_keeps_terminal_reward_and_rejects_future_or_stale_batches(self):
+    def test_buffer_shapes_terminal_reward_and_rejects_future_or_stale_batches(self):
         model = GameTransformer(TINY, SCHEMA)
         policy = TransformerPolicy(model, self.game, sample=True, record=True)
         runs = list(run_matches([Deal(11, (0,))], [policy], self.game))
@@ -122,8 +134,9 @@ class TestTrainingCore(unittest.TestCase):
         self.assertEqual(sample.valid.tolist(), [[True, True]])
         torch.testing.assert_close(sample.discount, torch.tensor([[0.995, 0.0]]))
         self.assertEqual(sample.tokens.cut.tolist(), [[30, 31]])
-        self.assertAlmostEqual(sample.reward[0, 1].item(), runs[0].outcome.utilities()[0])
-        self.assertEqual(sample.reward[0, 0], 0.0)
+        first, last = batch.potential.tolist()
+        self.assertAlmostEqual(sample.reward[0, 1].item(), runs[0].outcome.utilities()[0] - last)
+        self.assertAlmostEqual(sample.reward[0, 0].item(), 0.995 * last - first)
         torch.testing.assert_close(sample.target_probs.sum(-1), torch.ones(1, 2))
         self.assertEqual(sample.target_probs.masked_select(~sample.tokens.legal).count_nonzero(), 0)
         self.assertEqual(sample.forced.tolist(), [[False, False]])
@@ -142,7 +155,8 @@ class TestTrainingCore(unittest.TestCase):
             torch.ones(decisions, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
             torch.tensor(lengths).cumsum(0), torch.cat([torch.arange(1, n + 1) for n in lengths]),
             torch.full((decisions,), 2), torch.ones(decisions, dtype=torch.uint8), torch.zeros(decisions),
-            targets.to(torch.uint16), torch.zeros(decisions, dtype=torch.uint8),
+            targets.to(torch.uint16), torch.zeros(decisions, dtype=torch.uint8), torch.zeros(decisions),
+            torch.zeros(decisions),
         )
         buffer = _Buffer(decisions, 3)
         self.assertTrue(buffer.add(batch, 0))
@@ -216,6 +230,69 @@ class TestTrainingCore(unittest.TestCase):
         self.assertEqual([row.players.tolist() for row in emitted], [[1], [2, 2], [1]])
         self.assertEqual([row.action[0].item() for row in emitted], [0, 0, 1])
         self.assertEqual(emitted[1].action[2].item(), 0)
+
+    def test_mastery_updates_collection_only_at_the_threshold(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            trainer = Trainer.open(root, {
+                "game": self.game.to_dict(), "auto_curriculum": True, "torch_threads": 1,
+            }, spec=TINY)
+
+            def evaluate(wins):
+                def play(deals, policies, game, **kwargs):
+                    self.assertEqual([deal.curriculum for deal in deals], [1] * 48)
+                    self.assertEqual(policies[0].search_ply, 0)
+                    penalty = SimpleNamespace(qualifying_sequences=4)
+                    for i in range(len(deals)):
+                        yield SimpleNamespace(winner=0 if i < wins else None,
+                                              outcome=SimpleNamespace(penalties=(penalty,)))
+
+                with patch("src.training.train.run_matches", play):
+                    return trainer.evaluate()["curriculum"]
+
+            missed = evaluate(21)
+            self.assertEqual((missed["next_distance"], missed["next_share"]), (1, 0.92))
+            passed = evaluate(22)
+            self.assertEqual((passed["next_distance"], passed["next_share"], passed["mean_qualifying_sequences"]),
+                             (2, 0.85, 4))
+            self.assertEqual(trainer.curriculum_history, [passed])
+            winner = load_checkpoint(root / "best-model.pt", SCHEMA)
+            self.assertEqual(winner.meta["plan"]["curriculum_max_distance"], 2)
+
+    def test_collector_adopts_new_curriculum_on_new_deals(self):
+        plan = CollectPlan(player_counts=(1,), curriculum_share=0, batch_decisions=1, search_ply=0)
+        model = GameTransformer(TINY, SCHEMA)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_path = root / "latest-model.pt"
+            persist = Trajectories.save
+
+            def publish(version, share):
+                save_checkpoint(model_path, model, self.game.to_dict(), {
+                    "version": version, "run_id": RUN_ID,
+                    "plan": replace(plan, curriculum_share=share, curriculum_max_distance=1).to_dict(),
+                })
+
+            def on_save(batch, destination):
+                persist(batch, destination)
+                if batch.version == 0:
+                    publish(1, 1)
+
+            observed = []
+
+            def play(deals, policies, game, **kwargs):
+                def record():
+                    for deal in deals:
+                        observed.append(deal.curriculum)
+                        yield deal
+
+                return run_matches(record(), policies, game, **kwargs)
+
+            publish(0, 0)
+            with patch("src.training.train.run_matches", play), patch.object(Trajectories, "save", on_save):
+                collect(root / "inbox", model_path, worker=0, tables=1, max_batches=3)
+        self.assertEqual(observed[0], None)
+        self.assertTrue(all(0 <= distance <= 1 for distance in observed[1:]), observed)
 
     def test_external_collection_and_cold_evaluation_survive_resume(self):
         with TemporaryDirectory() as directory:

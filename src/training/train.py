@@ -32,8 +32,8 @@ from src.model.network import GameTransformer, TokenBatch, action_mask, load_che
 from src.model.spec import ModelSpec, TokenSchema
 
 
-STATE_VERSION = 16
-ROLLOUT_FORMAT = 4
+STATE_VERSION = 17
+ROLLOUT_FORMAT = 5
 VALIDATION_SEED = 30_000_001
 OUTBOX_LIMIT = 8
 LENGTH_BUCKET = 8
@@ -43,6 +43,10 @@ TUNABLE = {
     "learning_rate", "eta", "sync_every", "plan",
 }
 TUNABLE_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance")
+MASTERY_LADDER = {
+    1: (0.92, 0.45), 2: (0.85, 0.30), 3: (0.75, 0.20), 4: (0.75, 0.20),
+    6: (0.60, 0.12), 9: (0.60, 0.12), 14: (0.45, 0.12),
+}
 
 
 @dataclass(frozen=True)
@@ -98,9 +102,9 @@ class CollectPlan:
             for players in self.player_counts:
                 start = None
                 if rng.random() < self.curriculum_share:
-                    start = rng.randint(int(players > 1), self.curriculum_max_distance)
-                    if players == 1:
-                        start = min(start, rng.randint(0, self.curriculum_max_distance))
+                    low = int(players > 1)
+                    start = min(rng.randint(low, self.curriculum_max_distance),
+                                rng.randint(low, self.curriculum_max_distance))
                 yield Deal(rng.getrandbits(63), (0,) * players, start)
 
 
@@ -116,6 +120,7 @@ class TrainConfig:
     device: str = "cpu"
     precision: str = "bf16"
     batch_size: int = 8
+    unroll_steps: int = 12
     buffer_decisions: int = 400_000
     min_buffer_decisions: int = 20_000
     max_policy_lag: int = 200
@@ -124,7 +129,7 @@ class TrainConfig:
     grad_clip: float = 1.0
     value_weight: float = 1.0
     rho_bar: float = 1.0
-    c_bar: float = 1.0
+    c_bar: float = 0.85
     eta: float = 0.01
     entropy_weight: float = 0.0
     anchor_every: int = 2000
@@ -133,12 +138,13 @@ class TrainConfig:
     checkpoint_every: int = 500
     eval_every: int = 2000
     eval_deals: int = 64
+    auto_curriculum: bool = False
     promote_margin: float = 0.02
 
     def __post_init__(self) -> None:
         self.plan.validate(self.game)
         for name in (
-            "tables", "torch_threads", "actor_threads", "batch_size", "buffer_decisions",
+            "tables", "torch_threads", "actor_threads", "batch_size", "unroll_steps", "buffer_decisions",
             "min_buffer_decisions", "max_policy_lag", "anchor_every", "sync_every",
             "publish_every", "checkpoint_every", "eval_deals",
         ):
@@ -164,6 +170,14 @@ class TrainConfig:
             raise ValueError("publish_every exceeds max_policy_lag")
         if self.precision not in ("fp32", "bf16"):
             raise ValueError("precision must be fp32 or bf16")
+        if type(self.auto_curriculum) is not bool:
+            raise ValueError("auto_curriculum must be a boolean")
+        if self.auto_curriculum and (
+            not self.eval_every or self.game.cards_in_hand < 3
+            or self.plan.curriculum_max_distance not in (*MASTERY_LADDER, self.game.cards_in_hand)
+            or self.plan.curriculum_max_distance > self.game.cards_in_hand
+        ):
+            raise ValueError("auto_curriculum requires periodic evaluation and a valid mastery distance")
 
     @classmethod
     def from_dict(cls, data: dict) -> TrainConfig:
@@ -205,6 +219,8 @@ class Trajectories:
     behavior_logp: Tensor
     target_probs: Tensor
     forced: Tensor
+    potential: Tensor
+    behavior_value: Tensor
 
     @property
     def decisions(self) -> int:
@@ -234,6 +250,8 @@ class Trajectories:
             torch.tensor([logp for row in traces for logp in row.behavior_logp], dtype=torch.float32),
             _bytes_tensor(b"".join(row.target_probs for row in traces), (-1, SCHEMA.num_actions), torch.uint16),
             _bytes_tensor(b"".join(row.forced for row in traces), (-1,)),
+            torch.tensor([value for row in traces for value in row.potential], dtype=torch.float32),
+            torch.tensor([value for row in traces for value in row.behavior_value], dtype=torch.float32),
         )
 
     def save(self, path: Path) -> None:
@@ -277,7 +295,7 @@ class Trajectories:
             ("suffix", torch.uint8, (schema.suffix_tokens, schema.fields)), ("decision_end", torch.int64, ()),
             ("cut", torch.int16, ()), ("legal", torch.int64, ()), ("action", torch.uint8, ()),
             ("behavior_logp", torch.float32, ()), ("target_probs", torch.uint16, (schema.num_actions,)),
-            ("forced", torch.uint8, ()),
+            ("forced", torch.uint8, ()), ("potential", torch.float32, ()), ("behavior_value", torch.float32, ()),
         ):
             col = getattr(self, name)
             if (
@@ -292,6 +310,7 @@ class Trajectories:
             raise ValueError("invalid rollout trajectory column lengths")
         if any(len(col) != decisions for col in (
             self.suffix, self.cut, self.legal, self.behavior_logp, self.target_probs, self.forced,
+            self.potential, self.behavior_value,
         )):
             raise ValueError("invalid rollout decision column lengths")
         if bool((self.forced > 1).any()):
@@ -333,6 +352,10 @@ class Trajectories:
             raise ValueError("rollout has a pointer outside the action space")
         if not bool(((self.behavior_logp >= -104) & (self.behavior_logp <= 0)).all()):
             raise ValueError("invalid rollout behavior log-probabilities")
+        if not bool(((self.potential >= 0) & (self.potential <= 0.75)).all()):
+            raise ValueError("invalid rollout potential")
+        if not bool(self.behavior_value.isfinite().all()):
+            raise ValueError("invalid rollout behavior values")
         if not bool((self.utility.abs() <= 1).all()):
             raise ValueError("invalid rollout utilities")
 
@@ -377,24 +400,38 @@ def collect(
     admitted: dict[int, int] = {}
     pending: dict[int, _Completed] = {}
     incarnation = uuid4().hex
+    nonce = f"{run}:{worker}:{incarnation}"
     totals = {"batches": 0, "episodes": 0, "decisions": 0}
 
+    def deals() -> Iterator[Deal]:
+        nonlocal stamp, revision, policy, plan
+        queue = plan.deals(nonce)
+        while True:
+            if len(active) <= 1:
+                new_stamp = fingerprint()
+                if new_stamp != stamp:
+                    snapshot = load_checkpoint(model_path, SCHEMA, device)
+                    updated = CollectPlan.from_dict(snapshot.meta.get("plan"))
+                    if (
+                        snapshot.meta.get("run_id") != run or snapshot.game != game.to_dict()
+                        or snapshot.network.spec != spec or updated != replace(
+                            plan, curriculum_share=updated.curriculum_share,
+                            curriculum_max_distance=updated.curriculum_max_distance,
+                        )
+                    ):
+                        raise ValueError("collection checkpoint changed run, game, fixed plan fields, or model shape")
+                    if snapshot.version > revision:
+                        revision = snapshot.version
+                        if updated != plan:
+                            updated.validate(game)
+                            plan = updated
+                            queue = plan.deals(f"{nonce}:{revision}")
+                        policy = TransformerPolicy(snapshot.network, game, sample=True, uniform_mix=plan.uniform_mix,
+                                                   precision=precision, record=True, search_ply=plan.search_ply)
+                    stamp = new_stamp
+            yield next(queue)
+
     def admit(deal: Deal) -> tuple[TransformerPolicy, ...]:
-        nonlocal stamp, revision, policy
-        if len(active) <= 1:
-            new_stamp = fingerprint()
-            if new_stamp != stamp:
-                snapshot = load_checkpoint(model_path, SCHEMA, device)
-                if (
-                    snapshot.meta.get("run_id") != run or snapshot.game != game.to_dict()
-                    or CollectPlan.from_dict(snapshot.meta.get("plan")) != plan or snapshot.network.spec != spec
-                ):
-                    raise ValueError("collection checkpoint changed run, game, plan, or model shape")
-                if snapshot.version > revision:
-                    revision = snapshot.version
-                    policy = TransformerPolicy(snapshot.network, game, sample=True, uniform_mix=plan.uniform_mix,
-                                               precision=precision, record=True, search_ply=plan.search_ply)
-                stamp = new_stamp
         admitted[deal.seed] = revision
         active[revision] += 1
         return (policy,)
@@ -415,9 +452,8 @@ def collect(
         totals["episodes"] += len(chunk.deals)
         totals["decisions"] += chunk.decisions
 
-    queue = plan.deals(f"{run}:{worker}:{incarnation}")
     stopping = lambda: stop() or at_limit()
-    for result in run_matches(queue, admit, game, tables=tables, stop=stopping):
+    for result in run_matches(deals(), admit, game, tables=tables, stop=stopping):
         version = admitted.pop(result.deal.seed)
         active[version] -= 1
         if not active[version]:
@@ -434,7 +470,7 @@ def collect(
     return totals
 
 
-@dataclass(eq=False)
+@dataclass(frozen=True)
 class _SeatTrajectory:
     prefix: Tensor
     suffix: Tensor
@@ -445,15 +481,29 @@ class _SeatTrajectory:
     utility: Tensor
     target_probs: Tensor
     forced: Tensor
-    anchor: tuple[object, Tensor] | None = field(default=None, init=False)
+    potential: Tensor
+    behavior_value: Tensor
+
+
+@dataclass(frozen=True)
+class StepSample:
+    index: Tensor
+    weight: Tensor
+
+    def gather(self, column: Tensor) -> Tensor:
+        return column[torch.arange(self.index.size(0))[:, None], self.index]
+
+    def tokens(self, tokens: TokenBatch) -> TokenBatch:
+        cut = self.gather(tokens.cut)
+        return TokenBatch(tokens.prefix[:, :int(cut.max())], self.gather(tokens.suffix), cut, self.gather(tokens.legal))
 
 
 @dataclass(frozen=True)
 class TrajectoryBatch:
-    seats: tuple[_SeatTrajectory, ...]
     tokens: TokenBatch
     action: Tensor
     behavior_logp: Tensor
+    behavior_value: Tensor
     reward: Tensor
     discount: Tensor
     valid: Tensor
@@ -472,11 +522,29 @@ class TrajectoryBatch:
         valid = steps <= terminal
         reward = (steps == terminal) * torch.stack([seat.utility for seat in seats])[:, None]
         discount = (steps < terminal).float() * DISCOUNT
+        potential = pack("potential")
+        reward += discount * torch.roll(potential, -1, dims=1) - potential
         tokens = TokenBatch(pack("prefix"), pack("suffix"), pack("cut").long(),
                             action_mask(pack("legal"), SCHEMA.num_actions))
         targets = pad_sequence([seat.target_probs.float() for seat in seats], batch_first=True)
         targets /= targets.sum(-1, keepdim=True).clamp_min(1)
-        return cls(seats, tokens, action, pack("behavior_logp"), reward, discount, valid, targets, pack("forced").bool())
+        return cls(tokens, action, pack("behavior_logp"), pack("behavior_value"),
+                   reward, discount, valid, targets, pack("forced").bool())
+
+    def sample_steps(self, limit: int, rng: torch.Generator) -> StepSample:
+        lengths = self.valid.sum(1, keepdim=True)
+        index = torch.arange(self.valid.size(1)).expand_as(self.valid)
+        if limit >= index.size(1):
+            return StepSample(index, self.valid / lengths)
+        keys = torch.rand(self.valid.shape, generator=rng).masked_fill(~self.valid, -1)
+        if limit > 1:
+            keys.masked_fill_(index == lengths - 1, 2)
+        index = keys.topk(limit, dim=1).indices.sort(dim=1).values
+        weight = torch.ones_like(index, dtype=torch.float32)
+        if limit > 1:
+            count = lengths.clamp(max=limit)
+            weight = torch.where(index == lengths - 1, 1, (lengths - 1) / (count - 1).clamp_min(1))
+        return StepSample(index, (weight / lengths).masked_fill(index >= lengths, 0))
 
 
 @dataclass(frozen=True)
@@ -496,6 +564,7 @@ class _BatchIndex:
                 batch.prefix[prefix_start:prefix_end], batch.suffix[span], batch.cut[span],
                 batch.legal[span], batch.action[span], batch.behavior_logp[span], batch.utility[row],
                 batch.target_probs[span], batch.forced[span],
+                batch.potential[span], batch.behavior_value[span],
             )
             buckets.setdefault((players, (end - start - 1) // LENGTH_BUCKET), []).append(seat)
             start, prefix_start = end, prefix_end
@@ -567,11 +636,15 @@ def vtrace(
     c = log_rho.clamp(max=math.log(c_bar)).exp()
     next_value = torch.cat((value[:, 1:], bootstrap[:, None]), dim=1)
     delta = rho * (reward + discount * next_value - value)
-    correction = torch.zeros_like(bootstrap)
-    vs = torch.empty_like(value)
-    for t in range(value.size(1) - 1, -1, -1):
-        correction = delta[:, t] + discount[:, t] * c[:, t] * correction
-        vs[:, t] = value[:, t] + correction
+    decay = discount * c
+    correction = delta
+    stride = 1
+    while stride < value.size(1):
+        correction = torch.cat((correction[:, :-stride] + decay[:, :-stride] * correction[:, stride:],
+                                correction[:, -stride:]), dim=1)
+        decay = torch.cat((decay[:, :-stride] * decay[:, stride:], decay[:, -stride:]), dim=1)
+        stride *= 2
+    vs = value + correction
     next_vs = torch.cat((vs[:, 1:], bootstrap[:, None]), dim=1)
     return vs, rho * (reward + discount * next_vs - value)
 
@@ -585,6 +658,7 @@ class LearnStats:
     mean_rho: float
     kl_anchor: float
     grad_norm: float
+    trained_steps: int
 
 
 class _Step(IntEnum):
@@ -702,7 +776,7 @@ class Learner:
             raise ValueError("distributed learning requires a CPU learner")
         self.online = online.to(self.device, dtype=torch.float32)
         self.anchor = copy.deepcopy(self.online).eval().requires_grad_(False)
-        self._anchor_version = object()
+        self._step_rng = torch.Generator()
         self._parameters = tuple(self.online.parameters())
         self.optimizer = torch.optim.AdamW(
             self._parameters, lr=config.learning_rate, weight_decay=config.weight_decay,
@@ -716,59 +790,48 @@ class Learner:
                 for parameter in model.parameters():
                     dist.broadcast(parameter, src=0)
 
-    @torch.no_grad()
-    def _anchor_log_policy(self, batch: TrajectoryBatch, tokens: TokenBatch) -> Tensor:
-        missing: dict[_SeatTrajectory, int] = {}
-        for i, seat in enumerate(batch.seats):
-            if seat.anchor is None or seat.anchor[0] is not self._anchor_version:
-                missing.setdefault(seat, i)
-        if missing:
-            if len(missing) != len(batch.seats):
-                indices = torch.tensor(list(missing.values()), device=self.device)
-                tokens = TokenBatch(*(column.index_select(0, indices) for column in vars(tokens).values()))
-            ref = self.anchor.unroll(tokens).log_policy
-            for seat, logp in zip(missing, ref):
-                seat.anchor = (self._anchor_version, logp[:seat.action.numel()].clone())
-        return pad_sequence([seat.anchor[1] for seat in batch.seats], batch_first=True)
-
     def refresh_anchor(self) -> None:
         self.anchor.load_state_dict(self.online.state_dict())
-        self._anchor_version = object()
 
     def update(self, batch: TrajectoryBatch, *, skip_grad_sync: bool = False) -> LearnStats:
         config, device = self.config, self.device
-        tokens = TokenBatch(*(tensor.to(device) for tensor in vars(batch.tokens).values()))
-        action, behavior, reward, discount, valid = (
-            tensor.to(device) for tensor in (batch.action, batch.behavior_logp, batch.reward, batch.discount, batch.valid)
+        self._step_rng.manual_seed(config.seed + self.version * self.group.size + self.group.rank)
+        sample = batch.sample_steps(config.unroll_steps, self._step_rng)
+        tokens = TokenBatch(*(tensor.to(device) for tensor in vars(sample.tokens(batch.tokens)).values()))
+        action, behavior, expert, forced = (
+            sample.gather(tensor).to(device)
+            for tensor in (batch.action, batch.behavior_logp, batch.target_probs, batch.forced)
         )
+        weights = sample.weight.to(device)
+        value = batch.behavior_value
+        targets, advantage = vtrace(
+            torch.zeros_like(value), batch.reward, batch.discount,
+            value, value.new_zeros(value.size(0)), rho_bar=1.0, c_bar=config.c_bar,
+        )
+        targets, advantage = (sample.gather(tensor).to(device) for tensor in (targets, advantage))
         self.online.train()
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config.precision == "bf16"):
             heads = self.online.unroll(tokens)
-            log_anchor = self._anchor_log_policy(batch, tokens)
+            with torch.no_grad():
+                log_anchor = self.anchor.unroll(tokens).log_policy
         legal, log_pi = tokens.legal, heads.log_policy
         taken = log_pi.gather(-1, action.unsqueeze(-1)).squeeze(-1)
         ratio = taken.detach() - behavior
-        values = heads.value
-        targets, advantage = vtrace(
-            ratio, reward, discount,
-            values, values.new_zeros(values.size(0)), rho_bar=config.rho_bar, c_bar=config.c_bar,
-        )
+        rho = ratio.clamp(max=math.log(config.rho_bar)).exp()
         probabilities = log_pi.exp()
         divergence = (probabilities * (log_pi - log_anchor).masked_fill(~legal, 0)).sum(-1)
         masked_log_pi = log_pi.masked_fill(~legal, 0)
         entropy = -(probabilities * masked_log_pi).sum(-1)
-        lengths = valid.sum(dim=1).clamp_min(1)
 
         def per_trajectory(x: Tensor) -> Tensor:
-            return (x.masked_fill(~valid, 0).sum(dim=1) / lengths).mean()
+            return (x.masked_fill(weights == 0, 0) * weights).sum(dim=1).mean()
 
         kl = per_trajectory(divergence)
         entropy = per_trajectory(entropy)
-        ce_step = -(batch.target_probs.to(device) * masked_log_pi).sum(-1)
-        pg_step = -(advantage * taken)
-        step_policy_loss = torch.where(batch.forced.to(device), ce_step, pg_step)
-        policy_loss = per_trajectory(step_policy_loss)
-        value_loss = 0.5 * per_trajectory((targets - values).square())
+        ce_step = -(expert * masked_log_pi).sum(-1)
+        pg_step = -(rho * advantage * taken)
+        policy_loss = per_trajectory(torch.where(forced, ce_step, pg_step))
+        value_loss = 0.5 * per_trajectory((targets - heads.value).square())
         loss = policy_loss + config.value_weight * value_loss + config.eta * kl - config.entropy_weight * entropy
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -781,7 +844,8 @@ class Learner:
             self.refresh_anchor()
         return LearnStats(
             float(loss.detach()), float(policy_loss.detach()), float(value_loss.detach()),
-            float(entropy.detach()), float(ratio[valid].double().exp().mean()), float(kl.detach()), float(norm),
+            float(entropy.detach()), float(per_trajectory(ratio.double().exp())), float(kl.detach()), float(norm),
+            int(sample.weight.count_nonzero()),
         )
 
     def state_dict(self) -> dict:
@@ -801,7 +865,6 @@ class Learner:
         for group in self.optimizer.param_groups:
             group["lr"] = self.config.learning_rate
         self.version = state["version"]
-        self._anchor_version = object()
 
 
 class Trainer:
@@ -817,6 +880,7 @@ class Trainer:
         self.episodes, self.decisions, self.trained_decisions, self.dropped_batches = 0, 0, 0, 0
         self._group_progress: dict[str, int] = {}
         self.validation, self.last_update = {}, {}
+        self.curriculum_history: list[dict] = []
         self._start = time.monotonic()
         self._base_version, self._base_decisions = learner.version, 0
         self._base_trained_decisions = 0
@@ -876,6 +940,9 @@ class Trainer:
                     raise ValueError("initial model game config mismatch")
                 overrides = {**overrides, "game": game.to_dict()}
                 spec = ModelSpec.from_dict(initial_spec)
+            if overrides.get("auto_curriculum"):
+                plan = {"curriculum_share": MASTERY_LADDER[1][0], "curriculum_max_distance": 1}
+                overrides = {**overrides, "plan": {**plan, **overrides.get("plan", {})}}
             config = TrainConfig().with_overrides(overrides)
         torch.set_num_threads(config.torch_threads)
         torch.manual_seed(config.seed)
@@ -890,6 +957,7 @@ class Trainer:
                 trainer.episodes, trainer.decisions = state["episodes"], state["decisions"]
                 trainer.trained_decisions = state["trained_decisions"]
                 trainer.dropped_batches, trainer.validation = state["dropped_batches"], state["validation"]
+                trainer.curriculum_history = state["curriculum_history"]
         trainer.learner.synchronize()
         trainer._sync_progress()
         if state is None and group.rank == 0:
@@ -912,12 +980,14 @@ class Trainer:
             "spec": self.learner.online.spec.to_dict(),
             "config": asdict(self.config), "learner": self.learner.state_dict(), "rng": self.rng.getstate(),
             **{name: progress[name] for name in ("episodes", "decisions", "trained_decisions", "dropped_batches")},
-            "validation": self.validation,
+            "validation": self.validation, "curriculum_history": self.curriculum_history,
         }, self.root / "latest-state.pt")
 
     def evaluate(self, *, stop: Callable[[], bool] = lambda: False) -> dict:
         cfg = self.config
         candidate = TransformerPolicy(self.learner.online, cfg.game, precision=cfg.precision)
+        if cfg.auto_curriculum:
+            return self._evaluate_curriculum(candidate, stop)
         checkpoint = load_checkpoint(self.root / "best-model.pt", SCHEMA, self.learner.device)
         best = TransformerPolicy(checkpoint.network, GameConfig.from_dict(checkpoint.game), precision=cfg.precision)
         validation = {}
@@ -934,6 +1004,41 @@ class Trainer:
         self.validation = {**validation, "promoted": promote, "version": self.learner.version}
         if promote:
             self._save()
+            self.export_model(self.root / "best-model.pt")
+        return self.validation
+
+    def _evaluate_curriculum(self, candidate: TransformerPolicy, stop: Callable[[], bool]) -> dict:
+        cfg, plan = self.config, self.config.plan
+        distance = plan.curriculum_max_distance
+        cold = distance == cfg.game.cards_in_hand
+        threshold = None if cold else MASTERY_LADDER[distance][1]
+        seed = VALIDATION_SEED + distance * 100_000
+        deals = [Deal(seed + i, (0,), None if cold else distance) for i in range(48)]
+        results = list(run_matches(deals, (candidate,), cfg.game, tables=cfg.tables, stop=stop))
+        if len(results) != len(deals):
+            raise InterruptedError("mastery evaluation stopped before completing the frontier deals")
+        wins = sum(result.winner == 0 for result in results)
+        rate = wins / len(deals)
+        mastered = threshold is not None and rate >= threshold
+        next_plan = plan
+        if mastered:
+            next_distance = min((step for step in MASTERY_LADDER if distance < step < cfg.game.cards_in_hand),
+                                default=cfg.game.cards_in_hand)
+            share = MASTERY_LADDER[next_distance][0] if next_distance < cfg.game.cards_in_hand else 0.45
+            next_plan = replace(plan, curriculum_max_distance=next_distance, curriculum_share=share)
+        check = {
+            "distance": distance, "cold": cold, "wins": wins, "deals": len(deals), "seed": seed,
+            "win_rate": rate, "threshold": threshold, "search_ply": candidate.search_ply,
+            "mean_qualifying_sequences": sum(
+                result.outcome.penalties[0].qualifying_sequences for result in results
+            ) / len(results),
+            "next_distance": next_plan.curriculum_max_distance, "next_share": next_plan.curriculum_share,
+            "version": self.learner.version,
+        }
+        self.validation = {"curriculum": check, "promoted": mastered, "version": self.learner.version}
+        if mastered:
+            self.config = replace(cfg, plan=next_plan)
+            self.curriculum_history.append(check)
             self.export_model(self.root / "best-model.pt")
         return self.validation
 
@@ -987,6 +1092,7 @@ class Trainer:
             "trained_decisions_per_sec": (progress["trained_decisions"] - self._base_trained_decisions) / elapsed,
             "updates_per_sec": (version - self._base_version) / elapsed, "elapsed_seconds": elapsed,
             "validation": self.validation, "world_size": self.group.size,
+            "curriculum_history": self.curriculum_history, "plan": self.config.plan.to_dict(),
             "actors": self.config.actors, "tables": self.config.tables, "torch_threads": self.config.torch_threads,
             "actor_threads": self.config.actor_threads, "cpu_count": os.cpu_count(), "sync_every": self.config.sync_every,
             "device": self.config.device, "precision": self.config.precision,
@@ -1086,8 +1192,9 @@ class Trainer:
                     for version in range(before, before + steps):
                         rng = Random(f"{cfg.seed}:{self.group.rank}:{version}") if post_local else self.rng
                         batch = self.buffer.sample(rng, cfg.batch_size, version, seed=cfg.seed, targets=targets)
-                        self.last_update = asdict(self.learner.update(batch, skip_grad_sync=post_local))
-                        self.trained_decisions += int(batch.valid.sum())
+                        stats = self.learner.update(batch, skip_grad_sync=post_local)
+                        self.last_update = asdict(stats)
+                        self.trained_decisions += stats.trained_steps
                     version = self.learner.version
                     self.buffer.prune(version)
                     if post_local:
@@ -1097,11 +1204,7 @@ class Trainer:
                 self._sync_progress()
                 if step == _Step.UPDATE:
                     publish = version // cfg.publish_every > before // cfg.publish_every
-                    if publish:
-                        self.export_model(self.model_path)
-                    if primary:
-                        if publish or version // cfg.checkpoint_every > before // cfg.checkpoint_every:
-                            self._save()
+                    previous_plan = self.config.plan
                     if cfg.eval_every and version // cfg.eval_every > before // cfg.eval_every:
                         if self.group.size > 1:
                             dist.barrier()
@@ -1111,9 +1214,18 @@ class Trainer:
                             except Exception as exc:
                                 if not isinstance(exc, InterruptedError) or not stopping():
                                     eval_error = exc
-                        if self.group.size > 1:
+                        if cfg.auto_curriculum:
+                            shared = self.group.share(self.config.plan.to_dict() if primary else None)
+                            if not primary:
+                                self.config = replace(self.config, plan=CollectPlan.from_dict(shared))
+                        elif self.group.size > 1:
                             dist.barrier()
+                    publish |= self.config.plan != previous_plan
+                    if publish:
+                        self.export_model(self.model_path)
                     if primary:
+                        if publish or version // cfg.checkpoint_every > before // cfg.checkpoint_every:
+                            self._save()
                         metrics.write(json.dumps(self.summary(), allow_nan=False) + "\n")
                         metrics.flush()
                 if primary and time.monotonic() >= heartbeat:

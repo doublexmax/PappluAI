@@ -12,6 +12,7 @@ except ImportError:
 
 if torch is not None:
     from src.model.network import GameTransformer, TokenBatch, load_checkpoint, save_checkpoint
+    from src.training.train import StepSample
 
 
 class TestSpec(unittest.TestCase):
@@ -115,6 +116,23 @@ class TestGameTransformer(unittest.TestCase):
         extended[0, 4] = tail[0, 0]
         replay = model.step(fresh, rows, extended, suffix[:, 0], legal[:, 0], append_lengths=lengths + 1)
         torch.testing.assert_close(continued.value, replay.value, rtol=0, atol=1e-5)
+
+    def test_subsampled_unroll_matches_full_unroll_after_prefix_trim(self):
+        model = GameTransformer(self.model.spec, replace(self.schema, pointer_field=2))
+        prefix = torch.randint(1, 256, (2, 41, 3), dtype=torch.uint8)
+        suffix = torch.randint(1, 256, (2, 4, 5, 3), dtype=torch.uint8)
+        suffix[..., 2] %= self.schema.num_actions + 1
+        cuts = torch.tensor([[2, 9, 20, 41], [3, 6, 11, 19]])
+        legal = torch.rand(2, 4, 7) > 0.4
+        legal[..., 0] = True
+        batch = TokenBatch(prefix, suffix, cuts, legal)
+        sample = StepSample(torch.tensor([[0, 2], [1, 3]]), torch.full((2, 2), 0.5))
+        tokens = sample.tokens(batch)
+        self.assertEqual(tokens.prefix.size(1), 20)
+        with torch.no_grad():
+            full, picked = model.unroll(batch), model.unroll(tokens)
+        torch.testing.assert_close(picked.log_policy, sample.gather(full.log_policy), atol=1e-6, rtol=0)
+        torch.testing.assert_close(picked.value, sample.gather(full.value), atol=1e-6, rtol=0)
 
     def test_entities_add_scores_to_the_named_action_before_legal_masking(self):
         model = GameTransformer(self.model.spec, replace(self.schema, pointer_field=1))

@@ -1,7 +1,6 @@
 import copy
 import math
 import unittest
-from unittest.mock import patch
 
 from src.model.encoding import SCHEMA
 from src.model.spec import ModelSpec
@@ -56,6 +55,7 @@ class TestLearner(unittest.TestCase):
             torch.tensor([1]), torch.tensor([12]), torch.tensor([2]),
             torch.tensor([-math.log(2)]), torch.tensor(1.0), _expert(1, 3, 49151),
             torch.ones(1, dtype=torch.uint8),
+            torch.zeros(1), torch.zeros(1),
         )
         stats = learner.update(TrajectoryBatch.pack((row,)))
         self.assertAlmostEqual(stats.policy_loss, math.log(2), places=6)
@@ -79,9 +79,10 @@ class TestLearner(unittest.TestCase):
             torch.tensor([1, 2]), torch.tensor([12, 48]), torch.tensor([2, 5]),
             torch.tensor([-math.log(2), 0]), torch.tensor(1.0), targets.to(torch.uint16),
             torch.tensor([0, 1], dtype=torch.uint8),
+            torch.zeros(2), torch.zeros(2),
         )
         stats = learner.update(TrajectoryBatch.pack((row,)))
-        credit = 0.995 * 0.5
+        credit = 0.995
         self.assertAlmostEqual(stats.policy_loss, (credit + 1) * math.log(2) / 2, places=6)
         self.assertAlmostEqual(stats.loss, stats.policy_loss + stats.value_loss - 0.002 * math.log(2), places=6)
         torch.testing.assert_close(
@@ -99,6 +100,50 @@ class TestLearner(unittest.TestCase):
             [0.995**3, 0.995**2, 0.995, 1.0], [-0.995, -1.0, 0.0, 0.0],
         ]))
 
+    def test_shaped_rewards_telescope_with_ragged_terminal_steps(self):
+        seats = tuple(
+            _SeatTrajectory(
+                torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
+                torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
+                torch.arange(1, n + 1), torch.full((n,), 12), torch.full((n,), 2),
+                torch.full((n,), -math.log(2)), torch.tensor(utility), _expert(n),
+                torch.zeros(n, dtype=torch.uint8), torch.tensor(phi), torch.zeros(n),
+            )
+            for n, utility, phi in ((1, 1.0, [0.75]), (4, -0.4, [0.1, 0.3, 0.2, 0.7]))
+        )
+        batch = TrajectoryBatch.pack(seats)
+        torch.testing.assert_close(batch.reward, torch.tensor([
+            [0.25, 0, 0, 0], [0.1985, -0.101, 0.4965, -1.1],
+        ]))
+        torch.testing.assert_close(
+            (batch.reward * 0.995 ** torch.arange(4)).sum(1),
+            torch.tensor([0.25, -0.4 * 0.995**3 - 0.1]),
+        )
+
+    def test_subsample_keeps_terminal_and_weights_the_other_decisions(self):
+        def seat(n):
+            return _SeatTrajectory(
+                torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
+                torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
+                torch.arange(1, n + 1), torch.full((n,), 12), torch.full((n,), 2),
+                torch.zeros(n), torch.tensor(1.0), _expert(n), torch.zeros(n, dtype=torch.uint8),
+                torch.zeros(n), torch.zeros(n),
+            )
+
+        batch = TrajectoryBatch.pack((seat(2), seat(4)))
+        values = torch.tensor([[1.0, 3.0, 0.0, 0.0], [1.0, 2.0, 3.0, 40.0]])
+        observed = {}
+        rng = torch.Generator().manual_seed(983)
+        for _ in range(32):
+            sample = batch.sample_steps(2, rng)
+            self.assertEqual(sample.index[:, 1].tolist(), [1, 3])
+            self.assertEqual(sample.weight.tolist(), [[0.5, 0.5], [0.75, 0.25]])
+            estimate = (sample.gather(values) * sample.weight).sum(1)
+            self.assertEqual(float(estimate[0]), 2.0)
+            observed[int(sample.index[1, 0])] = float(estimate[1])
+        self.assertEqual(observed, {0: 10.75, 1: 11.5, 2: 12.25})
+        self.assertEqual(sum(observed.values()) / 3, float(values[1].mean()))
+
     def test_mixed_length_update_weights_each_complete_trajectory_equally(self):
         model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
         config = TrainConfig(precision="fp32", grad_clip=1000)
@@ -109,6 +154,7 @@ class TestLearner(unittest.TestCase):
                 torch.arange(1, n + 1), torch.full((n,), legal), torch.full((n,), 2),
                 torch.full((n,), -math.log(2)), torch.tensor(utility), _expert(n),
                 torch.zeros(n, dtype=torch.uint8),
+                torch.zeros(n), torch.zeros(n),
             )
             for n, legal, utility in ((1, 4, 1.0), (8, 12, -1.0))
         )
@@ -139,23 +185,19 @@ class TestLearner(unittest.TestCase):
                 torch.arange(1, n + 1), torch.full((n,), 12), torch.full((n,), 2),
                 torch.full((n,), -math.log(2)), torch.tensor(1.0), _expert(n),
                 torch.ones(n, dtype=torch.uint8),
+                torch.zeros(n), torch.zeros(n),
             )
             for n in (1, 2)
         )
         batch = TrajectoryBatch.pack((first, first, second))
         initial = learner.anchor.policy.weight.clone()
-        with patch.object(learner.anchor, "unroll", wraps=learner.anchor.unroll) as anchor_unroll:
-            stats = learner.update(batch)
-            self.assertAlmostEqual(stats.kl_anchor, 0.0)
-            self.assertTrue(math.isfinite(stats.loss))
-            self.assertFalse(torch.equal(learner.online.policy.weight, initial))
-            torch.testing.assert_close(learner.anchor.policy.weight, initial)
-            self.assertEqual(anchor_unroll.call_args.args[0].prefix.size(0), 2)
-            stats = learner.update(batch)
-            self.assertGreater(stats.kl_anchor, 0)
-            self.assertEqual(anchor_unroll.call_count, 1)
-            self.assertEqual(learner.version, 2)
-            torch.testing.assert_close(learner.online.policy.weight, learner.anchor.policy.weight)
-            self.assertAlmostEqual(learner.update(batch).kl_anchor, 0)
-            self.assertEqual(anchor_unroll.call_count, 2)
+        stats = learner.update(batch)
+        self.assertAlmostEqual(stats.kl_anchor, 0.0)
+        self.assertTrue(math.isfinite(stats.loss))
+        self.assertFalse(torch.equal(learner.online.policy.weight, initial))
+        torch.testing.assert_close(learner.anchor.policy.weight, initial)
+        self.assertGreater(learner.update(batch).kl_anchor, 0)
+        self.assertEqual(learner.version, 2)
+        torch.testing.assert_close(learner.online.policy.weight, learner.anchor.policy.weight)
+        self.assertAlmostEqual(learner.update(batch).kl_anchor, 0)
         self.assertTrue(all(p.dtype == torch.float32 and not p.requires_grad for p in learner.anchor.parameters()))

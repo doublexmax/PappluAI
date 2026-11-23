@@ -16,7 +16,7 @@ _GAME = ("num_decks", "cards_in_hand", "required_sequences", "max_turns", "recyc
 _PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance", "uniform_mix", "batch_decisions", "search_ply")
 _HOST = ("tables", "torch_threads", "precision", "device")
 _INTS = (
-    "actors", "actor_threads", "batch_size", "min_buffer_decisions", "buffer_decisions",
+    "actors", "actor_threads", "batch_size", "unroll_steps", "min_buffer_decisions", "buffer_decisions",
     "max_policy_lag", "anchor_every", "sync_every", "publish_every", "checkpoint_every", "eval_every",
     "eval_deals", "seed",
 )
@@ -34,6 +34,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-model", type=Path, help="seed a fresh learner from compatible weights")
     parser.add_argument("--players", dest="player_counts", type=int, nargs="+")
     parser.add_argument("--recycle-discard", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--auto-curriculum", action=argparse.BooleanOptionalAction, default=None,
+                        help="advance the collection plan on 0-ply frontier mastery")
     parser.add_argument("--device")
     parser.add_argument("--precision", choices=("fp32", "bf16"))
     parser.add_argument("--search-ply", type=int, choices=(0, 1), help="self-play depth for a fresh learner (default: 1)")
@@ -56,7 +58,8 @@ def main(argv=None) -> int:
     parser = build_arg_parser()
     try:
         args = parser.parse_args(argv)
-        learner = _selected(args, (*_SHAPE, *_GAME, *_PLAN, *_INTS, *_FLOATS, "initial_model", "max_updates"))
+        learner = _selected(args, (*_SHAPE, *_GAME, *_PLAN, *_INTS, *_FLOATS,
+                                   "auto_curriculum", "initial_model", "max_updates"))
         if args.collect is not None:
             if args.model is None or args.worker is None or args.worker < 0:
                 parser.error("--collect requires --model and a nonnegative --worker")
@@ -99,7 +102,7 @@ def main(argv=None) -> int:
             game, plan = _selected(args, _GAME), _selected(args, _PLAN)
             if "player_counts" in plan:
                 plan["player_counts"] = tuple(plan["player_counts"])
-            overrides = {**host, **_selected(args, (*_INTS, *_FLOATS))}
+            overrides = {**host, **_selected(args, (*_INTS, *_FLOATS, "auto_curriculum"))}
             if game:
                 overrides["game"] = game
             if plan:

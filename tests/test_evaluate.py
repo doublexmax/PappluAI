@@ -3,6 +3,8 @@ from __future__ import annotations
 import itertools
 import unittest
 from enum import IntEnum
+from functools import lru_cache
+from random import Random
 
 from src.evaluate import (
     NUM_FACES,
@@ -14,6 +16,7 @@ from src.evaluate import (
     is_valid_hand,
     minimum_penalty,
 )
+from src.game.outcome import hand_potential
 
 
 def face(suit, rank):
@@ -53,6 +56,72 @@ def classic_valid_21():
     for suit in range(3):
         cards.append(face(suit, 10))
     return from_cards(cards)
+
+
+class TestHandPotential(unittest.TestCase):
+    def test_ace_rules_shared_jokers_and_duplicate_pairs(self):
+        joker = JOKER_8S
+
+        def score(*cards):
+            return hand_potential(from_cards(cards), joker, 2, 6)
+
+        self.assertEqual(score(0, 11, 12), 0.375)
+        self.assertEqual(score(1, 2, 3), 0.375)
+        self.assertEqual(score(0, 1, 12), 0.09375)
+        self.assertEqual(score(0, 11), 0.09375)
+        self.assertEqual(score(10, 10), 0.09375)
+        self.assertEqual(score(joker, joker, joker), 0.375)
+        self.assertEqual(score(1, 3, 16, 18, joker), 0.46875)
+        self.assertEqual(score(1, 3, 16, 18, joker, joker), 0.75)
+        self.assertEqual(score(1, 3, JOKER_8H), 0.09375)
+
+    def test_triples_and_residual_melds_match_physical_card_packing(self):
+        rng = Random(801)
+        joker = JOKER_8S
+        pool = (0, 1, 2, 3, 4, 7, 7, 7, 11, 12, 13, 14, 15, 17, 20, 26, 30, 33, 43)
+        for _ in range(64):
+            n = rng.randint(6, 10)
+            quota = rng.randint(1, n // 3)
+            extra_limit = (n - 3 * quota) // 3
+            cards = tuple(rng.sample(pool, n))
+            pairs, pure, other = [], [], []
+            for i, j in itertools.combinations(range(n), 2):
+                a, b = sorted((cards[i], cards[j]))
+                if joker not in (a, b) and a // 13 == b // 13 and (
+                    b - a <= 2 or a % 13 == 0 and b % 13 >= 11
+                ):
+                    pairs.append((1 << i) | (1 << j))
+            for i, j, k in itertools.combinations(range(n), 3):
+                hand = from_cards((cards[i], cards[j], cards[k]))
+                mask = (1 << i) | (1 << j) | (1 << k)
+                if evaluate_hand(hand, joker, 1, 3).is_valid:
+                    pure.append(mask)
+                    other.append(mask)
+                elif evaluate_hand(hand, joker, 0, 3).is_valid:
+                    other.append(mask)
+
+            @lru_cache(maxsize=None)
+            def pack(left, melds, limit):
+                if not limit:
+                    return 0
+                return max((1 + pack(left ^ take, melds, limit - 1)
+                            for take in melds if left & take == take), default=0)
+
+            @lru_cache(maxsize=None)
+            def visit(left, needed):
+                if not needed:
+                    return 0, pack(left, tuple(other), extra_limit)
+                best = (0, pack(left, tuple(pairs), needed))
+                for take in pure:
+                    if left & take == take:
+                        q, residual = visit(left ^ take, needed - 1)
+                        best = max(best, (q + 1, residual))
+                return best
+
+            q, residual = visit((1 << n) - 1, quota)
+            expected = 0.75 * (20 * q + (4 if q == quota else 5) * residual) / (20 * quota + 4 * extra_limit)
+            with self.subTest(cards=cards, quota=quota):
+                self.assertEqual(hand_potential(from_cards(cards), joker, quota, n), expected)
 
 
 class TestEvaluateValid(unittest.TestCase):

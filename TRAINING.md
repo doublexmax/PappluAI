@@ -24,7 +24,7 @@ python -m src.cli.train --output-dir runs/smoke --max-updates 2 --max-seconds 90
 
 Check `status.json` for `status: max_updates` and `version: 2`. The update limit is an absolute policy revision, not a count of additional updates. Reuse the directory to resume.
 
-On resume you can change actor and table counts, thread counts, device, precision, `--checkpoint-every`, `--learning-rate`, `--eta`, and `--sync-every`. A new `--learning-rate` replaces the rate saved with AdamW without resetting its moments. You can also change `--players`, `--curriculum-share`, and `--curriculum-max-distance`. The game, model, and other collection settings stay fixed. Restart standalone collectors after changing the collection plan.
+On resume you can change actor and table counts, thread counts, device, precision, `--checkpoint-every`, `--learning-rate`, `--eta`, and `--sync-every`. A new `--learning-rate` replaces the rate saved with AdamW without resetting its moments. You can also change `--players`, `--curriculum-share`, and `--curriculum-max-distance`. The game, model, and other collection settings stay fixed. Restart standalone collectors if you change `--players`.
 
 ## Start a full run
 
@@ -36,27 +36,33 @@ The default `GameTransformer` has 2,175,224 parameters. Its four blocks use widt
 
 Training defaults to three decks, 21 cards per hand, five required pure sequences, 60 turns per seat, and discard recycling. Two actor processes per learner rank cycle through one-, two-, three-, and four-seat games, with 64 tables per process by default.
 
-Half of starts use the curriculum by default. Solo curriculum starts take the smaller of two uniform draws from zero through six. Distance zero starts with one extra card and ends after one discard. Multiplayer curriculum starts sample a distance uniformly from one through six and replace that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Validation and the arena use cold deals.
+Half of starts use the curriculum by default. Curriculum starts take the smaller of two uniform draws from zero through six in solo and from one through six in multiplayer. Distance zero starts with one extra card and ends after one discard. At positive distances, the dealer replaces that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Standard validation and the arena use cold deals.
+
+Use `--auto-curriculum` on a fresh run to start at distance 1 with a 92% curriculum share. At each `--eval-every` interval, rank 0 runs 48 fixed solo deals at the current distance with 0-ply inference. The check records the win rate and mean number of qualifying sequences. The thresholds at distances 1, 2, 3, 4, 6, 9, and 14 are 45%, 30%, 20%, 20%, 12%, 12%, and 12%. The final frontier is cold. The share falls to 45% by distance 14, so earlier distances remain in the mix. All ranks publish the new plan on promotion. Existing matches keep their admission plan and weights.
 
 Self-play defaults to `--search-ply 1`. The actor uses a pure sequence upper bound to skip declaration checks when the hand cannot meet the quota. It gives equal probability to every legal winning discard. If taking the top discard permits a legal winning discard that turn, it takes the card with probability one. On other decisions it uses the masked neural policy without scoring candidates. At `--search-ply 0` it skips the declaration checks.
 
-By default, actors mix 2% uniform probability over legal actions into the policy when no move is forced. The rollout records one `uint8` forced flag and the actual behavior log probability for each decision. It quantizes the policy target before exploration to 54 unsigned 16-bit values and stores their bits in an `int16` tensor. The learner validates target mass and legality on load. It applies cross-entropy only to forced decisions and uses a V-trace policy gradient on ordinary decisions. `--entropy-weight` defaults to zero.
+By default, actors mix 2% uniform probability over legal actions into the policy when no move is forced. The rollout records one `uint8` forced flag, the actual behavior log probability, the behavior value, and the hand potential for each decision. It quantizes the policy target before exploration to 54 unsigned 16-bit values and stores their bits in an `int16` tensor. The learner validates target mass and legality on load. It applies cross-entropy only to forced decisions and a clipped importance-weighted policy gradient to ordinary decisions. `--entropy-weight` defaults to zero.
 
-The value head uses V-trace with a discount of 0.995 and no terminal bootstrap. A declaration pays the winner `+1`. In multiplayer the other seats split `-1` equally. On a timeout let `f` be the share of the pure sequence quota recorded by `HandPenalty.qualifying_sequences`, capped at 1. A zero quota gives `f = 1`. Solo pays `-1 + 0.60 * f`. Multiplayer pays each seat `-0.50 + 0.30 * (f - mean_of_other_seats)`. The relative term sums to zero, while every seat still gets a negative payoff. The scoreboard still uses exact deadwood.
+The learner computes targets over the entire seat trajectory from the recorded behavior values. The V-trace target recurrence uses a unit ratio, discount `0.995`, trace cap `0.85`, and zero terminal bootstrap. The sampled policy-gradient terms use the actual clipped online-to-behavior likelihood ratio. The full-trajectory targets do not reevaluate the current policy on omitted steps.
 
-The learner drops data more than `--max-policy-lag` revisions old. The default lag limit is 200. Each rank samples `--batch-size` trajectories with replacement from one player-count and length bucket. The default batch size is eight. A bucket's weight is its trajectory count. Each trajectory has equal weight in the policy, value, and anchor KL losses.
+The hand potential counts up to the required number of disjoint qualifying triples. Below quota, disjoint natural pairs count for one quarter of a triple. At quota, disjoint extra three-card melds count for one fifth of a triple. Neither rule uses card point values. The learner adds `0.995 * next_potential - current_potential` to each nonterminal reward and subtracts the last potential from the terminal utility. The terminal state's potential is zero. Discounted return differs from the unshaped return by the starting potential alone. The scoreboard still uses exact deadwood.
 
-The default learning rate is `5e-4` and the default anchor weight (`--eta`) is `0.01`. Replay caches anchor log probabilities until the anchor refreshes. The default interval (`--anchor-every`) is 2,000 revisions. Training defaults to CPU with BF16 autocast, FP32 master weights, and FP32 loss math. Use `--precision fp32` to disable autocast.
+A declaration pays the winner `+1`. In multiplayer the other seats split `-1` equally. On a timeout let `f` be the share of the pure sequence quota recorded by `HandPenalty.qualifying_sequences`, capped at 1. A zero quota gives `f = 1`. Solo pays `-1 + 0.60 * f`. Multiplayer pays each seat `-0.50 + 0.30 * (f - mean_of_other_seats)`. The relative term sums to zero, and every seat still gets a negative payoff.
+
+The learner drops data more than `--max-policy-lag` revisions old. The default lag limit is 200. Each rank samples `--batch-size` trajectories with replacement from one player-count and length bucket. The default batch size is eight. A bucket's weight is its trajectory count. Each trajectory has equal weight in the policy, value, and anchor KL losses. For each trajectory the learner unrolls up to `--unroll-steps` decisions, 12 by default. For longer trajectories it keeps the terminal decision and samples the other positions without replacement. Inverse inclusion weights preserve the expected full-trajectory mean. `trained_decisions` counts the positions that reach the model, not all positions used to compute targets.
+
+The default learning rate is `5e-4` and the default anchor weight (`--eta`) is `0.01`. The frozen anchor evaluates the same sampled positions. The default refresh interval (`--anchor-every`) is 2,000 revisions. Training defaults to CPU with BF16 autocast, FP32 master weights, and FP32 loss math. Use `--precision fp32` to disable autocast.
 
 | File | Contents |
 | --- | --- |
 | `latest-model.pt` | Published weights, game, policy revision, and collection plan. |
-| `best-model.pt` | Cold validation selection, or the initial model until promotion. |
+| `best-model.pt` | Cold validation selection or the last model to clear a mastery threshold. Before a promotion, it holds the initial model. |
 | `latest-state.pt` | Learner and anchor weights, optimizer, progress, and sampler state. |
 | `inbox/batch-*.pt` | Complete byte-token rollout batches with quantized policy targets awaiting ingestion. |
 | `metrics.jsonl` and `status.json` | Update metrics and run status, including collected and trained decisions, throughput, importance ratio, KL, buffer depth, and inbox depth. |
 
-The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Rollout format 4 requires forced flags.
+The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Rollout format 5 requires forced flags, hand potentials, and behavior values. Training state format 17 stores mastery progress. Use `--initial-model` in a new run directory to start from an older Schema 8 checkpoint without its trainer state.
 
 ### Schema 8 tokens
 

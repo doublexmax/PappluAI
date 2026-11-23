@@ -33,7 +33,7 @@ def _seat(rank):
         torch.tensor([HEADER_TOKENS + 1, HEADER_TOKENS + 2], dtype=torch.int16), torch.full((2,), 12),
         torch.full((2,), 2 + rank, dtype=torch.uint8), torch.full((2,), -math.log(2)),
         torch.tensor(1.0 if rank == 0 else -0.5), targets.to(torch.uint16),
-        torch.tensor([0, 1], dtype=torch.uint8),
+        torch.tensor([0, 1], dtype=torch.uint8), torch.zeros(2), torch.zeros(2),
     )
 
 
@@ -60,7 +60,7 @@ def _train_rank(base):
     Trajectories(
         0, 1, trainer.run_id, torch.ones(1, dtype=torch.uint8), seat.utility[None],
         seat.prefix, torch.tensor([len(seat.prefix)]), seat.suffix, torch.tensor([2]), seat.cut,
-        seat.legal, seat.action, seat.behavior_logp, seat.target_probs, seat.forced,
+        seat.legal, seat.action, seat.behavior_logp, seat.target_probs, seat.forced, seat.potential, seat.behavior_value,
     ).save(trainer.inbox / "batch-test.pt")
     assert trainer.run(stop=lambda: rank == 1 and trainer.learner.version == 2, max_updates=3, max_seconds=20) == "stopped"
     assert not dist.is_initialized()
@@ -80,7 +80,7 @@ def _train_post_local_rank(base):
     Trajectories(
         0, 1, trainer.run_id, torch.ones(1, dtype=torch.uint8), seat.utility[None],
         seat.prefix, torch.tensor([len(seat.prefix)]), seat.suffix, torch.tensor([2]), seat.cut,
-        seat.legal, seat.action, seat.behavior_logp, seat.target_probs, seat.forced,
+        seat.legal, seat.action, seat.behavior_logp, seat.target_probs, seat.forced, seat.potential, seat.behavior_value,
     ).save(trainer.inbox / "batch-test.pt")
     references = [
         Learner(copy.deepcopy(trainer.learner.online), replace(trainer.config, anchor_every=100))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 from dataclasses import dataclass, field, replace
 import math
 from pathlib import Path
@@ -15,7 +16,7 @@ from src.game.environment import (
     ACTION_TAKE_DISCARD, GameConfig, Observation, PappluEnv, Phase, discard_action,
 )
 from src.game.multiplayer import MatchConfig, MatchTelemetry, MultiplayerEnv, TerminalSnapshot
-from src.game.outcome import DealOutcome
+from src.game.outcome import DealOutcome, hand_potential
 from src.model.encoding import FIELDS, SCHEMA, encode, legal_mask, validate_game
 from src.model.network import GameTransformer, action_mask, load_checkpoint
 
@@ -33,6 +34,8 @@ class SeatTrace:
     behavior_logp: tuple[float, ...]
     target_probs: bytes
     forced: bytes
+    potential: tuple[float, ...]
+    behavior_value: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -117,11 +120,14 @@ class _TraceDraft:
     logp: list[float] = field(default_factory=list)
     target_probs: bytearray = field(default_factory=bytearray)
     forced: bytearray = field(default_factory=bytearray)
+    potential: array = field(default_factory=lambda: array("f"))
+    value: list[float] = field(default_factory=list)
 
     def seal(self) -> SeatTrace:
         return SeatTrace(
             bytes(self.prefix), bytes(self.suffix), tuple(self.cut), tuple(self.legal),
             bytes(self.action), tuple(self.logp), bytes(self.target_probs), bytes(self.forced),
+            tuple(self.potential), tuple(self.value),
         )
 
 
@@ -230,9 +236,11 @@ class _TransformerActor:
             actions = log_policy.argmax(-1).tolist()
             logps = [0.0] * len(actions)
         targets = target.mul(65535).round().int().tolist() if self.policy.record else None
+        values = heads.value.tolist() if self.policy.record else None
         for i, (stream, row, action, logp) in enumerate(zip(streams, encoded, actions, logps)):
             stream.events = row.events
             if stream.trace is not None:
+                obs = turns[i].observation
                 stream.trace.prefix.extend(row.prefix)
                 stream.trace.suffix.extend(row.suffix)
                 stream.trace.cut.append(row.cut)
@@ -241,6 +249,10 @@ class _TransformerActor:
                 stream.trace.logp.append(logp)
                 stream.trace.target_probs.extend(_QUANTIZED_POLICY.pack(*targets[i]))
                 stream.trace.forced.append(i in forced)
+                stream.trace.potential.append(hand_potential(
+                    obs.hand, obs.joker, obs.config.required_sequences, obs.config.cards_in_hand,
+                ))
+                stream.trace.value.append(values[i])
         return actions
 
     def finish(self, stream: int) -> SeatTrace | None:
