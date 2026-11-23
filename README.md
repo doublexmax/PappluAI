@@ -207,7 +207,7 @@ See the [training guide](TRAINING.md) to start, resume, or evaluate a run on Azu
 | --- | --- |
 | `src.game` | Environments, public observations, terminal outcomes, and stock handling. |
 | `src.model` | Byte encoding, the game-independent Transformer, and versioned model checkpoints. |
-| `src.training.train` | Self-play collection, rollout loading, lag-bounded replay, and V-trace updates. |
+| `src.training.train` | Self-play collection, lag-bounded replay, policy distillation, and V-trace value updates. |
 | `src.evaluation` | One batched arena for collection, solo evaluation, and multiplayer evaluation. |
 | `src.checkpoints` | Atomic files and tensor validation. |
 
@@ -215,16 +215,28 @@ The Schema 8 encoder stores eight bytes per token. Its append-only prefix contai
 
 The default model has 2,175,224 parameters in four RMSNorm Transformer blocks. It uses width 192, six rotary attention heads of width 32, and a SwiGLU width of 512. The prefix is causal. Each decision reads its 30-token snapshot and only the prefix available at that decision. The action token supplies 54 base policy logits and a scalar value. Each hand token adds a score to its discard logit through `TokenSchema.pointer_field` before the legal mask. See [CPU training and Gloo synchronization](TRAINING.md#run-several-cpu-learners).
 
-The declarer earns `+1`. In a declared multiplayer game, the other seats split `-1` equally. A timeout pays `-1` in solo and `-0.5` per seat in multiplayer, regardless of deadwood. The scoreboard still uses exact deadwood for placement and ties. Each learner update gives every sampled trajectory equal loss weight, regardless of how many decisions it contains.
+Self-play uses 1-ply search to generate policy targets. The actor checks for immediate declarations and scores known afterstates against the cached prefix. The model learns the search distribution by cross-entropy. At 0-ply it still chooses from a single neural forward pass with a legal-action mask and no declaration check or lookahead.
 
-For Schema 8, Check-In #7 won selection at seed `600_000` with a 5.06% mean declaration rate. Check-In #8 reached 4.32% and Final Stage reached 4.39%. The run locked Check-In #7 before evaluating seed `910_000`. The results below are Python training results, not results for the browser model.
+The declarer earns `+1`. In a declared multiplayer game, the other seats split `-1` equally. Timeout payoffs are negative and depend on progress toward the pure sequence quota, not directly on card points. The scoreboard still uses exact deadwood for placement and ties. Each learner update gives every sampled trajectory equal weight regardless of length.
 
-| Held-out solo start | Check-In #7 | RandomPolicy | Revision 0 |
-| --- | ---: | ---: | ---: |
-| Warm d=0, 128 deals | 27.34%, -0.4531 | 25.78%, -0.4844 | 22.66%, -0.5469 |
-| Cold 21-card, 256 deals | 0.39%, -0.9922 | 1.17%, -0.9766 | 0.78%, -0.9844 |
+Seed `600_000` selected Check-In #10 at revision 826 before the run opened held-out seed `920_000`. The tables show valid declarations per game for the Python model, not the browser model.
 
-Each cell gives the declaration rate and mean utility. Check-In #7 also declared three times in 2,040 cold multiplayer games across nine matchups. The run did not establish a cold-game advantage over either baseline. See the [full Schema 8 tables](TRAINING.md#schema-8-azure-results) and the [historical Schema 7 results](TRAINING.md#azure-checkpoint-and-held-out-results).
+| Held-out solo start | Trained 0-ply | Trained 1-ply | RandomPolicy | Rev 0, 0-ply | Rev 0, 1-ply |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Warm d=0 | 29/128 | 128/128 | 26/128 | 27/128 | 128/128 |
+| d=1 | 1/128 | 19/128 | 3/128 | 4/128 | 26/128 |
+| d=2 | 5/128 | 17/128 | 2/128 | 2/128 | 14/128 |
+| d=4 | 1/128 | 1/128 | 0/128 | 0/128 | 2/128 |
+| d=6 | 0/128 | 6/128 | 0/128 | 0/128 | 2/128 |
+| Cold 21-card | 0/256 | 0/256 | 0/256 | 1/256 | 2/256 |
+
+| Cold multiplayer | Trained 0-ply vs Random | Trained 0-ply vs Rev 0, 0-ply | Trained 1-ply vs Random | Trained 1-ply vs Rev 0, 0-ply | Trained 1-ply vs Rev 0, 1-ply |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2 seats | 0/200 | 0/200 | 0/200 | 1/200 | 1/200 |
+| 3 seats | 0/240 | 1/240 | 0/240 | 4/240 | 3/240 |
+| 4 seats | 0/240 | 1/240 | 2/240 | 0/240 | 3/240 |
+
+Search alone solved the warm discard puzzles. The learned weights did not show a consistent advantage over untrained weights at the same search depth. See the [full search distillation results](TRAINING.md#schema-8-search-distillation-results) for check-ins, percentages, opponent declarations, and telemetry.
 
 ## Verification
 

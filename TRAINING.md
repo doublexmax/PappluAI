@@ -32,21 +32,25 @@ The default `GameTransformer` has 2,175,224 parameters. Its four blocks use widt
 
 Actors play games with one to four seats in rotation, with 64 tables per process by default. Half of starts use the environment curriculum. Solo starts sample a distance from zero through six. Distance zero starts with 22 cards and ends after one discard. Multiplayer starts sample one through six and replace that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Validation and the arena default to cold deals.
 
-Actors sample from the policy with a 2% uniform mixture over legal actions. They write complete seat trajectories with the actual behavior log probability. The learner drops data that exceeds `--max-policy-lag`. By default, each rank draws eight trajectories uniformly with replacement from one player-count and length bucket. A bucket's weight is its trajectory count, not its decision count. The learner averages policy loss, value loss, anchor KL, and entropy within each trajectory before averaging across the batch.
+Self-play defaults to `--search-ply 1`. The actor runs the model once at the decision, then scores candidate afterstates against the existing KV cache. It never writes a candidate back to the cache. Papplu rules stay in the actor. The encoder, byte layout, and model weights have the same shape as before.
 
-The learner applies V-trace with a discount of 0.995 and no terminal bootstrap. Solo pays `+1` on a declaration and `-1` on a timeout. In declared multiplayer games the winner earns `+1` and the other seats split `-1` equally. A multiplayer timeout pays `-0.5` per seat. Deadwood affects the scoreboard, not training payoffs. The default learning rate is `5e-4`, the anchor weight is `0.05`, and the entropy weight is `0.003`.
+On a discard, search checks every legal discard for a declaration. It selects uniformly among winning discards if any exist. Otherwise it scores the six highest-prior legal discards by the sum of log prior and three times the candidate value. Other legal discards use the root value minus `0.15` in place of the candidate value. On a draw with two legal actions, a known pickup that permits a declaration gets `0.99` probability. Otherwise the known pickup uses its afterstate value and the unknown stock draw uses the root value.
 
-The learner regularizes rewards and policy updates against a frozen anchor. It caches the anchor's log probabilities for replayed trajectories until the weights refresh at `--anchor-every`. The default BF16 mode uses FP32 master weights and FP32 loss math. Use `--precision fp32` to disable autocast.
+Actors sample with a 2% uniform mixture over legal actions, except when a discard wins immediately. Each decision stores the search target before exploration as 54 unsigned 16-bit integers and records the actual behavior log probability. The learner validates target mass and legality on load and normalizes the targets before applying policy cross-entropy.
+
+The value head uses V-trace with a discount of 0.995 and no terminal bootstrap. A declaration pays the winner `+1`. In multiplayer the other seats split `-1` equally. On a timeout let `f` be the share of the pure sequence quota recorded by `HandPenalty.qualifying_sequences`, capped at 1. A zero quota gives `f = 1`. Solo pays `-1 + 0.60 * f`. Multiplayer pays each seat `-0.50 + 0.30 * (f - mean_of_other_seats)`. The relative term sums to zero, while every seat still gets a negative payoff. The scoreboard still uses exact deadwood.
+
+The learner drops data that exceeds `--max-policy-lag`. By default, each rank samples eight trajectories with replacement from one player-count and length bucket. A bucket's weight is its trajectory count, not its decision count. Each trajectory has equal weight in the policy, value, and anchor KL losses. The default learning rate is `5e-4`. The anchor weight is `0.01`. Replay caches anchor log probabilities until `--anchor-every` refreshes the anchor. BF16 uses FP32 master weights and FP32 loss math. Use `--precision fp32` to disable autocast.
 
 | File | Contents |
 | --- | --- |
 | `latest-model.pt` | Published weights, game, policy revision, and collection plan. |
 | `best-model.pt` | Cold validation selection, or the initial model until promotion. |
 | `latest-state.pt` | Learner and anchor weights, optimizer, progress, and sampler state. |
-| `inbox/batch-*.pt` | Complete byte-token rollout batches awaiting ingestion. |
+| `inbox/batch-*.pt` | Complete byte-token rollout batches with quantized policy targets awaiting ingestion. |
 | `metrics.jsonl` and `status.json` | Update metrics and run status, including collected and trained decisions, throughput, importance ratio, KL, buffer depth, and inbox depth. |
 
-The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox.
+The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Trainer state and rollouts from before policy distillation are incompatible. To use earlier Schema 8 weights, start a fresh run with `--initial-model` rather than resuming the old state.
 
 ### Schema 8 tokens
 
@@ -77,7 +81,7 @@ torchrun --standalone --nproc_per_node=2 -m src.cli.train \
 
 For multiple hosts, replace `--standalone` with the same `--nnodes` and private `--rdzv-endpoint` on every host. Use `--rdzv-backend c10d` and the same unique `--rdzv-id`. Use the same model and training flags. Do not expose the Gloo or rendezvous ports to untrusted hosts.
 
-Each rank waits for local replay. The ranks weight shared buckets by their combined trajectory counts and sample from local replay within the chosen bucket. With `--sync-every 1`, they average gradients before clipping and stepping AdamW. With `--sync-every 8`, each rank takes eight local AdamW steps, then the ranks average the FP32 model parameters. This Post-Local AdamW mode does not average the optimizer moments. Metrics sum decision counts across ranks and advance the policy revision by eight per full synchronization interval.
+Each rank waits for local replay. The ranks weight buckets by their combined trajectory counts, even when only one rank has the bucket. A rank with no local entries in the chosen bucket samples from its nearest available bucket. With `--sync-every 1`, ranks average gradients before clipping and stepping AdamW. With `--sync-every 8`, each rank takes eight local AdamW steps before ranks average the FP32 model parameters. This Post-Local AdamW mode does not average the optimizer moments. Metrics sum decision counts across ranks and advance the policy revision by eight per full synchronization interval.
 
 Actors use `rank-N/inbox` and read weights from local disk. Rank 0 writes the canonical checkpoints, status, and metrics and runs evaluation. Other ranks publish `rank-N/latest-model.pt` for their actors. For resume, keep `latest-state.pt` and `best-model.pt` on rank 0. Rank 0 shares the saved startup state over Gloo, so no rollout or checkpoint files need to move between hosts during training.
 
@@ -96,12 +100,12 @@ Leave off `--max-batches` for continuous collection. Refresh the actor's model f
 
 ```bash
 python -m src.cli.evaluate --checkpoint runs/full21/best-model.pt \
-  --games 300 --warm-games 0 --output runs/full21/evaluation.json
+  --games 300 --warm-games 0 --search-ply 0 --output runs/full21/evaluation.json
 python -m src.cli.arena --model runs/full21/best-model.pt --model random \
-  --games 120 --output runs/full21/arena.json
+  --games 120 --search-ply 1 --output runs/full21/arena.json
 ```
 
-`src.cli.evaluate` pairs the model and random policy on the same solo seeds. It reports discard puzzles separately when `--warm-games` is positive. `src.cli.arena` rotates the lineup over one to six seats and reports each deal's utilities and winner. Supply a checkpoint or `random` for each seat. Checkpoints in the same lineup must use the same game settings.
+`src.cli.evaluate` pairs the model and random policy on the same solo seeds. It reports discard puzzles separately when `--warm-games` is positive. `src.cli.arena` rotates the lineup over one to six seats and reports each deal's utilities and winner. Supply a checkpoint or `random` for each seat. Checkpoints in the same lineup must use the same game settings. Both commands default to `--search-ply 0`, which picks from the model's legal logits without a declaration check or lookahead. Use `--search-ply 1` to enable the same search used by self-play.
 
 ## Azure checkpoint and held-out results
 
@@ -162,7 +166,75 @@ The locked checkpoint played every seat once per deal. All other seats used the 
 | 4 | Revision 0 | 60 | 0 / 240 | 0.00% | 0.00% | 0.0290 | 93.90 | 106.08 |
 | 4 | Stage 1 | 60 | 0 / 240 | 0.00% | 0.14% | 0.0206 | 95.63 | 104.56 |
 
+## Schema 8 search distillation results
+
+Slice 4k used one `Standard_D16als_v6` in West US 2. Two localhost Gloo ranks used BF16, seven learner threads, and one single-threaded actor with 32 tables per rank. Each rank sampled eight trajectories per update. The run started a new optimizer from the Slice 4j Check-In #7 weights at revision 283 and used `eta=0.01` throughout.
+
+| Stage | Budget | Curriculum share | Maximum distance | Learning rate | Revision | Updates | Collected decisions/s | Trained decisions/s | Mean CPU | Mean / peak RAM GiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Check-In #9 | 15 min | 80% | 4 | `5e-4` | 336 | 336 | 82.61 | 463.98 | 64.10% | 8.34 / 11.77 |
+| Check-In #10 | 25 min | 55% | 8 | `3.5e-4` | 826 | 490 | 88.68 | 500.09 | 72.30% | 9.18 / 12.81 |
+| Final | 25 min | 25% | 14 | `2e-4` | 1,262 | 436 | 98.95 | 531.76 | 76.95% | 9.02 / 12.56 |
+
+Decision rates count both ranks over the stage. CPU and RAM are guest-wide samples taken every 30 seconds and at exit. The three windows are one training run, not independent trials. A separate single-thread BF16 check measured a 6.80 ms median for six cached candidates on one row with a 30-token prefix. The five repeats ranged from 6.80 to 6.88 ms per call. For 32 rows, six candidates each, and a 90-token prefix, the median was 239.96 ms, with a range of 239.05 to 240.88 ms. These timings exclude the root pass and game-rule checks.
+
+### Check-ins and lock at seed 600,000
+
+Each checkpoint played 64 deals in each solo case and 48 two-seat deals against RandomPolicy, with both candidate seats per deal. The table shows declarations per game. Selection averaged the 12 case win rates equally across both depths. Ties use the cold case mean, then mean utility. The initial weights provide a comparison and are not eligible for selection.
+
+| Checkpoint | Search ply | Warm d=0 | d=1 | d=2 | d=4 | Cold solo | Cold 2p | Mean win rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Initial | 0 | 17/64 | 3/64 | 0/64 | 0/64 | 0/64 | 1/96 | 5.38% |
+| Initial | 1 | 64/64 | 18/64 | 5/64 | 4/64 | 0/64 | 0/96 | 23.70% |
+| Check-In #9 | 0 | 17/64 | 3/64 | 2/64 | 0/64 | 0/64 | 0/96 | 5.73% |
+| Check-In #9 | 1 | 64/64 | 20/64 | 6/64 | 4/64 | 0/64 | 0/96 | 24.48% |
+| Check-In #10 | 0 | 18/64 | 2/64 | 1/64 | 2/64 | 0/64 | 0/96 | 5.99% |
+| Check-In #10 | 1 | 64/64 | 18/64 | 7/64 | 5/64 | 1/64 | 0/96 | 24.74% |
+| Final | 0 | 21/64 | 4/64 | 1/64 | 0/64 | 0/64 | 0/96 | 6.77% |
+| Final | 1 | 64/64 | 15/64 | 6/64 | 4/64 | 1/64 | 0/96 | 23.44% |
+
+Check-In #10 led at 15.36% across both depths. The pipeline copied revision 826 to `locked-gt-az-winner.pt` before opening seed `920_000`. SHA-256 is `6bd3c6e47f82b2d9f49d5d0132238004c22f92cd6f2e29d62cc116875bfeae9b`.
+
+### Untouched solo at seed 920,000
+
+The holdout completed 7,880 games and 1,690,364 actions on 16 workers in 894 seconds, with no evaluation errors. All five solo policies played the same seeds within each start condition. Rev 0 is the fixed untrained Schema 8 checkpoint. In these tables a win means a valid declaration, not first place on points.
+
+| Start | Trained 0-ply | Trained 1-ply | RandomPolicy | Rev 0, 0-ply | Rev 0, 1-ply |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Warm d=0 | 29/128 (22.66%) | 128/128 (100.00%) | 26/128 (20.31%) | 27/128 (21.09%) | 128/128 (100.00%) |
+| d=1 | 1/128 (0.78%) | 19/128 (14.84%) | 3/128 (2.34%) | 4/128 (3.12%) | 26/128 (20.31%) |
+| d=2 | 5/128 (3.91%) | 17/128 (13.28%) | 2/128 (1.56%) | 2/128 (1.56%) | 14/128 (10.94%) |
+| d=4 | 1/128 (0.78%) | 1/128 (0.78%) | 0/128 (0.00%) | 0/128 (0.00%) | 2/128 (1.56%) |
+| d=6 | 0/128 (0.00%) | 6/128 (4.69%) | 0/128 (0.00%) | 0/128 (0.00%) | 2/128 (1.56%) |
+| Cold 21-card | 0/256 (0.00%) | 0/256 (0.00%) | 0/256 (0.00%) | 1/256 (0.39%) | 2/256 (0.78%) |
+
+### Untouched cold multiplayer at seed 920,000
+
+For each matchup the locked checkpoint played every seat once per deal. All other seats used the named opponent. Opponent declarations are combined across those seats. The remaining games timed out.
+
+| Seats | Trained mode | Opponent | Trained declarations | Opponent declarations | Timeouts |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 2 | 0-ply | RandomPolicy | 0/200 (0.00%) | 0 | 200 |
+| 2 | 0-ply | Rev 0, 0-ply | 0/200 (0.00%) | 0 | 200 |
+| 3 | 0-ply | RandomPolicy | 0/240 (0.00%) | 2 | 238 |
+| 3 | 0-ply | Rev 0, 0-ply | 1/240 (0.42%) | 0 | 239 |
+| 4 | 0-ply | RandomPolicy | 0/240 (0.00%) | 0 | 240 |
+| 4 | 0-ply | Rev 0, 0-ply | 1/240 (0.42%) | 1 | 238 |
+| 2 | 1-ply | RandomPolicy | 0/200 (0.00%) | 1 | 199 |
+| 2 | 1-ply | Rev 0, 0-ply | 1/200 (0.50%) | 0 | 199 |
+| 2 | 1-ply | Rev 0, 1-ply | 1/200 (0.50%) | 2 | 197 |
+| 3 | 1-ply | RandomPolicy | 0/240 (0.00%) | 0 | 240 |
+| 3 | 1-ply | Rev 0, 0-ply | 4/240 (1.67%) | 0 | 236 |
+| 3 | 1-ply | Rev 0, 1-ply | 3/240 (1.25%) | 0 | 237 |
+| 4 | 1-ply | RandomPolicy | 2/240 (0.83%) | 0 | 238 |
+| 4 | 1-ply | Rev 0, 0-ply | 0/240 (0.00%) | 1 | 239 |
+| 4 | 1-ply | Rev 0, 1-ply | 3/240 (1.25%) | 7 | 230 |
+
+Search completed every warm discard puzzle with both the trained and untrained weights. The trained 1-ply checkpoint beat the 1-ply control on two solo distances and trailed it on two others. Neither trained mode declared on a cold solo deal. Too few cold multiplayer games ended in a declaration to establish a consistent improvement from the learned weights.
+
 ## Schema 8 Azure results
+
+These are historical Slice 4j results from before search distillation and sequence-based timeout payoffs.
 
 Slice 4j trained on one 16-vCPU `Standard_D16als_v6` in West US 2. Two localhost Gloo ranks used BF16, seven learner threads per rank, and one single-threaded actor with 32 tables per rank. Each rank sampled eight trajectories per update. The run used `sync_every=1`, `eta=0.015`, `entropy_weight=0.002`, and `anchor_every=400` throughout.
 
