@@ -20,7 +20,9 @@ python -m src.cli.train --output-dir runs/smoke --max-turns 2 \
 python -m src.cli.train --output-dir runs/smoke --max-updates 2 --max-seconds 90
 ```
 
-Check `status.json` for `status: max_updates` and `version: 2`. The update limit is an absolute policy revision, not a count of additional updates. Reuse the directory to resume. You can change the actor count, table count, threads, device, precision, learning rate, and synchronization cadence. A new `--learning-rate` replaces the rate saved with the AdamW state without resetting its moments. You can also change `--players`, `--curriculum-share`, and `--curriculum-max-distance`. The game, model, and other collection settings stay fixed. Restart standalone collectors after changing the collection plan.
+Check `status.json` for `status: max_updates` and `version: 2`. The update limit is an absolute policy revision, not a count of additional updates. Reuse the directory to resume.
+
+On resume you can change actor and table counts, thread counts, device, precision, `--checkpoint-every`, `--learning-rate`, `--eta`, and `--sync-every`. A new `--learning-rate` replaces the rate saved with AdamW without resetting its moments. You can also change `--players`, `--curriculum-share`, and `--curriculum-max-distance`. The game, model, and other collection settings stay fixed. Restart standalone collectors after changing the collection plan.
 
 ## Start a full run
 
@@ -28,17 +30,21 @@ Check `status.json` for `status: max_updates` and `version: 2`. The update limit
 python -m src.cli.train --output-dir runs/full21 --max-seconds 3600
 ```
 
-The default `GameTransformer` has 2,175,224 parameters. Its four blocks use width 192, six rotary attention heads of width 32, RMSNorm, and a SwiGLU width of 512. It stores weights in checkpoint format 6 and uses the eight-byte Schema 8 tokens. Each actor keeps a key and value cache per seat and batches decisions across its live tables.
+The default `GameTransformer` has 2,175,224 parameters. Its four blocks use width 192, six rotary attention heads of width 32, RMSNorm, and a SwiGLU width of 512. It stores weights in checkpoint format 6 and uses eight-byte Schema 8 tokens. Each actor keeps a key and value cache per seat and batches decisions across its live tables.
 
-Actors play games with one to four seats in rotation, with 64 tables per process by default. Half of starts use the environment curriculum. Solo starts take the smaller of two uniform draws from zero through six, so short puzzles remain common when the maximum distance increases. Distance zero starts with 22 cards and ends after one discard. Multiplayer starts sample one through six uniformly and replace that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Validation and the arena default to cold deals.
+Training defaults to three decks, 21 cards per hand, five required pure sequences, 60 turns per seat, and discard recycling. Two actor processes per learner rank cycle through one-, two-, three-, and four-seat games, with 64 tables per process by default.
+
+Half of starts use the curriculum by default. Solo curriculum starts take the smaller of two uniform draws from zero through six. Distance zero starts with one extra card and ends after one discard. Multiplayer curriculum starts sample a distance uniformly from one through six and replace that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Validation and the arena use cold deals.
 
 Self-play defaults to `--search-ply 1`. The actor uses a pure sequence upper bound to skip declaration checks when the hand cannot meet the quota. It gives equal probability to every legal winning discard. If taking the top discard permits a legal winning discard that turn, it takes the card with probability one. On other decisions it uses the masked neural policy without scoring candidates. At `--search-ply 0` it skips the declaration checks.
 
-Actors sample with a 2% uniform mixture over legal actions, except on forced wins. The rollout records one `uint8` forced flag and the actual behavior log probability for each decision. It stores the policy target as 54 unsigned 16-bit integers before exploration. The learner validates target mass and legality on load. It applies cross-entropy only to forced decisions and uses a V-trace policy gradient on ordinary decisions. `--entropy-weight` adds an entropy bonus and defaults to zero.
+By default, actors mix 2% uniform probability over legal actions into the policy when no move is forced. The rollout records one `uint8` forced flag and the actual behavior log probability for each decision. It quantizes the policy target before exploration to 54 unsigned 16-bit values and stores their bits in an `int16` tensor. The learner validates target mass and legality on load. It applies cross-entropy only to forced decisions and uses a V-trace policy gradient on ordinary decisions. `--entropy-weight` defaults to zero.
 
 The value head uses V-trace with a discount of 0.995 and no terminal bootstrap. A declaration pays the winner `+1`. In multiplayer the other seats split `-1` equally. On a timeout let `f` be the share of the pure sequence quota recorded by `HandPenalty.qualifying_sequences`, capped at 1. A zero quota gives `f = 1`. Solo pays `-1 + 0.60 * f`. Multiplayer pays each seat `-0.50 + 0.30 * (f - mean_of_other_seats)`. The relative term sums to zero, while every seat still gets a negative payoff. The scoreboard still uses exact deadwood.
 
-The learner drops data that exceeds `--max-policy-lag`. By default, each rank samples eight trajectories with replacement from one player-count and length bucket. A bucket's weight is its trajectory count, not its decision count. Each trajectory has equal weight in the policy, value, and anchor KL losses. The default learning rate is `5e-4`. The anchor weight is `0.01`. Replay caches anchor log probabilities until `--anchor-every` refreshes the anchor. BF16 uses FP32 master weights and FP32 loss math. Use `--precision fp32` to disable autocast.
+The learner drops data more than `--max-policy-lag` revisions old. The default lag limit is 200. Each rank samples `--batch-size` trajectories with replacement from one player-count and length bucket. The default batch size is eight. A bucket's weight is its trajectory count. Each trajectory has equal weight in the policy, value, and anchor KL losses.
+
+The default learning rate is `5e-4` and the default anchor weight (`--eta`) is `0.01`. Replay caches anchor log probabilities until the anchor refreshes. The default interval (`--anchor-every`) is 2,000 revisions. Training defaults to CPU with BF16 autocast, FP32 master weights, and FP32 loss math. Use `--precision fp32` to disable autocast.
 
 | File | Contents |
 | --- | --- |
@@ -48,24 +54,26 @@ The learner drops data that exceeds `--max-policy-lag`. By default, each rank sa
 | `inbox/batch-*.pt` | Complete byte-token rollout batches with quantized policy targets awaiting ingestion. |
 | `metrics.jsonl` and `status.json` | Update metrics and run status, including collected and trained decisions, throughput, importance ratio, KL, buffer depth, and inbox depth. |
 
-The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Rollout format 4 requires forced flags, so older rollout batches do not load. The model checkpoint format and token schema did not change.
+The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Rollout format 4 requires forced flags.
 
 ### Schema 8 tokens
 
-The 30-token snapshot has one `ACT`, one `TABLE_STATE`, six `SEAT` slots, and 22 `HAND` slots. A 21-card hand can reach at most 22 distinct faces after a draw. Duplicate faces share one token with a copy count.
+The append-only prefix contains six rule tokens, the joker indicator, 22 slots for the observer's initial hand, and visible events. It does not encode unseen cards, meld estimates, or point scores.
+
+The 30-token snapshot has one `ACT`, one `TABLE_STATE`, six `SEAT` slots, and 22 `HAND` slots. Duplicate faces share one hand token with a copy count. The encoder leaves unused hand slots zeroed.
 
 | Byte | Meaning |
 | ---: | --- |
-| 0 | Token kind. |
-| 1 | Relative seat, phase, copies, or rule value. Each role has a separate byte range. |
-| 2, 3, 4 | Face, printed suit, and printed rank. An absent face uses `53`, `5`, and `14`. |
-| 5 | Visible offered face, hand size, next seat with active status, or discard pile size. Pile size caps at 150. |
-| 6 | Remaining turns up to 120, or the remaining stock in two-card buckets. |
-| 7 | `1 + discard_action(face)` on `HAND` tokens. Zero everywhere else. |
+| 0 | Token kind. Zero marks padding. |
+| 1 | `1 + relative_seat` for events and seat tokens. `ACT` uses `1`. `TABLE_STATE` uses `7 + phase.value`. Hand tokens use `10 + copies`. Rule tokens use `20 + rule_value`. |
+| 2, 3, 4 | One-based face, printed suit, and printed rank. An absent face uses `53`, `5`, and `14`. |
+| 5 | Events use the one-based offered face or `53` if absent. `SEAT` uses `60 + hand_size` for each present seat. `TABLE_STATE` uses `83 + 2 * next_player + int(active)` for the observer. `ACT` uses `100 + min(discard_pile_size, 150)`. |
+| 6 | Events, `ACT`, and present seat tokens use `1 + min(turns_remaining, 120)`. `TABLE_STATE` uses `130 + min(stock_remaining // 2, 120)`. |
+| 7 | `1 + discard_action(face)` on `HAND` tokens only. |
 
-Zero means unused in each field. All Transformer layers update all snapshot tokens. The `ACT` representation gives the base policy logits and value. For each nonzero pointer byte, the shared linear pointer head adds that token's score to the named action logit before legal masking. The network has no Papplu imports.
+Zero means unused in each field. The model encodes the prefix with causal attention. Each decision reads its snapshot and only the prefix available at that decision. The `ACT` token supplies 54 base policy logits and a scalar value. For each nonzero pointer byte, the shared linear pointer head adds that token's score to the named action logit before legal masking. The network does not import the game rules.
 
-Schema 8 supports up to 21 cards before drawing, four decks, and a configured budget of 235 turns. The header stores the full budget. Start a fresh run in a new directory. Schema 7 weights, trainer state, and rollouts do not use the same byte layout.
+Schema 8 supports up to 21 cards before drawing, four decks, and a configured budget of 235 turns per seat. The header stores the full turn budget. Start in a new directory if the saved checkpoint or trainer state uses an incompatible schema.
 
 ## Run several CPU learners
 
@@ -92,7 +100,7 @@ python -m src.cli.train --collect actor-outbox --model latest-model.pt \
   --worker 100 --tables 64 --max-batches 1
 ```
 
-Leave off `--max-batches` for continuous collection. Refresh the actor's model file atomically. Live deals keep their admission weights and caches. Copy completed `batch-*.pt` files to temporary names in the learner inbox, then rename each file to its final name. Transfer each batch once and clear it from the outbox after transfer. Continuous collectors pause when eight batches from the same worker await transfer or ingestion. The learner rejects incompatible files and discards stale batches.
+Leave off `--max-batches` for continuous collection. Refresh the actor's model file atomically. Live deals keep their admission weights and caches. Copy completed `batch-*.pt` files to temporary names in the learner inbox, then rename each file to its final name. Transfer each batch once and clear it from the outbox after transfer. A continuous collector pauses while eight or more batches for its worker ID remain in its outbox. The learner rejects incompatible files and discards stale batches.
 
 ## Evaluate a checkpoint
 
@@ -103,213 +111,126 @@ python -m src.cli.arena --model runs/full21/best-model.pt --model random \
   --games 120 --search-ply 1 --output runs/full21/arena.json
 ```
 
-`src.cli.evaluate` pairs the model and random policy on the same solo seeds. It reports discard puzzles separately when `--warm-games` is positive. `src.cli.arena` rotates the lineup over one to six seats and reports each deal's utilities and winner. Supply a checkpoint or `random` for each seat. Checkpoints in the same lineup must use the same game settings. Both commands default to `--search-ply 0`, which picks from the model's legal logits without a declaration check or lookahead. Use `--search-ply 1` to enable the same search used by self-play.
+`src.cli.evaluate` pairs the model and random policy on the same solo seeds. It reports discard puzzles separately when `--warm-games` is positive. `src.cli.arena` reports each deal's utilities and winner. It rotates the lineup between deals and plays each seed once. Supply a checkpoint or `random` for each of one to six seats. Checkpoints in the same lineup must use the same game settings. Both commands default to `--search-ply 0`. The model picks the highest legal logit without checking for a winning move first. Use `--search-ply 1` to enable the same search used by self-play.
 
-## Azure checkpoint and held-out results
+## Azure results
 
-These are historical Schema 7 results under the old deadwood-based utility. Do not compare these utility values with Schema 8's declaration and timeout payoffs.
+The Schema 8 run used commit `0f00513` on one 16-vCPU `Standard_D16als_v6` in West US 2. Two Gloo ranks ran on that VM with BF16 and `--sync-every 1`. Each rank used seven learner threads and one single-threaded actor with 32 tables. Each update sampled 12 trajectories per rank.
 
-Stage 2 used Schema 7 on five `Standard_D16als_v6` VMs with 80 AMD EPYC Genoa vCPUs and 160 GiB of provisioned RAM. Each VM ran two BF16 ranks. Each rank used seven learner threads and one single-threaded actor with 32 tables.
+The learner loaded weights from revision 826 and started a new AdamW state at revision 0. Check-In #12 and Final resumed from the preceding phase. The run used `--search-ply 1`, `--eta 0.01`, `--entropy-weight 0.002`, and `--anchor-every 400` throughout.
 
-Stage 2a started from Stage 1 at 750 cumulative updates and reached 1,446 with a 22-minute budget. It used batch size 4, learning rate `4e-4`, `eta=0.03`, `anchor_every=480`, and a 50% solo curriculum share up to distance 5. Stage 2b resumed the same run with learning rate `2e-4` and reached 2,158 cumulative updates with a second 22-minute budget. Both stages used `sync_every=8`.
+| Stage | Budget (s) | Players | Curriculum share | Max distance | Learning rate | Revision | Collected decisions/s | Trained decisions/s | Mean CPU busy | Mean / peak sampled RAM (GiB) |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Check-In #11 | 900 | 1, 2 | 95% | 2 | `0.0006` | 439 | 142.29 | 720.55 | 85.8% | 9.62 / 11.90 |
+| Check-In #12 | 1500 | 1, 2, 3, 4 | 70% | 6 | `0.0004` | 842 | 147.95 | 607.34 | 86.7% | 11.57 / 16.02 |
+| Final | 1500 | 1, 2, 3, 4 | 35% | 12 | `0.0002` | 1,184 | 217.04 | 594.95 | 86.6% | 11.79 / 15.03 |
 
-The matched burst used one 60-second budget per cadence. The fleet trained 537.11 decisions per second at `sync_every=1` and 1,098.13 at `sync_every=8`. In the sampled learner window, rank 0 spent 30.96% and 14.35% of time in the FP32 Gloo all-reduce, respectively. These times include rank arrival skew. This single comparison does not measure run-to-run variance. Per-VM CPU use at cadence 8 ranged from 56.40% to 66.85% in the burst and from 78.42% to 84.11% during Stage 2a.
-
-### Candidate lock and Check-In #4
-
-Candidate selection used only seed `600_000`. Check-In #4 evaluated Stage 2a on the same eight cases used for selection: cold solo, distance 4 solo, and multiplayer at two, three, and four seats against both RandomPolicy and Revision 0. Each case had equal weight in the mean utility. Ties use higher mean win rate, lower mean deadwood, then checkpoint name.
-
-| Rank | Checkpoint | Mean utility | Mean win rate | Mean deadwood |
-| ---: | --- | ---: | ---: | ---: |
-| 1 | Stage 2b | -0.0460 | 0.28% | 82.84 |
-| 2 | Stage 2a | -0.0634 | 0.00% | 87.74 |
-| 3 | Stage 1 | -0.0916 | 0.20% | 94.26 |
-| 4 | Revision 283 | -0.1077 | 0.15% | 98.68 |
-| 5 | Revision 0 | -0.1197 | 0.07% | 101.62 |
-
-On the 64 shared cold solo deals, mean deadwood fell from 88.08 for Stage 1 to 71.16 at Check-In #4 and 64.89 for Stage 2b. None of those checkpoints won a cold solo deal at this seed. The run locked Stage 2b before the held-out evaluation. The SHA-256 of `locked-gt-winner.pt` is `78c64274444d94e60b23eaa348effc24bf0e59e7d3dd848adfbb2e4ad25a9cc8`.
-
-### Untouched held-out solo
-
-The held-out run started at seed `900_000` after the lock. It used 16 evaluation processes per VM across all five VMs and took 53 seconds, including process startup. All three solo policies played the same 200 cold deals and the same 128 deals at each curriculum distance. Mean deadwood is terminal deadwood out of 210.
-
-| Start | Policy | Wins / deals | Win rate | Mean utility | Mean deadwood / 210 |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Cold 21-card | Locked GameTransformer | 2 / 200 | 1.00% | -0.3245 | 70.25 |
-| Cold 21-card | RandomPolicy | 1 / 200 | 0.50% | -0.5115 | 108.46 |
-| Cold 21-card | Revision 0 | 1 / 200 | 0.50% | -0.4924 | 104.46 |
-| Distance 2 | Locked GameTransformer | 1 / 128 | 0.78% | -0.2859 | 61.69 |
-| Distance 2 | RandomPolicy | 1 / 128 | 0.78% | -0.4916 | 104.88 |
-| Distance 2 | Revision 0 | 1 / 128 | 0.78% | -0.4679 | 99.91 |
-| Distance 4 | Locked GameTransformer | 4 / 128 | 3.13% | -0.2872 | 66.88 |
-| Distance 4 | RandomPolicy | 3 / 128 | 2.34% | -0.4596 | 101.43 |
-| Distance 4 | Revision 0 | 2 / 128 | 1.56% | -0.4426 | 96.23 |
-| Distance 6 | Locked GameTransformer | 0 / 128 | 0.00% | -0.3203 | 67.27 |
-| Distance 6 | RandomPolicy | 1 / 128 | 0.78% | -0.4893 | 104.39 |
-| Distance 6 | Revision 0 | 0 / 128 | 0.00% | -0.4664 | 97.95 |
-
-### Untouched held-out multiplayer
-
-The locked checkpoint played every seat once per deal. All other seats used the named opponent. Opponent win rate and mean deadwood are per seat. The locked checkpoint earned positive mean utility in every matchup but did not win a multiplayer game.
-
-| Seats | Opponent | Deals | Wins / games | Win rate | Opponent win rate | Mean utility | Mean deadwood / 210 | Opponent mean deadwood / 210 |
-| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | RandomPolicy | 100 | 0 / 200 | 0.00% | 0.00% | 0.0552 | 84.22 | 107.40 |
-| 2 | Revision 0 | 100 | 0 / 200 | 0.00% | 0.00% | 0.0262 | 96.35 | 107.36 |
-| 2 | Stage 1 | 100 | 0 / 200 | 0.00% | 0.00% | 0.0191 | 96.92 | 104.93 |
-| 3 | RandomPolicy | 80 | 0 / 240 | 0.00% | 0.21% | 0.0604 | 82.80 | 108.60 |
-| 3 | Revision 0 | 80 | 0 / 240 | 0.00% | 0.21% | 0.0309 | 93.74 | 107.14 |
-| 3 | Stage 1 | 80 | 0 / 240 | 0.00% | 0.21% | 0.0186 | 98.62 | 106.88 |
-| 4 | RandomPolicy | 60 | 0 / 240 | 0.00% | 0.14% | 0.0518 | 83.80 | 105.86 |
-| 4 | Revision 0 | 60 | 0 / 240 | 0.00% | 0.00% | 0.0290 | 93.90 | 106.08 |
-| 4 | Stage 1 | 60 | 0 / 240 | 0.00% | 0.14% | 0.0206 | 95.63 | 104.56 |
-
-## Schema 8 search distillation results
-
-Slice 4k evaluated the earlier 1-ply policy, which scored candidate afterstates. It used one `Standard_D16als_v6` in West US 2. Two localhost Gloo ranks used BF16, seven learner threads, and one single-threaded actor with 32 tables per rank. Each rank sampled eight trajectories per update. The run started a new optimizer from the Slice 4j Check-In #7 weights at revision 283 and used `eta=0.01` throughout.
-
-| Stage | Budget | Curriculum share | Maximum distance | Learning rate | Revision | Updates | Collected decisions/s | Trained decisions/s | Mean CPU | Mean / peak RAM GiB |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Check-In #9 | 15 min | 80% | 4 | `5e-4` | 336 | 336 | 82.61 | 463.98 | 64.10% | 8.34 / 11.77 |
-| Check-In #10 | 25 min | 55% | 8 | `3.5e-4` | 826 | 490 | 88.68 | 500.09 | 72.30% | 9.18 / 12.81 |
-| Final | 25 min | 25% | 14 | `2e-4` | 1,262 | 436 | 98.95 | 531.76 | 76.95% | 9.02 / 12.56 |
-
-Decision rates count both ranks over the stage. CPU and RAM are guest-wide samples taken every 30 seconds and at exit. The three windows are one training run, not independent trials. A separate single-thread BF16 check measured a 6.80 ms median for six cached candidates on one row with a 30-token prefix. The five repeats ranged from 6.80 to 6.88 ms per call. For 32 rows, six candidates each, and a 90-token prefix, the median was 239.96 ms, with a range of 239.05 to 240.88 ms. These timings exclude the root pass and game-rule checks.
+Decision rates count both ranks over each phase. The three rows are phases of one run, not independent trials.
 
 ### Check-ins and lock at seed 600,000
 
-Each checkpoint played 64 deals in each solo case and 48 two-seat deals against RandomPolicy, with both candidate seats per deal. The table shows declarations per game. Selection averaged the 12 case win rates equally across both depths. Ties use the cold case mean, then mean utility. The initial weights provide a comparison and are not eligible for selection.
+Each checkpoint used seed `600_000` for 64 deals per solo case and both seats on 48 cold deals against `RandomPolicy`. The distance-zero check-in ends after the first discard. The pipeline averages declaration rates over six cases at each of two search depths. It breaks ties by mean cold declaration rate, then by mean utility. Exact ties favor the earlier checkpoint.
 
-| Checkpoint | Search ply | Warm d=0 | d=1 | d=2 | d=4 | Cold solo | Cold 2p | Mean win rate |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Initial | 0 | 17/64 | 3/64 | 0/64 | 0/64 | 0/64 | 1/96 | 5.38% |
-| Initial | 1 | 64/64 | 18/64 | 5/64 | 4/64 | 0/64 | 0/96 | 23.70% |
-| Check-In #9 | 0 | 17/64 | 3/64 | 2/64 | 0/64 | 0/64 | 0/96 | 5.73% |
-| Check-In #9 | 1 | 64/64 | 20/64 | 6/64 | 4/64 | 0/64 | 0/96 | 24.48% |
-| Check-In #10 | 0 | 18/64 | 2/64 | 1/64 | 2/64 | 0/64 | 0/96 | 5.99% |
-| Check-In #10 | 1 | 64/64 | 18/64 | 7/64 | 5/64 | 1/64 | 0/96 | 24.74% |
-| Final | 0 | 21/64 | 4/64 | 1/64 | 0/64 | 0/64 | 0/96 | 6.77% |
-| Final | 1 | 64/64 | 15/64 | 6/64 | 4/64 | 1/64 | 0/96 | 23.44% |
+| Stage | Depth | d=0 | d=1 | d=2 | d=4 | Cold solo | Cold 2p vs RandomPolicy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Check-In #11 | 0 | 17/64 | 2/64 | 0/64 | 1/64 | 0/64 | 0/96 |
+| Check-In #11 | 1 | 64/64 | 19/64 | 4/64 | 5/64 | 1/64 | 0/96 |
+| Check-In #12 | 0 | 17/64 | 3/64 | 1/64 | 1/64 | 0/64 | 0/96 |
+| Check-In #12 | 1 | 64/64 | 18/64 | 6/64 | 8/64 | 0/64 | 0/96 |
+| Final | 0 | 18/64 | 2/64 | 2/64 | 3/64 | 0/64 | 0/96 |
+| Final | 1 | 64/64 | 21/64 | 8/64 | 9/64 | 0/64 | 0/96 |
 
-Check-In #10 led at 15.36% across both depths. The pipeline copied revision 826 to `locked-gt-az-winner.pt` before opening seed `920_000`. SHA-256 is `6bd3c6e47f82b2d9f49d5d0132238004c22f92cd6f2e29d62cc116875bfeae9b`.
+Final led at 16.54% mean declaration rate. The pipeline locked its revision 1,184 weights before opening held-out seed `930_000`.
 
-### Untouched solo at seed 920,000
+The SHA-256 of `locked-gt-v8-final.pt` is `5039c05e013e80c8af4e80ebb344c686421593c022c27d825e70a6a96b20486a`.
 
-The holdout completed 7,880 games and 1,690,364 actions on 16 workers in 894 seconds, with no evaluation errors. All five solo policies played the same seeds within each start condition. Rev 0 is the fixed untrained Schema 8 checkpoint. In these tables a win means a valid declaration, not first place on points.
+### Held-out solo at seed 930,000
 
-| Start | Trained 0-ply | Trained 1-ply | RandomPolicy | Rev 0, 0-ply | Rev 0, 1-ply |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Warm d=0 | 29/128 (22.66%) | 128/128 (100.00%) | 26/128 (20.31%) | 27/128 (21.09%) | 128/128 (100.00%) |
-| d=1 | 1/128 (0.78%) | 19/128 (14.84%) | 3/128 (2.34%) | 4/128 (3.12%) | 26/128 (20.31%) |
-| d=2 | 5/128 (3.91%) | 17/128 (13.28%) | 2/128 (1.56%) | 2/128 (1.56%) | 14/128 (10.94%) |
-| d=4 | 1/128 (0.78%) | 1/128 (0.78%) | 0/128 (0.00%) | 0/128 (0.00%) | 2/128 (1.56%) |
-| d=6 | 0/128 (0.00%) | 6/128 (4.69%) | 0/128 (0.00%) | 0/128 (0.00%) | 2/128 (1.56%) |
-| Cold 21-card | 0/256 (0.00%) | 0/256 (0.00%) | 0/256 (0.00%) | 1/256 (0.39%) | 2/256 (0.78%) |
+Across the solo and multiplayer cases, 16 workers completed 11,800 games and 2,925,096 decisions in 1,126.65 seconds with no evaluation errors. Both the check-ins and the holdout used BF16 inference and a 60-turn cap per seat. `Rev 0` is the fixed untrained Schema 8 baseline, not the weights used to start training. The 0-ply models choose from the masked policy alone. The 1-ply models add terminal-win search.
 
-### Untouched cold multiplayer at seed 920,000
+All five solo policies used the same deals within each start condition. On held-out distance-zero deals, a miss on the first discard leaves the game running until a declaration or the turn limit. The first-discard column counts only declarations on that first move. The other solo cases start in the draw phase.
 
-For each matchup the locked checkpoint played every seat once per deal. All other seats used the named opponent. Opponent declarations are combined across those seats. The remaining games timed out.
-
-| Seats | Trained mode | Opponent | Trained declarations | Opponent declarations | Timeouts |
-| ---: | --- | --- | ---: | ---: | ---: |
-| 2 | 0-ply | RandomPolicy | 0/200 (0.00%) | 0 | 200 |
-| 2 | 0-ply | Rev 0, 0-ply | 0/200 (0.00%) | 0 | 200 |
-| 3 | 0-ply | RandomPolicy | 0/240 (0.00%) | 2 | 238 |
-| 3 | 0-ply | Rev 0, 0-ply | 1/240 (0.42%) | 0 | 239 |
-| 4 | 0-ply | RandomPolicy | 0/240 (0.00%) | 0 | 240 |
-| 4 | 0-ply | Rev 0, 0-ply | 1/240 (0.42%) | 1 | 238 |
-| 2 | 1-ply | RandomPolicy | 0/200 (0.00%) | 1 | 199 |
-| 2 | 1-ply | Rev 0, 0-ply | 1/200 (0.50%) | 0 | 199 |
-| 2 | 1-ply | Rev 0, 1-ply | 1/200 (0.50%) | 2 | 197 |
-| 3 | 1-ply | RandomPolicy | 0/240 (0.00%) | 0 | 240 |
-| 3 | 1-ply | Rev 0, 0-ply | 4/240 (1.67%) | 0 | 236 |
-| 3 | 1-ply | Rev 0, 1-ply | 3/240 (1.25%) | 0 | 237 |
-| 4 | 1-ply | RandomPolicy | 2/240 (0.83%) | 0 | 238 |
-| 4 | 1-ply | Rev 0, 0-ply | 0/240 (0.00%) | 1 | 239 |
-| 4 | 1-ply | Rev 0, 1-ply | 3/240 (1.25%) | 7 | 230 |
-
-Search completed every warm discard puzzle with both the trained and untrained weights. The trained 1-ply checkpoint beat the 1-ply control on two solo distances and trailed it on two others. Neither trained mode declared on a cold solo deal. Too few cold multiplayer games ended in a declaration to establish a consistent improvement from the learned weights.
-
-## Schema 8 Azure results
-
-These are historical Slice 4j results from before search distillation and sequence-based timeout payoffs.
-
-Slice 4j trained on one 16-vCPU `Standard_D16als_v6` in West US 2. Two localhost Gloo ranks used BF16, seven learner threads per rank, and one single-threaded actor with 32 tables per rank. Each rank sampled eight trajectories per update. The run used `sync_every=1`, `eta=0.015`, `entropy_weight=0.002`, and `anchor_every=400` throughout.
-
-| Stage | Budget | Curriculum share | Maximum distance | Learning rate | Cumulative revision | Updates | Trained decisions/s | Mean CPU | Mean / peak RAM GiB |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Check-In #7 | 15 min | 85% | 3 | `5e-4` | 283 | 283 | 577.79 | 88.29% | 9.89 / 13.02 |
-| Check-In #8 | 25 min | 65% | 7 | `3.5e-4` | 735 | 452 | 563.04 | 89.79% | 9.92 / 13.15 |
-| Final Stage | 25 min | 40% | 14 | `2e-4` | 1,190 | 455 | 578.79 | 90.30% | 10.39 / 12.93 |
-
-CPU and RAM are guest-wide measurements sampled every 30 seconds, with a final sample at stage exit. The throughput column counts trained decisions across both ranks over the stage. These are three phases of one run, not repeated benchmarks.
-
-### Candidate lock at seed 600,000
-
-Each checkpoint played 64 paired deals in each solo case and 48 base deals in each two-seat case against RandomPolicy. Each two-seat deal ran once per candidate seat. Selection equally weighted the seven case win rates. Ties use the mean win rate of the two cold cases, then mean utility across all seven cases. Revision 0 is the fixed Schema 8 baseline from the earlier check-ins, not the initial weights of this run.
-
-| Checkpoint | Warm d=0 | d=1 | d=2 | d=4 | Cold solo | 2p d=2 | Cold 2p | Mean win rate | Cold mean | Mean utility |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Revision 0 | 17/64 | 0/64 | 2/64 | 0/64 | 0/64 | 4/96 | 0/96 | 4.84% | 0.00% | -0.7641 |
-| Check-In #7 | 17/64 | 3/64 | 0/64 | 0/64 | 0/64 | 3/96 | 1/96 | 5.06% | 0.52% | -0.7604 |
-| Check-In #8 | 17/64 | 1/64 | 0/64 | 0/64 | 0/64 | 2/96 | 0/96 | 4.32% | 0.00% | -0.7746 |
-| Final Stage | 15/64 | 2/64 | 0/64 | 0/64 | 0/64 | 4/96 | 0/96 | 4.39% | 0.00% | -0.7738 |
-| RandomPolicy | 18/64 | 4/64 | 1/64 | 3/64 | 0/64 | n/a | n/a | n/a | n/a | n/a |
-
-Check-In #7 led selection at 5.06%, 0.22 percentage points ahead of Revision 0. The run copied revision 283 to `locked-gt-winner.pt` before opening seed `910_000`. Its SHA-256 is `804adef0f664593e0b1a5a0a8b49ffc63e4ab7590553c0198810a29b08f28ca7`.
-
-### Held-out solo at seed 910,000
-
-The held-out run completed 6,348 games on 16 local workers with no evaluation errors. All three solo policies played the same seeds within each start condition. Every win below is a valid declaration. The locked checkpoint won two more warm starts than RandomPolicy but two fewer cold solo games.
-
-| Start | Policy | Wins / deals | Win rate | Mean utility | Mean deadwood / 210 |
+| Policy | Start | First discard | Declarations / games | Mean qualifying sequences | Mean utility |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Warm start, d=0 | Locked checkpoint | 35 / 128 | 27.34% | -0.4531 | 16.64 |
-| Warm start, d=0 | RandomPolicy | 33 / 128 | 25.78% | -0.4844 | 17.59 |
-| Warm start, d=0 | Revision 0 | 29 / 128 | 22.66% | -0.5469 | 18.19 |
-| Distance 1 | Locked checkpoint | 3 / 128 | 2.34% | -0.9531 | 108.28 |
-| Distance 1 | RandomPolicy | 1 / 128 | 0.78% | -0.9844 | 106.34 |
-| Distance 1 | Revision 0 | 3 / 128 | 2.34% | -0.9531 | 101.85 |
-| Distance 2 | Locked checkpoint | 2 / 128 | 1.56% | -0.9688 | 106.47 |
-| Distance 2 | RandomPolicy | 4 / 128 | 3.13% | -0.9375 | 103.32 |
-| Distance 2 | Revision 0 | 4 / 128 | 3.13% | -0.9375 | 101.34 |
-| Distance 4 | Locked checkpoint | 1 / 128 | 0.78% | -0.9844 | 108.29 |
-| Distance 4 | RandomPolicy | 2 / 128 | 1.56% | -0.9688 | 103.35 |
-| Distance 4 | Revision 0 | 1 / 128 | 0.78% | -0.9844 | 102.02 |
-| Distance 6 | Locked checkpoint | 1 / 128 | 0.78% | -0.9844 | 112.85 |
-| Distance 6 | RandomPolicy | 0 / 128 | 0.00% | -1.0000 | 101.23 |
-| Distance 6 | Revision 0 | 0 / 128 | 0.00% | -1.0000 | 102.66 |
-| Cold 21-card | Locked checkpoint | 1 / 256 | 0.39% | -0.9922 | 109.09 |
-| Cold 21-card | RandomPolicy | 3 / 256 | 1.17% | -0.9766 | 102.98 |
-| Cold 21-card | Revision 0 | 2 / 256 | 0.78% | -0.9844 | 104.41 |
+| Trained 0-ply | d=0 | 44/128 | 47/128 | 2.9219 | -0.160625 |
+| Trained 0-ply | d=1 | n/a | 5/128 | 1.5547 | -0.759687 |
+| Trained 0-ply | d=2 | n/a | 6/128 | 1.4844 | -0.757188 |
+| Trained 0-ply | d=4 | n/a | 3/128 | 1.4141 | -0.797500 |
+| Trained 0-ply | d=6 | n/a | 0/128 | 1.2812 | -0.846250 |
+| Trained 0-ply | Cold 21-card | n/a | 0/256 | 1.3633 | -0.836406 |
+| Trained 1-ply | d=0 | 128/128 | 128/128 | 5.7344 | 1.000000 |
+| Trained 1-ply | d=1 | n/a | 33/128 | 2.4219 | -0.357812 |
+| Trained 1-ply | d=2 | n/a | 25/128 | 2.0234 | -0.485625 |
+| Trained 1-ply | d=4 | n/a | 8/128 | 1.5938 | -0.722187 |
+| Trained 1-ply | d=6 | n/a | 1/128 | 1.3203 | -0.830625 |
+| Trained 1-ply | Cold 21-card | n/a | 1/256 | 1.3711 | -0.830000 |
+| RandomPolicy | d=0 | 31/128 | 33/128 | 2.7031 | -0.330625 |
+| RandomPolicy | d=1 | n/a | 4/128 | 1.9219 | -0.726562 |
+| RandomPolicy | d=2 | n/a | 2/128 | 1.6875 | -0.776563 |
+| RandomPolicy | d=4 | n/a | 1/128 | 1.8359 | -0.768750 |
+| RandomPolicy | d=6 | n/a | 0/128 | 1.5859 | -0.809688 |
+| RandomPolicy | Cold 21-card | n/a | 0/256 | 1.6172 | -0.805937 |
+| Rev 0, 0-ply | d=0 | 30/128 | 31/128 | 2.4453 | -0.380625 |
+| Rev 0, 0-ply | d=1 | n/a | 2/128 | 1.5859 | -0.788750 |
+| Rev 0, 0-ply | d=2 | n/a | 2/128 | 1.7031 | -0.774687 |
+| Rev 0, 0-ply | d=4 | n/a | 0/128 | 1.5703 | -0.811562 |
+| Rev 0, 0-ply | d=6 | n/a | 0/128 | 1.4922 | -0.820937 |
+| Rev 0, 0-ply | Cold 21-card | n/a | 0/256 | 1.6133 | -0.806406 |
+| Rev 0, 1-ply | d=0 | 128/128 | 128/128 | 5.7344 | 1.000000 |
+| Rev 0, 1-ply | d=1 | n/a | 37/128 | 2.5781 | -0.297187 |
+| Rev 0, 1-ply | d=2 | n/a | 24/128 | 2.2969 | -0.464688 |
+| Rev 0, 1-ply | d=4 | n/a | 10/128 | 1.8594 | -0.668438 |
+| Rev 0, 1-ply | d=6 | n/a | 3/128 | 1.5781 | -0.777813 |
+| Rev 0, 1-ply | Cold 21-card | n/a | 1/256 | 1.6172 | -0.800469 |
 
-### Held-out multiplayer at seed 910,000
+### Held-out 0-ply multiplayer at seed 930,000
 
-For each matchup the locked checkpoint played every seat once per base deal. All other seats used the named opponent. Opponent win rate and utility are per opponent seat. Check-In #7 matchups are self-play controls because the lock selected that checkpoint.
+In both multiplayer tables, the trained policy plays each seat once per deal. All other seats use the named opponent. The opponent declaration count combines those seats. First-place credit goes to the declarer, or to the lowest deadwood at the turn limit. Tied first places split the credit. Utility does not use point rank.
 
-| Seats | Start | Opponent | Base deals | Wins / games | Win rate | Mean utility | Opponent win rate | Opponent utility |
-| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | Distance 2 | RandomPolicy | 60 | 4 / 120 | 3.33% | -0.4750 | 5.00% | -0.4417 |
-| 2 | Distance 2 | Revision 0 | 60 | 5 / 120 | 4.17% | -0.4417 | 0.83% | -0.5083 |
-| 2 | Distance 2 | Check-In #7 | 60 | 8 / 120 | 6.67% | -0.4333 | 6.67% | -0.4333 |
-| 3 | Distance 2 | RandomPolicy | 60 | 7 / 180 | 3.89% | -0.4417 | 2.22% | -0.4667 |
-| 3 | Distance 2 | Revision 0 | 60 | 6 / 180 | 3.33% | -0.4500 | 2.22% | -0.4667 |
-| 3 | Distance 2 | Check-In #7 | 60 | 8 / 180 | 4.44% | -0.4333 | 4.44% | -0.4333 |
-| 4 | Distance 2 | RandomPolicy | 60 | 7 / 240 | 2.92% | -0.4514 | 0.97% | -0.4773 |
-| 4 | Distance 2 | Revision 0 | 60 | 12 / 240 | 5.00% | -0.4021 | 4.58% | -0.4076 |
-| 4 | Distance 2 | Check-In #7 | 60 | 13 / 240 | 5.42% | -0.3917 | 5.42% | -0.3917 |
-| 2 | Cold | RandomPolicy | 100 | 0 / 200 | 0.00% | -0.5025 | 0.50% | -0.4925 |
-| 2 | Cold | Revision 0 | 100 | 0 / 200 | 0.00% | -0.5000 | 0.00% | -0.5000 |
-| 2 | Cold | Check-In #7 | 100 | 0 / 200 | 0.00% | -0.5000 | 0.00% | -0.5000 |
-| 3 | Cold | RandomPolicy | 80 | 1 / 240 | 0.42% | -0.4938 | 0.21% | -0.4969 |
-| 3 | Cold | Revision 0 | 80 | 0 / 240 | 0.00% | -0.5000 | 0.21% | -0.4969 |
-| 3 | Cold | Check-In #7 | 80 | 0 / 240 | 0.00% | -0.5000 | 0.00% | -0.5000 |
-| 4 | Cold | RandomPolicy | 60 | 1 / 240 | 0.42% | -0.4924 | 0.28% | -0.4942 |
-| 4 | Cold | Revision 0 | 60 | 1 / 240 | 0.42% | -0.4938 | 0.00% | -0.4993 |
-| 4 | Cold | Check-In #7 | 60 | 0 / 240 | 0.00% | -0.5000 | 0.00% | -0.5000 |
+| Start | Seats | Opponent | Declarations / games | Opponent declarations | First-place credit | Mean utility |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| d=2 | 2 | RandomPolicy | 7/120 | 0 | 68.0000/120 (56.67%) | -0.411000 |
+| d=2 | 2 | Rev 0, 0-ply | 7/120 | 4 | 68.5000/120 (57.08%) | -0.426667 |
+| d=2 | 2 | Rev 0, 1-ply | 7/120 | 27 | 58.5000/120 (48.75%) | -0.518000 |
+| Cold | 2 | RandomPolicy | 0/200 | 0 | 86.0000/200 (43.00%) | -0.525500 |
+| Cold | 2 | Rev 0, 0-ply | 0/200 | 0 | 116.0000/200 (58.00%) | -0.487700 |
+| Cold | 2 | Rev 0, 1-ply | 0/200 | 0 | 116.0000/200 (58.00%) | -0.487700 |
+| d=2 | 3 | RandomPolicy | 6/180 | 4 | 62.5000/180 (34.72%) | -0.460833 |
+| d=2 | 3 | Rev 0, 0-ply | 9/180 | 7 | 68.0000/180 (37.78%) | -0.438500 |
+| d=2 | 3 | Rev 0, 1-ply | 7/180 | 61 | 56.0000/180 (31.11%) | -0.443500 |
+| Cold | 3 | RandomPolicy | 0/240 | 1 | 110.5000/240 (46.04%) | -0.502500 |
+| Cold | 3 | Rev 0, 0-ply | 0/240 | 1 | 86.0000/240 (35.83%) | -0.490750 |
+| Cold | 3 | Rev 0, 1-ply | 0/240 | 3 | 86.0000/240 (35.83%) | -0.490500 |
+| d=2 | 4 | RandomPolicy | 9/240 | 13 | 88.0000/240 (36.67%) | -0.435389 |
+| d=2 | 4 | Rev 0, 0-ply | 11/240 | 17 | 56.0000/240 (23.33%) | -0.429444 |
+| d=2 | 4 | Rev 0, 1-ply | 10/240 | 117 | 34.0000/240 (14.17%) | -0.359000 |
+| Cold | 4 | RandomPolicy | 0/240 | 0 | 73.0000/240 (30.42%) | -0.510250 |
+| Cold | 4 | Rev 0, 0-ply | 0/240 | 0 | 58.5000/240 (24.38%) | -0.489917 |
+| Cold | 4 | Rev 0, 1-ply | 0/240 | 3 | 58.5000/240 (24.38%) | -0.488417 |
 
-The locked checkpoint declared three times in 2,040 cold multiplayer games across the nine matchups. The cold results do not establish an advantage over either baseline.
+### Held-out 1-ply multiplayer at seed 930,000
+
+| Start | Seats | Opponent | Declarations / games | Opponent declarations | First-place credit | Mean utility |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| d=2 | 2 | RandomPolicy | 24/120 | 0 | 78.0000/120 (65.00%) | -0.193500 |
+| d=2 | 2 | Rev 0, 0-ply | 25/120 | 4 | 71.5000/120 (59.58%) | -0.211167 |
+| d=2 | 2 | Rev 0, 1-ply | 23/120 | 26 | 62.5000/120 (52.08%) | -0.321833 |
+| Cold | 2 | RandomPolicy | 0/200 | 0 | 86.0000/200 (43.00%) | -0.525500 |
+| Cold | 2 | Rev 0, 0-ply | 2/200 | 0 | 116.0000/200 (58.00%) | -0.473900 |
+| Cold | 2 | Rev 0, 1-ply | 2/200 | 0 | 116.0000/200 (58.00%) | -0.473900 |
+| d=2 | 3 | RandomPolicy | 31/180 | 4 | 80.5000/180 (44.72%) | -0.250667 |
+| d=2 | 3 | Rev 0, 0-ply | 38/180 | 5 | 85.0000/180 (47.22%) | -0.196500 |
+| d=2 | 3 | Rev 0, 1-ply | 30/180 | 52 | 71.0000/180 (39.44%) | -0.254333 |
+| Cold | 3 | RandomPolicy | 1/240 | 1 | 110.5000/240 (46.04%) | -0.496500 |
+| Cold | 3 | Rev 0, 0-ply | 4/240 | 1 | 86.0000/240 (35.83%) | -0.466625 |
+| Cold | 3 | Rev 0, 1-ply | 4/240 | 3 | 86.0000/240 (35.83%) | -0.466375 |
+| d=2 | 4 | RandomPolicy | 30/240 | 10 | 102.0000/240 (42.50%) | -0.307139 |
+| d=2 | 4 | Rev 0, 0-ply | 37/240 | 16 | 76.0000/240 (31.67%) | -0.267139 |
+| d=2 | 4 | Rev 0, 1-ply | 29/240 | 111 | 50.0000/240 (20.83%) | -0.243333 |
+| Cold | 4 | RandomPolicy | 1/240 | 0 | 73.0000/240 (30.42%) | -0.503917 |
+| Cold | 4 | Rev 0, 0-ply | 0/240 | 0 | 58.5000/240 (24.38%) | -0.489917 |
+| Cold | 4 | Rev 0, 1-ply | 0/240 | 3 | 58.5000/240 (24.38%) | -0.488417 |
 
 ## Shipped checkpoint
 
-The browser still loads the shipped v5 `card_mlp` from `web/papplu-model.json`. Its checkpoint SHA-256 is `a229f90e76ae9da9b8c97d35db10e2d921a3a46780fc54d292ba2bde3df67796`. See the [browser held-out results](README.md#held-out-results). The GameTransformer trainer does not read or export that artifact.
+The browser loads the separate v5 `card_mlp` from `web/papplu-model.json`. See the [browser held-out results](README.md#held-out-results) for that checkpoint. The [Azure results](#azure-results) cover the Python GameTransformer and report end-to-end evaluation time, not per-call inference latency.

@@ -200,45 +200,9 @@ The evaluator does not mutate its inputs.
 
 ## Model and training contract
 
-Python training uses `GameTransformer` with checkpoint format 6 and token schema 8. The shipped browser model above is a separate v5 artifact. Python training does not export or overwrite it.
-See the [training guide](TRAINING.md) to start, resume, or evaluate a run on Azure.
+The Python trainer uses `GameTransformer` with checkpoint format 6 and token schema 8. The default model has 2,175,224 parameters and is separate from the browser checkpoint. Self-play uses 1-ply search to find wins on the current turn. The learner uses cross-entropy on forced moves and a V-trace policy gradient on other moves. See the [training guide](TRAINING.md) for run commands, defaults, and the token layout.
 
-| Package | Responsibility |
-| --- | --- |
-| `src.game` | Environments, public observations, terminal outcomes, and stock handling. |
-| `src.model` | Byte encoding, the game-independent Transformer, and versioned model checkpoints. |
-| `src.training.train` | Self-play collection, lag-bounded replay, terminal-win distillation, and V-trace policy and value updates. |
-| `src.evaluation` | One batched arena for collection, solo evaluation, and multiplayer evaluation. |
-| `src.checkpoints` | Atomic files and tensor validation. |
-
-The Schema 8 encoder stores eight bytes per token. Its append-only prefix contains the rules, indicator, observer's initial hand, and visible events. Card tokens carry the printed face, suit, and rank in the same three fields. Each decision adds an action token, a table token, six seat slots, and 22 hand slots. No token contains meld estimates, unseen cards, or point features.
-
-The default model has 2,175,224 parameters in four RMSNorm Transformer blocks. It uses width 192, six rotary attention heads of width 32, and a SwiGLU width of 512. The prefix is causal. Each decision reads its 30-token snapshot and only the prefix available at that decision. The action token supplies 54 base policy logits and a scalar value. Each hand token adds a score to its discard logit through `TokenSchema.pointer_field` before the legal mask. See [CPU training and Gloo synchronization](TRAINING.md#run-several-cpu-learners).
-
-Self-play uses 1-ply search only to find immediate winning discards and discard pickups that permit a win that turn. The learner uses cross-entropy on those forced decisions and a V-trace policy gradient on ordinary decisions. The 0-ply policy uses only the neural policy and a legal-action mask. It does not check for declarations before choosing a move.
-
-The declarer earns `+1`. In a declared multiplayer game, the other seats split `-1` equally. Timeout payoffs are negative and depend on progress toward the pure sequence quota, not directly on card points. The scoreboard still uses exact deadwood for placement and ties. Each learner update gives every sampled trajectory equal weight regardless of length.
-
-### Slice 4k held-out results
-
-Seed `600_000` selected Check-In #10 at revision 826 before the run opened held-out seed `920_000`. These historical tables use the earlier 1-ply policy, which scored candidate afterstates. They show valid declarations per game for the Python model, not the browser model.
-
-| Held-out solo start | Trained 0-ply | Trained 1-ply | RandomPolicy | Rev 0, 0-ply | Rev 0, 1-ply |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Warm d=0 | 29/128 | 128/128 | 26/128 | 27/128 | 128/128 |
-| d=1 | 1/128 | 19/128 | 3/128 | 4/128 | 26/128 |
-| d=2 | 5/128 | 17/128 | 2/128 | 2/128 | 14/128 |
-| d=4 | 1/128 | 1/128 | 0/128 | 0/128 | 2/128 |
-| d=6 | 0/128 | 6/128 | 0/128 | 0/128 | 2/128 |
-| Cold 21-card | 0/256 | 0/256 | 0/256 | 1/256 | 2/256 |
-
-| Cold multiplayer | Trained 0-ply vs Random | Trained 0-ply vs Rev 0, 0-ply | Trained 1-ply vs Random | Trained 1-ply vs Rev 0, 0-ply | Trained 1-ply vs Rev 0, 1-ply |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 2 seats | 0/200 | 0/200 | 0/200 | 1/200 | 1/200 |
-| 3 seats | 0/240 | 1/240 | 0/240 | 4/240 | 3/240 |
-| 4 seats | 0/240 | 1/240 | 2/240 | 0/240 | 3/240 |
-
-Search alone solved the warm discard puzzles. The learned weights did not show a consistent advantage over untrained weights at the same search depth. See the [full search distillation results](TRAINING.md#schema-8-search-distillation-results) for check-ins, percentages, opponent declarations, and telemetry.
+The run selected and locked Final at revision 1,184 using seed `600_000`. On held-out seed `930_000`, the locked 0-ply model declared on the first discard in 44 of 128 distance-zero solo deals. The untrained 0-ply model declared on the first discard in 30 of the same 128 deals. On 256 cold solo deals, the locked model declared zero times at 0-ply and once at 1-ply. See the [Azure results](TRAINING.md#azure-results) for the lock and full solo and multiplayer tables.
 
 ## Verification
 
