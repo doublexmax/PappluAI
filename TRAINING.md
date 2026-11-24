@@ -267,7 +267,7 @@ The profiles put most of the time in the online and anchor unrolls and the backw
 The timing excludes rollout collection and gradient synchronization.
 `hand_potential` shapes the full-trajectory targets without adding a model token.
 Each reward adds `discount * next_potential - current_potential`. The terminal discount is zero.
-The learner computes these targets before sampling decisions for the online and anchor unrolls.
+The learner samples decision indices, computes full-trajectory V-trace targets, and gathers those sampled targets before the online and anchor unrolls.
 
 | `hand_potential` input | Median µs per call | Calls |
 | --- | ---: | ---: |
