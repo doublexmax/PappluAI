@@ -417,3 +417,49 @@ In head-to-head games, the prior checkpoint occupies all other seats. A timeout 
 | 4p_cold_vs_previous | `locked-gt-mastery` | 1 | 94/240 | 119 | 27 | 0.1724 |
 
 The run bundle contains per-deal outcomes, the warm-solo cases, checkpoint hashes, and 30-second host samples.
+
+## Balanced Azure resume and cold holdout
+
+Three learners and three rollout hosts used 96 Azure vCPUs. Each learner ran two Gloo ranks. Each rollout host ran 16 workers with 32 tables per worker.
+The run resumed AdamW at revision 1520 and trained in two 26-minute stages. The first used a learning rate of `5e-5` and a 15% warm-start share. The second used `2.5e-5` and an 8% share.
+
+### Training and candidate selection
+
+| Candidate | Revisions | End distance | Updates/s | Trained decisions/s | Cold declaration rate | Overall declaration rate | Mean utility |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Previous champion | n/a | n/a | n/a | n/a | 56.25% | 54.69% | 0.3387 |
+| First resume checkpoint | 1960 | 21 | 0.282 | 476.01 | 58.59% | 61.05% | 0.4362 |
+| Second resume checkpoint | 2440 | 21 | 0.306 | 517.92 | 51.43% | 58.67% | 0.4021 |
+
+Seed `600_000` selected the first resume checkpoint as `locked-gt-balanced.pt` before the run opened seed `960_000`.
+Selection ranks cold declaration rate first, then overall declaration rate and mean utility.
+The locked SHA-256 is `3d0bbd76c606f1877a9b3465b7f8e5c14bebedadd4721fe2bc683c75b3aaa6fc`.
+
+### Cold holdout on seed 960,000
+
+6 Azure hosts completed 10,488 games and 1,472,188 decisions in 183.31 seconds with 0 incomplete cases.
+The 500 solo deals per policy use the same seeds. Multiplayer rotates the tested policy through every seat.
+In head-to-head games, the prior checkpoint occupies all other seats. A timeout means no player declared.
+
+| Scenario | Policy | Search ply | Declarations | Opponent declarations | Timeouts | Mean utility |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| solo_cold | `locked-gt-balanced` | 0 | 191/500 | 0 | 309 | 0.0921 |
+| solo_cold | `locked-gt-balanced` | 1 | 374/500 | 0 | 126 | 0.6227 |
+| solo_cold | `previous` | 0 | 161/500 | 0 | 339 | -0.0049 |
+| solo_cold | `previous` | 1 | 333/500 | 0 | 167 | 0.4952 |
+| solo_cold | `rev0` | 0 | 0/500 | 0 | 500 | -0.8154 |
+| solo_cold | `random` | 0 | 1/500 | 0 | 499 | -0.8078 |
+| 2p_cold | `locked-gt-balanced` | 0 | 115/240 | 1 | 124 | 0.3029 |
+| 2p_cold | `locked-gt-balanced` | 1 | 186/240 | 0 | 54 | 0.6970 |
+| 3p_cold | `locked-gt-balanced` | 0 | 143/240 | 0 | 97 | 0.4607 |
+| 3p_cold | `locked-gt-balanced` | 1 | 211/240 | 0 | 29 | 0.8374 |
+| 4p_cold | `locked-gt-balanced` | 0 | 129/240 | 1 | 110 | 0.3780 |
+| 4p_cold | `locked-gt-balanced` | 1 | 196/240 | 1 | 43 | 0.7507 |
+| 2p_cold_vs_previous | `locked-gt-balanced` | 0 | 14/240 | 10 | 216 | -0.4273 |
+| 2p_cold_vs_previous | `locked-gt-balanced` | 1 | 29/240 | 26 | 185 | -0.3689 |
+| 3p_cold_vs_previous | `locked-gt-balanced` | 0 | 22/240 | 53 | 165 | -0.3580 |
+| 3p_cold_vs_previous | `locked-gt-balanced` | 1 | 56/240 | 103 | 81 | -0.1460 |
+| 4p_cold_vs_previous | `locked-gt-balanced` | 0 | 28/240 | 100 | 112 | -0.2552 |
+| 4p_cold_vs_previous | `locked-gt-balanced` | 1 | 45/240 | 155 | 40 | -0.1108 |
+
+The run bundle contains per-deal outcomes, the warm solo cases, checkpoint hashes, and 30-second host samples.

@@ -169,6 +169,8 @@ The Azure run selected `phase4-c3` on seed `600_000` before evaluating seed `940
 
 The hybrid Azure run locked `cluster-c3` on seed `600_000`. On the 500 cold solo deals from seed `950_000`, the locked 0-ply model declared 153 times and the prior 0-ply model declared 54 times. See the [hybrid Azure results](TRAINING.md#hybrid-azure-training-and-cold-holdout) for the holdout and multiplayer comparisons.
 
+On 500 cold solo deals from seed `960_000`, `locked-gt-balanced.pt` declared 191 times at 0-ply and the prior checkpoint declared 161 times. The [balanced Azure results](TRAINING.md#balanced-azure-resume-and-cold-holdout) include the paired multiplayer comparisons.
+
 ## Verification
 
 Run model verification from the repository root on the Azure compute host.
