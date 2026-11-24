@@ -165,6 +165,8 @@ The evaluator does not mutate its inputs.
 
 The run selected and locked Final at revision 1,184 using seed `600_000`. On held-out seed `930_000`, the locked 0-ply model declared on the first discard in 44 of 128 distance-zero solo deals. The untrained 0-ply model declared on the first discard in 30 of the same 128 deals. On 256 cold solo deals, the locked model declared zero times at 0-ply and once at 1-ply. See the [Azure results](TRAINING.md#azure-results) for the lock and full solo and multiplayer tables.
 
+The Azure run selected `phase4-c3` on seed `600_000` before evaluating seed `940_000`. At 0-ply the selected checkpoint declared on 37 of 128 first discards, against 40 for the previous winner on the same deals. The sampled learner processed 13.03x as many updates per second on the fixed learner benchmark. See the [Azure mastery run and paired holdout](TRAINING.md#azure-mastery-run-and-paired-holdout) for the full results.
+
 ## Verification
 
 Run model verification from the repository root on the Azure compute host.

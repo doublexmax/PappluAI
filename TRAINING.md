@@ -38,7 +38,20 @@ Training defaults to three decks, 21 cards per hand, five required pure sequence
 
 Half of starts use the curriculum by default. Curriculum starts take the smaller of two uniform draws from zero through six in solo and from one through six in multiplayer. Distance zero starts with one extra card and ends after one discard. At positive distances, the dealer replaces that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Standard validation and the arena use cold deals.
 
-Use `--auto-curriculum` on a fresh run to start at distance 1 with a 92% curriculum share. At each `--eval-every` interval, rank 0 runs 48 fixed solo deals at the current distance with 0-ply inference. The check records the win rate and mean number of qualifying sequences. The thresholds at distances 1, 2, 3, 4, 6, 9, and 14 are 45%, 30%, 20%, 20%, 12%, 12%, and 12%. The final frontier is cold. The share falls to 45% by distance 14, so earlier distances remain in the mix. All ranks publish the new plan on promotion. Existing matches keep their admission plan and weights.
+Use `--auto-curriculum` to start a fresh run at distance 1. Every `--eval-every` revisions, rank 0 runs 48 fixed solo deals at the current distance with 0-ply inference. You can change the interval on resume. The table gives the minimum wins needed on those 48 deals. It does not estimate win rates in cold play.
+
+| Distance | Curriculum share | Minimum win rate | Wins needed out of 48 |
+| ---: | ---: | ---: | ---: |
+| 1 | 88% | 8% | 4 |
+| 2 | 82% | 6% | 3 |
+| 3 | 75% | 5% | 3 |
+| 4 | 70% | 4% | 2 |
+| 6 | 60% | 2% | 1 |
+| 9 | 50% | 2% | 1 |
+| 14 | 40% | 2% | 1 |
+| 21 (cold) | 45% | None | None |
+
+The share controls how many collection deals use curriculum starts, with earlier distances still in the mix. At distance 21 the mastery check uses cold deals and stops advancing. All ranks publish the new plan on promotion. Existing matches keep the plan and weights they started with.
 
 Self-play defaults to `--search-ply 1`. The actor uses a pure sequence upper bound to skip declaration checks when the hand cannot meet the quota. It gives equal probability to every legal winning discard. If taking the top discard permits a legal winning discard that turn, it takes the card with probability one. On other decisions it uses the masked neural policy without scoring candidates. At `--search-ply 0` it skips the declaration checks.
 
@@ -238,3 +251,119 @@ In both multiplayer tables, the trained policy plays each seat once per deal. Al
 | Cold | 4 | RandomPolicy | 1/240 | 0 | 73.0000/240 (30.42%) | -0.503917 |
 | Cold | 4 | Rev 0, 0-ply | 0/240 | 0 | 58.5000/240 (24.38%) | -0.489917 |
 | Cold | 4 | Rev 0, 1-ply | 0/240 | 3 | 58.5000/240 (24.38%) | -0.488417 |
+
+## Azure mastery run and paired holdout
+
+Two BF16 Gloo ranks on a 16-vCPU `Standard_D16als_v6` started from `locked-gt-v8-final.pt`.
+Each rank used six learner threads, two actors, and 32 tables per actor.
+Check-ins B and C each resumed the saved AdamW state for 1,200 seconds.
+The earlier run won 4 of 48 distance-one mastery deals at revision 800. That meets the calibrated 8% threshold but missed the previous 45% threshold. Check-in B resumed at distance 2 with an 82% curriculum share.
+B checked mastery every 300 revisions. C kept that interval and used a learning rate of `2.5e-4`.
+
+The 12-step learner rose from 0.1452 to 1.8922 updates per second, a 13.03x speedup.
+The medians use five alternating updates per side on the same 24 archived 120-step trajectories with six threads.
+The full learner trained on 2,880 decisions per update. The sampled learner trained on 288.
+The profiles put most of the time in the online and anchor unrolls and the backward pass.
+The timing excludes rollout collection and gradient synchronization.
+`hand_potential` shapes the full-trajectory targets without adding a model token.
+Each reward adds `discount * next_potential - current_potential`. The terminal discount is zero.
+The learner computes these targets before sampling decisions for the online and anchor unrolls.
+
+| `hand_potential` input | Median µs per call | Calls |
+| --- | ---: | ---: |
+| cold | 17.93 | 10,000 |
+| distance 1 | 413.52 | 10,000 |
+| distance 0 | 103.16 | 10,000 |
+
+### Select the checkpoint on seed 600,000
+
+Each depth used 64 solo deals per start and both seats of 48 cold two-player deals.
+The distance-zero case ends after the first discard.
+Selection ranks mean declaration rate first, then cold declaration rate and mean utility.
+
+| Checkpoint | Revision | Active distance | Automatic promotions to date | 0-ply declarations | 1-ply declarations |
+| --- | ---: | ---: | --- | ---: | ---: |
+| `phase4-c1` | 851 | 1 | None | 34/480 | 125/480 |
+| `phase4-c2` | 1640 | 4 | 2 to 3 at rev 900 (4/48), 3 to 4 at rev 1200 (5/48) | 56/480 | 184/480 |
+| `phase4-c3` | 2251 | 6 | 2 to 3 at rev 900 (4/48), 3 to 4 at rev 1200 (5/48), 4 to 6 at rev 2100 (4/48) | 73/480 | 229/480 |
+
+The run locked `phase4-c3` as `locked-gt-phase4.pt` before it opened seed `940_000`.
+The locked checkpoint SHA-256 is `01ab8d38bc42f103be24adb5b5f1d172c1d76f579aae52649ba97f7588c41bb8`.
+
+### Compare on held-out seed 940,000
+
+Sixteen workers completed 14,872 games.
+Policy comparisons use identical deals and focal seats, with a 60-turn cap per seat.
+The tables round means. The proof bundle's `holdout.json` includes full precision and per-deal outcomes.
+
+In the solo table, each cell shows the locked model first and the previous winner second.
+
+| Solo start | Depth | Declarations | Mean qualifying sequences | Mean deadwood | Mean utility | Deals per policy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `d0_first` | 0 | 37 / 40 | 5.18 / 5.14 | 13.2188 / 12.4531 | -0.008438 / 0.026250 | 128 |
+| `d0_first` | 1 | 128 / 128 | 5.74 / 5.74 | 0.0000 / 0.0000 | 1.000000 / 1.000000 | 128 |
+| `d0_60turn` | 0 | 53 / 42 | 4.46 / 2.69 | 28.5547 / 70.8594 | 0.092500 / -0.235000 | 128 |
+| `d0_60turn` | 1 | 128 / 128 | 5.74 / 5.74 | 0.0000 / 0.0000 | 1.000000 / 1.000000 | 128 |
+| `d1` | 0 | 20 / 6 | 3.82 / 1.34 | 43.7812 / 106.4219 | -0.325625 / -0.774062 | 128 |
+| `d1` | 1 | 65 / 33 | 4.37 / 2.25 | 28.7656 / 82.1953 | 0.217188 / -0.377500 | 128 |
+| `d2` | 0 | 21 / 9 | 3.93 / 1.53 | 41.6406 / 99.4531 | -0.302500 / -0.717812 | 128 |
+| `d2` | 1 | 63 / 29 | 4.38 / 2.21 | 26.7188 / 81.9375 | 0.205625 / -0.423125 | 128 |
+| `d4` | 0 | 17 / 4 | 3.96 / 1.48 | 42.0938 / 101.5859 | -0.341562 / -0.778125 | 128 |
+| `d4` | 1 | 53 / 9 | 4.27 / 1.61 | 31.0859 / 97.8828 | 0.085937 / -0.709375 | 128 |
+| `d6` | 0 | 17 / 0 | 3.89 / 1.26 | 45.5625 / 107.8594 | -0.350000 / -0.849063 | 128 |
+| `d6` | 1 | 49 / 3 | 4.12 / 1.35 | 35.8047 / 105.4922 | 0.024375 / -0.805000 | 128 |
+| `d8` | 0 | 13 / 0 | 3.90 / 1.16 | 41.2812 / 109.8672 | -0.390000 / -0.860313 | 128 |
+| `d8` | 1 | 41 / 2 | 4.12 / 1.24 | 33.0078 / 107.9219 | -0.062188 / -0.829063 | 128 |
+| `solo_cold` | 0 | 28 / 0 | 3.91 / 1.32 | 43.1250 / 105.4102 | -0.382344 / -0.842031 | 256 |
+| `solo_cold` | 1 | 88 / 1 | 4.09 / 1.34 | 35.2383 / 104.9102 | -0.032188 / -0.834219 | 256 |
+
+In the multiplayer table, one focal policy faces random opponents. Each distance-two deal rotates through all seats.
+At the turn limit, tied first places split the credit. Each cell shows the locked model first.
+
+| Multiplayer start | Depth | Declarations | First-place credit | Mean deadwood | Games per policy |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `2p_d2` | 0 | 30 / 3 | 111.00 / 59.00 | 33.39 / 99.25 | 120 |
+| `2p_d2` | 1 | 77 / 25 | 115.00 / 74.00 | 18.53 / 79.57 | 120 |
+| `2p_cold` | 0 | 24 / 1 | 194.00 / 96.00 | 36.57 / 107.87 | 200 |
+| `2p_cold` | 1 | 92 / 1 | 195.00 / 96.00 | 25.70 / 107.87 | 200 |
+| `3p_d2` | 0 | 62 / 1 | 165.50 / 53.50 | 27.39 / 101.47 | 180 |
+| `3p_d2` | 1 | 120 / 23 | 168.50 / 67.00 | 15.96 / 89.54 | 180 |
+| `3p_cold` | 0 | 67 / 0 | 227.50 / 83.00 | 28.15 / 102.87 | 240 |
+| `3p_cold` | 1 | 149 / 4 | 229.50 / 86.00 | 17.73 / 101.08 | 240 |
+| `4p_d2` | 0 | 67 / 9 | 219.00 / 69.00 | 29.27 / 94.46 | 240 |
+| `4p_d2` | 1 | 164 / 40 | 222.50 / 87.50 | 15.23 / 82.82 | 240 |
+| `4p_cold` | 0 | 56 / 0 | 227.50 / 59.50 | 30.48 / 101.60 | 240 |
+| `4p_cold` | 1 | 150 / 4 | 230.50 / 60.50 | 17.06 / 100.57 | 240 |
+
+The direct two-player comparison uses the same depth for both checkpoints.
+
+| Start | Depth | Locked declarations | Previous declarations | No declaration | Locked first-place credit | Games |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `d2` | 0 | 17 | 6 | 97 | 100.00 | 120 |
+| `d2` | 1 | 45 | 20 | 55 | 90.00 | 120 |
+| `cold` | 0 | 5 | 0 | 195 | 175.50 | 200 |
+| `cold` | 1 | 34 | 0 | 166 | 175.50 | 200 |
+
+### Controls on the same deals
+
+Each pair lists the untrained Schema 8 model at 0-ply first and `RandomPolicy` second.
+
+| Solo start | Declarations | Mean qualifying sequences | Mean deadwood | Mean utility | Deals per policy |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `d0_first` | 38 / 33 | 5.1016 / 5.0703 | 15.6484 / 15.4062 | 0.000625 / -0.057813 | 128 |
+| `d0_60turn` | 40 / 37 | 2.8828 / 2.7422 | 71.7109 / 75.7969 | -0.237187 / -0.282187 | 128 |
+| `d1` | 6 / 5 | 1.7500 / 1.8047 | 101.0625 / 100.0156 | -0.726250 / -0.731563 | 128 |
+| `d2` | 4 / 3 | 1.6484 / 1.7500 | 102.3594 / 100.4766 | -0.758437 / -0.757188 | 128 |
+| `d4` | 1 / 1 | 1.6016 / 1.5938 | 102.8203 / 103.8438 | -0.796875 / -0.797813 | 128 |
+| `d6` | 0 / 1 | 1.5234 / 1.6484 | 103.8750 / 105.3359 | -0.817187 / -0.791250 | 128 |
+| `d8` | 0 / 0 | 1.4766 / 1.7578 | 104.2578 / 102.5938 | -0.822813 / -0.789062 | 128 |
+| `solo_cold` | 2 / 0 | 1.6445 / 1.7773 | 102.2383 / 103.0078 | -0.791719 / -0.786719 | 256 |
+
+| Multiplayer start | Declarations | First-place credit | Mean deadwood | Games per policy |
+| --- | ---: | ---: | ---: | ---: |
+| `2p_d2` | 2 / 3 | 72.5000 / 60.0000 | 95.0417 / 103.5333 | 120 |
+| `2p_cold` | 2 / 0 | 119.5000 / 100.0000 | 103.2300 / 102.2450 | 200 |
+| `3p_d2` | 2 / 4 | 57.0000 / 60.0000 | 103.0000 / 97.6333 | 180 |
+| `3p_cold` | 2 / 0 | 87.5000 / 80.0000 | 102.2875 / 106.6833 | 240 |
+| `4p_d2` | 9 / 3 | 70.5000 / 60.0000 | 95.3083 / 102.1750 | 240 |
+| `4p_cold` | 1 / 0 | 74.5000 / 60.0000 | 102.0167 / 104.6625 | 240 |
