@@ -53,7 +53,7 @@ module = sys.argv[1]
 sys.argv = [module, '--help']
 runpy.run_module(module, run_name='__main__')
 """
-        for module, text in (("train", "--collect"), ("evaluate", "--checkpoint"), ("arena", "--model")):
+        for module, text in (("train", "--collect"), ("evaluate", "--checkpoint"), ("arena", "--league")):
             with self.subTest(module=module):
                 result = subprocess.run(
                     [sys.executable, "-c", script, f"src.cli.{module}"], cwd=ROOT, capture_output=True, text=True, timeout=30,

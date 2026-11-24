@@ -87,6 +87,8 @@ jobs:
           python -c 'import pathlib, sys; assert len(list(pathlib.Path(sys.argv[1]).glob("batch-*.pt"))) == 1' "$run/collected"
           python -m src.cli.evaluate --checkpoint "$run/best-model.pt" --games 4 --warm-games 0 --output "$run/evaluation.json"
           python -m src.cli.arena --model "$run/best-model.pt" --model random --games 4 --max-turns 2 --output "$run/arena.json"
+          python -m src.cli.arena --league --model "$run/best-model.pt" --model "$run/latest-model.pt" --label best --label latest --games 1 --max-turns 1 --workers 2 --output "$run/league.json"
+          python -c 'import json, sys; s = json.load(open(sys.argv[1])); assert s["matches"] == 16 and [r["label"] for r in s["standings"]] == ["best", "latest"] and s["standings"][0]["elo"] == 1000 and sum(r["net_points_per_seat"] for r in s["standings"]) == 0' "$run/league.json"
           node --test tests/*.test.mjs
       - name: Upload lifecycle evidence
         if: always()
@@ -98,3 +100,4 @@ jobs:
             ${{ runner.temp }}/transformer/metrics.jsonl
             ${{ runner.temp }}/transformer/evaluation.json
             ${{ runner.temp }}/transformer/arena.json
+            ${{ runner.temp }}/transformer/league.json

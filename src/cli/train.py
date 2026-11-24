@@ -13,7 +13,7 @@ from src.cli._runtime import load_runtime
 
 _SHAPE = ("width", "layers", "heads", "ffn")
 _GAME = ("num_decks", "cards_in_hand", "required_sequences", "max_turns", "recycle_discard")
-_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance", "uniform_mix", "batch_decisions", "search_ply")
+_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance", "uniform_mix", "batch_decisions")
 _HOST = ("tables", "torch_threads", "precision", "device")
 _INTS = (
     "actors", "actor_threads", "batch_size", "unroll_steps", "min_buffer_decisions", "buffer_decisions",
@@ -25,7 +25,7 @@ _FLOATS = ("learning_rate", "weight_decay", "grad_clip", "value_weight", "eta",
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train GameTransformer with terminal-win distillation and V-trace.")
+    parser = argparse.ArgumentParser(description="Train GameTransformer with V-trace self-play.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--output-dir", type=Path, help="start or resume a learner (supports torchrun on CPU)")
     mode.add_argument("--collect", type=Path, help="write completed batches to this inbox")
@@ -38,7 +38,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="advance the collection plan on 0-ply frontier mastery")
     parser.add_argument("--device")
     parser.add_argument("--precision", choices=("fp32", "bf16"))
-    parser.add_argument("--search-ply", type=int, choices=(0, 1), help="self-play depth for a fresh learner (default: 1)")
     parser.add_argument("--max-seconds", type=float)
     for name in (
         *_SHAPE, *_INTS, *_GAME[:-1], "tables", "torch_threads",

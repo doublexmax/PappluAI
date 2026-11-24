@@ -15,14 +15,6 @@ if torch is not None:
     from src.training.train import Learner, TrainConfig, TrajectoryBatch, _SeatTrajectory, vtrace
 
 
-def _expert(n, action=2, mass=65535):
-    row = torch.zeros(n, SCHEMA.num_actions, dtype=torch.int32)
-    row[:, action] = mass
-    if mass != 65535:
-        row[:, 2] = 65535 - mass
-    return row.to(torch.uint16)
-
-
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class TestLearner(unittest.TestCase):
     def setUp(self):
@@ -43,7 +35,7 @@ class TestLearner(unittest.TestCase):
         )
         torch.testing.assert_close(values, torch.tensor([[1.1]]))
 
-    def test_distillation_fits_search_distribution_instead_of_the_sampled_move(self):
+    def test_policy_gradient_uses_the_action_taken_and_its_behavior_probability(self):
         model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
         with torch.no_grad():
             for parameter in model.parameters():
@@ -53,32 +45,28 @@ class TestLearner(unittest.TestCase):
             torch.ones(1, SCHEMA.fields, dtype=torch.uint8),
             torch.ones(1, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
             torch.tensor([1]), torch.tensor([12]), torch.tensor([2]),
-            torch.tensor([-math.log(2)]), torch.tensor(1.0), _expert(1, 3, 49151),
-            torch.ones(1, dtype=torch.uint8),
+            torch.zeros(1), torch.tensor(1.0),
             torch.zeros(1), torch.zeros(1),
         )
         stats = learner.update(TrajectoryBatch.pack((row,)))
-        self.assertAlmostEqual(stats.policy_loss, math.log(2), places=6)
+        self.assertAlmostEqual(stats.policy_loss, 0.5 * math.log(2), places=6)
         self.assertAlmostEqual(stats.value_loss, 0.5)
-        self.assertAlmostEqual(stats.loss, math.log(2) + 0.5, places=6)
-        torch.testing.assert_close(model.policy.bias.grad[2:4], torch.tensor([0.25, -0.25]), atol=1e-5, rtol=0)
-        self.assertGreater(float(model.policy.bias[3]), float(model.policy.bias[2]))
+        self.assertAlmostEqual(stats.loss, 0.5 * math.log(2) + 0.5, places=6)
+        torch.testing.assert_close(model.policy.bias.grad[2:4], torch.tensor([-0.25, 0.25]), atol=1e-5, rtol=0)
+        self.assertGreater(float(model.policy.bias[2]), float(model.policy.bias[3]))
         self.assertGreater(float(model.value.bias), 0.0)
 
-    def test_unforced_action_gets_credit_for_a_later_forced_win(self):
+    def test_sampled_actions_get_credit_for_a_later_declaration(self):
         model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.zero_()
         learner = Learner(model, TrainConfig(precision="fp32", entropy_weight=0.002, grad_clip=1000))
-        targets = torch.zeros(2, SCHEMA.num_actions, dtype=torch.int32)
-        targets[0, 3] = targets[1, 5] = 65535
         row = _SeatTrajectory(
             torch.ones(2, SCHEMA.fields, dtype=torch.uint8),
             torch.ones(2, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
             torch.tensor([1, 2]), torch.tensor([12, 48]), torch.tensor([2, 5]),
-            torch.tensor([-math.log(2), 0]), torch.tensor(1.0), targets.to(torch.uint16),
-            torch.tensor([0, 1], dtype=torch.uint8),
+            torch.full((2,), -math.log(2)), torch.tensor(1.0),
             torch.zeros(2), torch.zeros(2),
         )
         stats = learner.update(TrajectoryBatch.pack((row,)))
@@ -106,8 +94,7 @@ class TestLearner(unittest.TestCase):
                 torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
                 torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
                 torch.arange(1, n + 1), torch.full((n,), 12), torch.full((n,), 2),
-                torch.full((n,), -math.log(2)), torch.tensor(utility), _expert(n),
-                torch.zeros(n, dtype=torch.uint8), torch.tensor(phi), torch.zeros(n),
+                torch.full((n,), -math.log(2)), torch.tensor(utility), torch.tensor(phi), torch.zeros(n),
             )
             for n, utility, phi in ((1, 1.0, [0.75]), (4, -0.4, [0.1, 0.3, 0.2, 0.7]))
         )
@@ -126,8 +113,7 @@ class TestLearner(unittest.TestCase):
                 torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
                 torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
                 torch.arange(1, n + 1), torch.full((n,), 12), torch.full((n,), 2),
-                torch.zeros(n), torch.tensor(1.0), _expert(n), torch.zeros(n, dtype=torch.uint8),
-                torch.zeros(n), torch.zeros(n),
+                torch.zeros(n), torch.tensor(1.0), torch.zeros(n), torch.zeros(n),
             )
 
         batch = TrajectoryBatch.pack((seat(2), seat(4)))
@@ -152,9 +138,7 @@ class TestLearner(unittest.TestCase):
                 torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
                 torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
                 torch.arange(1, n + 1), torch.full((n,), legal), torch.full((n,), 2),
-                torch.full((n,), -math.log(2)), torch.tensor(utility), _expert(n),
-                torch.zeros(n, dtype=torch.uint8),
-                torch.zeros(n), torch.zeros(n),
+                torch.full((n,), -math.log(2)), torch.tensor(utility), torch.zeros(n), torch.zeros(n),
             )
             for n, legal, utility in ((1, 4, 1.0), (8, 12, -1.0))
         )
@@ -183,9 +167,7 @@ class TestLearner(unittest.TestCase):
                 torch.ones(n, SCHEMA.fields, dtype=torch.uint8),
                 torch.ones(n, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
                 torch.arange(1, n + 1), torch.full((n,), 12), torch.full((n,), 2),
-                torch.full((n,), -math.log(2)), torch.tensor(1.0), _expert(n),
-                torch.ones(n, dtype=torch.uint8),
-                torch.zeros(n), torch.zeros(n),
+                torch.full((n,), -math.log(2)), torch.tensor(1.0), torch.zeros(n), torch.zeros(n),
             )
             for n in (1, 2)
         )

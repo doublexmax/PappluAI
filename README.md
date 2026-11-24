@@ -161,15 +161,21 @@ The evaluator does not mutate its inputs.
 
 ## Model and training contract
 
-`GameTransformer` in [`src/model/`](src/model/) is the repository's only neural model. It uses checkpoint format 6 and token schema 8. The default model has 2,175,224 parameters. Self-play uses 1-ply search to find wins on the current turn. The learner computes targets from shaped rewards across the full trajectory and trains on sampled decisions. The hand potential stays out of the model tokens. Set `--auto-curriculum` to advance training starts when the 0-ply policy meets the current win-rate threshold. See the [training guide](TRAINING.md) for run commands, defaults, and the token layout.
+`GameTransformer` in [`src/model/`](src/model/) is the repository's only neural model. It uses checkpoint format 6 and token schema 8. The default model has 2,175,224 parameters. Self-play samples the masked neural policy and trains with V-trace. It no longer uses 1-ply lookahead or stores expert targets and forced-move flags. New runs use rollout format 6 and trainer state version 18.
 
-The run selected and locked Final at revision 1,184 using seed `600_000`. On held-out seed `930_000`, the locked 0-ply model declared on the first discard in 44 of 128 distance-zero solo deals. The untrained 0-ply model declared on the first discard in 30 of the same 128 deals. On 256 cold solo deals, the locked model declared zero times at 0-ply and once at 1-ply. See the [Azure results](TRAINING.md#azure-results) for the lock and full solo and multiplayer tables.
+`python -m src.cli.arena --league` compares checkpoints on the same cold deals with mirrored seats. It reports Bradley-Terry Elo and zero-sum net deadwood points per seat at two, three, and four players by default. No reference bots play in the league. After the optional solo curriculum, the trainer uses the same matchup rules to decide whether to promote `best-model.pt`.
 
-The Azure run selected `phase4-c3` on seed `600_000` before evaluating seed `940_000`. At 0-ply the selected checkpoint declared on 37 of 128 first discards, against 40 for the previous winner on the same deals. The sampled learner processed 13.03x as many updates per second on the fixed learner benchmark. See the [Azure mastery run and paired holdout](TRAINING.md#azure-mastery-run-and-paired-holdout) for the full results.
+The Azure cold league ran 7,680 matches on seed `970_000`. The first checkpoint, `rev0`, anchors each rating at 1,000.
 
-The hybrid Azure run locked `cluster-c3` on seed `600_000`. On the 500 cold solo deals from seed `950_000`, the locked 0-ply model declared 153 times and the prior 0-ply model declared 54 times. See the [hybrid Azure results](TRAINING.md#hybrid-azure-training-and-cold-holdout) for the holdout and multiplayer comparisons.
+| Checkpoint | Overall Elo | 2p Elo | 3p Elo | 4p Elo | Net points per seat |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `balanced` | 1430.6 | 1365.7 | 1424.7 | 1440.2 | +23.22 |
+| `mastery` | 1413.1 | 1349.8 | 1419.1 | 1416.4 | +20.00 |
+| `phase4` | 1322.4 | 1228.2 | 1331.3 | 1326.8 | +4.76 |
+| `v8-final` | 1010.7 | 978.8 | 1014.9 | 1011.5 | -21.92 |
+| `rev0` | 1000.0 | 1000.0 | 1000.0 | 1000.0 | -26.05 |
 
-On 500 cold solo deals from seed `960_000`, `locked-gt-balanced.pt` declared 191 times at 0-ply and the prior checkpoint declared 161 times. The [balanced Azure results](TRAINING.md#balanced-azure-resume-and-cold-holdout) include the paired multiplayer comparisons.
+See the [training guide](TRAINING.md) for commands, defaults, and the token layout.
 
 ## Verification
 
@@ -183,7 +189,7 @@ node --test tests/*.test.mjs
 
 The architecture checker rejects import cycles and function-local imports.
 It checks portable imports with Torch and NumPy blocked.
-CI also exercises training, resume, standalone collection, and both evaluation commands.
+CI also exercises training, resume, standalone collection, solo evaluation, single matches, and the checkpoint league.
 
 `tools/verify_browser.mjs` exercises the real browser through Playwright.
 It checks a full Tactical turn in the module worker, scoring, declarations, pass-and-play privacy, AI Watch, and the main-thread fallback.

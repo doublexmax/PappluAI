@@ -24,7 +24,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from src.checkpoints.io import atomic_write_json
 from src.checkpoints.tensor import atomic_torch_save, validate_model_state
-from src.evaluation.arena import Deal, MatchResult, RandomPolicy, TransformerPolicy, head_to_head, run_matches
+from src.evaluation.arena import CheckpointPolicy, Deal, MatchResult, TransformerPolicy, head_to_head, run_matches
 from src.game.environment import GameConfig
 from src.game.multiplayer import MatchConfig
 from src.model.encoding import HEADER_TOKENS, SCHEMA, validate_game
@@ -32,8 +32,8 @@ from src.model.network import GameTransformer, TokenBatch, action_mask, load_che
 from src.model.spec import ModelSpec, TokenSchema
 
 
-STATE_VERSION = 17
-ROLLOUT_FORMAT = 5
+STATE_VERSION = 18
+ROLLOUT_FORMAT = 6
 VALIDATION_SEED = 30_000_001
 OUTBOX_LIMIT = 8
 LENGTH_BUCKET = 8
@@ -56,7 +56,6 @@ class CollectPlan:
     curriculum_max_distance: int = 6
     uniform_mix: float = 0.02
     batch_decisions: int = 8192
-    search_ply: int = 1
 
     def __post_init__(self) -> None:
         counts = self.player_counts
@@ -73,8 +72,6 @@ class CollectPlan:
             raise ValueError("curriculum_max_distance must be positive")
         if type(self.batch_decisions) is not int or not 1 <= self.batch_decisions <= 262_144:
             raise ValueError("batch_decisions must be in 1..262144")
-        if type(self.search_ply) is not int or self.search_ply not in (0, 1):
-            raise ValueError("search_ply must be 0 or 1")
 
     def validate(self, game: GameConfig) -> None:
         validate_game(game)
@@ -198,8 +195,8 @@ def _run_id(value: object) -> str:
     return value
 
 
-def _bytes_tensor(values: bytes, shape: tuple[int, ...], dtype: torch.dtype = torch.uint8) -> Tensor:
-    return torch.frombuffer(bytearray(values), dtype=dtype).reshape(shape)
+def _bytes_tensor(values: bytes, shape: tuple[int, ...]) -> Tensor:
+    return torch.frombuffer(bytearray(values), dtype=torch.uint8).reshape(shape)
 
 
 @dataclass(frozen=True)
@@ -217,8 +214,6 @@ class Trajectories:
     legal: Tensor
     action: Tensor
     behavior_logp: Tensor
-    target_probs: Tensor
-    forced: Tensor
     potential: Tensor
     behavior_value: Tensor
 
@@ -248,17 +243,12 @@ class Trajectories:
             torch.tensor([bits for row in traces for bits in row.legal], dtype=torch.int64),
             _bytes_tensor(b"".join(row.action for row in traces), (-1,)),
             torch.tensor([logp for row in traces for logp in row.behavior_logp], dtype=torch.float32),
-            _bytes_tensor(b"".join(row.target_probs for row in traces), (-1, SCHEMA.num_actions), torch.uint16),
-            _bytes_tensor(b"".join(row.forced for row in traces), (-1,)),
             torch.tensor([value for row in traces for value in row.potential], dtype=torch.float32),
             torch.tensor([value for row in traces for value in row.behavior_value], dtype=torch.float32),
         )
 
     def save(self, path: Path) -> None:
-        atomic_torch_save({
-            "format": ROLLOUT_FORMAT, "schema": SCHEMA.to_dict(), **vars(self),
-            "target_probs": self.target_probs.view(torch.int16),
-        }, Path(path))
+        atomic_torch_save({"format": ROLLOUT_FORMAT, "schema": SCHEMA.to_dict(), **vars(self)}, Path(path))
 
     @classmethod
     def load(cls, path: Path, schema: TokenSchema = SCHEMA) -> Trajectories:
@@ -269,18 +259,16 @@ class Trajectories:
             payload = torch.load(path, map_location="cpu", weights_only=True)
         except (RuntimeError, UnpicklingError, EOFError) as exc:
             raise ValueError("cannot read rollout batch") from exc
-        if not isinstance(payload, dict) or set(payload) != {"format", "schema", *cls.__dataclass_fields__}:
+        if not isinstance(payload, dict):
             raise ValueError("invalid rollout batch fields")
-        if type(payload["format"]) is not int or payload["format"] != ROLLOUT_FORMAT:
+        if type(payload.get("format")) is not int or payload["format"] != ROLLOUT_FORMAT:
             raise ValueError("incompatible rollout batch format")
+        if set(payload) != {"format", "schema", *cls.__dataclass_fields__}:
+            raise ValueError("invalid rollout batch fields")
         if TokenSchema.from_dict(payload["schema"]) != schema:
             raise ValueError("incompatible rollout token schema")
         payload.pop("format")
         payload.pop("schema")
-        targets = payload["target_probs"]
-        if not isinstance(targets, Tensor) or targets.layout != torch.strided or targets.dtype != torch.int16:
-            raise ValueError("invalid rollout column target_probs")
-        payload["target_probs"] = targets.view(torch.uint16)
         batch = cls(**payload)
         batch._validate(schema)
         return batch
@@ -294,8 +282,7 @@ class Trajectories:
             ("prefix", torch.uint8, (schema.fields,)), ("prefix_end", torch.int64, ()),
             ("suffix", torch.uint8, (schema.suffix_tokens, schema.fields)), ("decision_end", torch.int64, ()),
             ("cut", torch.int16, ()), ("legal", torch.int64, ()), ("action", torch.uint8, ()),
-            ("behavior_logp", torch.float32, ()), ("target_probs", torch.uint16, (schema.num_actions,)),
-            ("forced", torch.uint8, ()), ("potential", torch.float32, ()), ("behavior_value", torch.float32, ()),
+            ("behavior_logp", torch.float32, ()), ("potential", torch.float32, ()), ("behavior_value", torch.float32, ()),
         ):
             col = getattr(self, name)
             if (
@@ -309,12 +296,9 @@ class Trajectories:
         if any(len(col) != streams for col in (self.utility, self.prefix_end, self.decision_end)):
             raise ValueError("invalid rollout trajectory column lengths")
         if any(len(col) != decisions for col in (
-            self.suffix, self.cut, self.legal, self.behavior_logp, self.target_probs, self.forced,
-            self.potential, self.behavior_value,
+            self.suffix, self.cut, self.legal, self.behavior_logp, self.potential, self.behavior_value,
         )):
             raise ValueError("invalid rollout decision column lengths")
-        if bool((self.forced > 1).any()):
-            raise ValueError("invalid rollout forced flags")
         lengths, prefix_lengths = (
             ends.diff(prepend=ends.new_zeros(1)) for ends in (self.decision_end, self.prefix_end)
         )
@@ -339,13 +323,6 @@ class Trajectories:
             or bool((acts >= schema.num_actions).any() or (((self.legal >> acts) & 1) == 0).any())
         ):
             raise ValueError("invalid rollout legal action")
-        legal = action_mask(self.legal, schema.num_actions)
-        targets = self.target_probs.int()
-        if bool(
-            targets.masked_fill(legal, 0).any()
-            or ((targets.sum(-1) - 65535).abs() > legal.sum(-1) // 2).any()
-        ):
-            raise ValueError("invalid rollout target probability mass or legality")
         if bool((self.suffix[:, 0, 0] == 0).any()):
             raise ValueError("rollout has a padded readout token")
         if schema.pointer_field is not None and bool((self.suffix[..., schema.pointer_field] > schema.num_actions).any()):
@@ -394,7 +371,7 @@ def collect(
     revision = checkpoint.version
     spec = checkpoint.network.spec
     policy = TransformerPolicy(checkpoint.network, game, sample=True, uniform_mix=plan.uniform_mix,
-                               precision=precision, record=True, search_ply=plan.search_ply)
+                               precision=precision, record=True)
     del checkpoint
     active: Counter[int] = Counter()
     admitted: dict[int, int] = {}
@@ -427,7 +404,7 @@ def collect(
                             plan = updated
                             queue = plan.deals(f"{nonce}:{revision}")
                         policy = TransformerPolicy(snapshot.network, game, sample=True, uniform_mix=plan.uniform_mix,
-                                                   precision=precision, record=True, search_ply=plan.search_ply)
+                                                   precision=precision, record=True)
                     stamp = new_stamp
             yield next(queue)
 
@@ -479,8 +456,6 @@ class _SeatTrajectory:
     action: Tensor
     behavior_logp: Tensor
     utility: Tensor
-    target_probs: Tensor
-    forced: Tensor
     potential: Tensor
     behavior_value: Tensor
 
@@ -507,8 +482,6 @@ class TrajectoryBatch:
     reward: Tensor
     discount: Tensor
     valid: Tensor
-    target_probs: Tensor
-    forced: Tensor
 
     @classmethod
     def pack(cls, seats: tuple[_SeatTrajectory, ...]) -> TrajectoryBatch:
@@ -526,10 +499,7 @@ class TrajectoryBatch:
         reward += discount * torch.roll(potential, -1, dims=1) - potential
         tokens = TokenBatch(pack("prefix"), pack("suffix"), pack("cut").long(),
                             action_mask(pack("legal"), SCHEMA.num_actions))
-        targets = pad_sequence([seat.target_probs.float() for seat in seats], batch_first=True)
-        targets /= targets.sum(-1, keepdim=True).clamp_min(1)
-        return cls(tokens, action, pack("behavior_logp"), pack("behavior_value"),
-                   reward, discount, valid, targets, pack("forced").bool())
+        return cls(tokens, action, pack("behavior_logp"), pack("behavior_value"), reward, discount, valid)
 
     def sample_steps(self, limit: int, rng: torch.Generator) -> StepSample:
         lengths = self.valid.sum(1, keepdim=True)
@@ -563,7 +533,6 @@ class _BatchIndex:
             seat = _SeatTrajectory(
                 batch.prefix[prefix_start:prefix_end], batch.suffix[span], batch.cut[span],
                 batch.legal[span], batch.action[span], batch.behavior_logp[span], batch.utility[row],
-                batch.target_probs[span], batch.forced[span],
                 batch.potential[span], batch.behavior_value[span],
             )
             buckets.setdefault((players, (end - start - 1) // LENGTH_BUCKET), []).append(seat)
@@ -798,10 +767,7 @@ class Learner:
         self._step_rng.manual_seed(config.seed + self.version * self.group.size + self.group.rank)
         sample = batch.sample_steps(config.unroll_steps, self._step_rng)
         tokens = TokenBatch(*(tensor.to(device) for tensor in vars(sample.tokens(batch.tokens)).values()))
-        action, behavior, expert, forced = (
-            sample.gather(tensor).to(device)
-            for tensor in (batch.action, batch.behavior_logp, batch.target_probs, batch.forced)
-        )
+        action, behavior = (sample.gather(tensor).to(device) for tensor in (batch.action, batch.behavior_logp))
         weights = sample.weight.to(device)
         value = batch.behavior_value
         targets, advantage = vtrace(
@@ -828,9 +794,7 @@ class Learner:
 
         kl = per_trajectory(divergence)
         entropy = per_trajectory(entropy)
-        ce_step = -(expert * masked_log_pi).sum(-1)
-        pg_step = -(rho * advantage * taken)
-        policy_loss = per_trajectory(torch.where(forced, ce_step, pg_step))
+        policy_loss = per_trajectory(-(rho * advantage * taken))
         value_loss = 0.5 * per_trajectory((targets - heads.value).square())
         loss = policy_loss + config.value_weight * value_loss + config.eta * kl - config.entropy_weight * entropy
         self.optimizer.zero_grad(set_to_none=True)
@@ -986,40 +950,42 @@ class Trainer:
     def evaluate(self, *, stop: Callable[[], bool] = lambda: False) -> dict:
         cfg = self.config
         candidate = TransformerPolicy(self.learner.online, cfg.game, precision=cfg.precision)
-        if cfg.auto_curriculum:
+        if cfg.auto_curriculum and cfg.plan.curriculum_max_distance < cfg.game.cards_in_hand:
             return self._evaluate_curriculum(candidate, stop)
-        checkpoint = load_checkpoint(self.root / "best-model.pt", SCHEMA, self.learner.device)
-        best = TransformerPolicy(checkpoint.network, GameConfig.from_dict(checkpoint.game), precision=cfg.precision)
-        validation = {}
-        for name, opponent in (("best", best), ("random", RandomPolicy())):
-            validation[name] = [
-                asdict(head_to_head(
-                    candidate, opponent, cfg.game, players, cfg.eval_deals, VALIDATION_SEED + players * cfg.eval_deals,
-                    tables=cfg.tables, stop=stop,
-                ))
-                for players in cfg.plan.player_counts
-            ]
-        scores = [row["advantage"] for row in validation["best"]]
-        promote = sum(scores) / len(scores) >= cfg.promote_margin and min(scores) >= -cfg.promote_margin
-        self.validation = {**validation, "promoted": promote, "version": self.learner.version}
+        best_path = self.root / "best-model.pt"
+        best = CheckpointPolicy(best_path, device=self.learner.device, precision=cfg.precision)
+        counts = tuple(p for p in cfg.plan.player_counts if p > 1) or cfg.plan.player_counts
+        rows = [
+            head_to_head(
+                candidate, best, cfg.game, players, cfg.eval_deals, VALIDATION_SEED + players * cfg.eval_deals,
+                tables=cfg.tables, stop=stop,
+            )
+            for players in counts
+        ]
+        margin = cfg.promote_margin
+        promote = (
+            sum(row.score for row in rows) / len(rows) >= 0.5 + margin
+            and math.fsum(row.net_points for row in rows) >= 0.0
+            and min(row.score for row in rows) >= 0.5 - margin
+        )
+        self.validation = {"best": [asdict(row) for row in rows], "promoted": promote, "version": self.learner.version}
         if promote:
             self._save()
-            self.export_model(self.root / "best-model.pt")
+            self.export_model(best_path)
         return self.validation
 
     def _evaluate_curriculum(self, candidate: TransformerPolicy, stop: Callable[[], bool]) -> dict:
         cfg, plan = self.config, self.config.plan
         distance = plan.curriculum_max_distance
-        cold = distance == cfg.game.cards_in_hand
-        threshold = None if cold else MASTERY_LADDER[distance][1]
+        threshold = MASTERY_LADDER[distance][1]
         seed = VALIDATION_SEED + distance * 100_000
-        deals = [Deal(seed + i, (0,), None if cold else distance) for i in range(48)]
+        deals = [Deal(seed + i, (0,), distance) for i in range(48)]
         results = list(run_matches(deals, (candidate,), cfg.game, tables=cfg.tables, stop=stop))
         if len(results) != len(deals):
             raise InterruptedError("mastery evaluation stopped before completing the frontier deals")
         wins = sum(result.winner == 0 for result in results)
         rate = wins / len(deals)
-        mastered = threshold is not None and rate >= threshold
+        mastered = rate >= threshold
         next_plan = plan
         if mastered:
             next_distance = min((step for step in MASTERY_LADDER if distance < step < cfg.game.cards_in_hand),
@@ -1027,8 +993,8 @@ class Trainer:
             share = MASTERY_LADDER[next_distance][0] if next_distance < cfg.game.cards_in_hand else 0.45
             next_plan = replace(plan, curriculum_max_distance=next_distance, curriculum_share=share)
         check = {
-            "distance": distance, "cold": cold, "wins": wins, "deals": len(deals), "seed": seed,
-            "win_rate": rate, "threshold": threshold, "search_ply": candidate.search_ply,
+            "distance": distance, "wins": wins, "deals": len(deals), "seed": seed,
+            "win_rate": rate, "threshold": threshold,
             "mean_qualifying_sequences": sum(
                 result.outcome.penalties[0].qualifying_sequences for result in results
             ) / len(results),

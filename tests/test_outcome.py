@@ -19,6 +19,7 @@ class TestOutcomes(unittest.TestCase):
         score = DealOutcome.score(TerminalSnapshot((maximum, one_less), 1), None, "turns_exhausted", 5)
         self.assertEqual(score.max_points, 210)
         self.assertEqual(score.utilities(), (-0.5, -0.5))
+        self.assertEqual(score.net_points(), (-0.5, 0.5))
         self.assertEqual(score.ranks(), (2, 1))
         self.assertEqual(score.margin(1, 0), 1)
 
@@ -40,6 +41,8 @@ class TestOutcomes(unittest.TestCase):
     def test_zero_sum_and_placements_on_declaration(self):
         score = DealOutcome(0, "win", tuple(HandPenalty(p, (), ()) for p in (0, 0, 210, 210)), 210)
         self.assertEqual(score.utilities(), (1.0, -1 / 3, -1 / 3, -1 / 3))
+        self.assertEqual(score.net_points(), (420.0, 0.0, -210.0, -210.0))
+        self.assertEqual(sum(score.net_points()), 0.0)
         self.assertAlmostEqual(sum(score.utilities()), 0)
         self.assertEqual(score.ranks(), (1, 2, 3, 3))
         self.assertEqual(score.margin(2, 3), 0)
@@ -57,6 +60,19 @@ class TestOutcomes(unittest.TestCase):
                 self.assertEqual(declared.utilities(), (loss,) * (players - 1) + (1.0,))
                 self.assertAlmostEqual(sum(declared.utilities()), 0)
                 self.assertEqual(expired.utilities(), (-0.5,) * players)
+                payouts = expired.net_points()
+                self.assertEqual(sum(payouts), 0.0)
+                for payout, points_at_seat in zip(payouts, points):
+                    self.assertAlmostEqual(payout, sum(points) / players - points_at_seat)
+
+    def test_solo_net_points_and_fractional_multiplayer_draw(self):
+        win = DealOutcome(0, "win", (HandPenalty(0, (), ()),), 210)
+        loss = DealOutcome(None, "turns_exhausted", (HandPenalty(26, (), ()),), 210)
+        draw = DealOutcome(None, "turns_exhausted", tuple(HandPenalty(p, (), ()) for p in (1, 4, 17)), 210)
+        self.assertEqual((win.net_points(), loss.net_points()), ((0.0,), (-26.0,)))
+        self.assertEqual(sum(draw.net_points()), 0.0)
+        for actual, expected in zip(draw.net_points(), (19 / 3, 10 / 3, -29 / 3)):
+            self.assertAlmostEqual(actual, expected)
 
     def test_solo_declaration_and_invalid_terminal_hands(self):
         winning = hand((0, 1), (1, 1), (2, 1))

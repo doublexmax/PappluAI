@@ -38,7 +38,7 @@ Training defaults to three decks, 21 cards per hand, five required pure sequence
 
 Half of starts use the curriculum by default. Curriculum starts take the smaller of two uniform draws from zero through six in solo and from one through six in multiplayer. Distance zero starts with one extra card and ends after one discard. At positive distances, the dealer replaces that many cards in each seat's hand from a shared shoe. The encoder does not receive the curriculum distance. Standard validation and the arena use cold deals.
 
-Use `--auto-curriculum` to start a fresh run at distance 1. Every `--eval-every` revisions, rank 0 runs 48 fixed solo deals at the current distance with 0-ply inference. You can change the interval on resume. The table gives the minimum wins needed on those 48 deals. It does not estimate win rates in cold play.
+Use `--auto-curriculum` to start a fresh run at distance 1. Every `--eval-every` revisions, rank 0 runs 48 fixed solo deals at the current distance using the greedy neural policy. You can change the interval on resume. The table gives the minimum wins needed on those 48 deals. It does not estimate win rates in cold play.
 
 | Distance | Curriculum share | Minimum win rate | Wins needed out of 48 |
 | ---: | ---: | ---: | ---: |
@@ -51,11 +51,9 @@ Use `--auto-curriculum` to start a fresh run at distance 1. Every `--eval-every`
 | 14 | 40% | 2% | 1 |
 | 21 (cold) | 45% | None | None |
 
-The share controls how many collection deals use curriculum starts, with earlier distances still in the mix. At distance 21 the mastery check uses cold deals and stops advancing. All ranks publish the new plan on promotion. Existing matches keep the plan and weights they started with.
+The share controls how many collection deals use curriculum starts, with earlier distances still in the mix. At distance 21 the trainer stops advancing the curriculum and switches to cold checkpoint validation. All ranks publish the new plan on promotion. Existing matches keep the plan and weights they started with.
 
-Self-play defaults to `--search-ply 1`. The actor uses a pure sequence upper bound to skip declaration checks when the hand cannot meet the quota. It gives equal probability to every legal winning discard. If taking the top discard permits a legal winning discard that turn, it takes the card with probability one. On other decisions it uses the masked neural policy without scoring candidates. At `--search-ply 0` it skips the declaration checks.
-
-By default, actors mix 2% uniform probability over legal actions into the policy when no move is forced. The rollout records one `uint8` forced flag, the actual behavior log probability, the behavior value, and the hand potential for each decision. It quantizes the policy target before exploration to 54 unsigned 16-bit values and stores their bits in an `int16` tensor. The learner validates target mass and legality on load. It applies cross-entropy only to forced decisions and a clipped importance-weighted policy gradient to ordinary decisions. `--entropy-weight` defaults to zero.
+Self-play no longer uses 1-ply lookahead or learns from expert targets. Actors sample the masked `GameTransformer` policy with a 2% uniform mix over legal actions by default. The rollout records the action, its behavior log probability, the behavior value, and the hand potential. The learner applies a clipped importance-weighted policy gradient to sampled decisions. `--entropy-weight` defaults to zero.
 
 The learner computes targets over the entire seat trajectory from the recorded behavior values. The V-trace target recurrence uses a unit ratio, discount `0.995`, trace cap `0.85`, and zero terminal bootstrap. The sampled policy-gradient terms use the actual clipped online-to-behavior likelihood ratio. The full-trajectory targets do not reevaluate the current policy on omitted steps.
 
@@ -72,10 +70,10 @@ The default learning rate is `5e-4` and the default anchor weight (`--eta`) is `
 | `latest-model.pt` | Published weights, game, policy revision, and collection plan. |
 | `best-model.pt` | Cold validation selection or the last model to clear a mastery threshold. Before a promotion, it holds the initial model. |
 | `latest-state.pt` | Learner and anchor weights, optimizer, progress, and sampler state. |
-| `inbox/batch-*.pt` | Complete byte-token rollout batches with quantized policy targets awaiting ingestion. |
+| `inbox/batch-*.pt` | Complete byte-token rollout batches awaiting ingestion. |
 | `metrics.jsonl` and `status.json` | Update metrics and run status, including collected and trained decisions, throughput, importance ratio, KL, buffer depth, and inbox depth. |
 
-The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Rollout format 5 requires forced flags, hand potentials, and behavior values. Training state format 17 stores mastery progress. Use `--initial-model` in a new run directory to start from an older Schema 8 checkpoint without its trainer state.
+The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Rollout format 6 drops the expert targets and forced-move flags. Trainer state version 18 stores the new collection plan and validation metrics. Use `--initial-model` in a new run directory to reuse older Schema 8 weights. Older trainer states and rollout batches are incompatible.
 
 ### Schema 8 tokens
 
@@ -127,18 +125,62 @@ Leave off `--max-batches` for continuous collection. Refresh the actor's model f
 
 ```bash
 python -m src.cli.evaluate --checkpoint runs/full21/best-model.pt \
-  --games 300 --warm-games 0 --search-ply 0 --output runs/full21/evaluation.json
+  --games 300 --warm-games 0 --output runs/full21/evaluation.json
 python -m src.cli.arena --model runs/full21/best-model.pt --model random \
-  --games 120 --search-ply 1 --output runs/full21/arena.json
+  --games 120 --output runs/full21/arena.json
 ```
 
-`src.cli.evaluate` pairs the model and random policy on the same solo seeds. It reports discard puzzles separately when `--warm-games` is positive. `src.cli.arena` reports each deal's utilities and winner. It rotates the lineup between deals and plays each seed once. Supply a checkpoint or `random` for each of one to six seats. Checkpoints in the same lineup must use the same game settings. Both commands default to `--search-ply 0`. The model picks the highest legal logit without checking for a winning move first. Use `--search-ply 1` to enable the same search used by self-play.
+`src.cli.evaluate` pairs the model and random policy on the same solo seeds. It reports discard puzzles separately when `--warm-games` is positive. In single-match mode, `src.cli.arena` rotates the lineup between deals and plays each seed once. It reports each deal's winner, utilities, and net deadwood points. Supply one checkpoint or `random` per seat, for up to six seats. Checkpoints must use the same game settings. Both commands pick the highest legal model logit without lookahead.
+
+## Rate checkpoints on cold deals
+
+```bash
+python -m src.cli.arena --league \
+  --model checkpoints/rev0-model.pt --label rev0 \
+  --model runs/full21/best-model.pt --label best \
+  --players 2 3 4 --games 48 --seed 970000 --precision bf16 \
+  --workers 16 --output runs/full21/league-970000.json
+```
+
+List at least two `GameTransformer` checkpoints with matching game settings. The first checkpoint anchors the overall Elo and each player-count Elo at `1000.0` unless you change `--anchor-elo`. The JSON records each checkpoint's SHA-256, the matchup metrics, and the standings. Use `--workers` to run matchups in parallel on a CPU host.
+
+For each checkpoint pair and seed, two-seat matches swap the checkpoints between seats. At larger tables, every seat takes a turn as the only seat running one checkpoint. A mirror runs the other checkpoint in that seat and swaps all remaining seats. Each comparison between seats running different checkpoints counts as one point for a higher finish, half for a tie, and zero for a lower finish. The Bradley-Terry fit uses all of these comparisons, so the overall Elo gives more weight to larger tables.
+
+A declaration pays the winner the sum of everyone else's deadwood. The other seats each pay their own deadwood. On expiry, each seat scores the table mean deadwood minus its own. The payments sum to zero. Standings report net points and declaration rate per seat. Mean winning turn uses declarations only, and losing deadwood uses non-winning seats only.
+
+When auto-curriculum is off or the distance reaches the hand size, `Trainer.evaluate()` compares the learner to `best-model.pt` at the configured multiplayer counts. Solo-only runs compare declarations and then deadwood on identical seeds. The trainer promotes a checkpoint only if the mean placement score is at least `0.5 + --promote-margin`, mean net points are nonnegative, and no player count scores below `0.5 - --promote-margin`. The default margin is `0.02`. These checks do not use a reference bot.
+
+### Five-checkpoint cold league on seed 970,000
+
+The league ran on `vm-papplu-v4-w128`, a 16-vCPU `Standard_D16als_v6` in West US 2. It used BF16, 64 live tables per matchup, and the checkpoint settings of 21 cards and 60 turns per seat. All 10 checkpoint pairs played 48 seeds per player count. Mirrors produced 7,680 matches and 18,240 cross-policy seat comparisons. `rev0` anchors the overall and player-count ratings at 1,000.
+
+| Checkpoint | Overall Elo | 2p Elo | 3p Elo | 4p Elo | Placement score |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `balanced` | 1430.6 | 1365.7 | 1424.7 | 1440.2 | 75.42% |
+| `mastery` | 1413.1 | 1349.8 | 1419.1 | 1416.4 | 73.20% |
+| `phase4` | 1322.4 | 1228.2 | 1331.3 | 1326.8 | 61.09% |
+| `v8-final` | 1010.7 | 978.8 | 1014.9 | 1011.5 | 20.74% |
+| `rev0` | 1000.0 | 1000.0 | 1000.0 | 1000.0 | 19.55% |
+
+The next table gives net deadwood per seat. Declarations count per seat, and the mean winning turn counts only declared wins. Losing deadwood includes every non-winning seat, even when the deal expires.
+
+| Checkpoint | Overall net | 2p net | 3p net | 4p net | Declaration rate | Mean winning turn | Losing deadwood |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `balanced` | +23.22 | +16.90 | +19.78 | +25.94 | 16.11% | 36.87 | 51.60 |
+| `mastery` | +20.00 | +19.32 | +17.69 | +21.38 | 15.20% | 37.12 | 52.32 |
+| `phase4` | +4.76 | +3.99 | +5.71 | +4.31 | 7.93% | 42.13 | 56.43 |
+| `v8-final` | -21.92 | -20.71 | -19.47 | -23.46 | 0.23% | 22.00 | 100.98 |
+| `rev0` | -26.05 | -19.50 | -23.71 | -28.18 | 0.14% | 32.29 | 100.62 |
+
+These ratings describe this seed and checkpoint set. They do not measure results against the browser AI or on curriculum deals.
 
 ## Azure results
 
+The results below predate the checkpoint league. Historical search-assisted runs used a policy option that has since been removed.
+
 The Schema 8 run used commit `0f00513` on one 16-vCPU `Standard_D16als_v6` in West US 2. Two Gloo ranks ran on that VM with BF16 and `--sync-every 1`. Each rank used seven learner threads and one single-threaded actor with 32 tables. Each update sampled 12 trajectories per rank.
 
-The learner loaded weights from revision 826 and started a new AdamW state at revision 0. Check-In #12 and Final resumed from the preceding phase. The run used `--search-ply 1`, `--eta 0.01`, `--entropy-weight 0.002`, and `--anchor-every 400` throughout.
+The learner loaded weights from revision 826 and started a new AdamW state at revision 0. Check-In #12 and Final resumed from the preceding phase. The run used 1-ply lookahead, `--eta 0.01`, `--entropy-weight 0.002`, and `--anchor-every 400` throughout.
 
 | Stage | Budget (s) | Players | Curriculum share | Max distance | Learning rate | Revision | Collected decisions/s | Trained decisions/s | Mean CPU busy | Mean / peak sampled RAM (GiB) |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

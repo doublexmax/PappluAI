@@ -30,9 +30,7 @@ def prepare(checkpoint: Path, output: Path) -> None:
 
 
 def batch_from(rollouts: Path) -> tuple[TrajectoryBatch, TrajectoryBatch]:
-    payload = torch.load(rollouts, map_location="cpu", weights_only=True)
-    payload["target_probs"] = payload["target_probs"].view(torch.uint16)
-    batch = Trajectories(**{name: payload[name] for name in Trajectories.__dataclass_fields__})
+    batch = Trajectories.load(rollouts)
     seats = next(iter(_BatchIndex.from_batch(batch).buckets.values()))
     assert len(seats) == 48 and all(seat.action.numel() == 120 for seat in seats)
     return TrajectoryBatch.pack(tuple(seats[24:])), TrajectoryBatch.pack(tuple(seats[:24]))

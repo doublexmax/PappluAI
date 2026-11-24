@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import combinations
+from math import ulp
 from typing import Iterator, Optional, Sequence
 
 from src.evaluate import HandPenalty, MIN_MELD, NUM_FACES, NUM_RANKS, RANK_PATTERNS, minimum_penalty
@@ -264,6 +265,23 @@ class DealOutcome:
             tuple(penalty.points for penalty in self.penalties),
             self.winner, self.ending,
         )
+
+    def net_points(self) -> tuple[float, ...]:
+        """Pay the declarer the losers' deadwood, or center deadwood on expiry.
+
+        Round the expiry mean to a shared binary precision before balancing the last seat.
+        """
+        points = tuple(penalty.points for penalty in self.penalties)
+        if len(points) == 1:
+            return (-float(points[0]) if self.winner is None else 0.0,)
+        total = sum(points)
+        if self.winner is not None:
+            return tuple(float(total if seat == self.winner else -p) for seat, p in enumerate(points))
+        mean = total / len(points)
+        quantum = ulp(float(total))
+        mean = round(mean / quantum) * quantum
+        payouts = tuple(mean - p for p in points[:-1])
+        return (*payouts, -sum(payouts))
 
     def margin(self, seat: int, other: int) -> int:
         ranks = self.ranks()

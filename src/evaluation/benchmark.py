@@ -78,7 +78,7 @@ def evaluate_checkpoint(
     warm_games: int = 300,
     warm_seed: int = 600000,
     sensitivity: bool = False, *,
-    tables: int = 64, precision: str = "fp32", search_ply: int = 0,
+    tables: int = 64, precision: str = "fp32",
 ) -> dict:
     if isinstance(warm_games, bool) or not isinstance(warm_games, int) or warm_games < 0:
         raise ValueError("warm_games must be a nonnegative integer")
@@ -88,7 +88,7 @@ def evaluate_checkpoint(
     torch.set_num_threads(1)
     try:
         checkpoint_sha256 = file_sha256(Path(path))
-        policy = CheckpointPolicy(path, precision=precision, search_ply=search_ply)
+        policy = CheckpointPolicy(path, precision=precision)
         network, config = policy.network, policy.game
         random_policy = RandomPolicy()
         result = {
@@ -102,7 +102,6 @@ def evaluate_checkpoint(
             "parameter_count": sum(
                 parameter.numel() for parameter in network.parameters()
             ),
-            "search_ply": search_ply,
             "game_seed": seed,
             "warm_seed": warm_seed,
             "greedy": evaluate_games(policy, config, games, seed, tables=tables).to_dict(),
