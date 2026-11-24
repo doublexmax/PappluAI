@@ -367,3 +367,53 @@ Each pair lists the untrained Schema 8 model at 0-ply first and `RandomPolicy` s
 | `3p_cold` | 2 / 0 | 87.5000 / 80.0000 | 102.2875 / 106.6833 | 240 |
 | `4p_d2` | 9 / 3 | 70.5000 / 60.0000 | 95.3083 / 102.1750 | 240 |
 | `4p_cold` | 1 / 0 | 74.5000 / 60.0000 | 102.0167 / 104.6625 | 240 |
+
+## Hybrid Azure training and cold holdout
+
+Azure allocated 64 vCPUs, and 64 passed the runtime check. Three on-demand nodes ran six Gloo learner ranks. Spot nodes supplied rollouts when available.
+The three training stages used 30-minute learner budgets. The first started from `locked-gt-phase4.pt` with a new optimizer.
+The second and third stages reused the optimizer state at lower learning rates.
+The automatic curriculum unlocked `d=9`, `d=14`, `d=21`.
+The third stage explicitly set `d=21` and a 20% curriculum share. This setting does not establish mastery.
+
+### Training and candidate selection
+
+| Candidate | Revisions | End distance | Updates/s | Trained decisions/s | Cold declaration rate | Overall declaration rate | Mean utility |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `previous` | n/a | n/a | n/a | n/a | 23.57% | 31.73% | -0.0316 |
+| `cluster-c1` | 488 | 14 | 0.271 | 383.15 | 39.32% | 41.59% | 0.1343 |
+| `cluster-c2` | 992 | 21 | 0.280 | 450.33 | 48.31% | 48.18% | 0.2331 |
+| `cluster-c3` | 1520 | 21 | 0.292 | 483.58 | 56.25% | 54.69% | 0.3387 |
+
+Seed `600_000` selected `cluster-c3` as `locked-gt-mastery.pt` before the run opened seed `950_000`.
+Selection ranks cold declaration rate first, then overall declaration rate and mean utility.
+The locked SHA-256 is `7f762a66c61adb68eb0ad66a291d5377ddc0721b2b2dca679810bf9208cc84be`.
+
+### Cold holdout on seed 950,000
+
+4 Azure hosts completed 12,024 games and 1,657,920 decisions in 276.81 seconds with 0 incomplete cases.
+The 500 solo deals per policy use the same seeds. Multiplayer rotates the tested policy through every seat.
+In head-to-head games, the prior checkpoint occupies all other seats. A timeout means no player declared.
+
+| Scenario | Policy | Search ply | Declarations | Opponent declarations | Timeouts | Mean utility |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| solo_cold | `locked-gt-mastery` | 0 | 153/500 | 0 | 347 | -0.0203 |
+| solo_cold | `locked-gt-mastery` | 1 | 342/500 | 0 | 158 | 0.5266 |
+| solo_cold | `previous` | 0 | 54/500 | 0 | 446 | -0.3916 |
+| solo_cold | `previous` | 1 | 149/500 | 0 | 351 | -0.1045 |
+| solo_cold | `rev0` | 0 | 2/500 | 0 | 498 | -0.7952 |
+| solo_cold | `random` | 0 | 1/500 | 0 | 499 | -0.8018 |
+| 2p_cold | `locked-gt-mastery` | 0 | 111/240 | 0 | 129 | 0.2807 |
+| 2p_cold | `locked-gt-mastery` | 1 | 185/240 | 0 | 55 | 0.6913 |
+| 3p_cold | `locked-gt-mastery` | 0 | 123/240 | 1 | 116 | 0.3438 |
+| 3p_cold | `locked-gt-mastery` | 1 | 192/240 | 0 | 48 | 0.7285 |
+| 4p_cold | `locked-gt-mastery` | 0 | 107/240 | 0 | 133 | 0.2587 |
+| 4p_cold | `locked-gt-mastery` | 1 | 199/240 | 0 | 41 | 0.7672 |
+| 2p_cold_vs_previous | `locked-gt-mastery` | 0 | 29/240 | 6 | 205 | -0.2905 |
+| 2p_cold_vs_previous | `locked-gt-mastery` | 1 | 73/240 | 20 | 147 | -0.0592 |
+| 3p_cold_vs_previous | `locked-gt-mastery` | 0 | 48/240 | 35 | 157 | -0.1851 |
+| 3p_cold_vs_previous | `locked-gt-mastery` | 1 | 99/240 | 74 | 67 | 0.1251 |
+| 4p_cold_vs_previous | `locked-gt-mastery` | 0 | 62/240 | 61 | 117 | -0.0600 |
+| 4p_cold_vs_previous | `locked-gt-mastery` | 1 | 94/240 | 119 | 27 | 0.1724 |
+
+The run bundle contains per-deal outcomes, the warm-solo cases, checkpoint hashes, and 30-second host samples.

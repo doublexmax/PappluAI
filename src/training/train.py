@@ -1046,7 +1046,7 @@ class Trainer:
         version = self.learner.version
         self.buffer.prune(version)
         files = sorted(self.inbox.glob("batch-*.pt"), key=lambda path: path.stat().st_mtime_ns)
-        for path in files[:max(1, self.config.actors)]:
+        for path in files[:max(6, self.config.actors)]:
             try:
                 batch = Trajectories.load(path)
                 lengths = batch.decision_end.diff(prepend=batch.decision_end.new_zeros(1))

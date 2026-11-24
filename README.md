@@ -167,6 +167,8 @@ The run selected and locked Final at revision 1,184 using seed `600_000`. On hel
 
 The Azure run selected `phase4-c3` on seed `600_000` before evaluating seed `940_000`. At 0-ply the selected checkpoint declared on 37 of 128 first discards, against 40 for the previous winner on the same deals. The sampled learner processed 13.03x as many updates per second on the fixed learner benchmark. See the [Azure mastery run and paired holdout](TRAINING.md#azure-mastery-run-and-paired-holdout) for the full results.
 
+The hybrid Azure run locked `cluster-c3` on seed `600_000`. On the 500 cold solo deals from seed `950_000`, the locked 0-ply model declared 153 times and the prior 0-ply model declared 54 times. See the [hybrid Azure results](TRAINING.md#hybrid-azure-training-and-cold-holdout) for the holdout and multiplayer comparisons.
+
 ## Verification
 
 Run model verification from the repository root on the Azure compute host.
