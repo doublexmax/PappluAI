@@ -32,7 +32,7 @@ from src.model.network import GameTransformer, TokenBatch, action_mask, load_che
 from src.model.spec import ModelSpec, TokenSchema
 
 
-STATE_VERSION = 18
+STATE_VERSION = 19
 ROLLOUT_FORMAT = 6
 VALIDATION_SEED = 30_000_001
 OUTBOX_LIMIT = 8
@@ -42,7 +42,8 @@ TUNABLE = {
     "actors", "tables", "torch_threads", "actor_threads", "device", "precision", "checkpoint_every",
     "learning_rate", "eta", "sync_every", "eval_every", "plan",
 }
-TUNABLE_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance")
+LIVE_PLAN = ("curriculum_share", "curriculum_max_distance", "champion_share")
+TUNABLE_PLAN = ("player_counts", *LIVE_PLAN)
 MASTERY_LADDER = {
     1: (0.88, 0.08), 2: (0.82, 0.06), 3: (0.75, 0.05), 4: (0.70, 0.04),
     6: (0.60, 0.02), 9: (0.50, 0.02), 14: (0.40, 0.02),
@@ -54,6 +55,7 @@ class CollectPlan:
     player_counts: tuple[int, ...] = (1, 2, 3, 4)
     curriculum_share: float = 0.50
     curriculum_max_distance: int = 6
+    champion_share: float = 0.25
     uniform_mix: float = 0.02
     batch_decisions: int = 8192
 
@@ -65,9 +67,10 @@ class CollectPlan:
             or len(set(counts)) != len(counts)
         ):
             raise ValueError("player_counts must be distinct integers in 1..6")
-        for value in (self.curriculum_share, self.uniform_mix):
+        for name in ("curriculum_share", "champion_share", "uniform_mix"):
+            value = getattr(self, name)
             if type(value) not in (int, float) or not 0 <= value <= 1:
-                raise ValueError("curriculum_share and uniform_mix must be in [0, 1]")
+                raise ValueError(f"{name} must be in [0, 1]")
         if type(self.curriculum_max_distance) is not int or self.curriculum_max_distance < 1:
             raise ValueError("curriculum_max_distance must be positive")
         if type(self.batch_decisions) is not int or not 1 <= self.batch_decisions <= 262_144:
@@ -102,7 +105,12 @@ class CollectPlan:
                     low = int(players > 1)
                     start = min(rng.randint(low, self.curriculum_max_distance),
                                 rng.randint(low, self.curriculum_max_distance))
-                yield Deal(rng.getrandbits(63), (0,) * players, start)
+                seed = rng.getrandbits(63)
+                seats = (0,) * players
+                if players > 1 and self.champion_share and rng.random() < self.champion_share:
+                    focal, majority = rng.randrange(players), rng.randrange(2)
+                    seats = tuple(majority if seat == focal else 1 - majority for seat in range(players))
+                yield Deal(seed, seats, start)
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,7 @@ class TrainConfig:
     min_buffer_decisions: int = 20_000
     max_policy_lag: int = 200
     learning_rate: float = 5e-4
+    warmup_steps: int = 50
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     value_weight: float = 1.0
@@ -148,7 +157,7 @@ class TrainConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        for name in ("seed", "actors", "eval_every"):
+        for name in ("seed", "actors", "eval_every", "warmup_steps"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
@@ -358,11 +367,11 @@ def collect(
     out_dir, model_path = Path(out_dir), Path(model_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    def fingerprint() -> tuple[int, int]:
-        stat = model_path.stat()
+    def fingerprint(path: Path) -> tuple[int, int]:
+        stat = path.stat()
         return stat.st_mtime_ns, stat.st_size
 
-    stamp = fingerprint()
+    stamp = fingerprint(model_path)
     checkpoint = load_checkpoint(model_path, SCHEMA, device)
     game = GameConfig.from_dict(checkpoint.game)
     plan = CollectPlan.from_dict(checkpoint.meta.get("plan"))
@@ -373,6 +382,12 @@ def collect(
     policy = TransformerPolicy(checkpoint.network, game, sample=True, uniform_mix=plan.uniform_mix,
                                precision=precision, record=True)
     del checkpoint
+    model_dir = model_path.parent
+    if model_dir.name.startswith("rank-") and model_dir.name[5:].isdecimal():
+        model_dir = model_dir.parent
+    champion_path = model_dir / "best-model.pt"
+    champion = None
+    champion_stamp = None
     active: Counter[int] = Counter()
     admitted: dict[int, int] = {}
     pending: dict[int, _Completed] = {}
@@ -385,16 +400,14 @@ def collect(
         queue = plan.deals(nonce)
         while True:
             if len(active) <= 1:
-                new_stamp = fingerprint()
+                new_stamp = fingerprint(model_path)
                 if new_stamp != stamp:
                     snapshot = load_checkpoint(model_path, SCHEMA, device)
                     updated = CollectPlan.from_dict(snapshot.meta.get("plan"))
                     if (
                         snapshot.meta.get("run_id") != run or snapshot.game != game.to_dict()
-                        or snapshot.network.spec != spec or updated != replace(
-                            plan, curriculum_share=updated.curriculum_share,
-                            curriculum_max_distance=updated.curriculum_max_distance,
-                        )
+                        or snapshot.network.spec != spec
+                        or updated != replace(plan, **{key: getattr(updated, key) for key in LIVE_PLAN})
                     ):
                         raise ValueError("collection checkpoint changed run, game, fixed plan fields, or model shape")
                     if snapshot.version > revision:
@@ -409,9 +422,28 @@ def collect(
             yield next(queue)
 
     def admit(deal: Deal) -> tuple[TransformerPolicy, ...]:
+        nonlocal champion, champion_stamp
         admitted[deal.seed] = revision
         active[revision] += 1
-        return (policy,)
+        if 1 not in deal.seats:
+            return (policy,)
+        try:
+            new_stamp = fingerprint(champion_path)
+        except FileNotFoundError:
+            new_stamp = None
+        if champion is None or new_stamp != champion_stamp or (
+            new_stamp is None and champion.network is not policy.network
+        ):
+            network = policy.network
+            if new_stamp is not None:
+                snapshot = load_checkpoint(champion_path, SCHEMA, device)
+                if snapshot.game != game.to_dict() or snapshot.network.spec != spec:
+                    raise ValueError("champion checkpoint changed game or model shape")
+                network = snapshot.network
+            champion = TransformerPolicy(network, game, sample=True, uniform_mix=0.0,
+                                         precision=precision, record=False)
+            champion_stamp = new_stamp
+        return policy, champion
 
     def at_limit() -> bool:
         return max_batches is not None and totals["batches"] >= max_batches
@@ -435,10 +467,14 @@ def collect(
         active[version] -= 1
         if not active[version]:
             del active[version]
-        chunk = pending.setdefault(version, _Completed())
-        chunk.deals.append(result)
-        chunk.decisions += result.action_count
-        if chunk.decisions >= plan.batch_decisions or (version != revision and version not in active):
+        decisions = sum(len(trace.action) for trace in result.traces if trace is not None)
+        if decisions:
+            chunk = pending.setdefault(version, _Completed())
+            chunk.deals.append(result)
+            chunk.decisions += decisions
+        if version in pending and (
+            pending[version].decisions >= plan.batch_decisions or (version != revision and version not in active)
+        ):
             flush(version)
         if stopping():
             break
@@ -802,6 +838,9 @@ class Learner:
         if not skip_grad_sync:
             self.group.average_gradients(self._parameters)
         norm = torch.nn.utils.clip_grad_norm_(self._parameters, config.grad_clip, error_if_nonfinite=True)
+        progress = min(1.0, (self.version + 1) / config.warmup_steps) if config.warmup_steps else 1.0
+        for group in self.optimizer.param_groups:
+            group["lr"] = config.learning_rate * progress
         self.optimizer.step()
         self.version += 1
         if not skip_grad_sync and self.version % config.anchor_every == 0:
@@ -891,7 +930,7 @@ class Trainer:
             if any(getattr(config, k) != getattr(saved, k) for k in overrides.keys() - TUNABLE):
                 raise ValueError("cannot change training config on resume")
             if config.plan != replace(saved.plan, **{key: getattr(config.plan, key) for key in TUNABLE_PLAN}):
-                raise ValueError("cannot change the collection plan on resume except players, curriculum share, and distance")
+                raise ValueError("cannot change fixed collection plan fields on resume")
             spec = ModelSpec.from_dict(state["spec"])
             run = _run_id(state["run_id"])
         else:

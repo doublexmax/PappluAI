@@ -83,8 +83,8 @@ class TestArena(unittest.TestCase):
         self.assertIn(12, actor.batches[2])
         self.assertEqual(actor.finished, {0, 6, 7, 8, 9, 10, 11, 12})
         self.assertEqual(results[-1].outcome.ending, "turns_exhausted")
-        self.assertAlmostEqual(sum(results[-1].outcome.utilities()), -3)
-        self.assertLessEqual(max(results[-1].outcome.utilities()), -0.2)
+        self.assertEqual(sum(results[-1].outcome.utilities()), 0)
+        self.assertLessEqual(max(results[-1].outcome.utilities()), 0.475)
 
     def test_recorded_uniform_behavior_uses_only_present_legal_actions(self):
         model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
@@ -150,7 +150,8 @@ class TestArena(unittest.TestCase):
         with patch("src.evaluation.arena.run_matches", finish):
             row = head_to_head(FirstLegal(), RandomPolicy(), self.game, 3, 1, 17)
         self.assertEqual((row.matches, row.comparisons, row.seats_per_policy), (6, 12, 9))
-        self.assertEqual((row.score, row.net_points, row.advantage), (0.875, 9.0, 0.5))
+        self.assertEqual((row.score, row.net_points), (0.875, 9.0))
+        self.assertAlmostEqual(row.advantage, 0.3325)
         self.assertEqual((row.win_rate, row.opponent_win_rate, row.losing_deadwood), (2 / 3, 0.0, 9.0))
         self.assertEqual(row.mean_win_turn, 10 / 6)
 

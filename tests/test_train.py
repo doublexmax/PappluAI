@@ -28,8 +28,12 @@ class TestTrainCli(unittest.TestCase):
             ), mock.patch("sys.stderr", new_callable=io.StringIO) as error:
                 self.assertEqual(main(flags), 2)
                 self.assertIn(message, error.getvalue())
-        args = build_arg_parser().parse_args(["--output-dir", "run", "--players", "1", "3", "--heads", "2"])
+        args = build_arg_parser().parse_args([
+            "--output-dir", "run", "--players", "1", "3", "--heads", "2",
+            "--champion-share", "0.5", "--warmup-steps", "12",
+        ])
         self.assertEqual((args.output_dir, args.player_counts, args.heads), (Path("run"), [1, 3], 2))
+        self.assertEqual((args.champion_share, args.warmup_steps), (0.5, 12))
 
     def test_missing_dependency_does_not_create_run_directory(self):
         with tempfile.TemporaryDirectory() as temporary, mock.patch(

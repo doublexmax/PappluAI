@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import combinations
-from math import ulp
+from math import ceil, floor, ulp
 from typing import Iterator, Optional, Sequence
 
 from src.evaluate import HandPenalty, MIN_MELD, NUM_FACES, NUM_RANKS, RANK_PATTERNS, minimum_penalty
@@ -292,19 +292,44 @@ class DealOutcome:
 
     def utilities(self) -> tuple[float, ...]:
         players = len(self.penalties)
-        if self.ending == "win":
-            if players == 1:
-                return (1.0,)
-            return tuple(1.0 if seat == self.winner else -1.0 / (players - 1) for seat in range(players))
         quota = self.required_sequences
-        fractions = tuple(
-            min(penalty.qualifying_sequences, quota) / quota if quota else 1.0
-            for penalty in self.penalties
-        )
         if players == 1:
-            return (-1.0 + 0.60 * fractions[0],)
-        total = sum(fractions)
-        return tuple(-0.50 + 0.30 * (fraction - (total - fraction) / (players - 1)) for fraction in fractions)
+            if self.winner is not None:
+                return (1.0,)
+            fraction = min(self.penalties[0].qualifying_sequences, quota) / quota if quota else 1.0
+            return (-1.0 + 0.60 * fraction,)
+        others = players - 1
+        scale = float(self.max_points * others)
+        nets = self.net_points()
+        if self.winner is not None:
+            loss_base = -0.65 / others
+            base = tuple(0.65 if seat == self.winner else loss_base for seat in range(players))
+            bounds = tuple((0.65, 1.0) if seat == self.winner else (-1.0, loss_base) for seat in range(players))
+        else:
+            sequences = tuple(min(penalty.qualifying_sequences, quota) for penalty in self.penalties)
+            total = sum(sequences)
+            base = tuple(0.30 * ((players * count - total) / (quota * others)) if quota else 0.0
+                         for count in sequences)
+            bounds = ((-0.475, 0.475),) * players
+        return _zero_sum(tuple(b + 0.35 * (net / scale) for b, net in zip(base, nets)), bounds)
+
+
+def _zero_sum(values: tuple[float, ...], bounds: tuple[tuple[float, float], ...]) -> tuple[float, ...]:
+    balanced = (*values[:-1], -sum(values[:-1]))
+    if sum(balanced) == 0.0 and all(lo <= value <= hi for value, (lo, hi) in zip(balanced, bounds)):
+        return balanced
+    quantum = ulp(1.0)
+    limits = tuple((ceil(lo / quantum), floor(hi / quantum)) for lo, hi in bounds)
+    ticks = [min(hi, max(lo, round(value / quantum))) for value, (lo, hi) in zip(values, limits)]
+    remaining = -sum(ticks)
+    for seat in reversed(range(len(ticks))):
+        lo, hi = limits[seat]
+        shift = min(hi - ticks[seat], max(lo - ticks[seat], remaining))
+        ticks[seat] += shift
+        remaining -= shift
+        if remaining == 0:
+            break
+    return tuple(tick * quantum for tick in ticks)
 
 
 def solo_outcome(

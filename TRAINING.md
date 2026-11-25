@@ -24,7 +24,7 @@ python -m src.cli.train --output-dir runs/smoke --max-updates 2 --max-seconds 90
 
 Check `status.json` for `status: max_updates` and `version: 2`. The update limit is an absolute policy revision, not a count of additional updates. Reuse the directory to resume.
 
-On resume you can change actor and table counts, thread counts, device, precision, `--checkpoint-every`, `--learning-rate`, `--eta`, and `--sync-every`. A new `--learning-rate` replaces the rate saved with AdamW without resetting its moments. You can also change `--players`, `--curriculum-share`, and `--curriculum-max-distance`. The game, model, and other collection settings stay fixed. Restart standalone collectors if you change `--players`.
+On resume you can change actor and table counts, thread counts, device, precision, `--checkpoint-every`, `--learning-rate`, `--eta`, and `--sync-every`. A new `--learning-rate` changes AdamW's base rate without resetting its moments or its progress through warmup. You can also change `--players`, `--curriculum-share`, `--curriculum-max-distance`, and `--champion-share`. The game, model, and other collection settings stay fixed. Restart standalone collectors if you change `--players`.
 
 ## Start a full run
 
@@ -55,15 +55,28 @@ The share controls how many collection deals use curriculum starts, with earlier
 
 Self-play no longer uses 1-ply lookahead or learns from expert targets. Actors sample the masked `GameTransformer` policy with a 2% uniform mix over legal actions by default. The rollout records the action, its behavior log probability, the behavior value, and the hand potential. The learner applies a clipped importance-weighted policy gradient to sampled decisions. `--entropy-weight` defaults to zero.
 
+`--champion-share` defaults to `0.25`. On that fraction of multiplayer deals the online learner plays against `best-model.pt`. One side gets a uniformly chosen seat and the other side gets the rest. The learner is equally likely to be either side. The champion samples without uniform exploration and contributes no training data. The collector loads a new champion for new tables when the file changes. If the file is absent, a non-recording copy of the current policy role fills its seats. Solo deals always use the learner.
+
 The learner computes targets over the entire seat trajectory from the recorded behavior values. The V-trace target recurrence uses a unit ratio, discount `0.995`, trace cap `0.85`, and zero terminal bootstrap. The sampled policy-gradient terms use the actual clipped online-to-behavior likelihood ratio. The full-trajectory targets do not reevaluate the current policy on omitted steps.
 
 The hand potential counts up to the required number of disjoint qualifying triples. Below quota, disjoint natural pairs count for one quarter of a triple. At quota, disjoint extra three-card melds count for one fifth of a triple. Neither rule uses card point values. The learner adds `0.995 * next_potential - current_potential` to each nonterminal reward and subtracts the last potential from the terminal utility. The terminal state's potential is zero. Discounted return differs from the unshaped return by the starting potential alone. The scoreboard still uses exact deadwood.
 
-A declaration pays the winner `+1`. In multiplayer the other seats split `-1` equally. On a timeout let `f` be the share of the pure sequence quota recorded by `HandPenalty.qualifying_sequences`, capped at 1. A zero quota gives `f = 1`. Solo pays `-1 + 0.60 * f`. Multiplayer pays each seat `-0.50 + 0.30 * (f - mean_of_other_seats)`. The relative term sums to zero, and every seat still gets a negative payoff.
+Solo pays `+1` for a declaration and `-1 + 0.60 * f` on a timeout. The fraction `f` is the share of the pure sequence quota recorded by `HandPenalty.qualifying_sequences`, capped at 1. A zero quota gives `f = 1`.
+
+In multiplayer, let `n` be the number of seats and `scale = max_points * (n - 1)`. Let `net` be the seat's net deadwood payout. The declarer collects each opponent's deadwood. On a timeout, `net` is the mean table deadwood minus the seat's deadwood.
+
+| Ending | Utility per seat |
+| --- | --- |
+| Declaration | `win_base + 0.35 * (net / scale)`, where `win_base` is `0.65` for the winner and `-0.65 / (n - 1)` for each other seat. |
+| Timeout | `0.30 * (f - mean_f_of_other_seats) + 0.35 * (net / scale)`. |
+
+The trainer uses payoffs that sum to exactly zero in floating point. A declaration win pays at least `0.65`. A timeout pays at most `0.475`. Equal hands expire at zero, which is better than a declaration loss at any supported player count.
 
 The learner drops data more than `--max-policy-lag` revisions old. The default lag limit is 200. Each rank samples `--batch-size` trajectories with replacement from one player-count and length bucket. The default batch size is eight. A bucket's weight is its trajectory count. Each trajectory has equal weight in the policy, value, and anchor KL losses. For each trajectory the learner unrolls up to `--unroll-steps` decisions, 12 by default. For longer trajectories it keeps the terminal decision and samples the other positions without replacement. Inverse inclusion weights preserve the expected full-trajectory mean. `trained_decisions` counts the positions that reach the model, not all positions used to compute targets.
 
-The default learning rate is `5e-4` and the default anchor weight (`--eta`) is `0.01`. The frozen anchor evaluates the same sampled positions. The default refresh interval (`--anchor-every`) is 2,000 revisions. Training defaults to CPU with BF16 autocast, FP32 master weights, and FP32 loss math. Use `--precision fp32` to disable autocast.
+The default learning rate is `5e-4`. AdamW uses `learning_rate * min(1, (version + 1) / warmup_steps)` before each update when `--warmup-steps` is positive. The default is 50 updates. Use `--warmup-steps 0` for the full rate from the first update. A run started with `--initial-model` starts at revision zero. A resume keeps the saved revision.
+
+The default anchor weight (`--eta`) is `0.01`. The frozen anchor evaluates the same sampled positions. The default refresh interval (`--anchor-every`) is 2,000 revisions. Training defaults to CPU with BF16 autocast, FP32 master weights, and FP32 loss math. Use `--precision fp32` to disable autocast.
 
 | File | Contents |
 | --- | --- |
@@ -73,7 +86,7 @@ The default learning rate is `5e-4` and the default anchor weight (`--eta`) is `
 | `inbox/batch-*.pt` | Complete byte-token rollout batches awaiting ingestion. |
 | `metrics.jsonl` and `status.json` | Update metrics and run status, including collected and trained decisions, throughput, importance ratio, KL, buffer depth, and inbox depth. |
 
-The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Rollout format 6 drops the expert targets and forced-move flags. Trainer state version 18 stores the new collection plan and validation metrics. Use `--initial-model` in a new run directory to reuse older Schema 8 weights. Older trainer states and rollout batches are incompatible.
+The learner does not save its in-memory rollout buffer. On resume, it refills the buffer from actors and any compatible files still in the inbox. Rollout format 6 drops the expert targets and forced-move flags. Trainer state version 19 stores the collection plan and warmup length. Use `--initial-model` in a new run directory to reuse older Schema 8 weights. Older trainer states and rollout batches from earlier runs are incompatible.
 
 ### Schema 8 tokens
 
@@ -173,6 +186,41 @@ The next table gives net deadwood per seat. Declarations count per seat, and the
 | `rev0` | -26.05 | -19.50 | -23.71 | -28.18 | 0.14% | 32.29 | 100.62 |
 
 These ratings describe this seed and checkpoint set. They do not measure results against the browser AI or on curriculum deals.
+
+### Single-VM competitive proof run
+
+The learner ran three 20-minute stages on `vm-papplu-v4-w128`, a 16-vCPU Azure VM. It used 11 single-threaded actors, four learner threads, 32 tables per actor, and BF16.
+The stages resumed the same optimizer at base rates `6e-5`, `4e-5`, and `2e-5`. The curriculum share dropped from `0.25` to `0.12` to `0.05`. All three stages used a champion share of `0.25`.
+
+The selection league used seed `600_000` with 24 deals per pair and player count. Its 2,304 matches used two, three, and four seats. The prior checkpoint anchored Elo at 1,000.
+Selection ranks by overall Elo, then net deadwood per seat.
+
+| Checkpoint | Overall Elo | Net deadwood per seat | Declarations per seat |
+| --- | ---: | ---: | ---: |
+| gate-c3 | 1086.6 | +5.71 | 12.04% |
+| gate-c2 | 1086.2 | +4.82 | 11.88% |
+| gate-c1 | 1056.3 | -0.68 | 11.11% |
+| AdamW resume | 1000.0 | -9.86 | 8.02% |
+
+The promoted weights and matching version 19 AdamW state are `locked-gt.pt` and `locked-gt-state.pt`.
+
+After the lock, the seed `980_000` holdout used 48 cold deals per pair and player count. It produced 7,680 mirrored matches at 0-ply. The untrained checkpoint anchors Elo at 1,000.
+
+| Training milestone | Overall Elo | 2p Elo | 3p Elo | 4p Elo | Net deadwood per seat | Declarations per seat |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Untrained (rev 0) | 1000.0 | 1000.0 | 1000.0 | 1000.0 | -38.02 | 0.15% |
+| Potential and subsampling | 1324.1 | 1254.7 | 1348.1 | 1319.4 | -9.72 | 6.81% |
+| Cluster cold play | 1422.1 | 1383.7 | 1445.2 | 1415.2 | +10.87 | 14.16% |
+| AdamW resume | 1434.0 | 1388.0 | 1466.2 | 1423.3 | +12.13 | 15.01% |
+| Pure 0-ply zero-sum | 1512.3 | 1464.3 | 1540.9 | 1503.7 | +24.73 | 20.45% |
+
+The same two locked and prior saves also played 500 paired, cold, 21-card solo deals at 0-ply. The solo deals use seeds `980_000` through `980_499`, separate from the league fixtures.
+
+| Checkpoint | Declarations | Win rate | Mean utility |
+| --- | ---: | ---: | ---: |
+| Locked checkpoint | 249/500 | 49.80% | +0.2730 |
+| Prior checkpoint | 197/500 | 39.40% | +0.1067 |
+
 
 ## Azure results
 

@@ -13,12 +13,12 @@ from src.cli._runtime import load_runtime
 
 _SHAPE = ("width", "layers", "heads", "ffn")
 _GAME = ("num_decks", "cards_in_hand", "required_sequences", "max_turns", "recycle_discard")
-_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance", "uniform_mix", "batch_decisions")
+_PLAN = ("player_counts", "curriculum_share", "curriculum_max_distance", "champion_share", "uniform_mix", "batch_decisions")
 _HOST = ("tables", "torch_threads", "precision", "device")
 _INTS = (
     "actors", "actor_threads", "batch_size", "unroll_steps", "min_buffer_decisions", "buffer_decisions",
     "max_policy_lag", "anchor_every", "sync_every", "publish_every", "checkpoint_every", "eval_every",
-    "eval_deals", "seed",
+    "eval_deals", "seed", "warmup_steps",
 )
 _FLOATS = ("learning_rate", "weight_decay", "grad_clip", "value_weight", "eta",
            "entropy_weight", "rho_bar", "c_bar", "promote_margin")
@@ -44,7 +44,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "curriculum_max_distance", "batch_decisions", "max_updates", "max_batches",
     ):
         parser.add_argument("--" + name.replace("_", "-"), type=int)
-    for name in (*_FLOATS, "curriculum_share", "uniform_mix"):
+    for name in (*_FLOATS, "curriculum_share", "champion_share", "uniform_mix"):
         parser.add_argument("--" + name.replace("_", "-"), type=float)
     return parser
 
