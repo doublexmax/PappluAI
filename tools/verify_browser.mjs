@@ -7,7 +7,6 @@ const browser = await chromium.launch({ channel: process.env.PAPPLU_BROWSER_CHAN
 const url = process.argv[2] ?? "http://127.0.0.1:8765";
 const errors = [];
 const apiCalls = [];
-const modules = new Set();
 
 async function setup({ fallback = false, mobile = false } = {}) {
   const context = await browser.newContext({ viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 900 } });
@@ -19,10 +18,6 @@ async function setup({ fallback = false, mobile = false } = {}) {
   page.on("pageerror", (error) => errors.push(error.message));
   page.on("request", (request) => {
     if (new URL(request.url()).pathname.startsWith("/api/")) apiCalls.push(request.url());
-  });
-  page.on("response", (response) => {
-    const path = new URL(response.url()).pathname;
-    if (response.ok() && (path.endsWith(".mjs") || path.endsWith(".json"))) modules.add(path);
   });
   await page.goto(url);
   await page.getByText("Minimum deadwood · 0 points", { exact: true }).waitFor();
@@ -83,18 +78,29 @@ try {
   assert.equal(await page.locator("#table-board .hand [data-card-id]").count(), 0);
   console.log("PASS pass-and-play privacy between turns.");
 
+  const workers = page.workers().filter((worker) => new URL(worker.url()).pathname === "/engine-worker.mjs");
+  assert.ok(workers.length > 0);
+  await Promise.all(workers.map((worker) => worker.evaluate(() => {
+    self.tacticalPhases = [];
+    self.addEventListener("message", ({ data }) => {
+      if (data.op === "chooseMove" && data.tier === "tactical") self.tacticalPhases.push(data.view.phase);
+    });
+  })));
   await page.locator("#table-preset").selectOption("vs-ai");
   await page.locator("#table-ai-speed").selectOption("instant");
   await page.locator("#table-deal").click();
   await page.locator("#table-draw-stock").click();
   await page.locator("#table-discard-drawn").click();
-  await page.waitForFunction(() => document.querySelector("#table-board h2")?.textContent.includes("Turn 3"), { timeout: 30000 });
+  await page.getByRole("heading", { name: "You · Turn 3 · draw", exact: true }).waitFor({ timeout: 30_000 });
   assert.equal(await page.locator("#table-board .hand [data-card-id]").count(), 21);
-  assert.equal(await page.locator(".seat-list .ai-tier").innerText(), "Neural");
-  assert.equal(await page.locator(".seat-list .muted").filter({ hasText: "greedy" }).count(), 1);
-  console.log("PASS a neural AI turn through the real worker.");
+  assert.equal(await page.locator(".seat-list .ai-tier").innerText(), "Tactical");
+  assert.equal(await page.getByText("min penalty", { exact: true }).count(), 1);
+  const phases = await Promise.all(workers.map((worker) => worker.evaluate(() => self.tacticalPhases)));
+  assert.deepEqual(phases.flat(), ["draw", "discard"]);
+  console.log("PASS a Tactical AI draw and discard through the real worker.");
 
   await page.locator("#table-preset").selectOption("ai-watch");
+  await page.locator("#table-ai-speed").selectOption("slow");
   await page.locator("#table-deal").click();
   await page.locator("#table-pause").click();
   assert.equal(await page.locator("#table-pause").innerText(), "Resume");
@@ -102,11 +108,10 @@ try {
   await page.waitForTimeout(400);
   assert.equal(await page.locator("#table-board h2").innerText(), paused);
   assert.ok(await page.locator("#table-board .hand [data-card-id]").count() >= 63);
+  assert.deepEqual(await page.locator(".seat-list .ai-tier").allTextContents(), ["Tactical", "Tactical", "Casual"]);
   await page.locator("#table-pause").click();
   assert.equal(await page.locator("#table-pause").innerText(), "Pause");
   await page.locator("#table-pause").click();
-  assert.ok(modules.has("/engine-worker.mjs"));
-  assert.ok(modules.has("/papplu-model.json"));
   console.log("PASS AI Watch spectator hands and pause-resume.");
   await context.close();
 

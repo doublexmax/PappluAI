@@ -10,10 +10,12 @@ from src.game.environment import (
     GameConfig,
     Observation,
     Phase,
+    _build_natural_winning_hands,
+    _swap_hand_cards,
     action_to_discard_face,
     legal_action_mask,
 )
-from src.evaluate import NUM_FACES, hand_reward
+from src.evaluate import NUM_FACES, hand_reward, is_valid_hand
 from src.game.reward_cache import RewardCache
 from src.game.stock import refill_stock
 from src.game.information import EventKind, InformationJournal, player_views
@@ -101,14 +103,43 @@ class MultiplayerEnv:
         ]
         self._rng.shuffle(deck)
 
-        self._hands = [
-            [0] * NUM_FACES for _ in range(self.config.players)
-        ]
+        hands = [[0] * NUM_FACES for _ in range(self.config.players)]
         for _ in range(self.config.game.cards_in_hand):
-            for hand in self._hands:
+            for hand in hands:
                 hand[deck.pop()] += 1
+        return self._start(hands, deck.pop(), deck)
 
-        self._joker = deck.pop()
+    def reset_curriculum(self, distance: int, seed: int) -> MatchView:
+        if type(seed) is not int:
+            raise TypeError("seed must be an int")
+        if type(distance) is not int:
+            raise TypeError("distance must be an int")
+        cfg, players = self.config.game, self.config.players
+        if not 1 <= distance <= cfg.cards_in_hand:
+            raise ValueError(f"distance must be in 1..{cfg.cards_in_hand}")
+        if distance > cfg.num_decks * NUM_FACES - cfg.cards_in_hand * players - 1:
+            raise ValueError("not enough shoe cards for the requested curriculum distance")
+
+        rng = random.Random(seed)
+        for _ in range(200):
+            hands, joker, shoe = _build_natural_winning_hands(cfg, players, rng)
+            for seat, hand in enumerate(hands):
+                swapped = _swap_hand_cards(hand, shoe, distance, rng)
+                if swapped is None:
+                    break
+                new_hand, shoe = swapped
+                if is_valid_hand(new_hand, joker, cfg.required_sequences, cfg.cards_in_hand):
+                    break
+                hands[seat] = new_hand
+            else:
+                rng.shuffle(shoe)
+                self._rng.setstate(rng.getstate())
+                return self._start(hands, joker, shoe)
+        raise ValueError(f"could not build a {players}-seat curriculum deal at distance {distance} after 200 attempts")
+
+    def _start(self, hands: list[list[int]], joker: int, deck: list[int]) -> MatchView:
+        self._hands = hands
+        self._joker = joker
         self._discard = [deck.pop()]
         self._stock = deck
         self._phase = Phase.DRAW

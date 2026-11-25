@@ -6,6 +6,7 @@ import operator
 import unittest
 from unittest import mock
 
+from src.evaluate import is_valid_hand
 from src.game.environment import (
     ACTION_DRAW_STOCK,
     ACTION_TAKE_DISCARD,
@@ -14,6 +15,7 @@ from src.game.environment import (
     discard_action,
     legal_action_mask,
 )
+from src.game import multiplayer
 from src.game.multiplayer import MatchConfig, MatchView, MultiplayerEnv
 
 
@@ -101,6 +103,46 @@ class TestMultiplayerDeal(unittest.TestCase):
         self.assertEqual(snapshot(first), snapshot(second))
         first.reset(seed=444)
         self.assertEqual(snapshot(first), snapshot(second))
+
+    def test_curriculum_swaps_each_seat_at_exact_distance_from_a_shared_shoe(self):
+        for players, distance in ((2, 1), (3, 6), (4, 12)):
+            with self.subTest(players=players, distance=distance):
+                env = MultiplayerEnv(MatchConfig(players=players))
+                targets = []
+                builder = multiplayer._build_natural_winning_hands
+
+                def capture(game, seats, rng):
+                    hands, joker, shoe = builder(game, seats, rng)
+                    targets.append(tuple(tuple(hand) for hand in hands))
+                    return hands, joker, shoe
+
+                with mock.patch.object(multiplayer, "_build_natural_winning_hands", side_effect=capture):
+                    view = env.reset_curriculum(distance, seed=3209)
+                self.assertEqual(view, MatchView(0, Phase.DRAW, None, False, None, (60,) * players, 154 - 21 * players))
+                self.assertEqual(env.observe().history[0].offered_top, env.observe().discard_top)
+                self.assertEqual(env.telemetry().stock_draws, (0,) * players)
+                counts = Counter(env._stock + env._discard + [env.observe().joker])
+                for target, hand in zip(targets[-1], env.private_hands(0)[:players]):
+                    self.assertTrue(is_valid_hand(target, env.observe().joker))
+                    self.assertFalse(is_valid_hand(hand, env.observe().joker))
+                    self.assertEqual(sum(hand), 21)
+                    self.assertEqual(sum(abs(a - b) for a, b in zip(target, hand)), 2 * distance)
+                    counts.update(dict(enumerate(hand)))
+                self.assertEqual(counts, Counter({face: 3 for face in range(52)}))
+                first = snapshot(env)
+                env.step(ACTION_DRAW_STOCK)
+                self.assertEqual(env.view().phase, Phase.DISCARD)
+                env.reset_curriculum(distance, seed=3209)
+                self.assertEqual(snapshot(env), first)
+
+    def test_bad_curriculum_distance_cannot_change_a_running_match(self):
+        env = MultiplayerEnv(MatchConfig())
+        env.reset(seed=77)
+        before = snapshot(env)
+        for distance in (0, 22, True, 1.5):
+            with self.subTest(distance=distance), self.assertRaises((ValueError, TypeError)):
+                env.reset_curriculum(distance, seed=13)
+            self.assertEqual(snapshot(env), before)
 
     def test_public_view_contains_no_hands_or_stock_order(self):
         env = MultiplayerEnv(MatchConfig(players=3))

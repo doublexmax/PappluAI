@@ -1,30 +1,23 @@
-"""Paired game evaluations, with discard puzzles reported separately."""
-
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import random
-import time
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Sequence
 
 import torch
 
-from src.game.environment import ENCODING_VERSION, GameConfig, PappluEnv, Phase, discard_action
-from src.evaluate import hand_reward
-from src.model.encoding import encode, legal_actions
-from src.model.network import (
-    collate,
-    greedy_actions,
-    load_checkpoint,
-)
-from src.model.spec import CHECKPOINT_VERSION
 from src.checkpoints.io import file_sha256
+from src.evaluation.arena import CheckpointPolicy, Deal, Policy, RandomPolicy, Turn, run_matches
+from src.evaluate import hand_reward
+from src.game.environment import ENCODING_VERSION, GameConfig, discard_action
+from src.model.spec import CHECKPOINT_VERSION
 
 
 @dataclass(frozen=True)
 class PolicyResults:
-    outcomes: Tuple[int, ...]
+    outcomes: tuple[int, ...]
+    mean_utility: float
     stock_draws: int
     discard_draws: int
 
@@ -37,82 +30,45 @@ class PolicyResults:
         }
 
 
+class _DiscardOracle:
+    game = None
+
+    def open(self) -> _DiscardOracle:
+        return self
+
+    def finish(self, stream: int) -> None:
+        return None
+
+    def act(self, turns: Sequence[Turn]) -> list[int]:
+        actions = []
+        for turn in turns:
+            obs = turn.observation
+            for face, count in enumerate(obs.hand):
+                if count:
+                    hand = list(obs.hand)
+                    hand[face] -= 1
+                    if hand_reward(hand, obs.joker, obs.config.required_sequences, obs.config.cards_in_hand):
+                        actions.append(discard_action(face))
+                        break
+            else:
+                raise RuntimeError("discard puzzle has no winning discard")
+        return actions
+
+
 def evaluate_games(
-    network,
-    config: GameConfig,
-    games: int,
-    seed: int,
-    policy: str = "greedy",
-    warm_start: bool = False,
-    deadline: Optional[float] = None,
-    stop_requested: Callable[[], bool] = lambda: False,
-    *,
-    seed_stride: int = 1,
+    policy: Policy, config: GameConfig, games: int, seed: int, *,
+    warm_start: bool = False, tables: int = 64,
 ) -> PolicyResults:
-    if isinstance(games, bool) or not isinstance(games, int) or games <= 0:
+    if type(games) is not int or games <= 0:
         raise ValueError("games must be a positive integer")
-    if policy not in ("greedy", "random", "oracle"):
-        raise ValueError("policy must be greedy, random, or oracle")
-    if policy == "oracle" and not warm_start:
-        raise ValueError("oracle is only a discard-puzzle sensitivity check")
-    if type(seed_stride) is not int or seed_stride < 1:
-        raise ValueError("seed_stride must be a positive integer")
-    outcomes = []
-    draws = [0, 0]
-    was_training = network.training
-    network.eval()
-    try:
-        for start in range(0, games, 32):
-            if stop_requested():
-                raise InterruptedError("Game evaluation stopped")
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("Game evaluation reached its time limit")
-            indices = range(start, min(start + 32, games))
-            envs = [PappluEnv(config) for _ in indices]
-            observations = [
-                env.reset_warm_start(seed=seed + index * seed_stride)
-                if warm_start else env.reset(seed=seed + index * seed_stride)
-                for env, index in zip(envs, indices)
-            ]
-            rngs = [random.Random(seed + index * seed_stride + 10_000_000) for index in indices]
-            while any(not obs.done for obs in observations):
-                if stop_requested():
-                    raise InterruptedError("Game evaluation stopped")
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("Game evaluation reached its time limit")
-                active = [index for index, obs in enumerate(observations) if not obs.done]
-                features = [encode(observations[index]) for index in active]
-                if policy == "greedy":
-                    device = next(network.parameters()).device
-                    actions = greedy_actions(
-                        network, collate(features, device),
-                    ).tolist()
-                elif policy == "random":
-                    actions = [rngs[index].choice(legal_actions(row)) for index, row in zip(active, features)]
-                else:
-                    actions = []
-                    for index in active:
-                        obs = observations[index]
-                        for face, count in enumerate(obs.hand):
-                            if count:
-                                hand = list(obs.hand)
-                                hand[face] -= 1
-                                if hand_reward(
-                                    hand, obs.joker, config.required_sequences,
-                                    config.cards_in_hand,
-                                ):
-                                    actions.append(discard_action(face))
-                                    break
-                        else:
-                            raise RuntimeError("warm-start puzzle has no winning discard")
-                for index, action in zip(active, actions):
-                    if observations[index].phase is Phase.DRAW:
-                        draws[action] += 1
-                    observations[index] = envs[index].step(action)
-            outcomes.extend(int(obs.won) for obs in observations)
-    finally:
-        network.train(was_training)
-    return PolicyResults(tuple(outcomes), draws[0], draws[1])
+    deals = (Deal(seed + i, (0,), curriculum=0 if warm_start else None) for i in range(games))
+    results = sorted(run_matches(deals, (policy,), config, tables=tables), key=lambda row: row.deal.seed)
+    return PolicyResults(
+        tuple(int(row.winner == 0) for row in results),
+        sum(row.outcome.utilities()[0] for row in results) / games,
+        sum(row.telemetry.stock_draws[0] for row in results),
+        sum(row.telemetry.discard_draws[0] for row in results),
+    )
 
 
 def evaluate_checkpoint(
@@ -121,7 +77,8 @@ def evaluate_checkpoint(
     seed: int = 300000,
     warm_games: int = 300,
     warm_seed: int = 600000,
-    sensitivity: bool = False,
+    sensitivity: bool = False, *,
+    tables: int = 64, precision: str = "fp32",
 ) -> dict:
     if isinstance(warm_games, bool) or not isinstance(warm_games, int) or warm_games < 0:
         raise ValueError("warm_games must be a nonnegative integer")
@@ -131,7 +88,9 @@ def evaluate_checkpoint(
     torch.set_num_threads(1)
     try:
         checkpoint_sha256 = file_sha256(Path(path))
-        network, config, _ = load_checkpoint(path)
+        policy = CheckpointPolicy(path, precision=precision)
+        network, config = policy.network, policy.game
+        random_policy = RandomPolicy()
         result = {
             "checkpoint": path,
             "checkpoint_sha256": checkpoint_sha256,
@@ -145,31 +104,19 @@ def evaluate_checkpoint(
             ),
             "game_seed": seed,
             "warm_seed": warm_seed,
-            "greedy": evaluate_games(network, config, games, seed).to_dict(),
-            "random": evaluate_games(
-                network, config, games, seed, policy="random"
-            ).to_dict(),
+            "greedy": evaluate_games(policy, config, games, seed, tables=tables).to_dict(),
+            "random": evaluate_games(random_policy, config, games, seed, tables=tables).to_dict(),
         }
         if warm_games:
             result["warm_greedy"] = evaluate_games(
-                network, config, warm_games, warm_seed, warm_start=True,
+                policy, config, warm_games, warm_seed, warm_start=True, tables=tables,
             ).to_dict()
             result["warm_random"] = evaluate_games(
-                network,
-                config,
-                warm_games,
-                warm_seed,
-                policy="random",
-                warm_start=True,
+                random_policy, config, warm_games, warm_seed, warm_start=True, tables=tables,
             ).to_dict()
             if sensitivity:
                 result["warm_oracle"] = evaluate_games(
-                    network,
-                    config,
-                    warm_games,
-                    warm_seed,
-                    policy="oracle",
-                    warm_start=True,
+                    _DiscardOracle(), config, warm_games, warm_seed, warm_start=True, tables=tables,
                 ).to_dict()
                 if result["warm_oracle"]["win_rate"] != 1.0:
                     raise RuntimeError(
@@ -192,7 +139,6 @@ def paired_comparison(
     samples: int = 2000,
     seed: int = 91827,
 ) -> dict:
-    """Bootstrap both training seeds and shared evaluation deals."""
     if not candidate or len(candidate) != len(control):
         raise ValueError("paired comparison requires equal, nonempty seed groups")
     games = len(candidate[0])

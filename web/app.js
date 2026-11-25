@@ -1,47 +1,27 @@
 import { moveCard, sortCards, toCounts } from "./game.mjs";
 import { cardBackSvg, cardFaceSvg } from "./cards.mjs";
 import { createEngine, createLocalEngine } from "./engine.mjs";
-import { parseQModel } from "./qnet.mjs";
 import { createTable } from "./table.mjs";
 
 const SUITS = ["♠", "♥", "♦", "♣"];
 const SUIT_NAMES = ["Spades", "Hearts", "Diamonds", "Clubs"];
 const RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
-const TIER_NAMES = { neural: "Neural", tactical: "Tactical", casual: "Casual" };
+const TIER_NAMES = { tactical: "Tactical", casual: "Casual" };
 const $ = (id) => document.getElementById(id);
 const builder = { hand: [], nextId: 1, selectedId: null, draggedId: null, revision: 0, timer: null };
 const pointer = { selectedId: null, draggedId: null, stamp: null };
-const modelUrl = new URL("./papplu-model.json", import.meta.url);
 
-function uiEngine(url = null) {
+function uiEngine() {
   if (typeof Worker !== "undefined") {
-    try { return createEngine({ modelUrl: url }); } catch {}
+    try { return createEngine(); } catch {}
   }
-  let local = createLocalEngine();
-  let disposed = false;
-  if (url) {
-    fetch(url).then((response) => {
-      if (!response.ok) throw new Error("model download failed");
-      return response.json();
-    }).then((json) => {
-      if (disposed) return;
-      const model = parseQModel(json);
-      local.dispose();
-      local = createLocalEngine({ model });
-    }).catch(() => {});
-  }
-  return {
-    evaluate: (...args) => local.evaluate(...args),
-    penalties: (...args) => local.penalties(...args),
-    chooseMove: (...args) => local.chooseMove(...args),
-    dispose() { disposed = true; local.dispose(); },
-  };
+  return createLocalEngine();
 }
 
 const builderEngine = uiEngine();
 let storage = null;
 try { storage = window.localStorage; } catch {}
-const table = createTable({ engineFactory: () => uiEngine(modelUrl), storage });
+const table = createTable({ engineFactory: uiEngine, storage });
 
 function node(tag, className = "", text = "") {
   const value = document.createElement(tag);
@@ -297,7 +277,7 @@ function renderSeatEditor(settings) {
     const tier = node("select");
     tier.setAttribute("aria-label", `Seat ${index + 1} AI tier`);
     for (const [value, label] of Object.entries(TIER_NAMES)) tier.append(new Option(label, value));
-    tier.value = spec.tier ?? "neural";
+    tier.value = spec.tier ?? "tactical";
     tierLabel.hidden = spec.kind !== "ai";
     tierLabel.append(tier);
     const change = () => {
@@ -391,8 +371,7 @@ function renderTable() {
       node("span", "", `${seat.roundPenalty} round · ${seat.penaltyPoints} total penalty points`),
     );
     if (seat.kind === "ai") {
-      const tier = TIER_NAMES[seat.effectiveTier ?? seat.tier];
-      item.append(node("span", "ai-tier", `${tier}${seat.downgrade ? ` · ${seat.downgrade}` : ""}`));
+      item.append(node("span", "ai-tier", TIER_NAMES[seat.tier]));
       if (seat.lastReason) item.append(node("span", "muted", seat.lastReason.replaceAll("-", " ")));
     }
     scoreboard.append(item);

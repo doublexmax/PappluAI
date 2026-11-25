@@ -25,11 +25,10 @@ function assertPythonError(call, expected, name) {
   }, name);
 }
 
-test("fixtures identify their current Python sources and exporter", () => {
-  for (const [path, expected] of Object.entries(fixture.sources)) {
-    const source = readFileSync(new URL(`../${path}`, import.meta.url), "utf8").replace(/\r\n?/g, "\n");
-    assert.equal(createHash("sha256").update(source).digest("hex"), expected, path);
-  }
+test("the fixture matches the Python evaluator source", () => {
+  const path = "src/evaluate.py";
+  const source = readFileSync(new URL(`../${path}`, import.meta.url), "utf8").replace(/\r\n?/g, "\n");
+  assert.equal(createHash("sha256").update(source).digest("hex"), fixture.sources[path], path);
 });
 
 test("evaluateHand matches every Python witness and validation error", () => {

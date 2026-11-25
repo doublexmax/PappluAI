@@ -5,15 +5,15 @@ import {
 
 const SETTINGS_KEY = "papplu:settings:v1";
 const AI_SPEED_MS = { instant: 0, normal: 600, slow: 1200 };
-const TIERS = ["neural", "tactical", "casual"];
+const TIERS = ["tactical", "casual"];
 const STALL_NOTICE = "No legal move. The stock and the pile are both empty. Deal again to continue.";
 const PRESETS = {
-  "vs-ai": [{ kind: "human", name: "You" }, { kind: "ai", name: "Neural AI", tier: "neural" }],
+  "vs-ai": [{ kind: "human", name: "You" }, { kind: "ai", name: "Tactical AI", tier: "tactical" }],
   solo: [{ kind: "human", name: "You" }],
   "pass-and-play": [{ kind: "human", name: "Player 1" }, { kind: "human", name: "Player 2" }],
   "ai-watch": [
-    { kind: "ai", name: "Neural", tier: "neural" },
-    { kind: "ai", name: "Tactical", tier: "tactical" },
+    { kind: "ai", name: "Tactical 1", tier: "tactical" },
+    { kind: "ai", name: "Tactical 2", tier: "tactical" },
     { kind: "ai", name: "Casual", tier: "casual" },
   ],
 };
@@ -84,7 +84,7 @@ export function createTable({
   let checkKey = null;
   let checkRevision = 0;
   let watchTurns = 0;
-  let lastChoices = [];
+  let lastReasons = [];
   let declaration = { status: "none" };
   let handCheck = { status: "off" };
   let summary = { status: "none" };
@@ -133,14 +133,12 @@ export function createTable({
         seats: game.players.map((player, index) => {
           const visible = eyes.mode === "spectator" ||
             (["seat", "hand"].includes(eyes.mode) && eyes.seat === index);
-          const choice = lastChoices[index];
           return {
             ...roundSeats[index], tier: roundSeats[index].tier ?? null,
-            effectiveTier: choice?.tier ?? null, downgrade: choice?.downgrade ?? null,
             handSize: player.hand.length, active: player.active,
             roundPenalty: player.roundPenalty, penaltyPoints: player.penaltyPoints,
             thinking: aiJob?.seat === index && aiJob.running,
-            lastReason: choice?.reason ?? null,
+            lastReason: lastReasons[index] ?? null,
             hand: visible ? player.hand.map((card) => ({ ...card })) : null,
             drawnCardId: visible && index === game.currentPlayer ? game.drawnCardId : null,
           };
@@ -179,13 +177,12 @@ export function createTable({
     if (aiJob !== job || !started || paused) return;
     job.running = true;
     commit();
-    let choice = null;
+    let reason = null;
     let move;
     let failure = null;
     try {
-      choice = await engine.chooseMove(observe(game, job.seat), roundSeats[job.seat].tier,
-        Math.floor(random() * 4294967296));
-      move = choice.move;
+      ({ move, reason } = await engine.chooseMove(observe(game, job.seat), roundSeats[job.seat].tier,
+        Math.floor(random() * 4294967296)));
     } catch (error) {
       if (error.name === "EngineDisposed") return;
       failure = error;
@@ -198,7 +195,7 @@ export function createTable({
         { type: "discard", cardId: view.drawnCardId ?? view.hand.at(-1).id };
       notice = `${roundSeats[job.seat].name} ${failure.name === "EngineTimeout" ? "took too long" : "could not choose a move"}, so it played a safe move.`;
     }
-    lastChoices[job.seat] = choice;
+    lastReasons[job.seat] = reason;
     applyMove(move, true);
     if (move.type !== "draw" && roundSeats.every((seat) => seat.kind === "ai")) {
       watchTurns += 1;
@@ -339,7 +336,7 @@ export function createTable({
       }, random);
       roundSeats = settings.seats.map((seat) => ({ ...seat }));
       dealId += 1;
-      lastChoices = [];
+      lastReasons = [];
       paused = false;
       revealedTurn = null;
       declaration = { status: "none" };

@@ -1,179 +1,48 @@
-import random
 from pathlib import Path
 import tempfile
 import unittest
-from unittest import mock
 
-from src.evaluation.benchmark import (
-    PolicyResults,
-    evaluate_checkpoint,
-    evaluate_games,
-    paired_comparison,
-)
 from src.game.environment import GameConfig
+from src.model.encoding import SCHEMA
+from src.model.spec import ModelSpec
 
 try:
     import torch
 except ImportError:
     torch = None
 
-
-class TestPairedComparison(unittest.TestCase):
-    def test_identical_outcomes_have_no_gain(self):
-        outcomes = [[0, 1, 0, 1], [1, 0, 0, 1]]
-        result = paired_comparison(outcomes, outcomes, samples=100)
-        self.assertEqual(result["absolute_gain"], 0.0)
-        self.assertEqual(result["ci95"], [0.0, 0.0])
-
-    def test_known_complete_improvement(self):
-        result = paired_comparison([[1] * 10] * 3, [[0] * 10] * 3, samples=100)
-        self.assertEqual(result["absolute_gain"], 1.0)
-        self.assertEqual(result["ci95"], [1.0, 1.0])
-
-    def test_repeatable_without_global_rng_change(self):
-        before = random.getstate()
-        args = ([[0, 1, 1], [1, 1, 0]], [[0, 0, 1], [1, 0, 0]])
-        self.assertEqual(
-            paired_comparison(*args, samples=100),
-            paired_comparison(*args, samples=100),
-        )
-        self.assertEqual(before, random.getstate())
-
-    def test_rejects_unpaired_results(self):
-        for args in (([], []), ([[1]], []), ([[1, 0]], [[0]]), ([[2]], [[0]])):
-            with self.subTest(args=args), self.assertRaises(ValueError):
-                paired_comparison(*args, samples=100)
+if torch is not None:
+    from src.evaluation.arena import RandomPolicy
+    from src.evaluation.benchmark import evaluate_checkpoint, evaluate_games, paired_comparison
+    from src.model.network import GameTransformer, save_checkpoint
 
 
-@unittest.skipIf(torch is None, "Training dependencies not installed")
-class TestEvaluation(unittest.TestCase):
-    def test_cold_games_batch_without_changing_deal_order_or_random_policy_streams(self):
-        from src.model.network import QNetwork
-        from src.model.spec import ModelSpec
-
-        previous_threads = torch.get_num_threads()
+@unittest.skipIf(torch is None, "PyTorch not installed")
+class TestBenchmark(unittest.TestCase):
+    def setUp(self):
         torch.set_num_threads(1)
-        try:
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(17)
-                network = QNetwork(ModelSpec(8, 1))
-            with torch.no_grad():
-                for parameter in network.parameters():
-                    parameter.zero_()
-                network.policy.draw_out.bias[0] = 1.0
-            config = GameConfig(max_turns=1)
-            with mock.patch.object(network, "forward", wraps=network.forward) as forward:
-                greedy = evaluate_games(network, config, 35, 600000)
-            self.assertEqual(greedy, PolicyResults((0,) * 35, 35, 0))
-            self.assertEqual([call.args[0].card.shape[0] for call in forward.call_args_list], [32, 32, 3, 3])
-            self.assertEqual(
-                evaluate_games(network, config, 35, 600000, policy="random"),
-                PolicyResults((0,) * 35, 14, 21),
-            )
-            self.assertTrue(network.training)
-        finally:
-            torch.set_num_threads(previous_threads)
+        self.game = GameConfig(max_turns=1)
 
-    def test_lockstep_batches_preserve_scalar_deal_order_outcomes_and_draws(self):
-        from src.model.network import QNetwork
-        from src.model.spec import ModelSpec
+    def test_result_order_and_draw_totals_do_not_depend_on_table_count(self):
+        one = evaluate_games(RandomPolicy(), self.game, 7, 47, tables=1)
+        many = evaluate_games(RandomPolicy(), self.game, 7, 47, tables=3)
+        self.assertEqual(one, many)
+        self.assertEqual(one.stock_draws + one.discard_draws, 7)
+        self.assertEqual(one.outcomes, (0,) * 7)
 
-        previous_threads = torch.get_num_threads()
-        torch.set_num_threads(1)
-        try:
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(17)
-                network = QNetwork(ModelSpec(8, 1))
-            with torch.no_grad():
-                for parameter in network.parameters():
-                    parameter.zero_()
-                network.policy.draw_out.bias[0] = 1.0
-            config = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=3)
-            greedy = evaluate_games(network, config, 35, 600000, warm_start=True)
-            self.assertEqual(greedy, PolicyResults((
-                0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0,
-                0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1,
-            ), 0, 0))
-            random_policy = evaluate_games(network, config, 35, 600000, "random", True)
-            self.assertEqual(random_policy, PolicyResults((
-                0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0,
-            ), 0, 0))
-            ordinary = evaluate_games(network, config, 35, 600000)
-            self.assertEqual(ordinary, PolicyResults(tuple(int(index in (9, 26)) for index in range(35)), 103, 0))
-        finally:
-            torch.set_num_threads(previous_threads)
-
-    def test_checkpoint_evaluation_restores_torch_threads(self):
-        from src.model.network import QNetwork, save_checkpoint
-
-        before = torch.get_num_threads()
-        outcomes = PolicyResults((0,), 0, 0)
+    def test_checkpoint_report_keeps_puzzles_separate_and_has_a_positive_control(self):
+        model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pt"
-            save_checkpoint(str(path), QNetwork(), GameConfig())
-            with mock.patch("src.evaluation.benchmark.evaluate_games", return_value=outcomes):
-                result = evaluate_checkpoint(str(path), games=1, warm_games=0)
-            self.assertEqual(result["greedy"]["outcomes"], (0,))
-            self.assertEqual(torch.get_num_threads(), before)
-            with mock.patch("src.evaluation.benchmark.load_checkpoint", side_effect=RuntimeError("load failed")):
-                with self.assertRaisesRegex(RuntimeError, "load failed"):
-                    evaluate_checkpoint(str(path), games=1, warm_games=0)
-            self.assertEqual(torch.get_num_threads(), before)
+            save_checkpoint(path, model, self.game.to_dict(), {"version": 1})
+            report = evaluate_checkpoint(str(path), games=3, warm_games=8, sensitivity=True, tables=2)
+        self.assertEqual((report["architecture"], report["checkpoint_version"], report["encoding_version"]),
+                         ("game_transformer", 6, 8))
+        self.assertEqual(report["greedy"]["outcomes"], (0, 0, 0))
+        self.assertEqual(report["warm_oracle"]["outcomes"], (1,) * 8)
+        self.assertEqual(report["warm_random"]["stock_draws"], 0)
+        self.assertEqual(report["parameter_count"], sum(t.numel() for t in model.parameters()))
 
-    def test_seed_stride_matches_separate_games_for_both_policy_rngs(self):
-        from src.model.network import QNetwork
-        from src.model.spec import ModelSpec
-
-        torch.set_num_threads(1)
-        torch.manual_seed(17)
-        network = QNetwork(ModelSpec(8, 1))
-        config = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=3)
-        for policy in ("greedy", "random"):
-            with self.subTest(policy=policy):
-                actual = evaluate_games(network, config, 7, 30000001, policy, seed_stride=2)
-                scalar = [evaluate_games(network, config, 1, seed, policy) for seed in range(30000001, 30000015, 2)]
-                self.assertEqual(actual, PolicyResults(
-                    tuple(row.outcomes[0] for row in scalar),
-                    sum(row.stock_draws for row in scalar), sum(row.discard_draws for row in scalar),
-                ))
-
-    def test_puzzle_oracle_proves_sensitivity(self):
-        from src.model.network import QNetwork
-
-        config = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=3)
-        network = QNetwork()
-        oracle = evaluate_games(network, config, 20, 600000, "oracle", True)
-        random_policy = evaluate_games(network, config, 20, 600000, "random", True)
-        self.assertEqual(sum(oracle.outcomes), 20)
-        self.assertLess(sum(random_policy.outcomes), 19)
-
-    def test_evaluation_preserves_network_and_rng(self):
-        from src.model.network import QNetwork
-
-        network = QNetwork()
-        config = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=2)
-        before = [parameter.detach().clone() for parameter in network.parameters()]
-        rng_state = torch.get_rng_state().clone()
-        a = evaluate_games(network, config, 5, 900000)
-        b = evaluate_games(network, config, 5, 900000)
-        self.assertEqual(a, b)
-        self.assertTrue(network.training)
-        self.assertTrue(torch.equal(rng_state, torch.get_rng_state()))
-        for old, new in zip(before, network.parameters()):
-            self.assertTrue(torch.equal(old, new))
-
-    def test_validation_rejects_empty_games(self):
-        from src.model.network import QNetwork
-
-        with self.assertRaises(ValueError):
-            evaluate_games(QNetwork(), GameConfig(), 0, 0)
-        with self.assertRaisesRegex(ValueError, "only a discard-puzzle"):
-            evaluate_games(QNetwork(), GameConfig(), 1, 0, policy="oracle")
-        for stride in (0, -1, True):
-            with self.subTest(stride=stride), self.assertRaisesRegex(ValueError, "seed_stride"):
-                evaluate_games(QNetwork(), GameConfig(), 1, 0, seed_stride=stride)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_paired_bootstrap_keeps_the_matched_deal_effect(self):
+        result = paired_comparison(((1, 1), (1, 1)), ((0, 0), (0, 0)), samples=100)
+        self.assertEqual((result["absolute_gain"], result["ci95"]), (1, [1, 1]))

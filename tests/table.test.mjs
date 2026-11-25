@@ -5,7 +5,7 @@ import {
   createEngine, createLocalEngine, ENGINE_WORKER_SOURCE, EngineDisposed, EngineTimeout, serveEngine,
 } from "../web/engine.mjs";
 import { evaluateHand, minimumPenalty } from "../web/evaluate.mjs";
-import { parseQModel } from "../web/qnet.mjs";
+import { createGame, observe } from "../web/game.mjs";
 import { createTable } from "../web/table.mjs";
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -175,9 +175,8 @@ test("verified AI declarations resolve synchronously without an evaluation round
   h.table.stop();
 });
 
-test("the table preserves the neural tier and greedy reason through the local engine", async () => {
-  const model = parseQModel(JSON.parse(readFileSync(new URL("../web/papplu-model.json", import.meta.url), "utf8")));
-  const h = harness(() => createLocalEngine({ model }));
+test("Tactical AI plays a full vs AI turn through the local engine", async () => {
+  const h = harness();
   h.table.dispatch({ type: "preset", name: "vs-ai" });
   h.table.dispatch({ type: "configure", patch: { aiSpeed: "instant" } });
   h.table.dispatch({ type: "deal" });
@@ -187,15 +186,15 @@ test("the table preserves the neural tier and greedy reason through the local en
   let round = h.table.getSnapshot().round;
   assert.equal(round.phase, "discard");
   assert.equal(round.currentSeat, 1);
-  assert.equal(round.seats[1].effectiveTier, "neural");
-  assert.equal(round.seats[1].downgrade, null);
-  assert.equal(round.seats[1].lastReason, "greedy");
+  assert.equal(round.seats[1].name, "Tactical AI");
+  assert.equal(round.seats[1].tier, "tactical");
+  assert.equal(round.seats[1].lastReason, "min-penalty");
   assert.equal(await h.advance(), true);
   round = h.table.getSnapshot().round;
   assert.equal(round.phase, "draw");
   assert.equal(round.currentSeat, 0);
   assert.equal(round.seats[1].handSize, 21);
-  assert.equal(round.seats[1].lastReason, "greedy");
+  assert.equal(round.seats[1].lastReason, "min-penalty");
   h.table.stop();
 });
 
@@ -214,7 +213,7 @@ test("AI pause, stale async replies, and stop-start preserve a single turn write
   await h.advance();
   assert.equal(calls, 1);
   h.table.dispatch({ type: "pause" });
-  resolveMove({ move: { type: "draw", source: "stock" }, tier: "casual", downgrade: null, reason: "forced" });
+  resolveMove({ move: { type: "draw", source: "stock" }, tier: "tactical", reason: "forced" });
   await tick();
   assert.equal(h.table.getSnapshot().round.phase, "draw");
   assert.equal(h.table.getSnapshot().paused, true);
@@ -238,7 +237,7 @@ test("AI Watch pauses after 200 completed turns and resumes on demand", async ()
       return Promise.resolve({
         move: view.phase === "draw" ? { type: "draw", source: "discard" } :
           { type: "discard", cardId: view.drawnCardId },
-        tier, downgrade: null, reason: "forced",
+        tier, reason: "forced",
       });
     },
   }));
@@ -247,6 +246,10 @@ test("AI Watch pauses after 200 completed turns and resumes on demand", async ()
   h.table.dispatch({ type: "deal" });
   for (let step = 0; step < 400; step += 1) assert.equal(await h.advance(), true, `step ${step}`);
   const snapshot = h.table.getSnapshot();
+  assert.equal(snapshot.round.viewer.mode, "spectator");
+  assert.deepEqual(snapshot.round.seats.map(({ name, tier, hand }) => [name, tier, hand.length]), [
+    ["Tactical 1", "tactical", 21], ["Tactical 2", "tactical", 21], ["Casual", "casual", 21],
+  ]);
   assert.equal(snapshot.round.turn, 201);
   assert.equal(snapshot.paused, true);
   assert.equal(snapshot.notice, "Paused after 200 turns. Resume to keep watching.");
@@ -320,6 +323,21 @@ test("local engine and worker protocol return the same evaluator values and mapp
   assert.equal(replies[1].error.name, "RangeError");
   receive({ data: { id: 9, op: "unknown" } });
   assert.equal(replies[2].error.name, "TypeError");
+  const view = observe(createGame({ players: 1, decks: 1, cardsInHand: 3, requiredSequences: 1 },
+    () => 0.9999), 0);
+  for (const [tier, source, reason] of [
+    ["tactical", "discard", "exact-win"], ["casual", "stock", "keep-score"],
+  ]) {
+    const request = { id: 10, op: "chooseMove", view, tier, seed: 0 };
+    const value = { move: { type: "draw", source }, tier, reason };
+    assert.deepEqual(await engine.chooseMove(view, tier, 0), value);
+    receive({ data: request });
+    assert.deepEqual(replies.at(-1), { id: 10, ok: true, value });
+  }
+  const error = { name: "TypeError", message: "unknown AI tier" };
+  await assert.rejects(engine.chooseMove(view, "neural", 0), error);
+  receive({ data: { id: 11, op: "chooseMove", view, tier: "neural", seed: 0 } });
+  assert.deepEqual(replies.at(-1), { id: 11, ok: false, error });
   engine.dispose();
   engine.dispose();
   await assert.rejects(engine.evaluate(counts, rules), EngineDisposed);
@@ -342,7 +360,7 @@ test("worker engine times out pending calls, restarts, and rejects calls after d
       });
     }
     postMessage(data) {
-      if (data.op === "init" || this.hang) return;
+      if (this.hang) return;
       queueMicrotask(() => { if (!this.stopped) this.receive({ data }); });
     }
     terminate() { this.stopped = true; }

@@ -138,14 +138,12 @@ class ServerTests(unittest.TestCase):
 
     def test_browser_engine_assets(self):
         for filename in (
-            "evaluate.mjs", "qnet.mjs", "ai.mjs", "engine.mjs",
-            "engine-worker.mjs", "table.mjs", "papplu-model.json",
+            "evaluate.mjs", "ai.mjs", "engine.mjs", "engine-worker.mjs", "table.mjs",
         ):
             with self.subTest(filename=filename):
                 status, headers, body = self.request("GET", "/" + filename)
                 self.assertEqual(status, 200)
-                content_type = "application/json" if filename.endswith(".json") else "text/javascript"
-                self.assertEqual(headers["Content-Type"], content_type + "; charset=utf-8")
+                self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
                 self.assertGreater(len(body), 0)
 
     def test_static_assets_and_head(self):

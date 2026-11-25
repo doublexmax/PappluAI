@@ -1,12 +1,18 @@
+from collections import Counter
+from dataclasses import replace
+from itertools import islice
 import json
+import os
 from pathlib import Path
-import tempfile
+from random import Random
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
-from unittest import mock
-import zlib
+from unittest.mock import patch
+from uuid import UUID
 
-from src.game.environment import GameConfig, PappluEnv
-from src.model.encoding import encode
+from src.game.environment import GameConfig, PappluEnv, discard_action
+from src.model.encoding import SCHEMA
 from src.model.spec import ModelSpec
 
 try:
@@ -15,86 +21,458 @@ except ImportError:
     torch = None
 
 if torch is not None:
-    from src.training.train import Replay, Step, Trainer, Trajectory, collect_round, save_rollout_batch
+    from src.evaluation.arena import Deal, HeadToHead, TransformerPolicy, run_matches
+    from src.model.network import GameTransformer, load_checkpoint, save_checkpoint
+    from src.training.train import CollectPlan, Learner, TrainConfig, Trajectories, Trainer, _Buffer, collect
+
+
+RUN_ID = str(UUID(int=93))
+TINY = ModelSpec(width=16, layers=1, heads=2, ffn=32)
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
-@mock.patch("src.training.train.ZLIB_CHUNK", 128)
-class TestReplayStreams(unittest.TestCase):
+class TestTrainingCore(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
-        env = PappluEnv(GameConfig(cards_in_hand=3, required_sequences=1))
-        first, second = (encode(env.reset(seed)) for seed in (17, 23))
-        self.raw = first.data + second.data
-        self.replay = Replay(3, gamma=0.5)
-        self.replay.append(Trajectory((Step(first, 1), Step(second, 53, False)), 1.0))
+        self.game = GameConfig(max_turns=1)
 
-    def test_round_trip_accepts_chunked_and_legacy_zlib_streams(self):
-        state = self.replay.state_dict()
-        self.assertGreater(len(state["features"]), 128)
-        self.assertEqual(zlib.decompress(state["features"]), self.raw)
-        legacy = zlib.compress(self.raw, level=1)
-        for payload in (state["features"], bytearray(legacy), memoryview(legacy)):
-            with self.subTest(payload_type=type(payload)):
-                restored = Replay(3, gamma=0.5)
-                restored.load_state_dict({**state, "features": payload})
-                self.assertEqual((len(restored), restored.cursor), (2, 2))
-                torch.testing.assert_close(restored.features[:2], self.replay.features[:2], rtol=0, atol=0)
-                self.assertEqual(restored.actions[:2].tolist(), [1, 53])
-                self.assertEqual(restored.returns[:2].tolist(), [0.5, 1.0])
-                self.assertEqual(restored.greedy[:2].tolist(), [True, False])
+    def test_columnar_roundtrip_rejects_incompatible_and_corrupt_rollouts(self):
+        network = GameTransformer(TINY, SCHEMA)
+        policy = TransformerPolicy(network, self.game, sample=True, record=True)
+        results = list(run_matches((Deal(9, (0,)), Deal(11, (0, 0))), (policy,), self.game))
+        batch = Trajectories.from_results(results, 4, RUN_ID)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "batch-001.pt"
+            batch.save(path)
+            loaded = Trajectories.load(path)
+            self.assertEqual((loaded.version, loaded.episodes, loaded.decisions), (4, 2, 6))
+            self.assertEqual(loaded.suffix.shape, (6, 30, 8))
+            for name in ("prefix", "suffix", "decision_end", "cut", "action", "behavior_logp", "utility", "legal",
+                         "potential", "behavior_value"):
+                torch.testing.assert_close(getattr(batch, name), getattr(loaded, name))
+            payload = torch.load(path, weights_only=True)
+            payload["format"] = 5
+            torch.save(payload, path)
+            with self.assertRaisesRegex(ValueError, "incompatible rollout batch format"):
+                Trajectories.load(path)
+            payload["format"] = 6
+            payload["schema"]["version"] = 6
+            torch.save(payload, path)
+            with self.assertRaisesRegex(ValueError, "incompatible rollout token schema"):
+                Trajectories.load(path)
+            for changes, text in (
+                ({"cut": batch.cut + 1}, "prefix cuts"),
+                ({"decision_end": batch.decision_end + 1}, "offsets"),
+                ({"behavior_logp": torch.full_like(batch.behavior_logp, float("nan"))}, "behavior"),
+                ({"behavior_value": torch.full_like(batch.behavior_value, float("inf"))}, "behavior values"),
+                ({"potential": torch.full_like(batch.potential, 0.76)}, "rollout potential"),
+                ({"behavior_value": batch.behavior_value[:-1]}, "decision column lengths"),
+            ):
+                with self.subTest(text=text):
+                    replace(batch, **changes).save(path)
+                    with self.assertRaisesRegex(ValueError, text):
+                        Trajectories.load(path)
+            replace(batch, action=torch.full_like(batch.action, 54)).save(path)
+            with self.assertRaisesRegex(ValueError, "legal action"):
+                Trajectories.load(path)
+            suffix = batch.suffix.clone()
+            suffix[0, -1, 7] = 55
+            replace(batch, suffix=suffix).save(path)
+            with self.assertRaisesRegex(ValueError, "pointer outside the action space"):
+                Trajectories.load(path)
 
-    def test_invalid_streams_and_byte_lengths_do_not_overrun_the_replay(self):
-        state = self.replay.state_dict()
-        compressed = state["features"]
-        for case, payload, message in (
-            ("invalid header", b"not zlib", "corrupted replay data"),
-            ("truncated", compressed[:-1], "corrupted replay data"),
-            ("trailing data", compressed + b"\x00", "corrupted replay data"),
-            ("not bytes-like", None, "corrupted replay data"),
-            ("oversized", zlib.compress(self.raw + b"\xff"), "replay byte length mismatch"),
-            ("undersized", zlib.compress(self.raw[:-1]), "replay byte length mismatch"),
-        ):
-            with self.subTest(case=case):
-                restored = Replay(3, gamma=0.5)
-                restored.features[2].fill_(42)
-                with self.assertRaisesRegex(ValueError, message):
-                    restored.load_state_dict({**state, "features": payload})
-                torch.testing.assert_close(restored.features[2], torch.full_like(restored.features[2], 42), rtol=0, atol=0)
+    def test_neural_declaration_reward_survives_rollout_and_replay(self):
+        model = GameTransformer(TINY, SCHEMA)
+        env = PappluEnv(self.game)
+        obs = env.reset_warm_start(9)
+        for face, count in enumerate(obs.hand):
+            if count:
+                env.reset_warm_start(9)
+                action = discard_action(face)
+                if env.step(action).won:
+                    break
+        else:
+            self.fail("warm-start fixture has no winning discard")
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+            model.policy.bias[action] = 100
+            model.value.weight.zero_()
+            model.value.bias.fill_(0.375)
+        policy = TransformerPolicy(model, self.game, record=True)
+        runs = list(run_matches((Deal(9, (0,), curriculum=0),), (policy,), self.game))
+        self.assertEqual((runs[0].winner, runs[0].action_count), (0, 1))
+        batch = Trajectories.from_results(runs, 0, RUN_ID)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "batch-win.pt"
+            batch.save(path)
+            batch = Trajectories.load(path)
+        self.assertEqual(batch.action.tolist(), [action])
+        self.assertEqual((batch.potential.tolist(), batch.behavior_value.tolist()), ([0.75], [0.375]))
+        buffer = _Buffer(4, 3)
+        self.assertTrue(buffer.add(batch, 0))
+        sample = buffer.sample(Random(55), 1, 0)
+        self.assertEqual(sample.reward.tolist(), [[0.25]])
 
+    def test_collection_ladder_includes_solo_puzzles_but_keeps_cold_deals_separate(self):
+        plan = CollectPlan(curriculum_share=1.0, curriculum_max_distance=6)
+        deals = list(islice(plan.deals("mastery"), 4096))
+        self.assertEqual(deals, list(islice(plan.deals("mastery"), 4096)))
+        self.assertEqual([deal.players for deal in deals[:8]], [1, 2, 3, 4, 1, 2, 3, 4])
+        self.assertEqual({deal.curriculum for deal in deals if deal.players == 1}, set(range(7)))
+        self.assertGreater(sum(deal.players == 1 and deal.curriculum <= 1 for deal in deals), 420)
+        for players in (2, 3, 4):
+            self.assertEqual({deal.curriculum for deal in deals if deal.players == players}, set(range(1, 7)))
+        cold = list(islice(replace(plan, curriculum_share=0).deals("mastery"), 8))
+        self.assertEqual([deal.curriculum for deal in cold], [None] * 8)
 
-@unittest.skipIf(torch is None, "PyTorch not installed")
-class TestRoundExports(unittest.TestCase):
-    def test_each_round_exports_current_weights_and_consumes_at_most_two_sorted_batches(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            trainer = Trainer.open(Path(temporary), {
-                "num_decks": 1, "cards_in_hand": 3, "required_sequences": 1, "max_turns": 1,
-                "player_counts": (1,), "round_episodes": 1, "updates_per_episode": 1,
-                "replay_capacity": 16, "batch_size": 4, "validation_games": 0, "checkpoint_every": 100,
-            }, initial=ModelSpec(9, 1))
-            trajectories = collect_round(trainer.config, trainer.learner.online, str(trainer.root / "best-model.pt"), [], 0, 1)
-            inbox = trainer.root / "inbox"
-            for index in range(5, 0, -1):
-                save_rollout_batch(inbox / ("batch-%03d.pt" % index), episodes=1, trajectories=trajectories)
-            rounds = []
+    def test_buffer_shapes_terminal_reward_and_rejects_future_or_stale_batches(self):
+        model = GameTransformer(TINY, SCHEMA)
+        policy = TransformerPolicy(model, self.game, sample=True, record=True)
+        runs = list(run_matches([Deal(11, (0,))], [policy], self.game))
+        batch = Trajectories.from_results(runs, 7, RUN_ID)
+        buffer = _Buffer(4, 3)
+        self.assertFalse(buffer.add(batch, 6))
+        self.assertTrue(buffer.add(batch, 10))
+        sample = buffer.sample(Random(55), 1, 10)
+        self.assertEqual(sample.valid.tolist(), [[True, True]])
+        torch.testing.assert_close(sample.discount, torch.tensor([[0.995, 0.0]]))
+        self.assertEqual(sample.tokens.cut.tolist(), [[30, 31]])
+        first, last = batch.potential.tolist()
+        self.assertAlmostEqual(sample.reward[0, 1].item(), runs[0].outcome.utilities()[0] - last)
+        self.assertAlmostEqual(sample.reward[0, 0].item(), 0.995 * last - first)
+        torch.testing.assert_close(sample.behavior_logp[0], batch.behavior_logp)
+        buffer.prune(11)
+        self.assertEqual(len(buffer), 0)
+        self.assertFalse(buffer.add(batch, 11))
 
-            def stop():
-                if not trainer.episodes:
-                    return False
-                latest = torch.load(trainer.root / "latest-model.pt", weights_only=True)
-                state = torch.load(trainer.root / "latest-state.pt", weights_only=True)
-                self.assertEqual(latest["meta"]["episodes"], trainer.episodes)
-                torch.testing.assert_close(latest["model_state_dict"], trainer.learner.online.state_dict(), rtol=0, atol=0)
-                rounds.append((trainer.episodes, state["episodes"], sorted(path.name for path in inbox.glob("batch-*.pt"))))
-                return len(rounds) == 2
+    def test_inbox_loads_newest_batches_and_drops_the_oldest_excess(self):
+        with TemporaryDirectory() as directory:
+            trainer = Trainer.open(Path(directory), {
+                "game": self.game.to_dict(), "actors": 1, "torch_threads": 1,
+            }, spec=TINY)
+            policy = TransformerPolicy(trainer.learner.online, self.game, record=True)
+            results = list(run_matches((Deal(9, (0,), curriculum=0),), (policy,), self.game))
+            trainer.learner.version = 18
+            for version in range(19):
+                path = trainer.inbox / f"batch-{version}.pt"
+                Trajectories.from_results(results, version, trainer.run_id).save(path)
+                os.utime(path, (version + 1, version + 1))
+            trainer._ingest()
+            self.assertEqual([chunk.version for chunk in trainer.buffer.chunks], list(range(18, 10, -1)))
+            self.assertEqual({path.name for path in trainer.inbox.iterdir()},
+                             {f"batch-{version}.pt" for version in range(3, 11)})
+            self.assertEqual(trainer.dropped_batches, 3)
 
-            self.assertEqual(trainer.run(max_episodes=5, stop=stop), "stopped")
-            self.assertEqual(rounds, [
-                (2, 0, ["batch-003.pt", "batch-004.pt", "batch-005.pt"]),
-                (4, 0, ["batch-005.pt"]),
-            ])
-            lines = (trainer.root / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
-            self.assertEqual([(row["episodes"], row["updates"]) for row in map(json.loads, lines)], [(2, 2), (4, 2)])
-            self.assertEqual(trainer.run(max_episodes=5), "max_episodes")
-            self.assertEqual(trainer.episodes, 5)
-            self.assertFalse((inbox / "batch-005.pt").exists())
+    def test_buckets_keep_short_trajectories_separate_and_only_pad_after_terminal(self):
+        lengths = (1, 8, 120)
+        decisions = sum(lengths)
+        batch = Trajectories(
+            0, 3, RUN_ID, torch.ones(3, dtype=torch.uint8), torch.tensor([1.0, 0.5, -1.0]),
+            torch.ones(decisions, SCHEMA.fields, dtype=torch.uint8), torch.tensor(lengths).cumsum(0),
+            torch.ones(decisions, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
+            torch.tensor(lengths).cumsum(0), torch.cat([torch.arange(1, n + 1) for n in lengths]),
+            torch.full((decisions,), 2), torch.ones(decisions, dtype=torch.uint8), torch.zeros(decisions),
+            torch.zeros(decisions), torch.zeros(decisions),
+        )
+        buffer = _Buffer(decisions, 3)
+        self.assertTrue(buffer.add(batch, 0))
+        rng = Random(21)
+        observed = set()
+        for _ in range(12):
+            sample = buffer.sample(rng, 4, 0)
+            seen = set(sample.valid.sum(dim=1).tolist())
+            self.assertTrue(seen <= {1, 8} or seen == {120}, seen)
+            observed.update(seen)
+            self.assertEqual(sample.action.size(1), max(seen))
+            for index, valid in enumerate(sample.valid):
+                length = int(valid.sum())
+                torch.testing.assert_close(sample.tokens.cut[index, :length], torch.arange(1, length + 1))
+                torch.testing.assert_close(sample.discount[index, :length - 1], torch.full((length - 1,), .995))
+                self.assertFalse(sample.discount[index, length - 1:].any())
+                self.assertEqual(sample.reward[index].nonzero().flatten().tolist(), [length - 1])
+                self.assertEqual(sample.reward[index, length - 1].item(), {1: 1.0, 8: 0.5, 120: -1.0}[length])
+        self.assertEqual(observed, set(lengths))
+
+        frequencies = Counter(int(buffer.sample(rng, 1, 0).valid.sum()) for _ in range(900))
+        for length in lengths:
+            self.assertGreater(frequencies[length], 240, frequencies)
+            self.assertLess(frequencies[length], 360, frequencies)
+
+        peer = _Buffer(decisions * 2, 20)
+        peer.add(batch, 0)
+        peer.add(replace(batch, players=torch.tensor([2, 2, 1], dtype=torch.uint8)), 0)
+        shared = {(1, 0): 2, (1, 14): 1}
+        observed_buckets = set()
+        for version in range(4):
+            left = buffer.sample(Random(55), 4, version, seed=41, targets=shared)
+            right = peer.sample(Random(73), 4, version, seed=41, targets=shared)
+            self.assertEqual(left.valid.size(1) > 8, right.valid.size(1) > 8)
+            observed_buckets.add(left.valid.size(1) > 8)
+        self.assertEqual(observed_buckets, {False, True})
+
+        fallback = peer.sample(Random(55), 4, 4, seed=41, targets={(2, 14): 1})
+        self.assertLessEqual(fallback.valid.size(1), 8)
+
+        recent = _Buffer(decisions * 2, 100)
+        recent.add(batch, 50)
+        recent.add(replace(batch, version=50, utility=-batch.utility), 50)
+        sample = recent.sample(Random(55), 200, 50, targets={(1, 14): 1})
+        fresh = int((sample.reward[:, -1] == 1).sum())
+        self.assertGreater(fresh, 180)
+        self.assertLess(fresh, 200)
+
+    def test_published_revision_does_not_change_live_stream_actions(self):
+        plan = CollectPlan(player_counts=(1, 2), curriculum_share=0, champion_share=0, batch_decisions=1, uniform_mix=0)
+        old, new = (GameTransformer(TINY, SCHEMA) for _ in range(2))
+        for action, network in enumerate((old, new)):
+            with torch.no_grad():
+                for param in network.parameters():
+                    param.zero_()
+                network.policy.bias[action] = 100
+        emitted = []
+        persist = Trajectories.save
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "latest-model.pt"
+
+            def publish(network, version):
+                save_checkpoint(path, network, self.game.to_dict(), {
+                    "version": version, "run_id": RUN_ID, "plan": plan.to_dict(),
+                })
+
+            def on_save(batch, destination):
+                persist(batch, destination)
+                emitted.append(Trajectories.load(destination))
+                if len(emitted) == 1:
+                    publish(new, 1)
+
+            publish(old, 0)
+            with patch.object(Trajectories, "save", on_save):
+                report = collect(root / "inbox", path, worker=2, tables=2, max_batches=3)
+        self.assertEqual(report, {"batches": 3, "episodes": 3, "decisions": 8})
+        self.assertEqual([row.version for row in emitted], [0, 0, 1])
+        self.assertEqual([row.players.tolist() for row in emitted], [[1], [2, 2], [1]])
+        self.assertEqual([row.action[0].item() for row in emitted], [0, 0, 1])
+        self.assertEqual(emitted[1].action[2].item(), 0)
+
+    def test_champion_deals_cover_both_roles_and_every_focal_seat(self):
+        plan = CollectPlan(player_counts=(1, 4), curriculum_share=0, champion_share=1)
+        deals = list(islice(plan.deals("roles"), 256))
+        self.assertEqual({d.seats for d in deals if d.players == 1}, {(0,)})
+        self.assertEqual({d.seats for d in deals if d.players == 4}, {
+            tuple(focal_role if seat == focal else 1 - focal_role for seat in range(4))
+            for focal in range(4) for focal_role in range(2)
+        })
+        self.assertEqual({d.seats for d in islice(replace(plan, champion_share=0).deals("roles"), 8)},
+                         {(0,), (0, 0, 0, 0)})
+        for value in (True, -0.1, 1.1, float("nan")):
+            with self.assertRaisesRegex(ValueError, "champion_share"):
+                replace(plan, champion_share=value)
+
+    def test_rank_collector_reloads_champion_and_emits_only_learner_traces(self):
+        plan = CollectPlan(player_counts=(2,), curriculum_share=0, champion_share=0, batch_decisions=1, uniform_mix=1)
+        model = GameTransformer(TINY, SCHEMA)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+            model.value.bias.fill_(0.375)
+        observed, emitted = [], []
+        persist = Trajectories.save
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rank-2" / "latest-model.pt"
+            path.parent.mkdir()
+
+            def publish(target, version, share, bias):
+                with torch.no_grad():
+                    model.policy.bias.fill_(bias)
+                save_checkpoint(target, model, self.game.to_dict(), {
+                    "version": version, "run_id": RUN_ID, "plan": replace(plan, champion_share=share).to_dict(),
+                })
+
+            def play(deals, admit, game, **kwargs):
+                def inspect(deal):
+                    policies = admit(deal)
+                    observed.append(tuple(float(p.network.policy.bias[0].detach()) for p in policies))
+                    return policies
+
+                return run_matches(deals, inspect, game, **kwargs)
+
+            def on_save(batch, destination):
+                persist(batch, destination)
+                emitted.append(Trajectories.load(destination))
+                if len(emitted) == 1:
+                    publish(path, 1, 1, 3)
+                elif len(emitted) in (2, 3):
+                    target = root / "best-model.pt"
+                    previous = target.stat() if target.exists() else None
+                    publish(target, 0, 1, 3 + len(emitted))
+                    if previous is not None:
+                        self.assertNotEqual(target.stat().st_mtime_ns, previous.st_mtime_ns)
+
+            publish(path, 0, 0, 2)
+            with patch("src.training.train.run_matches", play), patch.object(Trajectories, "save", on_save):
+                report = collect(root / "inbox", path, worker=2, tables=1, precision="fp32", max_batches=4)
+        self.assertEqual(observed, [(2,), (3, 3), (3, 5), (3, 6)])
+        self.assertEqual(report, {"batches": 4, "episodes": 4, "decisions": 10})
+        self.assertEqual([row.players.tolist() for row in emitted], [[2, 2], [2], [2], [2]])
+        for row in emitted:
+            torch.testing.assert_close(row.behavior_value, torch.full_like(row.behavior_value, 0.375))
+            count = torch.tensor([mask.bit_count() for mask in row.legal.tolist()])
+            torch.testing.assert_close(row.behavior_logp, -count.float().log())
+
+    def test_warmup_applies_before_the_first_update_and_reaches_base_rate(self):
+        net = GameTransformer(TINY, SCHEMA)
+        policy = TransformerPolicy(net, self.game, sample=True, record=True)
+        results = list(run_matches((Deal(9, (0,)),), (policy,), self.game))
+        rollouts = Trajectories.from_results(results, 0, RUN_ID)
+        buffer = _Buffer(64, 10)
+        buffer.add(rollouts, 0)
+        batch = buffer.sample(Random(55), 1, 0, seed=41)
+        cfg = TrainConfig(game=self.game, precision="fp32", learning_rate=0.003, warmup_steps=3)
+        reference = GameTransformer(TINY, SCHEMA)
+        reference.load_state_dict(net.state_dict())
+        warm = Learner(net, cfg)
+        cold = Learner(reference, replace(cfg, learning_rate=0.001, warmup_steps=0))
+        cold.update(batch)
+        for version, lr in enumerate((0.001, 0.002, 0.003, 0.003), 1):
+            warm.update(batch)
+            self.assertEqual(warm.version, version)
+            self.assertAlmostEqual(warm.optimizer.param_groups[0]["lr"], lr)
+            if version == 1:
+                for actual, expected in zip(net.parameters(), reference.parameters()):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-8)
+        for value in (-1, 1.0, True):
+            with self.assertRaisesRegex(ValueError, "warmup_steps"):
+                replace(cfg, warmup_steps=value)
+
+    def test_mastery_updates_collection_only_at_the_threshold(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            trainer = Trainer.open(root, {
+                "game": self.game.to_dict(), "auto_curriculum": True, "torch_threads": 1,
+            }, spec=TINY)
+
+            def evaluate(wins):
+                def play(deals, policies, game, **kwargs):
+                    self.assertEqual([deal.curriculum for deal in deals], [1] * 48)
+                    penalty = SimpleNamespace(qualifying_sequences=4)
+                    for i in range(len(deals)):
+                        yield SimpleNamespace(winner=0 if i < wins else None,
+                                              outcome=SimpleNamespace(penalties=(penalty,)))
+
+                with patch("src.training.train.run_matches", play):
+                    return trainer.evaluate()["curriculum"]
+
+            missed = evaluate(3)
+            self.assertEqual((missed["next_distance"], missed["next_share"]), (1, 0.88))
+            passed = evaluate(4)
+            self.assertEqual((passed["next_distance"], passed["next_share"], passed["mean_qualifying_sequences"]),
+                             (2, 0.82, 4))
+            self.assertEqual(trainer.curriculum_history, [passed])
+            winner = load_checkpoint(root / "best-model.pt", SCHEMA)
+            self.assertEqual(winner.meta["plan"]["curriculum_max_distance"], 2)
+
+    def test_competitive_promotion_uses_weighted_outcomes_and_saves_the_anchor(self):
+        cases = (
+            ((0.51, 0.51), (3, -1), False),
+            ((0.49, 0.50), (2, 2), False),
+            ((0.47, 0.515), (2, 2), False),
+            ((0.47, 0.61), (-1, -2), True),
+            ((0.50, 0.51), (-2, 1), True),
+        )
+        for scores, points, promoted in cases:
+            def match(candidate, best, game, players, deals, seed, **kwargs):
+                i = (2, 4).index(players)
+                return HeadToHead(
+                    players, deals, deals * (2 if players == 2 else 8), scores[i], points[i], 0,
+                    0, 0, None, 25, None, 25, deals * (2 if players == 2 else 24), deals * players**2,
+                )
+
+            with self.subTest(scores=scores, points=points), TemporaryDirectory() as directory:
+                root = Path(directory)
+                game = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=1)
+                trainer = Trainer.open(root, {
+                    "game": game.to_dict(), "auto_curriculum": True, "torch_threads": 1,
+                    "plan": {"player_counts": (1, 2, 4), "curriculum_max_distance": 3},
+                    "promote_margin": 0.02,
+                }, spec=TINY)
+                trainer.learner.version = 2
+                initial = trainer.learner.anchor.value.bias.detach().clone()
+                with torch.no_grad():
+                    trainer.learner.online.value.bias.fill_(3)
+                with patch("src.training.train.head_to_head", match):
+                    result = trainer.evaluate()
+                self.assertEqual(result["promoted"], promoted)
+                self.assertEqual([(row["players"], row["score"]) for row in result["best"]],
+                                 list(zip((2, 4), scores)))
+                best = load_checkpoint(root / "best-model.pt", SCHEMA)
+                self.assertEqual(best.version, 2 if promoted else 0)
+                state = torch.load(root / "latest-state.pt", weights_only=True)
+                self.assertEqual(state["learner"]["version"], 2 if promoted else 0)
+                expected = torch.full_like(initial, 3) if promoted else initial
+                torch.testing.assert_close(state["learner"]["anchor"]["value.bias"], expected)
+
+    def test_collector_adopts_new_curriculum_on_new_deals(self):
+        plan = CollectPlan(player_counts=(1,), curriculum_share=0, batch_decisions=1)
+        model = GameTransformer(TINY, SCHEMA)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_path = root / "latest-model.pt"
+            persist = Trajectories.save
+
+            def publish(version, share):
+                save_checkpoint(model_path, model, self.game.to_dict(), {
+                    "version": version, "run_id": RUN_ID,
+                    "plan": replace(plan, curriculum_share=share, curriculum_max_distance=1).to_dict(),
+                })
+
+            def on_save(batch, destination):
+                persist(batch, destination)
+                if batch.version == 0:
+                    publish(1, 1)
+
+            observed = []
+
+            def play(deals, policies, game, **kwargs):
+                def record():
+                    for deal in deals:
+                        observed.append(deal.curriculum)
+                        yield deal
+
+                return run_matches(record(), policies, game, **kwargs)
+
+            publish(0, 0)
+            with patch("src.training.train.run_matches", play), patch.object(Trajectories, "save", on_save):
+                collect(root / "inbox", model_path, worker=0, tables=1, max_batches=3)
+        self.assertEqual(observed[0], None)
+        self.assertTrue(all(0 <= distance <= 1 for distance in observed[1:]), observed)
+
+    def test_external_collection_and_cold_evaluation_survive_resume(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            trainer = Trainer.open(root, {
+                "game": self.game.to_dict(), "plan": {"batch_decisions": 6, "curriculum_share": 0.0},
+                "actors": 0, "tables": 2, "torch_threads": 1, "batch_size": 2,
+                "min_buffer_decisions": 2, "eval_every": 1, "eval_deals": 1, "anchor_every": 2,
+            }, spec=TINY)
+            for version, last_eval in ((1, 1), (2, 1), (3, 3)):
+                result = collect(trainer.inbox, root / "latest-model.pt", worker=35, tables=2, max_batches=1)
+                self.assertEqual(result["batches"], 1)
+                self.assertEqual(trainer.run(max_updates=version, max_seconds=15), "max_updates")
+                state = json.loads((root / "status.json").read_text())
+                self.assertEqual((state["status"], state["version"]), ("max_updates", version))
+                self.assertEqual(state["validation"]["version"], last_eval)
+                self.assertEqual(set(state["validation"]), {"best", "promoted", "version"})
+                self.assertEqual([row["matches"] for row in state["validation"]["best"]], [2, 6, 8])
+                self.assertGreater(state["updates_per_sec"], 0)
+                self.assertEqual(state["trained_decisions"], version * 4)
+                checkpoint = load_checkpoint(root / "latest-model.pt", SCHEMA)
+                self.assertEqual((checkpoint.version, checkpoint.meta["run_id"]), (version, trainer.run_id))
+                self.assertEqual(checkpoint.meta["plan"]["curriculum_share"], 0.0)
+                trainer = Trainer.open(root, {"eval_every": 3} if version == 1 else {})
+                self.assertEqual(trainer.learner.version, version)
+                self.assertEqual(trainer.run_id, checkpoint.meta["run_id"])
+            with self.assertRaisesRegex(ValueError, "cannot change"):
+                Trainer.open(root, {"plan": {"uniform_mix": 0.5}})
