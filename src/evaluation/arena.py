@@ -179,20 +179,21 @@ class _TransformerActor:
             actions = heads.log_policy.argmax(-1).tolist()
             logps = [0.0] * len(actions)
         values = heads.value.tolist() if self.policy.record else None
-        for i, (stream, row, action, logp) in enumerate(zip(streams, encoded, actions, logps)):
+        for i, (turn, stream, row, action, logp) in enumerate(zip(turns, streams, encoded, actions, logps)):
             stream.events = row.events
-            if stream.trace is not None:
-                obs = turns[i].observation
-                stream.trace.prefix.extend(row.prefix)
-                stream.trace.suffix.extend(row.suffix)
-                stream.trace.cut.append(row.cut)
-                stream.trace.legal.append(row.legal)
-                stream.trace.action.append(action)
-                stream.trace.logp.append(logp)
-                stream.trace.potential.append(hand_potential(
+            trace = stream.trace
+            if trace is not None:
+                obs = turn.observation
+                trace.prefix.extend(row.prefix)
+                trace.suffix.extend(row.suffix)
+                trace.cut.append(row.cut)
+                trace.legal.append(row.legal)
+                trace.action.append(action)
+                trace.logp.append(logp)
+                trace.potential.append(hand_potential(
                     obs.hand, obs.joker, obs.config.required_sequences, obs.config.cards_in_hand,
                 ))
-                stream.trace.value.append(values[i])
+                trace.value.append(values[i])
         return actions
 
     def finish(self, stream: int) -> SeatTrace | None:

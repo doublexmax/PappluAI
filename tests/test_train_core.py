@@ -2,6 +2,7 @@ from collections import Counter
 from dataclasses import replace
 from itertools import islice
 import json
+import os
 from pathlib import Path
 from random import Random
 from tempfile import TemporaryDirectory
@@ -145,6 +146,24 @@ class TestTrainingCore(unittest.TestCase):
         self.assertEqual(len(buffer), 0)
         self.assertFalse(buffer.add(batch, 11))
 
+    def test_inbox_loads_newest_batches_and_drops_the_oldest_excess(self):
+        with TemporaryDirectory() as directory:
+            trainer = Trainer.open(Path(directory), {
+                "game": self.game.to_dict(), "actors": 1, "torch_threads": 1,
+            }, spec=TINY)
+            policy = TransformerPolicy(trainer.learner.online, self.game, record=True)
+            results = list(run_matches((Deal(9, (0,), curriculum=0),), (policy,), self.game))
+            trainer.learner.version = 18
+            for version in range(19):
+                path = trainer.inbox / f"batch-{version}.pt"
+                Trajectories.from_results(results, version, trainer.run_id).save(path)
+                os.utime(path, (version + 1, version + 1))
+            trainer._ingest()
+            self.assertEqual([chunk.version for chunk in trainer.buffer.chunks], list(range(18, 10, -1)))
+            self.assertEqual({path.name for path in trainer.inbox.iterdir()},
+                             {f"batch-{version}.pt" for version in range(3, 11)})
+            self.assertEqual(trainer.dropped_batches, 3)
+
     def test_buckets_keep_short_trajectories_separate_and_only_pad_after_terminal(self):
         lengths = (1, 8, 120)
         decisions = sum(lengths)
@@ -194,6 +213,14 @@ class TestTrainingCore(unittest.TestCase):
 
         fallback = peer.sample(Random(55), 4, 4, seed=41, targets={(2, 14): 1})
         self.assertLessEqual(fallback.valid.size(1), 8)
+
+        recent = _Buffer(decisions * 2, 100)
+        recent.add(batch, 50)
+        recent.add(replace(batch, version=50, utility=-batch.utility), 50)
+        sample = recent.sample(Random(55), 200, 50, targets={(1, 14): 1})
+        fresh = int((sample.reward[:, -1] == 1).sum())
+        self.assertGreater(fresh, 180)
+        self.assertLess(fresh, 200)
 
     def test_published_revision_does_not_change_live_stream_actions(self):
         plan = CollectPlan(player_counts=(1, 2), curriculum_share=0, champion_share=0, batch_decisions=1, uniform_mix=0)
@@ -347,38 +374,45 @@ class TestTrainingCore(unittest.TestCase):
             winner = load_checkpoint(root / "best-model.pt", SCHEMA)
             self.assertEqual(winner.meta["plan"]["curriculum_max_distance"], 2)
 
-    def test_completed_curriculum_promotes_only_when_all_competitive_gates_pass(self):
+    def test_competitive_promotion_uses_weighted_outcomes_and_saves_the_anchor(self):
         cases = (
-            ((0.51, 0.51), (2, 2), False),
-            ((0.56, 0.57), (1, -2), False),
-            ((0.47, 0.61), (0, 0), False),
-            ((0.51, 0.55), (-1, 1), True),
+            ((0.51, 0.51), (3, -1), False),
+            ((0.49, 0.50), (2, 2), False),
+            ((0.47, 0.515), (2, 2), False),
+            ((0.47, 0.61), (-1, -2), True),
+            ((0.50, 0.51), (-2, 1), True),
         )
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            game = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=1)
-            trainer = Trainer.open(root, {
-                "game": game.to_dict(), "auto_curriculum": True, "torch_threads": 1,
-                "plan": {"player_counts": (1, 2, 4), "curriculum_max_distance": 3},
-            }, spec=TINY)
-            trainer.learner.version = 2
-            for scores, points, promoted in cases:
-                def match(candidate, best, game, players, deals, seed, **kwargs):
-                    i = (2, 4).index(players)
-                    return HeadToHead(
-                        players, deals, deals * (2 if players == 2 else 8), scores[i], points[i], 0,
-                        0, 0, None, 25, None, 25, deals * (2 if players == 2 else 24), deals * players**2,
-                    )
+        for scores, points, promoted in cases:
+            def match(candidate, best, game, players, deals, seed, **kwargs):
+                i = (2, 4).index(players)
+                return HeadToHead(
+                    players, deals, deals * (2 if players == 2 else 8), scores[i], points[i], 0,
+                    0, 0, None, 25, None, 25, deals * (2 if players == 2 else 24), deals * players**2,
+                )
 
-                with self.subTest(scores=scores, points=points), patch("src.training.train.head_to_head", match):
+            with self.subTest(scores=scores, points=points), TemporaryDirectory() as directory:
+                root = Path(directory)
+                game = GameConfig(cards_in_hand=3, required_sequences=1, max_turns=1)
+                trainer = Trainer.open(root, {
+                    "game": game.to_dict(), "auto_curriculum": True, "torch_threads": 1,
+                    "plan": {"player_counts": (1, 2, 4), "curriculum_max_distance": 3},
+                    "promote_margin": 0.02,
+                }, spec=TINY)
+                trainer.learner.version = 2
+                initial = trainer.learner.anchor.value.bias.detach().clone()
+                with torch.no_grad():
+                    trainer.learner.online.value.bias.fill_(3)
+                with patch("src.training.train.head_to_head", match):
                     result = trainer.evaluate()
-                    self.assertEqual(result["promoted"], promoted)
-                    self.assertEqual([(row["players"], row["score"]) for row in result["best"]],
-                                     list(zip((2, 4), scores)))
-                    best = load_checkpoint(root / "best-model.pt", SCHEMA)
-                    self.assertEqual(best.version, 2 if promoted else 0)
-                    state = torch.load(root / "latest-state.pt", weights_only=True)
-                    self.assertEqual(state["learner"]["version"], 2 if promoted else 0)
+                self.assertEqual(result["promoted"], promoted)
+                self.assertEqual([(row["players"], row["score"]) for row in result["best"]],
+                                 list(zip((2, 4), scores)))
+                best = load_checkpoint(root / "best-model.pt", SCHEMA)
+                self.assertEqual(best.version, 2 if promoted else 0)
+                state = torch.load(root / "latest-state.pt", weights_only=True)
+                self.assertEqual(state["learner"]["version"], 2 if promoted else 0)
+                expected = torch.full_like(initial, 3) if promoted else initial
+                torch.testing.assert_close(state["learner"]["anchor"]["value.bias"], expected)
 
     def test_collector_adopts_new_curriculum_on_new_deals(self):
         plan = CollectPlan(player_counts=(1,), curriculum_share=0, batch_decisions=1)

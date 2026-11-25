@@ -40,7 +40,7 @@ LENGTH_BUCKET = 8
 DISCOUNT = 0.995
 TUNABLE = {
     "actors", "tables", "torch_threads", "actor_threads", "device", "precision", "checkpoint_every",
-    "learning_rate", "eta", "sync_every", "eval_every", "plan",
+    "learning_rate", "eta", "sync_every", "eval_every", "plan", "batch_size", "unroll_steps",
 }
 LIVE_PLAN = ("curriculum_share", "curriculum_max_distance", "champion_share")
 TUNABLE_PLAN = ("player_counts", *LIVE_PLAN)
@@ -125,7 +125,7 @@ class TrainConfig:
     device: str = "cpu"
     precision: str = "bf16"
     batch_size: int = 8
-    unroll_steps: int = 12
+    unroll_steps: int = 20
     buffer_decisions: int = 400_000
     min_buffer_decisions: int = 20_000
     max_policy_lag: int = 200
@@ -627,8 +627,12 @@ class _Buffer:
         if not any(key in chunk.buckets for chunk in self.chunks):
             players, length = key
             key = min(self.bucket_sizes(), key=lambda k: (abs(k[0] - players), abs(k[1] - length), k))
-        group = [seat for chunk in self.chunks for seat in chunk.buckets.get(key, ())]
-        return TrajectoryBatch.pack(tuple(rng.choices(group, k=batch_size)))
+        group, weights = [], []
+        for chunk in self.chunks:
+            seats = chunk.buckets.get(key, ())
+            group.extend(seats)
+            weights.extend([1.0 / (1 + max(0, step_version - chunk.version))] * len(seats))
+        return TrajectoryBatch.pack(tuple(rng.choices(group, weights=weights, k=batch_size)))
 
 
 @torch.no_grad()
@@ -810,12 +814,15 @@ class Learner:
             torch.zeros_like(value), batch.reward, batch.discount,
             value, value.new_zeros(value.size(0)), rho_bar=1.0, c_bar=config.c_bar,
         )
-        targets, advantage = (sample.gather(tensor).to(device) for tensor in (targets, advantage))
+        targets, advantage, behavior_value = (
+            sample.gather(tensor).to(device) for tensor in (targets, advantage, value)
+        )
         self.online.train()
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config.precision == "bf16"):
             heads = self.online.unroll(tokens)
             with torch.no_grad():
                 log_anchor = self.anchor.unroll(tokens).log_policy
+        advantage = advantage + behavior_value - heads.value.detach()
         legal, log_pi = tokens.legal, heads.log_policy
         taken = log_pi.gather(-1, action.unsqueeze(-1)).squeeze(-1)
         ratio = taken.detach() - behavior
@@ -1002,13 +1009,17 @@ class Trainer:
             for players in counts
         ]
         margin = cfg.promote_margin
+        mean_score = sum(row.score * row.comparisons for row in rows) / sum(row.comparisons for row in rows)
+        mean_net = math.fsum(row.net_points * row.seats_per_policy for row in rows) / sum(
+            row.seats_per_policy for row in rows
+        )
         promote = (
-            sum(row.score for row in rows) / len(rows) >= 0.5 + margin
-            and math.fsum(row.net_points for row in rows) >= 0.0
-            and min(row.score for row in rows) >= 0.5 - margin
+            mean_score >= 0.5 + margin
+            or (mean_score > 0.5 and mean_net >= 0.0 and min(row.score for row in rows) >= 0.5 - margin)
         )
         self.validation = {"best": [asdict(row) for row in rows], "promoted": promote, "version": self.learner.version}
         if promote:
+            self.learner.refresh_anchor()
             self._save()
             self.export_model(best_path)
         return self.validation
@@ -1050,8 +1061,9 @@ class Trainer:
     def _ingest(self) -> None:
         version = self.learner.version
         self.buffer.prune(version)
-        files = sorted(self.inbox.glob("batch-*.pt"), key=lambda path: path.stat().st_mtime_ns)
-        for path in files[:max(6, self.config.actors)]:
+        files = sorted(self.inbox.glob("batch-*.pt"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        ingest_limit = max(OUTBOX_LIMIT, self.config.actors)
+        for path in files[:ingest_limit]:
             try:
                 batch = Trajectories.load(path)
                 lengths = batch.decision_end.diff(prepend=batch.decision_end.new_zeros(1))
@@ -1072,6 +1084,9 @@ class Trainer:
             else:
                 self.dropped_batches += 1
             path.unlink()
+        for path in files[ingest_limit + OUTBOX_LIMIT:]:
+            path.unlink()
+            self.dropped_batches += 1
 
     def _local_progress(self) -> dict[str, int]:
         return {
@@ -1195,6 +1210,8 @@ class Trainer:
                     break
                 if step == _Step.UPDATE:
                     for version in range(before, before + steps):
+                        if version > before:
+                            self._ingest()
                         rng = Random(f"{cfg.seed}:{self.group.rank}:{version}") if post_local else self.rng
                         batch = self.buffer.sample(rng, cfg.batch_size, version, seed=cfg.seed, targets=targets)
                         stats = self.learner.update(batch, skip_grad_sync=post_local)
@@ -1213,18 +1230,21 @@ class Trainer:
                     if cfg.eval_every and version // cfg.eval_every > before // cfg.eval_every:
                         if self.group.size > 1:
                             dist.barrier()
+                        promoted = False
                         if primary and not stopping():
                             try:
-                                self.evaluate(stop=stopping)
+                                validation = self.evaluate(stop=stopping)
+                                promoted = "best" in validation and validation["promoted"]
                             except Exception as exc:
                                 if not isinstance(exc, InterruptedError) or not stopping():
                                     eval_error = exc
-                        if cfg.auto_curriculum:
-                            shared = self.group.share(self.config.plan.to_dict() if primary else None)
+                        if self.group.size > 1:
+                            shared = self.group.share((self.config.plan.to_dict(), promoted) if primary else None)
                             if not primary:
-                                self.config = replace(self.config, plan=CollectPlan.from_dict(shared))
-                        elif self.group.size > 1:
-                            dist.barrier()
+                                plan, promoted = shared
+                                self.config = replace(self.config, plan=CollectPlan.from_dict(plan))
+                                if promoted:
+                                    self.learner.refresh_anchor()
                     publish |= self.config.plan != previous_plan
                     if publish:
                         self.export_model(self.model_path)

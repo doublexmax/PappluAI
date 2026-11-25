@@ -163,19 +163,19 @@ The evaluator does not mutate its inputs.
 
 `GameTransformer` in [`src/model/`](src/model/) is the repository's only neural model. The latest promoted save is `locked-gt.pt`. Earlier saves are checkpoints of the same model at different points in training. The default model has 2,175,224 parameters. It uses checkpoint format 6 and token schema 8. Self-play samples the masked 0-ply policy and trains with V-trace. New runs use rollout format 6 and trainer state version 19.
 
-`python -m src.cli.arena --league` compares checkpoints on the same cold deals with mirrored seats. It reports Bradley-Terry Elo and zero-sum net deadwood points per seat at two, three, and four players by default. No reference bots play in the league. After the optional solo curriculum, the trainer uses the same matchup rules to decide whether to promote `best-model.pt`.
+`python -m src.cli.arena --league` compares checkpoints on the same cold deals with mirrored seats. It reports Bradley-Terry Elo and zero-sum net deadwood points per seat at two, three, and four players by default. No reference bots play in the league. After the optional solo curriculum, the trainer weighs cold results by cross-policy comparisons and refreshes the learner's KL anchor when it promotes `best-model.pt`.
 
-The 0-ply holdout league ran 8,640 cold matches on seed `1_200_000`. The untrained checkpoint anchors Elo at 1,000.
-The separate `700_000` selection league locked **Cluster 0-ply zero-sum** before either holdout. The weights and matching version 19 AdamW state are `locked-gt.pt` and `locked-gt-state.pt`.
+A seed `800_000` league selected **Stage 1** as `locked-gt.pt` before the cold holdouts.
+The seed `1_600_000` league ran 7,680 mirrored matches. Its untrained checkpoint anchors Elo at 1,000.
 
-| Training milestone | Overall Elo | 2p Elo | 3p Elo | 4p Elo | Net deadwood per seat | Declarations per seat |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Untrained (rev 0) | 1000.0 | 1000.0 | 1000.0 | 1000.0 | -42.11 | 0.16% |
-| Potential and subsampling | 1344.3 | 1273.4 | 1343.6 | 1351.3 | -12.37 | 6.98% |
-| Cluster cold play | 1439.0 | 1450.8 | 1412.2 | 1452.8 | +4.81 | 12.74% |
-| AdamW resume | 1458.9 | 1435.2 | 1433.8 | 1474.7 | +7.35 | 13.79% |
-| Single-VM 0-ply gate | 1526.8 | 1522.5 | 1510.4 | 1536.7 | +19.83 | 19.12% |
-| Cluster 0-ply zero-sum | 1566.0 | 1526.6 | 1549.0 | 1579.1 | +22.49 | 20.86% |
+| Checkpoint | Elo | Net deadwood per seat | Declarations per seat |
+| --- | ---: | ---: | ---: |
+| Learning-fix candidate | 1554.8 | +22.05 | 21.88% |
+| Cluster 0-ply zero-sum | 1545.7 | +20.39 | 19.65% |
+| Single-VM 0-ply gate | 1520.1 | +14.76 | 16.99% |
+| AdamW resume | 1442.0 | +3.27 | 12.34% |
+| Potential and subsampling | 1327.0 | -15.65 | 6.88% |
+| Untrained (rev 0) | 1000.0 | -44.82 | 0.12% |
 
 See the [training guide](TRAINING.md) for commands, defaults, and the token layout.
 

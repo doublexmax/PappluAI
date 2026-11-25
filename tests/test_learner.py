@@ -77,6 +77,25 @@ class TestLearner(unittest.TestCase):
             model.policy.bias.grad[2:6], torch.tensor([-credit, credit, 1.0, -1.0]) / 4,
         )
 
+    def test_policy_gradient_centers_return_on_the_current_critic(self):
+        model = GameTransformer(ModelSpec(16, 1, 2, 32), SCHEMA)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+            model.value.bias.fill_(0.75)
+        learner = Learner(model, TrainConfig(precision="fp32", entropy_weight=0, grad_clip=1000))
+        row = _SeatTrajectory(
+            torch.ones(1, SCHEMA.fields, dtype=torch.uint8),
+            torch.ones(1, SCHEMA.suffix_tokens, SCHEMA.fields, dtype=torch.uint8),
+            torch.tensor([1]), torch.tensor([12]), torch.tensor([2]),
+            torch.full((1,), -math.log(2)), torch.tensor(0.5),
+            torch.zeros(1), torch.tensor([-0.5]),
+        )
+        stats = learner.update(TrajectoryBatch.pack((row,)))
+        self.assertAlmostEqual(stats.policy_loss, -0.25 * math.log(2), places=6)
+        torch.testing.assert_close(model.policy.bias.grad[2:4], torch.tensor([0.125, -0.125]))
+        torch.testing.assert_close(model.value.bias.grad, torch.tensor([0.25]))
+
     def test_on_policy_terminal_reward_reaches_the_first_decision(self):
         values, _ = vtrace(
             torch.zeros((2, 4)), torch.tensor([[0.0, 0.0, 0.0, 1.0], [0.0, -1.0, 0.0, 0.0]]),

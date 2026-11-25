@@ -70,6 +70,7 @@ class TestHandPotential(unittest.TestCase):
         self.assertEqual(score(0, 1, 12), 0.09375)
         self.assertEqual(score(0, 11), 0.09375)
         self.assertEqual(score(10, 10), 0.09375)
+        self.assertEqual(score(1, 1, 3, 5), 0.1875)
         self.assertEqual(score(joker, joker, joker), 0.375)
         self.assertEqual(score(1, 3, 16, 18, joker), 0.46875)
         self.assertEqual(score(1, 3, 16, 18, joker, joker), 0.75)
@@ -111,7 +112,7 @@ class TestHandPotential(unittest.TestCase):
             def visit(left, needed):
                 if not needed:
                     return 0, pack(left, tuple(other), extra_limit)
-                best = (0, pack(left, tuple(pairs), needed))
+                best = (0, pack(left, tuple(pairs), needed + extra_limit))
                 for take in pure:
                     if left & take == take:
                         q, residual = visit(left ^ take, needed - 1)
@@ -119,9 +120,29 @@ class TestHandPotential(unittest.TestCase):
                 return best
 
             q, residual = visit((1 << n) - 1, quota)
-            expected = 0.75 * (20 * q + (4 if q == quota else 5) * residual) / (20 * quota + 4 * extra_limit)
+            needed = quota - q
+            points = 20 * q + (
+                5 * min(residual, needed) + 2 * max(0, residual - needed) if needed else 4 * residual
+            )
+            expected = 0.75 * points / (20 * quota + 4 * extra_limit)
             with self.subTest(cards=cards, quota=quota):
                 self.assertEqual(hand_potential(from_cards(cards), joker, quota, n), expected)
+
+    def test_pairs_beyond_quota_fill_two_extra_meld_slots(self):
+        faces = (1, 5, 9, 14, 18, 22, 27, 31)
+        for pairs, points in ((5, 25), (6, 27), (7, 29), (8, 29)):
+            hand = from_cards(faces[:pairs] * 2)
+            with self.subTest(pairs=pairs):
+                self.assertEqual(hand_potential(hand, JOKER_8S), 0.75 * points / 108)
+
+    def test_drawn_hand_scores_the_best_discard(self):
+        cards = (1, 2, 14, 15, 16, 43)
+        held = from_cards(cards)
+        improved = from_cards((*cards, 3))
+        unwanted = from_cards((*cards, 34))
+        self.assertEqual(hand_potential(held, JOKER_8S, 2, 6), 0.46875)
+        self.assertEqual(hand_potential(unwanted, JOKER_8S, 2, 6), 0.46875)
+        self.assertEqual(hand_potential(improved, JOKER_8S, 2, 6), 0.75)
 
 
 class TestEvaluateValid(unittest.TestCase):

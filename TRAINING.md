@@ -57,9 +57,9 @@ Self-play no longer uses 1-ply lookahead or learns from expert targets. Actors s
 
 `--champion-share` defaults to `0.25`. On that fraction of multiplayer deals the online learner plays against `best-model.pt`. One side gets a uniformly chosen seat and the other side gets the rest. The learner is equally likely to be either side. The champion samples without uniform exploration and contributes no training data. The collector loads a new champion for new tables when the file changes. If the file is absent, a non-recording copy of the current policy role fills its seats. Solo deals always use the learner.
 
-The learner computes targets over the entire seat trajectory from the recorded behavior values. The V-trace target recurrence uses a unit ratio, discount `0.995`, trace cap `0.85`, and zero terminal bootstrap. The sampled policy-gradient terms use the actual clipped online-to-behavior likelihood ratio. The full-trajectory targets do not reevaluate the current policy on omitted steps.
+The learner computes targets over the entire seat trajectory from the recorded behavior values. The V-trace target recurrence uses a unit ratio, discount `0.995`, trace cap `0.85`, and zero terminal bootstrap. For each sampled decision, the policy advantage subtracts the current learner value from the V-trace one-step return. The policy gradient uses the clipped online-to-behavior likelihood ratio. The full-trajectory targets do not reevaluate the current policy on omitted steps.
 
-The hand potential counts up to the required number of disjoint qualifying triples. Below quota, disjoint natural pairs count for one quarter of a triple. At quota, disjoint extra three-card melds count for one fifth of a triple. Neither rule uses card point values. The learner adds `0.995 * next_potential - current_potential` to each nonterminal reward and subtracts the last potential from the terminal utility. The terminal state's potential is zero. Discounted return differs from the unshaped return by the starting potential alone. The scoreboard still uses exact deadwood.
+The hand potential counts up to the required number of disjoint qualifying triples. Below quota, a natural pair counts for one quarter of a triple toward the quota or one tenth toward an extra meld slot. At quota, a disjoint extra three-card meld counts for one fifth of a triple. When a hand has more than `cards_in_hand` cards, the potential maximizes over removing one copy of any held face. Neither rule uses card point values. The learner adds `0.995 * next_potential - current_potential` to each nonterminal reward and subtracts the last potential from the terminal utility. The terminal state's potential is zero. Discounted return differs from the unshaped return by the starting potential alone. The scoreboard still uses exact deadwood.
 
 Solo pays `+1` for a declaration and `-1 + 0.60 * f` on a timeout. The fraction `f` is the share of the pure sequence quota recorded by `HandPenalty.qualifying_sequences`, capped at 1. A zero quota gives `f = 1`.
 
@@ -72,11 +72,11 @@ In multiplayer, let `n` be the number of seats and `scale = max_points * (n - 1)
 
 The trainer uses payoffs that sum to exactly zero in floating point. A declaration win pays at least `0.65`. A timeout pays at most `0.475`. Equal hands expire at zero, which is better than a declaration loss at any supported player count.
 
-The learner drops data more than `--max-policy-lag` revisions old. The default lag limit is 200. Each rank samples `--batch-size` trajectories with replacement from one player-count and length bucket. The default batch size is eight. A bucket's weight is its trajectory count. Each trajectory has equal weight in the policy, value, and anchor KL losses. For each trajectory the learner unrolls up to `--unroll-steps` decisions, 12 by default. For longer trajectories it keeps the terminal decision and samples the other positions without replacement. Inverse inclusion weights preserve the expected full-trajectory mean. `trained_decisions` counts the positions that reach the model, not all positions used to compute targets.
+The learner drops data more than `--max-policy-lag` revisions old. The default lag limit is 200. It ingests the newest inbox files first on each update and keeps at most eight files from the unprocessed backlog. Each rank samples `--batch-size` trajectories with replacement from one player-count and length bucket. The default batch size is eight. A bucket's weight is its trajectory count. Inside the bucket, a trajectory's sampling weight is `1 / (1 + policy_lag)`. Each sampled trajectory has equal weight in the losses. The learner unrolls up to `--unroll-steps` decisions per trajectory, 20 by default. You can change both settings on resume. For longer trajectories the learner keeps the terminal decision and samples the other positions without replacement. Inverse inclusion weights preserve the expected full-trajectory mean. `trained_decisions` counts the positions that reach the model, not all positions used to compute targets.
 
 The default learning rate is `5e-4`. AdamW uses `learning_rate * min(1, (version + 1) / warmup_steps)` before each update when `--warmup-steps` is positive. The default is 50 updates. Use `--warmup-steps 0` for the full rate from the first update. A run started with `--initial-model` starts at revision zero. A resume keeps the saved revision.
 
-The default anchor weight (`--eta`) is `0.01`. The frozen anchor evaluates the same sampled positions. The default refresh interval (`--anchor-every`) is 2,000 revisions. Training defaults to CPU with BF16 autocast, FP32 master weights, and FP32 loss math. Use `--precision fp32` to disable autocast.
+The default anchor weight (`--eta`) is `0.01`. The frozen anchor evaluates the same sampled positions. The default refresh interval (`--anchor-every`) is 2,000 revisions. Cold validation also refreshes the anchor when it promotes a checkpoint. A candidate qualifies by meeting the comparison-weighted score margin, or by scoring above 50% with nonnegative seat-weighted net deadwood and no player count below the lower margin. Training defaults to CPU with BF16 autocast, FP32 master weights, and FP32 loss math. Use `--precision fp32` to disable autocast.
 
 | File | Contents |
 | --- | --- |
@@ -286,6 +286,28 @@ A win is a valid declaration within 60 turns. The 95% intervals resample paired 
 | Cluster 0-ply zero-sum minus Single-VM 0-ply gate | +6.80 | +2.20 to +11.20 |
 | Cluster 0-ply zero-sum minus AdamW resume | +17.80 | +13.20 to +22.60 |
 | Single-VM 0-ply gate minus AdamW resume | +11.00 | +6.00 to +16.00 |
+
+### Learning updates and cold holdouts
+
+A single 16-vCPU Azure VM resumed the previous locked checkpoint for two 20-minute 0-ply stages.
+Both stages used BF16, 11 actors, 32 tables, batches of 32 trajectories, and up to 20 decisions per trajectory.
+Seed `800_000` selected **Stage 1** over three checkpoints in 1,152 mirrored matches.
+The selected `locked-gt.pt` and its matching `locked-gt-state.pt` were fixed before the holdouts.
+
+The cold league on seed `1_600_000` used 7,680 mirrored matches.
+The untrained checkpoint anchors Elo at 1,000. Positive net deadwood means the checkpoint gained points.
+
+| Checkpoint | Elo | Net deadwood per seat | Declarations per seat |
+| --- | ---: | ---: | ---: |
+| Learning-fix candidate | 1554.8 | +22.05 | 21.88% |
+| Cluster 0-ply zero-sum | 1545.7 | +20.39 | 19.65% |
+| Single-VM 0-ply gate | 1520.1 | +14.76 | 16.99% |
+| AdamW resume | 1442.0 | +3.27 | 12.34% |
+| Potential and subsampling | 1327.0 | -15.65 | 6.88% |
+| Untrained (rev 0) | 1000.0 | -44.82 | 0.12% |
+
+The 0-ply solo holdout used the same 500 cold deals for every checkpoint, starting at seed `1_800_000`.
+Locked checkpoint declared on 287 of 500 deals; Top training stage declared on 287 of 500 deals; Cluster 0-ply zero-sum declared on 277 of 500 deals; Single-VM 0-ply gate declared on 263 of 500 deals.
 
 ## Azure results
 

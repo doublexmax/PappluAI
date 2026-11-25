@@ -30,17 +30,23 @@ def _low_bits(bits: int) -> Iterator[int]:
         bits ^= bit
 
 
+@lru_cache(maxsize=32_768)
 def _linear_pairs(cards: int) -> int:
     pairs = 0
     while cards:
         cards >>= ((cards & -cards).bit_length() - 1) & -8
         copies = cards & 255
         cards ^= copies
-        pairs += copies // 2
         neighbors = cards & 0xffff00
-        if copies & 1 and neighbors:
-            cards -= 1 << (((neighbors & -neighbors).bit_length() - 1) & -8)
+        if neighbors:
+            neighbor = 1 << (((neighbors & -neighbors).bit_length() - 1) & -8)
+            if not copies & 1:
+                run_first = 1 + _linear_pairs(cards + copies - 1 - neighbor)
+                return pairs + max(run_first, copies // 2 + _linear_pairs(cards))
+            copies -= 1
+            cards -= neighbor
             pairs += 1
+        pairs += copies // 2
     return pairs
 
 
@@ -160,8 +166,14 @@ def _extra_potential(suits: tuple[int, ...], joker: int, jokers: int, quota: int
 def hand_potential(
     hand: Sequence[int], joker: int, required_sequences: int = 5, cards_in_hand: int = 21,
 ) -> float:
-    """Score disjoint triples, then pairs below quota or extra melds at quota, without point values."""
+    """Score the best retained hand using disjoint triples and residual melds."""
     counts = bytes(hand)
+    if sum(counts) > cards_in_hand:
+        return max(
+            hand_potential(counts[:face] + bytes((copies - 1,)) + counts[face + 1:],
+                           joker, required_sequences, cards_in_hand)
+            for face, copies in enumerate(counts) if copies
+        )
     jokers = counts[joker]
     suits = tuple(
         int.from_bytes(counts[i:i + NUM_RANKS], "little")
@@ -183,7 +195,9 @@ def hand_potential(
     if not ceiling:
         return 0.0
     if sequences < required_sequences:
-        points = 20 * sequences + 5 * min(pairs, required_sequences - sequences)
+        quota_pairs = min(pairs, required_sequences - sequences)
+        extra_pairs = min(pairs - quota_pairs, extra_limit)
+        points = 20 * sequences + 5 * quota_pairs + 2 * extra_pairs
     else:
         extra = extra_limit if sequences >= required_sequences + extra_limit else _extra_potential(
             suits, joker, jokers, required_sequences, extra_limit,
