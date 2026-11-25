@@ -165,17 +165,17 @@ The evaluator does not mutate its inputs.
 
 `python -m src.cli.arena --league` compares checkpoints on the same cold deals with mirrored seats. It reports Bradley-Terry Elo and zero-sum net deadwood points per seat at two, three, and four players by default. No reference bots play in the league. After the optional solo curriculum, the trainer uses the same matchup rules to decide whether to promote `best-model.pt`.
 
-The 0-ply holdout league ran 7,680 cold matches on seed `980_000`. The untrained checkpoint anchors Elo at 1,000.
-The promoted weights and matching version 19 AdamW state are `locked-gt.pt` and `locked-gt-state.pt`.
+The 0-ply holdout league ran 8,640 cold matches on seed `1_200_000`. The untrained checkpoint anchors Elo at 1,000.
+The separate `700_000` selection league locked **Cluster 0-ply zero-sum** before either holdout. The weights and matching version 19 AdamW state are `locked-gt.pt` and `locked-gt-state.pt`.
 
 | Training milestone | Overall Elo | 2p Elo | 3p Elo | 4p Elo | Net deadwood per seat | Declarations per seat |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Untrained (rev 0) | 1000.0 | 1000.0 | 1000.0 | 1000.0 | -38.02 | 0.15% |
-| Potential and subsampling | 1324.1 | 1254.7 | 1348.1 | 1319.4 | -9.72 | 6.81% |
-| Cluster cold play | 1422.1 | 1383.7 | 1445.2 | 1415.2 | +10.87 | 14.16% |
-| AdamW resume | 1434.0 | 1388.0 | 1466.2 | 1423.3 | +12.13 | 15.01% |
-| Pure 0-ply zero-sum | 1512.3 | 1464.3 | 1540.9 | 1503.7 | +24.73 | 20.45% |
-
+| Untrained (rev 0) | 1000.0 | 1000.0 | 1000.0 | 1000.0 | -42.11 | 0.16% |
+| Potential and subsampling | 1344.3 | 1273.4 | 1343.6 | 1351.3 | -12.37 | 6.98% |
+| Cluster cold play | 1439.0 | 1450.8 | 1412.2 | 1452.8 | +4.81 | 12.74% |
+| AdamW resume | 1458.9 | 1435.2 | 1433.8 | 1474.7 | +7.35 | 13.79% |
+| Single-VM 0-ply gate | 1526.8 | 1522.5 | 1510.4 | 1536.7 | +19.83 | 19.12% |
+| Cluster 0-ply zero-sum | 1566.0 | 1526.6 | 1549.0 | 1579.1 | +22.49 | 20.86% |
 
 See the [training guide](TRAINING.md) for commands, defaults, and the token layout.
 

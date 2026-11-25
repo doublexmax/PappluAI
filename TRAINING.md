@@ -222,6 +222,71 @@ The same two locked and prior saves also played 500 paired, cold, 21-card solo d
 | Prior checkpoint | 197/500 | 39.40% | +0.1067 |
 
 
+### Two-learner cluster and final cold holdouts
+
+Two learners and four actors ran on six 16-vCPU Azure VMs. The 96-vCPU cluster resumed at revision 1,022.
+The three stages used 0-ply self-play, with no search at inference.
+
+| Revision range | Trained decisions | Trained decisions/s | Dropped batches |
+| --- | ---: | ---: | ---: |
+| 1,022 to 1,526 | 769,472 | 549.52 | 0 |
+| 1,526 to 1,894 | 565,244 | 548.09 | 0 |
+| 1,894 to 2,294 | 612,868 | 599.47 | 0 |
+
+The cluster trained on 1,947,584 decisions at 563.88 decisions/s over the summed learner-stage elapsed time.
+Across 234 learner samples, CPU busy was 79.98% mean and 98.12% median.
+Across 468 actor samples, CPU busy was 98.27% mean and 100.00% median.
+
+#### Selection on seed 700,000
+
+Only `vm-papplu-v4-w128` ran evaluation. It used 16 workers and BF16 at 0-ply.
+The built-in league ran 2,304 cold matches with 24 mirrored deals per pair and player count.
+It ranked overall Elo first and net deadwood per seat second. An exact tie kept `gate-0ply`.
+The gate anchors selection Elo at 1,000.
+
+| Checkpoint | Overall Elo | Net deadwood per seat | Declarations per seat |
+| --- | ---: | ---: | ---: |
+| c5-s2 | 1028.2 | +0.67 | 12.81% |
+| c5-s3 | 1024.1 | +1.86 | 12.71% |
+| c5-s1 | 1017.1 | +0.15 | 11.57% |
+| gate-0ply | 1000.0 | -2.69 | 9.52% |
+
+Selection locked `c5-s2` at revision 1,894 before either holdout. The best cluster checkpoint replaced the single-VM gate.
+The matching AdamW state uses format 19. Neither holdout could change the lock.
+
+#### Six-milestone holdout on seed 1,200,000
+
+The holdout played 8,640 mirrored matches over 36 cold deals per pair and player count.
+Its deal seeds did not overlap selection or the recorded earlier evaluations.
+Untrained weights anchor each rating at 1,000. Positive net deadwood means the checkpoint gained points.
+Declarations per seat counts winning declarations divided by seat appearances.
+
+| Training milestone | Overall Elo | 2p Elo | 3p Elo | 4p Elo | Net deadwood per seat | Declarations per seat |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Untrained (rev 0) | 1000.0 | 1000.0 | 1000.0 | 1000.0 | -42.11 | 0.16% |
+| Potential and subsampling | 1344.3 | 1273.4 | 1343.6 | 1351.3 | -12.37 | 6.98% |
+| Cluster cold play | 1439.0 | 1450.8 | 1412.2 | 1452.8 | +4.81 | 12.74% |
+| AdamW resume | 1458.9 | 1435.2 | 1433.8 | 1474.7 | +7.35 | 13.79% |
+| Single-VM 0-ply gate | 1526.8 | 1522.5 | 1510.4 | 1536.7 | +19.83 | 19.12% |
+| Cluster 0-ply zero-sum | 1566.0 | 1526.6 | 1549.0 | 1579.1 | +22.49 | 20.86% |
+
+#### Paired solo holdout on seed 1,500,000
+
+All three checkpoints played the same 500 cold 21-card deals, seeds `1_500_000` through `1_500_499`.
+A win is a valid declaration within 60 turns. The 95% intervals resample paired deals, not independent training runs.
+
+| Checkpoint | Declarations | Win rate | Mean utility |
+| --- | ---: | ---: | ---: |
+| Cluster 0-ply zero-sum | 289/500 | 57.80% | +0.3924 |
+| Single-VM 0-ply gate | 255/500 | 51.00% | +0.2941 |
+| AdamW resume | 200/500 | 40.00% | +0.1146 |
+
+| Paired comparison | Win rate difference (pp) | 95% interval (pp) |
+| --- | ---: | ---: |
+| Cluster 0-ply zero-sum minus Single-VM 0-ply gate | +6.80 | +2.20 to +11.20 |
+| Cluster 0-ply zero-sum minus AdamW resume | +17.80 | +13.20 to +22.60 |
+| Single-VM 0-ply gate minus AdamW resume | +11.00 | +6.00 to +16.00 |
+
 ## Azure results
 
 The results below predate the checkpoint league. Historical search-assisted runs used a policy option that has since been removed.
